@@ -116,14 +116,7 @@ function optSingletonNode(obj: ELObj): Node | null {
     return first;
   }
 
-  // Not a node or node-list - handle booleans and nil like other primitives
-  // Templates may pass #f/#t/() when conditionals don't match
-  if (obj.asNil() || obj.asBoolean() !== null) {
-    return null; // Treat as empty/missing node
-  }
-
-  // Not a node/node-list/boolean/nil - likely a template error
-  // Return null to allow templates to continue (will return #f from primitive)
+  // Not a node or node-list - return null (OpenJade behavior)
   return null;
 }
 
@@ -342,8 +335,7 @@ const carPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
 
   const pair = args[0].asPair();
   if (!pair) {
-    // OpenJade allows car of non-pair in some contexts (returns empty list)
-    return theNilObj;
+    throw new Error('car requires a pair');
   }
 
   return pair.car;
@@ -360,8 +352,7 @@ const cdrPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
 
   const pair = args[0].asPair();
   if (!pair) {
-    // OpenJade allows cdr of non-pair in some contexts (returns empty list)
-    return theNilObj;
+    throw new Error('cdr requires a pair');
   }
 
   return pair.cdr;
@@ -819,9 +810,7 @@ const stringLengthPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj 
 
   const str = args[0].asString();
   if (!str) {
-    // Non-string types (like #f, #t, ()) return 0 length
-    // This matches template patterns where conditionals may return non-strings
-    return makeNumber(0, true);
+    throw new Error('string-length requires a string');
   }
 
   return makeNumber(str.value.length, true);
@@ -837,18 +826,16 @@ const stringAppendPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
 
-    // Port from: OpenJade StringAppend - treats (), #f, and #t as empty string
+    // Port from: OpenJade StringAppend - treats () and #f as empty string
     // This allows templates to use (if ...) and (case ...) without else clauses
     // AND allows attribute-string returning #f to be safely concatenated
-    // Also skip functions and other non-string types
-    if (arg.asNil() || arg.asBoolean() !== null || arg.asFunction() !== null) {
-      continue; // Treat non-strings as empty string
+    if (arg.asNil() || (arg.asBoolean() !== null && !arg.asBoolean()!.value)) {
+      continue; // Treat () and #f as empty string
     }
 
     const str = arg.asString();
     if (!str) {
-      // Skip any other non-string types
-      continue;
+      throw new Error('string-append requires string arguments');
     }
     result += str.value;
   }
@@ -1693,17 +1680,8 @@ const substringPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => 
   const str = args[0].asString();
   const start = args[1].asNumber();
   const end = args[2].asNumber();
-
-  // Handle nil as empty string (OpenJade behavior)
-  if (args[0].asNil()) {
-    return makeString('');
-  }
-
   if (!str || !start || !end) {
-    const arg0Type = str ? 'string' : args[0].constructor.name;
-    const arg1Type = start ? 'number' : args[1].constructor.name;
-    const arg2Type = end ? 'number' : args[2].constructor.name;
-    throw new Error(`substring requires string and two number arguments, got (${arg0Type}, ${arg1Type}, ${arg2Type})`);
+    throw new Error('substring requires string and two number arguments');
   }
 
   const startIdx = Math.floor(start.value);
@@ -2478,9 +2456,7 @@ const mapPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
 
   const proc = args[0].asFunction();
   if (!proc) {
-    // Template may pass non-procedure (e.g., #f from conditional)
-    // Return empty list to allow template to continue
-    return theNilObj;
+    throw new Error('map: first argument must be a procedure');
   }
 
   const lists = args.slice(1);
@@ -5810,12 +5786,6 @@ const elementWithIdPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj
     throw new Error('element-with-id requires 1 or 2 arguments');
   }
 
-  // Handle #f and () by returning empty node-list
-  // This allows templates to use (element-with-id (attribute-string ...)) safely
-  if (args[0].asNil() || args[0].asBoolean() !== null) {
-    return makeNodeList(EMPTY_NODE_LIST);
-  }
-
   const idStr = args[0].asString();
   if (!idStr) {
     throw new Error('element-with-id requires a string as first argument');
@@ -5865,39 +5835,22 @@ const elementWithIdPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj
  * Port from: primitive.h PRIMITIVE(Data, "data", 0, 1, 0)
  */
 const dataPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
-  // Port from: OpenJade PRIMITIVE(Data, "data", 0, 1, 0)
-  // 0 required, 1 optional - can be called with 0 or 1 arguments
-  if (args.length > 1) {
-    throw new Error('data takes at most 1 argument');
+  if (args.length !== 1) {
+    throw new Error('data requires exactly 1 argument');
   }
 
-  let nodeObj: ELObj;
-  if (args.length === 0) {
-    // Use current-node from VM context
-    const groveNode = vm.currentNode;
-    if (!groveNode) {
-      throw new Error('data: no current node');
-    }
-    nodeObj = makeNode(groveNode);
-  } else {
-    nodeObj = args[0];
-  }
+  let node = args[0].asNode();
 
-  // Check if it's a node
-  let node = nodeObj.asNode();
-
-  // If it's a node-list, extract the first node
+  // If it's a node-list, extract the first node (OpenJade behavior)
   if (!node) {
-    const nodeList = nodeObj.asNodeList();
+    const nodeList = args[0].asNodeList();
     if (nodeList) {
       const first = nodeList.nodes.first();
       if (!first) {
         // Empty node-list
         return theFalseObj;
       }
-      // Use first node (whether single or multiple)
-      nodeObj = makeNode(first);
-      node = nodeObj.asNode();
+      node = makeNode(first).asNode()!;
     }
   }
 
@@ -5914,43 +5867,13 @@ const dataPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
  * Port from: primitive.h PRIMITIVE(Parent, "parent", 0, 1, 0)
  */
 const parentPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
-  // Port from: OpenJade PRIMITIVE(Parent, "parent", 0, 1, 0)
-  // 0 required, 1 optional - can be called with 0 or 1 arguments
-  if (args.length > 1) {
-    throw new Error('parent takes at most 1 argument');
+  if (args.length !== 1) {
+    throw new Error('parent requires exactly 1 argument');
   }
 
-  let nodeObj: ELObj;
-  if (args.length === 0) {
-    // Use current-node from VM context
-    const groveNode = vm.currentNode;
-    if (!groveNode) {
-      throw new Error('parent: no current node');
-    }
-    nodeObj = makeNode(groveNode);
-  } else {
-    nodeObj = args[0];
-  }
-
-  // Check if it's a node
-  let node = nodeObj.asNode();
-
-  // If it's a node-list, extract the first node
+  const node = args[0].asNode();
   if (!node) {
-    const nodeList = nodeObj.asNodeList();
-    if (nodeList) {
-      const first = nodeList.nodes.first();
-      if (!first) {
-        // Empty node-list
-        return theFalseObj;
-      }
-      nodeObj = makeNode(first);
-      node = nodeObj.asNode();
-    }
-  }
-
-  if (!node) {
-    // Non-node types return #f
+    // Non-node types return #f (OpenJade behavior)
     return theFalseObj;
   }
 
@@ -5997,8 +5920,7 @@ const childrenPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
     return makeNodeList(nodeListFromArray(allChildren));
   }
 
-  // Non-node types (like #f, #t, ()) return empty node-list
-  return makeNodeList(EMPTY_NODE_LIST);
+  throw new Error('children requires a node or node-list argument');
 };
 
 /**
@@ -6070,8 +5992,7 @@ const nodeListFirstPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj
 
   const nl = args[0].asNodeList();
   if (!nl) {
-    // Non-node-list types return #f
-    return theFalseObj;
+    throw new Error('node-list-first requires a node-list argument');
   }
 
   const first = nl.nodes.first();
@@ -6240,8 +6161,7 @@ const nodeListMapPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj =
         const nodeArray = resultNodeList.nodes.toArray();
         results.push(...nodeArray);
       } else {
-        // Non-node/non-node-list results are skipped (treated as empty node-list)
-        // This allows template conditionals to return #f/#t/() etc.
+        // Non-node/non-node-list results are skipped (OpenJade behavior)
       }
     }
 
@@ -6368,8 +6288,7 @@ const nodeListEqualPredicate: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj
   } else {
     const list1 = obj1.asNodeList();
     if (!list1) {
-      // Non-node/non-node-list first argument means not equal
-      return theFalseObj;
+      throw new Error('node-list=? requires node or node-list as first argument');
     }
     nl1 = list1.nodes;
   }
@@ -6380,8 +6299,7 @@ const nodeListEqualPredicate: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj
   } else {
     const list2 = obj2.asNodeList();
     if (!list2) {
-      // Non-node/non-node-list second argument means not equal
-      return theFalseObj;
+      throw new Error('node-list=? requires node or node-list as second argument');
     }
     nl2 = list2.nodes;
   }
@@ -6436,26 +6354,9 @@ const nodeListContainsPredicate: PrimitiveFunction = (args: ELObj[], vm: VM): EL
     throw new Error('node-list-contains? requires a node-list as first argument');
   }
 
-  // Second argument can be a node or node-list
-  let searchNodeObj = args[1];
-  let searchNode = searchNodeObj.asNode();
+  const searchNode = args[1].asNode();
   if (!searchNode) {
-    const searchNodeList = searchNodeObj.asNodeList();
-    if (searchNodeList) {
-      const first = searchNodeList.nodes.first();
-      if (!first) {
-        // Empty node-list - not found
-        return theFalseObj;
-      }
-      searchNodeObj = makeNode(first);
-      searchNode = searchNodeObj.asNode();
-      if (!searchNode) {
-        throw new Error('node-list-contains?: failed to extract node from node-list');
-      }
-    } else {
-      // Non-node types are not found in the list
-      return theFalseObj;
-    }
+    throw new Error('node-list-contains? requires a node as second argument');
   }
 
   // Search for the node in the list
