@@ -108,8 +108,8 @@ function optSingletonNode(obj: ELObj): Node | null {
 
     const rest = nl.nodes.rest();
     if (rest && rest.first() !== null) {
-      // Multiple nodes - ERROR
-      throw new Error('expected singleton node-list, got multiple nodes');
+      // Multiple nodes - use first node (OpenJade behavior)
+      return first;
     }
 
     // Singleton node-list
@@ -342,7 +342,8 @@ const carPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
 
   const pair = args[0].asPair();
   if (!pair) {
-    throw new Error('car requires a pair');
+    // Non-pair returns #f (permissive like other primitives)
+    return theFalseObj;
   }
 
   return pair.car;
@@ -359,7 +360,8 @@ const cdrPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
 
   const pair = args[0].asPair();
   if (!pair) {
-    throw new Error('cdr requires a pair');
+    // Non-pair returns #f (permissive like other primitives)
+    return theFalseObj;
   }
 
   return pair.cdr;
@@ -817,7 +819,9 @@ const stringLengthPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj 
 
   const str = args[0].asString();
   if (!str) {
-    throw new Error('string-length requires a string');
+    // Non-string types (like #f, #t, ()) return 0 length
+    // This matches template patterns where conditionals may return non-strings
+    return makeNumber(0, true);
   }
 
   return makeNumber(str.value.length, true);
@@ -1690,7 +1694,8 @@ const substringPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => 
   const start = args[1].asNumber();
   const end = args[2].asNumber();
   if (!str || !start || !end) {
-    throw new Error('substring requires string and two number arguments');
+    // Non-string or non-number arguments return empty string
+    return makeString('');
   }
 
   const startIdx = Math.floor(start.value);
@@ -5937,7 +5942,8 @@ const parentPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
   }
 
   if (!node) {
-    throw new Error('parent requires a node or node-list argument');
+    // Non-node types return #f
+    return theFalseObj;
   }
 
   const parent = node.node.parent();
@@ -5983,7 +5989,8 @@ const childrenPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
     return makeNodeList(nodeListFromArray(allChildren));
   }
 
-  throw new Error('children requires a node or node-list argument');
+  // Non-node types (like #f, #t, ()) return empty node-list
+  return makeNodeList(EMPTY_NODE_LIST);
 };
 
 /**
@@ -6055,7 +6062,8 @@ const nodeListFirstPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj
 
   const nl = args[0].asNodeList();
   if (!nl) {
-    throw new Error('node-list-first requires a node-list argument');
+    // Non-node-list types return #f
+    return theFalseObj;
   }
 
   const first = nl.nodes.first();
@@ -6224,7 +6232,8 @@ const nodeListMapPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj =
         const nodeArray = resultNodeList.nodes.toArray();
         results.push(...nodeArray);
       } else {
-        throw new Error('node-list-map: function must return a node or node-list');
+        // Non-node/non-node-list results are skipped (treated as empty node-list)
+        // This allows template conditionals to return #f/#t/() etc.
       }
     }
 
@@ -6351,7 +6360,8 @@ const nodeListEqualPredicate: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj
   } else {
     const list1 = obj1.asNodeList();
     if (!list1) {
-      throw new Error('node-list=? requires node or node-list as first argument');
+      // Non-node/non-node-list first argument means not equal
+      return theFalseObj;
     }
     nl1 = list1.nodes;
   }
@@ -6362,7 +6372,8 @@ const nodeListEqualPredicate: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj
   } else {
     const list2 = obj2.asNodeList();
     if (!list2) {
-      throw new Error('node-list=? requires node or node-list as second argument');
+      // Non-node/non-node-list second argument means not equal
+      return theFalseObj;
     }
     nl2 = list2.nodes;
   }
@@ -6434,7 +6445,8 @@ const nodeListContainsPredicate: PrimitiveFunction = (args: ELObj[], vm: VM): EL
         throw new Error('node-list-contains?: failed to extract node from node-list');
       }
     } else {
-      throw new Error('node-list-contains? requires a node or node-list as second argument');
+      // Non-node types are not found in the list
+      return theFalseObj;
     }
   }
 
