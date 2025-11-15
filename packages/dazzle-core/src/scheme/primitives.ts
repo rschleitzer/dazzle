@@ -342,8 +342,8 @@ const carPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
 
   const pair = args[0].asPair();
   if (!pair) {
-    // Non-pair returns #f (permissive like other primitives)
-    return theFalseObj;
+    // OpenJade allows car of non-pair in some contexts (returns empty list)
+    return theNilObj;
   }
 
   return pair.car;
@@ -360,8 +360,8 @@ const cdrPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
 
   const pair = args[0].asPair();
   if (!pair) {
-    // Non-pair returns #f (permissive like other primitives)
-    return theFalseObj;
+    // OpenJade allows cdr of non-pair in some contexts (returns empty list)
+    return theNilObj;
   }
 
   return pair.cdr;
@@ -1693,9 +1693,17 @@ const substringPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => 
   const str = args[0].asString();
   const start = args[1].asNumber();
   const end = args[2].asNumber();
-  if (!str || !start || !end) {
-    // Non-string or non-number arguments return empty string
+
+  // Handle nil as empty string (OpenJade behavior)
+  if (args[0].asNil()) {
     return makeString('');
+  }
+
+  if (!str || !start || !end) {
+    const arg0Type = str ? 'string' : args[0].constructor.name;
+    const arg1Type = start ? 'number' : args[1].constructor.name;
+    const arg2Type = end ? 'number' : args[2].constructor.name;
+    throw new Error(`substring requires string and two number arguments, got (${arg0Type}, ${arg1Type}, ${arg2Type})`);
   }
 
   const startIdx = Math.floor(start.value);

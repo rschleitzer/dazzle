@@ -115,9 +115,18 @@ class LibxmljsNode implements Node {
   }
 
   data(): string | null {
-    return this.native.type() === 'text'
-      ? (this.native as any).text()  // Text node has text() method
-      : null;
+    // For text nodes, return their text content directly
+    if (this.native.type() === 'text') {
+      return (this.native as any).text();
+    }
+
+    // For element nodes, return the concatenated text content of all child text nodes
+    // This is the DSSSL/SGML behavior - (data element) returns its character data
+    if (this.native.type() === 'element') {
+      return (this.native as any).text();  // libxmljs2's text() method returns all descendant text
+    }
+
+    return null;
   }
 
   systemData(): string | null {
