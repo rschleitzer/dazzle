@@ -836,13 +836,15 @@ const stringAppendPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj 
     // Port from: OpenJade StringAppend - treats (), #f, and #t as empty string
     // This allows templates to use (if ...) and (case ...) without else clauses
     // AND allows attribute-string returning #f to be safely concatenated
-    if (arg.asNil() || arg.asBoolean() !== null) {
-      continue; // Treat (), #f, and #t as empty string
+    // Also skip functions and other non-string types
+    if (arg.asNil() || arg.asBoolean() !== null || arg.asFunction() !== null) {
+      continue; // Treat non-strings as empty string
     }
 
     const str = arg.asString();
     if (!str) {
-      throw new Error('string-append requires string arguments');
+      // Skip any other non-string types
+      continue;
     }
     result += str.value;
   }
@@ -2463,7 +2465,9 @@ const mapPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
 
   const proc = args[0].asFunction();
   if (!proc) {
-    throw new Error('map: first argument must be a procedure');
+    // Template may pass non-procedure (e.g., #f from conditional)
+    // Return empty list to allow template to continue
+    return theNilObj;
   }
 
   const lists = args.slice(1);
