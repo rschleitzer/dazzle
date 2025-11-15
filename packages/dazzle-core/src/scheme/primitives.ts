@@ -826,11 +826,11 @@ const stringAppendPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
 
-    // Port from: OpenJade StringAppend - treats () and #f as empty string
+    // Port from: OpenJade StringAppend - treats (), #f, and #t as empty string
     // This allows templates to use (if ...) and (case ...) without else clauses
     // AND allows attribute-string returning #f to be safely concatenated
-    if (arg.asNil() || (arg.asBoolean() !== null && !arg.asBoolean()!.value)) {
-      continue; // Treat () and #f as empty string
+    if (arg.asNil() || arg.asBoolean() !== null) {
+      continue; // Treat (), #f, and #t as empty string
     }
 
     const str = arg.asString();
@@ -5784,6 +5784,12 @@ const idPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
 const elementWithIdPrimitive: PrimitiveFunction = (args: ELObj[], vm: VM): ELObj => {
   if (args.length < 1 || args.length > 2) {
     throw new Error('element-with-id requires 1 or 2 arguments');
+  }
+
+  // Handle #f and () by returning empty node-list
+  // This allows templates to use (element-with-id (attribute-string ...)) safely
+  if (args[0].asNil() || args[0].asBoolean() !== null) {
+    return makeNodeList(EMPTY_NODE_LIST);
   }
 
   const idStr = args[0].asString();
