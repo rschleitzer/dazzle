@@ -116,8 +116,15 @@ function optSingletonNode(obj: ELObj): Node | null {
     return first;
   }
 
-  // Not a node or node-list - ERROR
-  throw new Error('expected node or node-list');
+  // Not a node or node-list - handle booleans and nil like other primitives
+  // Templates may pass #f/#t/() when conditionals don't match
+  if (obj.asNil() || obj.asBoolean() !== null) {
+    return null; // Treat as empty/missing node
+  }
+
+  // Not a node/node-list/boolean/nil - likely a template error
+  // Return null to allow templates to continue (will return #f from primitive)
+  return null;
 }
 
 /**
