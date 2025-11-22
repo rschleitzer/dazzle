@@ -15,11 +15,9 @@ $prog =~ s@.*/@@;
 
 $gen_c = 0;
 
-undef $opt_l;
-undef $opt_p;
-undef $opt_t;
-do 'getopts.pl';
-&Getopts('l:p:t:');
+use Getopt::Std;
+our ($opt_l, $opt_p, $opt_t);
+getopts('l:p:t:');
 $module = $opt_l;
 $pot_file = $opt_p;
 

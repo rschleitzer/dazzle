@@ -1,6 +1,7 @@
 
 #include "MultiLineInlineNote.h"
-#include <iostream.h>
+#include <iostream>
+using namespace std;
 
 #ifdef DSSSL_NAMESPACE
 namespace DSSSL_NAMESPACE {
