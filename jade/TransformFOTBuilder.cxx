@@ -9,6 +9,7 @@
 #include "ErrnoMessageArg.h"
 
 #include <errno.h>
+#include <sys/stat.h>
 
 #ifdef DSSSL_NAMESPACE
 namespace DSSSL_NAMESPACE {
@@ -153,6 +154,23 @@ public:
   private:
     StringC systemId_;
   };
+  class DirectoryFlowObj : public TransformCompoundExtensionFlowObj {
+    void start(TransformFOTBuilder &fotb, const NodePtr &) const {
+      fotb.startDirectory(path_);
+    }
+    void end(TransformFOTBuilder &fotb) const {
+      fotb.endDirectory();
+    }
+    bool hasNIC(const StringC &name) const {
+      return name == "path";
+    }
+    void setNIC(const StringC &name, const Value &value) {
+      value.convertString(path_);
+    }
+    ExtensionFlowObj *copy() const { return new DirectoryFlowObj(*this); }
+  private:
+    StringC path_;
+  };
   class DocumentTypeFlowObj : public TransformExtensionFlowObj {
     void atomic(TransformFOTBuilder &fotb, const NodePtr &nd) const {
       fotb.documentType(nic_);
@@ -190,6 +208,8 @@ public:
   void entityRef(const StringC &);
   void startEntity(const StringC &);
   void endEntity();
+  void startDirectory(const StringC &);
+  void endDirectory();
   void extension(const ExtensionFlowObj &fo, const NodePtr &);
   void startExtensionSerial(const CompoundExtensionFlowObj &fo, const NodePtr &nd);
   void endExtensionSerial(const CompoundExtensionFlowObj &fo);
@@ -229,6 +249,7 @@ private:
     StringC systemId;
   };
   IList<OpenFile> openFileStack_;
+  Vector<StringC> directoryStack_;
   bool xml_;
   enum ReState {
     stateMiddle,
@@ -254,6 +275,7 @@ FOTBuilder *makeTransformFOTBuilder(CmdLineApp *app,
   static const TransformFOTBuilder::EntityFlowObj entity;
   static const TransformFOTBuilder::EntityRefFlowObj entityRef;
   static const TransformFOTBuilder::DocumentTypeFlowObj documentType;
+  static const TransformFOTBuilder::DirectoryFlowObj directory;
   static const FOTBuilder::Extension extensions[] = {
     {
       "UNREGISTERED::James Clark//Flow Object Class::processing-instruction",
@@ -302,6 +324,14 @@ FOTBuilder *makeTransformFOTBuilder(CmdLineApp *app,
       0,
       0,
       &documentType
+    },
+    {
+      "UNREGISTERED::OpenJade//Flow Object Class::directory",
+      0,
+      0,
+      0,
+      0,
+      &directory
     },
     {
       "UNREGISTERED::James Clark//Characteristic::preserve-sdata?",
@@ -487,17 +517,29 @@ void TransformFOTBuilder::startEntity(const StringC &systemId)
   openFileStack_.insert(ofp);
   ofp->systemId = systemId;
   ofp->saveOs = os_;
+
+  // Combine with current directory if one is set
+  StringC fullPath;
+  if (directoryStack_.size() > 0) {
+    fullPath = directoryStack_.back();
+    fullPath += '/';
+    fullPath += systemId;
+  }
+  else {
+    fullPath = systemId;
+  }
+
   String<CmdLineApp::AppChar> filename;
 #ifdef SP_WIDE_SYSTEM
-  filename = systemId;
+  filename = fullPath;
 #else
-  filename = app_->codingSystem()->convertOut(systemId);
+  filename = app_->codingSystem()->convertOut(fullPath);
 #endif
   if (filename.size()) {
     filename += 0;
     if (!ofp->fb.open(filename.data())) {
       app_->message(CmdLineApp::openFileErrorMessage(),
-		    StringMessageArg(systemId),
+		    StringMessageArg(fullPath),
 		    ErrnoMessageArg(errno));
     }
     else {
@@ -525,6 +567,40 @@ void TransformFOTBuilder::endEntity()
   }
   os_ = of.saveOs;
   delete openFileStack_.get();
+}
+
+void TransformFOTBuilder::startDirectory(const StringC &path)
+{
+  StringC fullPath;
+  if (directoryStack_.size() > 0) {
+    // Combine with current directory
+    fullPath = directoryStack_.back();
+    fullPath += '/';
+    fullPath += path;
+  }
+  else {
+    fullPath = path;
+  }
+
+  // Create directory if it doesn't exist
+  if (fullPath.size() > 0) {
+    String<CmdLineApp::AppChar> dirName;
+#ifdef SP_WIDE_SYSTEM
+    dirName = fullPath;
+#else
+    dirName = app_->codingSystem()->convertOut(fullPath);
+#endif
+    dirName += 0;
+    mkdir(dirName.data(), 0755);
+  }
+
+  directoryStack_.push_back(fullPath);
+}
+
+void TransformFOTBuilder::endDirectory()
+{
+  if (directoryStack_.size() > 0)
+    directoryStack_.resize(directoryStack_.size() - 1);
 }
 
 inline
