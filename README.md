@@ -12,7 +12,7 @@ The `directory` flow object allows creating directory hierarchies during SGML/XM
 
 ```scheme
 (declare-flow-object-class directory
-  "UNREGISTERED::OpenJade//Flow Object Class::directory")
+  "UNREGISTERED::Dazzle//Flow Object Class::directory")
 
 (make directory path: "output"
   (make directory path: "subdir"

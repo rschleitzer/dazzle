@@ -326,7 +326,7 @@ FOTBuilder *makeTransformFOTBuilder(CmdLineApp *app,
       &documentType
     },
     {
-      "UNREGISTERED::OpenJade//Flow Object Class::directory",
+      "UNREGISTERED::Dazzle//Flow Object Class::directory",
       0,
       0,
       0,
