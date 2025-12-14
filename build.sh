@@ -31,17 +31,17 @@ echo ""
 echo "=== Building OpenSP ==="
 cd "${TOP}/opensp"
 
-# Apply patches if needed (check if already patched)
-if grep -q "IListBase::clear;" include/IList.h 2>/dev/null; then
+# Apply patches if needed (check if already patched by looking for "using")
+if ! grep -q "using IListBase::clear;" include/IList.h 2>/dev/null; then
     echo "Applying C++11 compatibility patches..."
-    # Fix access declarations
-    sed -i '' 's/IListBase::clear;/using IListBase::clear;/' include/IList.h
-    sed -i '' 's/IListBase::empty;/using IListBase::empty;/' include/IList.h
-    sed -i '' 's/IListIterBase::next;/using IListIterBase::next;/' include/IListIter.h
-    sed -i '' 's/IListIterBase::done;/using IListIterBase::done;/' include/IListIter.h
-    sed -i '' 's/Ptr<T>::isNull;/using Ptr<T>::isNull;/' include/Ptr.h
-    sed -i '' 's/Ptr<T>::clear;/using Ptr<T>::clear;/' include/Ptr.h
-    sed -i '' 's/ParserState::\([a-zA-Z]*\);/using ParserState::\1;/g' lib/Parser.h
+    # Fix access declarations (old C++ style -> C++11 using declarations)
+    sed -i '' 's/^[[:space:]]*IListBase::clear;/  using IListBase::clear;/' include/IList.h
+    sed -i '' 's/^[[:space:]]*IListBase::empty;/  using IListBase::empty;/' include/IList.h
+    sed -i '' 's/^[[:space:]]*IListIterBase::next;/  using IListIterBase::next;/' include/IListIter.h
+    sed -i '' 's/^[[:space:]]*IListIterBase::done;/  using IListIterBase::done;/' include/IListIter.h
+    sed -i '' 's/^[[:space:]]*Ptr<T>::isNull;/  using Ptr<T>::isNull;/' include/Ptr.h
+    sed -i '' 's/^[[:space:]]*Ptr<T>::clear;/  using Ptr<T>::clear;/' include/Ptr.h
+    sed -i '' 's/^[[:space:]]*ParserState::\([a-zA-Z]*\);/  using ParserState::\1;/' lib/Parser.h
 fi
 
 if [ ! -f Makefile ] || [ ! -f config.h ]; then
@@ -50,7 +50,8 @@ if [ ! -f Makefile ] || [ ! -f config.h ]; then
         --enable-http \
         --enable-default-catalog="${SGML_CATALOG}" \
         --disable-doc-build \
-        --disable-dependency-tracking
+        --disable-dependency-tracking \
+        --disable-nls
 fi
 
 # Fix config.h issues for modern compilers

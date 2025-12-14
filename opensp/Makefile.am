@@ -4,7 +4,7 @@ AUTOMAKE_OPTIONS = check-news
 
 SUBDIRS = pubtext unicode doc \
 	include generic \
-	intl po \
+	po \
 	lib nsgmls spent spam sgmlnorm sx spcat \
 	tests @DOCSRC@
 
