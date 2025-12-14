@@ -1,6 +1,21 @@
-# OpenJade (Personal Fork)
+# Dazzle
 
-This is my personal fork of OpenJade with custom modifications.
+A custom DSSSL processor based on OpenJade, with bundled OpenSP.
+
+## Quick Install
+
+```bash
+# Install dependencies (macOS)
+brew install gettext
+
+# Build
+./build.sh
+
+# Install to /usr/local
+sudo ./install.sh
+```
+
+That's it. No environment variables needed - dazzle finds SGML catalogs automatically.
 
 ## Modifications
 
