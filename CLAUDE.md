@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-OpenJade is an implementation of the ISO/IEC 10179:1996 DSSSL (Document Style Semantics and Specification Language) standard. It processes SGML/XML documents using DSSSL stylesheets and transforms them into various output formats:
+Dazzle is a modernized, self-contained DSSSL processor forked from OpenJade. It implements the ISO/IEC 10179:1996 DSSSL (Document Style Semantics and Specification Language) standard, processing SGML/XML documents using DSSSL stylesheets into various output formats:
 - RTF (Rich Text Format)
 - TeX
 - MIF (FrameMaker)
@@ -12,37 +12,58 @@ OpenJade is an implementation of the ISO/IEC 10179:1996 DSSSL (Document Style Se
 - HTML+CSS
 - FOT (Flow Object Tree as XML)
 
-OpenJade is built on top of OpenSP (SGML parser library) and is written in C++.
+### What Makes Dazzle Different from OpenJade
+
+1. **Self-contained distribution** - OpenSP 1.5.2 is bundled in `opensp/` and built together with the rest. No external OpenSP dependency needed.
+
+2. **Directory flow object** - A custom DSSSL extension not found in OpenJade. The `directory` flow object in `TransformFOTBuilder` enables hierarchical directory creation during SGML/XML transformation output. Declared as:
+   ```scheme
+   (declare-flow-object-class directory
+     "UNREGISTERED::Dazzle//Flow Object Class::directory")
+   ```
+   Directories can be nested and combined with `entity` flow objects to organize multi-file output.
+
+3. **Modern compiler support** - C++11 compatibility patches applied automatically during build, cross-platform iconv detection, portable build scripts for macOS and Linux.
+
+4. **Binary is named `dazzle`** (not `openjade`).
 
 ## Build Commands
 
 ```bash
-# Configure (requires OpenSP installed, e.g. via homebrew: open-sp)
+# Build everything (OpenSP + dazzle) - the recommended way
+./build.sh
+
+# Install (default prefix: /usr/local)
+./install.sh
+
+# Or with custom prefix
+PREFIX=/path/to/install ./install.sh
+
+# Manual configure (alternative to build.sh)
 ./configure --enable-spincludedir=/opt/homebrew/opt/open-sp/include/OpenSP \
             --enable-splibdir=/opt/homebrew/opt/open-sp/lib \
             --prefix=/path/to/install
-
-# Build
 make
-
-# Install
-make install
 
 # Clean
 make clean
 ```
 
-## Running OpenJade
+`build.sh` is a two-stage build: it builds OpenSP first, then configures and builds dazzle against it. Parallel builds supported via `JOBS` env var (default 4).
+
+## Running Dazzle
 
 ```bash
 # Basic usage (outputs FOT by default)
-./jade/openjade -c dsssl/catalog document.sgml
+./jade/dazzle -c dsssl/catalog document.sgml
 
 # Specify output type and stylesheet
-./jade/openjade -c dsssl/catalog -t rtf -d stylesheet.dsl document.sgml
+./jade/dazzle -c dsssl/catalog -t rtf -d stylesheet.dsl document.sgml
 
 # Output types: fot, rtf, tex, sgml, xml, html, mif
 ```
+
+After installation, SGML catalogs are set up automatically — no manual `SGML_CATALOG_FILES` configuration needed.
 
 ## Running Tests
 
@@ -54,6 +75,8 @@ make all
 ## Architecture
 
 ### Library Structure
+
+- **opensp/** - Bundled OpenSP 1.5.2 SGML parser library (built first by `build.sh`).
 
 - **grove/** - SGML grove library implementing the SGML property set. Provides the `Node` class hierarchy for representing parsed SGML documents as a node tree.
 
@@ -73,16 +96,13 @@ make all
   - `HtmlFOTBuilder` - HTML+CSS output
   - `MifFOTBuilder` - FrameMaker MIF output
   - `SgmlFOTBuilder` - SGML/XML transformation output
-  - `TransformFOTBuilder` - SGML transformation backend
+  - `TransformFOTBuilder` - SGML transformation backend (includes dazzle's `directory` flow object)
   - `jade.cxx` - Main entry point (`JadeApp`)
-
-### Key Dependencies
-
-- **OpenSP** - Required external dependency for SGML parsing. Include path and library path configured via `--enable-spincludedir` and `--enable-splibdir`.
 
 ### Build System
 
 Uses autoconf/automake with custom Makefile structure:
+- `build.sh` / `install.sh` - Top-level build and install scripts
 - `Makefile.comm` - Common definitions
 - `Makefile.lib` - Library build rules
 - `Makefile.prog` - Program build rules
