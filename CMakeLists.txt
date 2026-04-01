@@ -34,6 +34,7 @@ check_include_file("limits.h" HAVE_LIMITS_H)
 check_function_exists(setlocale HAVE_SETLOCALE)
 check_function_exists(strerror HAVE_STRERROR)
 check_function_exists(memmove HAVE_MEMMOVE)
+check_function_exists(memcmp HAVE_MEMCMP)
 check_function_exists(wcslen HAVE_WCSLEN)
 
 # Type sizes

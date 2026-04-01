@@ -18,7 +18,9 @@
 class SP_API SGMLApplication {
 public:
 #ifdef SP_MULTI_BYTE
-#if UINT_MAX >= 0xffffffffL /* 2^32 - 1 */
+#if defined(_MSC_VER)
+  typedef wchar_t Char;
+#elif UINT_MAX >= 0xffffffffL /* 2^32 - 1 */
   typedef unsigned int Char;
 #else
   typedef unsigned long Char;

@@ -50,7 +50,7 @@ void ConsoleOutputCharStream::flush()
 void ConsoleOutputCharStream::flushBuf(Char c)
 {
   DWORD nWritten;
-  unsigned short ch = c;
+  wchar_t ch = c;
   if (WriteConsoleW(h_, &ch, 1, &nWritten, 0))
     return;
   char buf[2];

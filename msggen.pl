@@ -20,6 +20,7 @@ our ($opt_l, $opt_p, $opt_t);
 getopts('l:p:t:');
 $module = $opt_l;
 $pot_file = $opt_p;
+$libinclude = ($module eq 'libModule') ? 'splib.h' : 'stylelib.h';
 
 if (defined($opt_t)) {
   # don't try to read translations for English
@@ -35,7 +36,8 @@ foreach $def_file (@ARGV) {
 open(DEF, $def_file) || die "can't open \`$def_file': $!\n";
 
 while (<DEF>) {
-    chop;
+    chomp;
+    s/\r$//;
     if (/^!cxx$/) {
 	$gen_c = 1;
 	next;
@@ -179,7 +181,7 @@ if ($gen_c) {
 #pragma implementation
 #endif
 
-#include "stylelib.h"
+#include "$libinclude"
 #include "$class.h"
 
 #ifdef SP_NAMESPACE

@@ -32,6 +32,9 @@ public:
   OutputCharStream &operator<<(const StringC &);
   OutputCharStream &operator<<(unsigned long);
   OutputCharStream &operator<<(int);
+#if defined(_MSC_VER) && defined(_WIN64)
+  OutputCharStream &operator<<(size_t n) { return *this << (unsigned long)n; }
+#endif
   OutputCharStream &operator<<(Newline);
 private:
   OutputCharStream(const OutputCharStream &);	// undefined

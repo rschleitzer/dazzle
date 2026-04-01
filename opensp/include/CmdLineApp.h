@@ -95,7 +95,7 @@ private:
 #ifdef SP_WIDE_SYSTEM
 #define SP_DEFINE_APP(CLASS) \
   extern "C" \
-  wmain(int argc, wchar_t **argv) { CLASS app; return app.run(argc, argv); }
+  int wmain(int argc, wchar_t **argv) { CLASS app; return app.run(argc, argv); }
 #else
 #define SP_DEFINE_APP(CLASS) \
  extern "C" \

@@ -65,7 +65,6 @@ set(OSP_SOURCES
   lib/Parser.cxx
   lib/ParserApp.cxx
   lib/ParserEventGeneratorKit.cxx
-  lib/ParserMessages.cxx
   lib/ParserOptions.cxx
   lib/ParserState.cxx
   lib/Partition.cxx
@@ -164,7 +163,7 @@ endif()
 set(OSP_GENERATED_MSGS)
 foreach(msg ${OSP_MSG_FILES})
   dazzle_generate_messages(
-    "${PROJECT_SOURCE_DIR}/opensp/msggen.pl"
+    "${PROJECT_SOURCE_DIR}/msggen.pl"
     "${OSP_M4_DIR}/${msg}.msg"
     "${OSP_GEN_DIR}"
     "libModule"
@@ -175,7 +174,7 @@ endforeach()
 
 # ParserMessages also generates .cxx (has !cxx directive) — handle separately
 dazzle_generate_messages(
-  "${PROJECT_SOURCE_DIR}/opensp/msggen.pl"
+  "${PROJECT_SOURCE_DIR}/msggen.pl"
   "${OSP_M4_DIR}/ParserMessages.msg"
   "${OSP_GEN_DIR}"
   "libModule"

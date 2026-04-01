@@ -26,8 +26,13 @@ typedef Unsigned32 Index;
 
 #ifdef SP_MULTI_BYTE
 
+#if defined(_MSC_VER) && defined(SP_WIDE_SYSTEM)
+typedef wchar_t Char;
+typedef int Xchar;
+#else
 typedef Unsigned32 Char;
 typedef Signed32 Xchar;
+#endif
 
 #else /* not SP_MULTI_BYTE */
 

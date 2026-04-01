@@ -26,6 +26,9 @@ public:
   OutputByteStream &operator<<(unsigned);
   OutputByteStream &operator<<(long);
   OutputByteStream &operator<<(unsigned long);
+#if defined(_MSC_VER) && defined(_WIN64)
+  OutputByteStream &operator<<(size_t n) { return *this << (unsigned long)n; }
+#endif
   OutputByteStream &operator<<(const String<char> &);
   char *getBufferPtr() const;
   size_t getBufferSize() const;

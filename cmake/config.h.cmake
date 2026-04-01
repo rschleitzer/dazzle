@@ -31,6 +31,7 @@
 #cmakedefine HAVE_LIMITS_H
 #cmakedefine HAVE_STRERROR
 #cmakedefine HAVE_MEMMOVE
+#cmakedefine HAVE_MEMCMP
 #cmakedefine HAVE_LIBPTHREAD
 #cmakedefine HAVE_LIBTHREADS
 
@@ -60,7 +61,11 @@
  * Paths (substituted by CMake)
  * ====================================================================== */
 
+#ifdef _WIN32
+#define SGML_CATALOG_FILES_DEFAULT L"@SGML_CATALOG_FILES_DEFAULT@"
+#else
 #define SGML_CATALOG_FILES_DEFAULT "@SGML_CATALOG_FILES_DEFAULT@"
+#endif
 #define SP_LOCALE_DIR "@SP_LOCALE_DIR@"
 #define PATH_SEPARATOR '@PATH_SEPARATOR@'
 
@@ -74,6 +79,9 @@
 
 #cmakedefine SP_MULTI_BYTE 1
 #cmakedefine SP_HAVE_SOCKET 1
+#if defined(_WIN32) && defined(SP_HAVE_SOCKET)
+#define WINSOCK
+#endif
 #cmakedefine SP_DTDDECL 1
 #define SP_DEFINE_TEMPLATES 1
 
@@ -113,21 +121,8 @@
 #define SP_DLLEXPORT __declspec(dllexport)
 #define SP_DLLIMPORT __declspec(dllimport)
 
-#ifdef _DLL
-#define SP_USE_DLL
-#endif
-
-#ifdef SP_USE_DLL
-#ifndef BUILD_LIBSP
+/* SP_USE_DLL is not defined: we build static libraries */
 #define SP_DEFINE_TEMPLATES
-#endif
-#endif
-
-#ifndef SP_MANUAL_INST
-#ifndef SP_DEFINE_TEMPLATES
-#define SP_MANUAL_INST
-#endif
-#endif
 
 #ifdef SP_MULTI_BYTE
 #define SP_WIDE_SYSTEM
@@ -136,7 +131,7 @@
 #define SP_WCHAR_T_USHORT
 
 #define SP_PCH
-#define SP_NO_MESSAGE_TEXT
+/* #undef SP_NO_MESSAGE_TEXT */
 
 #ifdef _MT
 #define SP_MUTEX_WIN32
@@ -322,8 +317,8 @@
 #endif
 #endif
 
-#define OPENJADE_PACKAGE PACKAGE
-#define OPENJADE_VERSION VERSION
+#define OPENJADE_PACKAGE "dazzle"
+#define OPENJADE_VERSION "1.3.3"
 #ifndef OPENJADE_MESSAGE_DOMAIN
 #define OPENJADE_MESSAGE_DOMAIN ""
 #endif

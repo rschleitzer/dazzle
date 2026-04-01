@@ -12,6 +12,8 @@
 
 #include "Hash.h"
 #include "StringC.h"
+#include "Ptr.h"
+#include "Location.h"
 #include "Node.h"
 
 #ifdef SP_NAMESPACE

@@ -595,7 +595,7 @@ void TransformFOTBuilder::startDirectory(const StringC &path)
 #endif
     dirName += 0;
 #ifdef _WIN32
-    _mkdir(dirName.data());
+    _wmkdir(dirName.data());
 #else
     mkdir(dirName.data(), 0755);
 #endif
