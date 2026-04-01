@@ -10,6 +10,9 @@
 
 #include <errno.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 #ifdef DSSSL_NAMESPACE
 namespace DSSSL_NAMESPACE {
@@ -591,7 +594,11 @@ void TransformFOTBuilder::startDirectory(const StringC &path)
     dirName = app_->codingSystem()->convertOut(fullPath);
 #endif
     dirName += 0;
+#ifdef _WIN32
+    _mkdir(dirName.data());
+#else
     mkdir(dirName.data(), 0755);
+#endif
   }
 
   directoryStack_.push_back(fullPath);
