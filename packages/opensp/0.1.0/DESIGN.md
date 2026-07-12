@@ -359,6 +359,59 @@ has no shrink). Deferred (rare SGML, absent from the XML/model-DTD corpus):
 `pointer[Node]` use PLAIN `.` (`set p.field: v`) — the explicit-deref
 `(*p).field` form silently mutates a value COPY (root_pages.scaly's note).
 
+### Landed (Stage 3, Increment — attributes)
+
+JIT-green (`tests/opensp/run.sh` → `PASS`), emission-neutral (`cycle.sh`
+IDENTICAL). Ports `Attribute.cs` (1824), `AttributeList.cs` (587),
+`Attributed.cs` (41):
+- **`Attribute.scaly`** — the declared-value classification and the produced
+  value/semantics/spec:
+  - `DeclaredValue` — the C++ `DeclaredValue → Cdata / Tokenized → Group →
+    NameTokenGroup / Notation, Entity / Id / Idref` hierarchy flattened to one
+    tagged struct (`dv_kind`); the `TokenizedDeclaredValue` ctor's
+    initial/subsequent CATEGORY selection per `TokenType`, `tokenized`/`isId`/
+    `isIdref`/`isNotation`/`isEntity`/`containsToken`, and the full
+    `buildDesc` → `AttributeDefinitionDesc.declaredValue` mapping (the
+    `type + (isList ? names : name)` arithmetic plus the id/idref/notation/
+    nameTokenGroup overrides).
+  - `AttributeDefinition` — `Required / Current / Implied → Conref, Default →
+    Fixed` flattened (`ad_kind`); `isConref`/`isCurrent`/`isFixed`, name/
+    origName, `setSpecified`/`isSpecified`, `buildDesc` → `DefaultValueType`,
+    `getDesc` (both halves), and `makeMissingValue`'s value-selection branch
+    (driven by the context).
+  - `AttributeValue` — `Implied / Cdata / Tokenized → Data` flattened;
+    `info` → `Type`, `string`, and `TokenizedAttributeValue::token(i)` /
+    `nTokens` token splitting over a `spaceIndex` vector.
+  - `AttributeSemantics` — `Entity / Notation` flattened; entity/notation held
+    by IDENTITY (borrowed `pointer[void]`, their concepts land with the Dtd).
+  - `Attribute` — the per-spec slot (specIndexPlus/value/semantics).
+  - `AttributeContext` — the `Messenger` base as a concrete synthetic context
+    (validate/mayDefaultAttribute flags + a message counter + cached implied
+    value); the live parser subclass (id table, entity/notation lookup,
+    current-value store) lands with the parser stage.
+- **`AttributeList.scaly`** — `AttributeDefinitionList` (append with id/
+  notation/current index tracking, `attributeIndex`/`tokenIndex`/
+  `tokenIndexUnique`), `AttributeList` (init/size/name/value/specified/id/
+  idref/getId, `setSpec` spec-index tracking + duplicate detection, `finish`'s
+  missing-value fill + grpcnt/conref checks), and `Attributed`.
+
+**Minimal seeds & deferrals** (port-order faithful, documented in-file):
+- `Text` — a minimal seed (`StringC` + `fixedEqual`); the full content Text
+  (`TextIter`/`TextItem`, per-char locations, subst tables) lands with the
+  parser stage, which is also where the message-emitting value
+  NORMALISATION/VALIDATION (`makeValue`'s category/length checks, allowed-value
+  and entity/notation/id resolution through the live context) and the
+  `setValue`/`recoverUnquoted`/`handleAsUnterminated` + `makeSemantics` paths
+  are driven. This increment ports the type structure, the pure classification/
+  `buildDesc` logic, missing-value selection, and token splitting.
+- `DataDeclaredValue`/`DataAttributeValue` fields (notation + attribute list
+  for NDATA) reserved in the tag space, resolution deferred to the parser.
+- `out` params modelled as pointer-out (`isSpecified`) or a `-1` sentinel
+  return (`attributeIndex`/`tokenIndex`).
+
+**Trap hit:** `StringC.substr` added (needed by `token(i)`) — allocates the
+slice on the returned value's own page, clamping out-of-range slices to empty.
+
 ### Landed (Stage 3, Increment A)
 
 JIT-green (`tests/opensp/run.sh` → `PASS`):
