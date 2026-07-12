@@ -282,11 +282,42 @@ followed here: `ElementType : Named + Attributed` → an `Attributed` member;
   `parseShortrefDecl`; `parseParam`(the param workhorse); helpers `Param`(388),
   `SdParam`(111), `SdBuilder`(36), `ParserOptions`(235).
 
-Port order (map's): Tokens → Sd+Syntax (**Increment A**) → scanner (B) →
-content-model DFA (C, the strongest self-contained non-trivial island) →
+Port order (map's): Tokens → Sd+Syntax (**Increment A**) → content-model DFA
+(**Increment C**, taken next as the strongest self-contained island — no
+InputSource/delimiter integration, cleanly unit-testable) → scanner (**B**,
+deferred: needs the Syntax delimiter tables + InputSource token primitives) →
 attributes → Notation → Dtd → ContentState → ParserState → Parser (by section:
 parseSd → parseParam → parseDecl → prolog). Dtd/ParserState/Parser are the
 integration tail, last.
+
+### Landed (Stage 3, Increment C — content-model DFA)
+
+JIT-green (`tests/opensp/run.sh` → `PASS`, 50 assertions):
+- **`ElementType.scaly`** — minimal seed (identity + dense `index`, all the DFA
+  needs); the full `ElementType` (389 LOC) lands whole in the Dtd increment.
+- **`ContentToken.scaly`** — Clark's position-automaton construction:
+  `analyze`/`analyze1` (FIRST/LAST sets, AND-depth bookkeeping),
+  `addTransitions` (adjacent-position follow threading), `finish`/`andFinish`
+  (follow dedup+compaction → element→transition table, PCDATA-reachability,
+  ambiguity detection), `CompiledModelGroup.compile`, and the parse-time
+  `AndState`/`MatchState` runtime (`tryTransition`/`tryTransitionPcdata`/
+  `isFinished`/`computeMinAndDepth`). Tests cover SEQ, optional members, OR
+  choice, `+` repetition, mixed content `(#PCDATA|a)*`, AND groups (both
+  orders + double-member rejection), and a nested OR-in-SEQ (recursion +
+  branch mutual-exclusion). Emission-neutral (`cycle.sh` IDENTICAL).
+
+**Port shape:** the C++ `ContentToken` class hierarchy (ContentToken →
+ModelGroup → And/Or/Seq; ContentToken → LeafContentToken →
+Pcdata/Initial/Element) is FLATTENED into one page-hosted `Node` struct tagged
+by `kind`/`connector`. Rationale: `analyze`/`finish` mutate a shared node graph
+in place and cross-link nodes by pointer, which a Scaly union models awkwardly
+(no in-place field mutation across variants); the tag replaces C++ virtual
+dispatch, and the whole graph lives on the run's compile page. Growable follow
+sets → `Array` with a separate `n_follow` live-count after compaction (Array
+has no shrink). Deferred (rare SGML, absent from the XML/model-DTD corpus):
+`DataTagGroup`/`DataTagElementToken`. **Mutation trap confirmed:** through a
+`pointer[Node]` use PLAIN `.` (`set p.field: v`) — the explicit-deref
+`(*p).field` form silently mutates a value COPY (root_pages.scaly's note).
 
 ### Landed (Stage 3, Increment A)
 
