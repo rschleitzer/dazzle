@@ -219,6 +219,94 @@ Port order (map's, condensed): Storage → ExternalId → EntityCatalog →
 EntityManager.open → Entity + stacking. File-I/O touches only `Storage.File`
 (→ `scaly.io.File`); everything above reaches bytes only through `Storage.read`.
 
+## Stage 3 — declarations: SGML decl, prolog, DTD (in progress)
+
+The summit before instance parsing: parse the SGML/implied-XML declaration, the
+prolog (DOCTYPE + internal/external subset), and the markup declarations
+(ELEMENT/ATTLIST/ENTITY/NOTATION), compiling content models to a DFA and
+building the `Dtd`.
+
+### Scope (this is a multi-increment stage)
+
+Far larger than Stages 1–2 (the C++ parser family is thousands of LOC). Ported
+as separable increments, each JIT-tested:
+1. **`Tokens` table** (`Token.cs`) — the 61 lexer tokens + `tokenFirstShortref`
+   (read; ready to land).
+2. **`Sd` + `Syntax`** — SGML declaration + concrete syntax, with the XML
+   reference defaults (delimiters, name chars, quantities). Enough for the
+   implied XML declaration the corpus uses.
+3. **DTD data structures** — `Dtd`, `ElementType`, `AttributeDefinition`(+List),
+   `Notation` (the declaration-dump target).
+4. **Content model** — `ContentToken`/`ModelGroup` tree → DFA compile.
+5. **Declaration parser** — ELEMENT/ATTLIST/ENTITY/NOTATION over a token stream
+   → builds the `Dtd`.
+
+### Memory & residency
+
+Same one-region-per-run rule. The `Dtd` and its element/attribute/notation
+tables, the content-model token trees and their compiled DFA states, all live
+to run end → `Owner<T>` fields become plain fields, shared refs are borrowed
+pointers. Content-model DFA states are a fixed graph built once per element
+type; index leaf tokens densely (arena arrays).
+
+### Type inventory & MI (Stage 3)
+
+No true MI in the C# port; three C++ MI sites resolved by the mirror and
+followed here: `ElementType : Named + Attributed` → an `Attributed` member;
+`Notation : EntityDecl + Attributed` → EntityDecl base + inline attributed;
+`ParserState`'s C++ `ContentState + AttributeContext` → linearized
+(`ContentState : AttributeContext`). Key shapes (C# LOC):
+
+- **`Sd`** (822) — feature flags (OMITTAG/SHORTTAG/…), capacities, quantities,
+  charset, `execToInternal`, `www()`. **`Syntax`** (1019) — char-class sets +
+  `categoryTable` (per-char Category), general delimiters, quantities
+  (`referenceQuantity_`), namecase subst, standard functions, markup-scan table;
+  the `Syntax(Sd)` ctor builds the reference/XML defaults.
+- **Scanner:** `Recognizer`(100, trie-driven `recognize(InputSource)`) built by
+  `TrieBuilder`(206)/`Trie`(169)/`Partition`(245) from `ModeInfo`(335)+`Syntax`;
+  `Mode`(74)/`MarkupScan`(21) enums; `ParserState.getToken(Mode)` is the choke
+  point.
+- **DTD:** `Dtd`(451, element/entity/notation/rankstem/shortref tables),
+  `ElementType`(389: `ElementDefinition` owns `CompiledModelGroup`, omit flags,
+  inclusions/exclusions; `RankStem`; `ElementType`), `Attribute`(1824: declared
+  values + `AttributeDefinition` subclasses + `AttributeContext:Messenger`),
+  `AttributeList`(587), `Notation`(92), `ShortReferenceMap`(105),
+  `Attributed`(41).
+- **Content model + DFA:** `ContentToken`(1283: `ModelGroup`(And/Or/Seq),
+  `LeafContentToken` indexing, `FirstSet`/`LastSet`, `CompiledModelGroup.compile`
+  = the DFA builder, `AndState`, `MatchState`), `Group`(292 parse scratch),
+  `ContentState`(216, open-element stack).
+- **Parser:** `Parser.cs`(11801, = `ParserState`(1627 god-object) + all parse
+  methods): `parseSgmlDecl`→Sd/Syntax; `doProlog`/`doDeclSubset`;
+  `parseElementDecl`/`parseAttlistDecl`/`parseEntityDecl`/`parseNotationDecl`/
+  `parseShortrefDecl`; `parseParam`(the param workhorse); helpers `Param`(388),
+  `SdParam`(111), `SdBuilder`(36), `ParserOptions`(235).
+
+Port order (map's): Tokens → Sd+Syntax (**Increment A**) → scanner (B) →
+content-model DFA (C, the strongest self-contained non-trivial island) →
+attributes → Notation → Dtd → ContentState → ParserState → Parser (by section:
+parseSd → parseParam → parseDecl → prolog). Dtd/ParserState/Parser are the
+integration tail, last.
+
+### Landed (Stage 3, Increment A)
+
+JIT-green (`tests/opensp/run.sh` → `PASS`):
+- **`Tokens.scaly`** — the full 61-token table + `tokenFirstShortref` (module
+  constants, visible unqualified to sibling modules).
+- **`Sd.scaly`** — minimal reference `Sd`: identity `exec_to_internal`, `www()`.
+- **`Syntax.scaly`** — the reference-syntax `Syntax(Sd)` character
+  classification (256-entry category table: letters→nameStart, digits→digit),
+  namecase `fold` (lc→uc subst), reference quantities, `is_name_start_character`/
+  `is_name_character`/`is_digit`/`is_hex_digit`/`get_quantity`, and
+  `add_name_start_characters`/`add_name_characters` (the SD/XML naming
+  extensions). Delimiters/standard-functions/s-sets/reserved-names/markup-scan →
+  Increment B (scanner). Emission-neutral (`cycle.sh` IDENTICAL).
+
+**Parser trap hit:** a multi-line single-expression function body (an `or`
+chain on continuation lines) breaks the Scaly parser with a *misleading* error
+at the enclosing concept header — keep a braceless body on one line, else use
+`{ … }` with explicit `return`s.
+
 ### Landed (Stage 2)
 
 All green through the JIT (`tests/opensp/run.sh` → `PASS`):
