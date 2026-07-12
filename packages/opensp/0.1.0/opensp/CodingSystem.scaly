@@ -1,0 +1,301 @@
+use scaly.memory.Page
+
+; Coding systems — the byte<->Char translation layer (OpenSP CodingSystem.cs,
+; IdentityCodingSystem.cs, UTF8CodingSystem.cs, XMLCodingSystem.cs).
+;
+; The C++/C# runtime hierarchy (InputCodingSystem/OutputCodingSystem/CodingSystem
+; + Decoder/Encoder abstracts + concretes) has no Scaly vtable equivalent, so it
+; ports to the ELObj pattern: a CLOSED union over the set the CodingSystemKit
+; actually wires — Identity, UTF-8, XML autodetect — dispatched with choose.
+; Exotic systems (Big5/EUCJP/SJIS/Fixed2/4/UTF16/Unicode/Win32/Translate) are
+; deliberately omitted; resolving one is a LOUD fatal error (exit 120), matching
+; CodingSystemKitImpl's Identity/UTF-8/XML-only wiring.
+;
+; Stage 1 is stateless whole-buffer decode/encode, faithful to convertIn/
+; convertOut. Streaming decoder state (partial UTF-8 sequences, XML PI phases)
+; and the OutputByteStream sink arrive with the entity/IO layer (Stage 2).
+
+define OSP_EOF: i32 -1
+define OSP_CHAR_MAX: u32 0x10FFFF
+define OSP_REPLACEMENT_CHAR: u32 0xFFFD
+
+define CodingSystem union
+(
+    Identity
+    UTF8
+    XML
+)
+{
+    ; Decode external bytes into Char codepoints written to `result`
+    ; (capacity >= input_len for Identity; >= input_len for multibyte too,
+    ; since each Char consumes >= 1 byte). Returns the Char count produced.
+    function decode(this: CodingSystem, input: pointer[u8], input_len: size_t, result: pointer[u32]) returns size_t
+    {
+        choose this
+            when x: Identity
+                decode_identity(input, input_len, result)
+            when x: UTF8
+                decode_utf8(input, input_len, result)
+            else
+                decode_xml(input, input_len, result)
+    }
+
+    ; Encode Char codepoints into `out` bytes (capacity out_cap). Returns the
+    ; byte count produced. Unencodable Chars are dropped (Stage 1 has no
+    ; unencodable-handler); UTF-8 encodes the full Unicode range.
+    function encode(this: CodingSystem, chars: pointer[u32], len: size_t, out: pointer[u8], out_cap: size_t) returns size_t
+    {
+        choose this
+            when x: Identity
+                encode_identity(chars, len, out, out_cap)
+            when x: UTF8
+                encode_utf8(chars, len, out, out_cap)
+            else
+                encode_utf8(chars, len, out, out_cap)
+    }
+
+    ; --- Identity: byte <-> Char is zero-extend / low-byte ---
+
+    function decode_identity(this: CodingSystem, input: pointer[u8], input_len: size_t, result: pointer[u32]) returns size_t
+    {
+        var i: size_t 0
+        while i < input_len
+        {
+            set *(result + i): *(input + i) as u32
+            set i: i + 1
+        }
+        input_len
+    }
+
+    function encode_identity(this: CodingSystem, chars: pointer[u32], len: size_t, out: pointer[u8], out_cap: size_t) returns size_t
+    {
+        var n: size_t 0
+        var i: size_t 0
+        while i < len
+        {
+            if n >= out_cap
+                break
+
+            let c *(chars + i)
+            ; IdentityEncoder: c > 255 is unencodable -> dropped here
+            if c <= (255 as u32)
+            {
+                set *(out + n): c as u8
+                set n: n + 1
+            }
+            set i: i + 1
+        }
+        n
+    }
+
+    ; --- UTF-8 ---
+
+    function decode_utf8(this: CodingSystem, input: pointer[u8], input_len: size_t, result: pointer[u32]) returns size_t
+    {
+        var n: size_t 0
+        var i: size_t 0
+        while i < input_len
+        {
+            let b0 *(input + i)
+            var cp: u32 0
+            var extra: size_t 0
+            if (b0 & (0x80 as u8)) = (0 as u8)
+            {
+                set cp: b0 as u32
+                set extra: 0
+            }
+            else if (b0 & (0xE0 as u8)) = (0xC0 as u8)
+            {
+                set cp: (b0 & (0x1F as u8)) as u32
+                set extra: 1
+            }
+            else if (b0 & (0xF0 as u8)) = (0xE0 as u8)
+            {
+                set cp: (b0 & (0x0F as u8)) as u32
+                set extra: 2
+            }
+            else if (b0 & (0xF8 as u8)) = (0xF0 as u8)
+            {
+                set cp: (b0 & (0x07 as u8)) as u32
+                set extra: 3
+            }
+            else
+            {
+                ; invalid lead byte -> replacement, consume 1
+                set cp: OSP_REPLACEMENT_CHAR
+                set extra: 0
+            }
+
+            var k: size_t 0
+            while k < extra
+            {
+                set i: i + 1
+                if i >= input_len
+                {
+                    set cp: OSP_REPLACEMENT_CHAR
+                    break
+                }
+                let cont *(input + i)
+                if (cont & (0xC0 as u8)) <> (0x80 as u8)
+                {
+                    set cp: OSP_REPLACEMENT_CHAR
+                    break
+                }
+                set cp: (cp << (6 as u32)) | ((cont & (0x3F as u8)) as u32)
+                set k: k + 1
+            }
+
+            set *(result + n): cp
+            set n: n + 1
+            set i: i + 1
+        }
+        n
+    }
+
+    function encode_utf8(this: CodingSystem, chars: pointer[u32], len: size_t, out: pointer[u8], out_cap: size_t) returns size_t
+    {
+        var n: size_t 0
+        var i: size_t 0
+        while i < len
+        {
+            let c *(chars + i)
+            if c < (0x80 as u32)
+            {
+                if n + (1 as size_t) > out_cap
+                    break
+                set *(out + n): c as u8
+                set n: n + 1
+            }
+            else if c < (0x800 as u32)
+            {
+                if n + (2 as size_t) > out_cap
+                    break
+                set *(out + n): ((c >> (6 as u32)) | (0xC0 as u32)) as u8
+                set *(out + n + (1 as size_t)): ((c & (0x3F as u32)) | (0x80 as u32)) as u8
+                set n: n + 2
+            }
+            else if c < (0x10000 as u32)
+            {
+                if n + (3 as size_t) > out_cap
+                    break
+                set *(out + n): ((c >> (12 as u32)) | (0xE0 as u32)) as u8
+                set *(out + n + (1 as size_t)): (((c >> (6 as u32)) & (0x3F as u32)) | (0x80 as u32)) as u8
+                set *(out + n + (2 as size_t)): ((c & (0x3F as u32)) | (0x80 as u32)) as u8
+                set n: n + 3
+            }
+            else
+            {
+                if n + (4 as size_t) > out_cap
+                    break
+                set *(out + n): ((c >> (18 as u32)) | (0xF0 as u32)) as u8
+                set *(out + n + (1 as size_t)): (((c >> (12 as u32)) & (0x3F as u32)) | (0x80 as u32)) as u8
+                set *(out + n + (2 as size_t)): (((c >> (6 as u32)) & (0x3F as u32)) | (0x80 as u32)) as u8
+                set *(out + n + (3 as size_t)): ((c & (0x3F as u32)) | (0x80 as u32)) as u8
+                set n: n + 4
+            }
+            set i: i + 1
+        }
+        n
+    }
+
+    ; --- XML autodetect (XMLDecoder) ---
+    ; Stage 1: detect the UTF-8 BOM and otherwise treat input as UTF-8 (the
+    ; corpus's SP_ENCODING=XML inputs are UTF-8). A UTF-16 BOM (FE FF / FF FE)
+    ; is a LOUD fatal (exit 121) until the UTF-16 coding system is ported.
+    function decode_xml(this: CodingSystem, input: pointer[u8], input_len: size_t, result: pointer[u32]) returns size_t
+    {
+        if input_len >= (2 as size_t)
+        {
+            let a *(input + (0 as size_t))
+            let b *(input + (1 as size_t))
+            if (a = (0xFE as u8)) & (b = (0xFF as u8))
+                exit 121
+            if (a = (0xFF as u8)) & (b = (0xFE as u8))
+                exit 121
+        }
+        ; skip a UTF-8 BOM (EF BB BF) if present
+        var start: size_t 0
+        if input_len >= (3 as size_t)
+        {
+            if (*(input + (0 as size_t)) = (0xEF as u8)) & (*(input + (1 as size_t)) = (0xBB as u8)) & (*(input + (2 as size_t)) = (0xBF as u8))
+                set start: 3
+        }
+        decode_utf8(input + start, input_len - start, result)
+    }
+
+    function test() returns int
+    {
+        ; --- Identity round-trip: bytes 0x41 0x42 0xE9 ---
+        var bytes u8[8]
+        set *(bytes as pointer[u8] + (0 as size_t)): (0x41 as u8)
+        set *(bytes as pointer[u8] + (1 as size_t)): (0x42 as u8)
+        set *(bytes as pointer[u8] + (2 as size_t)): (0xE9 as u8)
+        var chars u32[8]
+        let idc CodingSystem.Identity
+        let nc idc.decode(bytes as pointer[u8], 3 as size_t, chars as pointer[u32])
+        if nc <> (3 as size_t)
+            return -1
+        if *(chars as pointer[u32] + (2 as size_t)) <> (0xE9 as u32)
+            return -2
+        var back u8[8]
+        let nb idc.encode(chars as pointer[u32], 3 as size_t, back as pointer[u8], 8 as size_t)
+        if nb <> (3 as size_t)
+            return -3
+        if *(back as pointer[u8] + (2 as size_t)) <> (0xE9 as u8)
+            return -4
+
+        ; --- UTF-8 round-trip: euro sign U+20AC -> 3 bytes -> back ---
+        var uc u32[4]
+        set *(uc as pointer[u32]): (0x20AC as u32)
+        var ub u8[8]
+        let utf8 CodingSystem.UTF8
+        let ubn utf8.encode(uc as pointer[u32], 1 as size_t, ub as pointer[u8], 8 as size_t)
+        if ubn <> (3 as size_t)
+            return -5
+        if *(ub as pointer[u8]) <> (0xE2 as u8)
+            return -6
+        if *(ub as pointer[u8] + (1 as size_t)) <> (0x82 as u8)
+            return -7
+        if *(ub as pointer[u8] + (2 as size_t)) <> (0xAC as u8)
+            return -8
+        var ucback u32[4]
+        let ucn utf8.decode(ub as pointer[u8], 3 as size_t, ucback as pointer[u32])
+        if ucn <> (1 as size_t)
+            return -9
+        if *(ucback as pointer[u32]) <> (0x20AC as u32)
+            return -10
+
+        ; --- UTF-8 multi-codepoint: "A€" (0x41, 0x20AC) ---
+        var mc u32[4]
+        set *(mc as pointer[u32]): (0x41 as u32)
+        set *(mc as pointer[u32] + (1 as size_t)): (0x20AC as u32)
+        var mb u8[8]
+        let mbn utf8.encode(mc as pointer[u32], 2 as size_t, mb as pointer[u8], 8 as size_t)
+        if mbn <> (4 as size_t)
+            return -11
+        var mcback u32[4]
+        let mcn utf8.decode(mb as pointer[u8], mbn, mcback as pointer[u32])
+        if mcn <> (2 as size_t)
+            return -12
+        if *(mcback as pointer[u32]) <> (0x41 as u32)
+            return -13
+        if *(mcback as pointer[u32] + (1 as size_t)) <> (0x20AC as u32)
+            return -14
+
+        ; --- XML autodetect: UTF-8 BOM stripped, body decoded as UTF-8 ---
+        var xb u8[8]
+        set *(xb as pointer[u8] + (0 as size_t)): (0xEF as u8)
+        set *(xb as pointer[u8] + (1 as size_t)): (0xBB as u8)
+        set *(xb as pointer[u8] + (2 as size_t)): (0xBF as u8)
+        set *(xb as pointer[u8] + (3 as size_t)): (0x41 as u8)
+        let xml CodingSystem.XML
+        var xc u32[8]
+        let xcn xml.decode(xb as pointer[u8], 4 as size_t, xc as pointer[u32])
+        if xcn <> (1 as size_t)
+            return -15
+        if *(xc as pointer[u32]) <> (0x41 as u32)
+            return -16
+
+        0
+    }
+}
