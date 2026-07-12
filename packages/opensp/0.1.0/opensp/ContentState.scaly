@@ -1,0 +1,366 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.ElementType.ElementType
+use opensp.ElementType.ElementDefinition
+use opensp.ShortReferenceMap.ShortReferenceMap
+use opensp.Dtd.Dtd
+use opensp.OpenElement.OpenElement
+use opensp.ContentToken.ContentToken
+use opensp.ContentToken.Node
+use opensp.ContentToken.CompiledModelGroup
+use opensp.ContentToken.Ambiguity
+
+; ContentState — ContentState.cs (216 LOC). The parser's open-element stack and
+; the machinery that tracks, for every dense element-type index, how many
+; instances are currently open / included / excluded — so the content checker
+; can answer elementIsOpen/Included/Excluded in O(1) and drive tag-omission and
+; content-model transitions.
+;
+; MI resolution: C++ `ParserState : ContentState + AttributeContext`, and the C#
+; port linearized it as `ContentState : AttributeContext` so ParserState could
+; single-inherit. Scaly has neither — ContentState is ported as a STANDALONE
+; concept holding the stack + counts; the eventual ParserState will COMPOSE a
+; ContentState and an AttributeContext (their state is disjoint). ContentState is
+; concrete here (C# made it abstract only because ParserState supplied the
+; Messenger — irrelevant to the data structure).
+;
+; PORT SHAPE: page-hosted flat struct. The C++ intrusive `IList<OpenElement>`
+; stack becomes an `Array[pointer[OpenElement]]` + a live `depth` (Array cannot
+; shrink; pop just decrements and reuses slots). The Vector<uint> count arrays
+; are `Array[u32]`, rebuilt by startContent and grown one slot at a time by
+; lookupCreateUndefinedElement (C++ push_back).
+;
+; DEFERRED to the Parser increment (emit diagnostics / need the live parser):
+; getOpenElementInfo (open-element context for messages — needs an OpenElementInfo
+; record + the rniPcdata name, both message-formatting surface).
+
+; Build an Array[u32] of `n` zeros on `host` (Vector<uint>::assign(n, 0)).
+function fill_zeros_u32(host: pointer[Page], n: size_t) returns pointer[Array[u32]]
+{
+    let a Array[u32]^host()
+    var i: size_t 0
+    while i < n
+    {
+        a.add(0 as u32)
+        set i: i + 1
+    }
+    a
+}
+
+define ContentState
+(
+    open_elements: pointer[Array[pointer[OpenElement]]]
+    depth: size_t
+    open_element_count: pointer[Array[u32]]
+    include_count: pointer[Array[u32]]
+    exclude_count: pointer[Array[u32]]
+    total_exclude_count: u32
+    tag_level: u32
+    net_enabling_count: u32
+    next_index: u64
+    last_ended_element_type: pointer[ElementType]
+    document_element_container: pointer[ElementType]
+    the_empty_map: pointer[ShortReferenceMap]
+)
+{
+    function make(host: pointer[Page]) returns pointer[ContentState]
+    {
+        let cs host.allocate(sizeof ContentState, alignof ContentState) as pointer[ContentState]
+        set cs.open_elements: Array[pointer[OpenElement]]^host()
+        set cs.depth: 0
+        set cs.open_element_count: Array[u32]^host()
+        set cs.include_count: Array[u32]^host()
+        set cs.exclude_count: Array[u32]^host()
+        set cs.total_exclude_count: 0 as u32
+        set cs.tag_level: 0 as u32
+        set cs.net_enabling_count: 0 as u32
+        set cs.next_index: 0 as u64
+        set cs.last_ended_element_type: null
+        ; documentElementContainer: a nameless element with the undefined index
+        ; (nuint.MaxValue) — the synthetic root the document element lives inside.
+        set cs.document_element_container: ElementType^host(StringC(), ELEMENT_UNDEFINED_INDEX)
+        set cs.the_empty_map: ShortReferenceMap.make(host, StringC())
+        cs
+    }
+
+    ; ---- stack primitives (Array + live depth) ---------------------------
+    function stack_push(this: pointer[ContentState], e: pointer[OpenElement])
+    {
+        if this.depth < this.open_elements.get_length()
+            this.open_elements.put(this.depth, e)
+        else
+            this.open_elements.add(e)
+        set this.depth: this.depth + (1 as size_t)
+    }
+
+    ; the element at stack offset `k` from the top (0 = current/head).
+    function at_top(this: ContentState, k: size_t) returns pointer[OpenElement]
+        *(open_elements.get_buffer() + (depth - (1 as size_t) - k))
+
+    function current_element(this: ContentState) returns pointer[OpenElement]
+        *(open_elements.get_buffer() + (depth - (1 as size_t)))
+
+    ; ---- startContent ----------------------------------------------------
+    ; Build the synthetic document-element container: a SEQ model group of the
+    ; single document element type, compiled to a DFA, and install it as the
+    ; base of the (freshly cleared) open-element stack.
+    function start_content(this: pointer[ContentState], host: pointer[Page], dtd: pointer[Dtd])
+    {
+        var members Array[pointer[Node]]^host()
+        members.add(ContentToken.make_leaf(host, dtd.get_document_element_type(), OI_NONE, false, false))
+        let group ContentToken.make_group(host, CONN_SEQ, members, OI_NONE)
+        var amb Array[Ambiguity]^host()
+        var unreach false
+        let compiled ContentToken.compile(host, group, dtd.n_element_type_index(), amb, &unreach)
+        let def ElementDefinition.make_with_model(host, Location(), 0 as size_t, 0 as u8, DC_MODEL_GROUP, compiled)
+        this.document_element_container.set_element_definition(def, 0 as size_t)
+
+        set this.tag_level: 0 as u32
+        set this.depth: 0
+        this.stack_push(OpenElement.make(host, this.document_element_container, false, false, this.the_empty_map, Location()))
+
+        let n dtd.n_element_type_index()
+        set this.include_count: fill_zeros_u32(host, n)
+        set this.exclude_count: fill_zeros_u32(host, n)
+        set this.open_element_count: fill_zeros_u32(host, n)
+        set this.net_enabling_count: 0 as u32
+        set this.total_exclude_count: 0 as u32
+        set this.last_ended_element_type: null
+        set this.next_index: 0 as u64
+    }
+
+    ; ---- push / pop ------------------------------------------------------
+    function push_element(this: pointer[ContentState], e: pointer[OpenElement])
+    {
+        set this.tag_level: this.tag_level + (1 as u32)
+        let oec this.open_element_count.get_buffer()
+        let ti e.get_type().get_index()
+        set *(oec + ti): *(oec + ti) + (1 as u32)
+        let def e.get_type().get_definition()
+        if def <> null
+        {
+            let inc this.include_count.get_buffer()
+            var i: size_t 0
+            let ni def.n_inclusions()
+            while i < ni
+            {
+                let idx def.inclusion(i).get_index()
+                set *(inc + idx): *(inc + idx) + (1 as u32)
+                set i: i + 1
+            }
+            let exc this.exclude_count.get_buffer()
+            var j: size_t 0
+            let ne def.n_exclusions()
+            while j < ne
+            {
+                let idx def.exclusion(j).get_index()
+                set *(exc + idx): *(exc + idx) + (1 as u32)
+                set this.total_exclude_count: this.total_exclude_count + (1 as u32)
+                set j: j + 1
+            }
+        }
+        if e.get_net_enabling()
+            set this.net_enabling_count: this.net_enabling_count + (1 as u32)
+        e.set_index(this.next_index)
+        set this.next_index: this.next_index + (1 as u64)
+        this.stack_push(e)
+    }
+
+    function pop_save_element(this: pointer[ContentState]) returns pointer[OpenElement]
+    {
+        let e *(this.open_elements.get_buffer() + (this.depth - (1 as size_t)))
+        set this.depth: this.depth - (1 as size_t)
+        set this.tag_level: this.tag_level - (1 as u32)
+        let oec this.open_element_count.get_buffer()
+        let ti e.get_type().get_index()
+        set *(oec + ti): *(oec + ti) - (1 as u32)
+        let def e.get_type().get_definition()
+        if def <> null
+        {
+            let inc this.include_count.get_buffer()
+            var i: size_t 0
+            let ni def.n_inclusions()
+            while i < ni
+            {
+                let idx def.inclusion(i).get_index()
+                set *(inc + idx): *(inc + idx) - (1 as u32)
+                set i: i + 1
+            }
+            let exc this.exclude_count.get_buffer()
+            var j: size_t 0
+            let ne def.n_exclusions()
+            while j < ne
+            {
+                let idx def.exclusion(j).get_index()
+                set *(exc + idx): *(exc + idx) - (1 as u32)
+                set this.total_exclude_count: this.total_exclude_count - (1 as u32)
+                set j: j + 1
+            }
+        }
+        if e.get_net_enabling()
+            set this.net_enabling_count: this.net_enabling_count - (1 as u32)
+        set this.last_ended_element_type: e.get_type()
+        e
+    }
+
+    function pop_element(this: pointer[ContentState])
+    {
+        let discard this.pop_save_element()
+    }
+
+    ; ---- queries ---------------------------------------------------------
+    function tag_level_of(this: ContentState) returns u32
+        tag_level
+
+    function element_is_open(this: ContentState, e: pointer[ElementType]) returns bool
+        *(open_element_count.get_buffer() + e.get_index()) <> (0 as u32)
+
+    function element_is_included(this: ContentState, e: pointer[ElementType]) returns bool
+    {
+        let idx e.get_index()
+        (*(include_count.get_buffer() + idx) <> (0 as u32)) && (*(exclude_count.get_buffer() + idx) = (0 as u32))
+    }
+
+    function element_is_excluded(this: ContentState, e: pointer[ElementType]) returns bool
+        *(exclude_count.get_buffer() + e.get_index()) <> (0 as u32)
+
+    function last_ended_element_type(this: ContentState) returns pointer[ElementType]
+        last_ended_element_type
+
+    function after_document_element(this: ContentState) returns bool
+        (tag_level = (0 as u32)) && this.current_element().is_finished()
+
+    function content_mode(this: ContentState) returns int
+        this.current_element().mode(net_enabling_count > (0 as u32))
+
+    ; checkImplyLoop — a loop is detected if any of the top `count` open elements
+    ; has the same type AND match state as the current head.
+    function check_imply_loop(this: ContentState, count: u32) returns bool
+    {
+        let head this.current_element()
+        var k: size_t 0
+        var c count
+        while c > (0 as u32)
+        {
+            let cur this.at_top(k)
+            if cur.get_type() = head.get_type()
+            {
+                if ContentToken.ms_equals(cur.get_match_state(), head.get_match_state())
+                    return false
+            }
+            set k: k + 1
+            set c: c - (1 as u32)
+        }
+        true
+    }
+
+    ; lookupCreateUndefinedElement — a referenced-but-undeclared element: create
+    ; it with an undefined ANY definition, register it in the DTD, hand it the
+    ; implicit attribute def, and grow the count arrays by one slot.
+    function lookup_create_undefined_element(this: pointer[ContentState], host: pointer[Page], name: StringC, loc: Location, dtd: pointer[Dtd], allow_immediate_recursion: bool) returns pointer[ElementType]
+    {
+        let p ElementType^host(name, dtd.alloc_element_type_index())
+        dtd.insert_element_type(p)
+        let def ElementDefinition.make(host, loc, ELEMENT_UNDEFINED_INDEX, OMIT_END, DC_ANY, allow_immediate_recursion)
+        p.set_element_definition(def, 0 as size_t)
+        p.set_attribute_def(dtd.get_implicit_element_attribute_def())
+        this.include_count.add(0 as u32)
+        this.exclude_count.add(0 as u32)
+        this.open_element_count.add(0 as u32)
+        p
+    }
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+
+        ; a DTD whose document element "doc" has model (a), with "a" EMPTY.
+        let dtd Dtd.make(host, StringC("doc"), true)
+        let doc_type dtd.get_document_element_type()
+        let a ElementType^host(StringC("a"), dtd.alloc_element_type_index())
+        dtd.insert_element_type(a)
+        var m Array[pointer[Node]]^host()
+        m.add(ContentToken.make_leaf(host, a, OI_NONE, false, false))
+        let grp ContentToken.make_group(host, CONN_SEQ, m, OI_NONE)
+        var amb Array[Ambiguity]^host()
+        var unreach false
+        let cmg ContentToken.compile(host, grp, dtd.n_element_type_index(), amb, &unreach)
+        let doc_def ElementDefinition.make_with_model(host, Location(), 0 as size_t, 0 as u8, DC_MODEL_GROUP, cmg)
+        doc_type.set_element_definition(doc_def, 0 as size_t)
+        let a_def ElementDefinition.make(host, Location(), 1 as size_t, 0 as u8, DC_EMPTY, true)
+        a.set_element_definition(a_def, 0 as size_t)
+
+        let cs ContentState.make(host)
+        cs.start_content(host, dtd)
+        if cs.tag_level_of() <> (0 as u32)
+            return -1
+        ; the container (model SEQ(doc)) is not finished until doc is seen.
+        if cs.after_document_element()
+            return -2
+        ; the container admits a transition to the document element type.
+        if cs.current_element().try_transition(doc_type) = false
+            return -3
+
+        ; push doc.
+        let oe_doc OpenElement.make(host, doc_type, false, false, null, Location())
+        cs.push_element(oe_doc)
+        if cs.tag_level_of() <> (1 as u32)
+            return -4
+        if cs.element_is_open(doc_type) = false
+            return -5
+        if cs.element_is_open(a)
+            return -6
+        if cs.current_element() <> oe_doc
+            return -7
+
+        ; within doc, transition to a and push it.
+        if cs.current_element().try_transition(a) = false
+            return -8
+        let oe_a OpenElement.make(host, a, false, false, null, Location())
+        cs.push_element(oe_a)
+        if cs.tag_level_of() <> (2 as u32)
+            return -9
+        if cs.element_is_open(a) = false
+            return -10
+        ; each open element got a distinct serial index.
+        if oe_doc.get_index() <> (0 as u64)
+            return -11
+        if oe_a.get_index() <> (1 as u64)
+            return -12
+
+        ; pop a: count clears, last-ended records a.
+        cs.pop_element()
+        if cs.tag_level_of() <> (1 as u32)
+            return -13
+        if cs.element_is_open(a)
+            return -14
+        if cs.last_ended_element_type() <> a
+            return -15
+
+        ; a checkImplyLoop over the head compares it to itself -> loop (false);
+        ; a zero-length window sees no loop (true).
+        if cs.check_imply_loop(0 as u32) = false
+            return -16
+        if cs.check_imply_loop(1 as u32)
+            return -17
+
+        ; pop doc.
+        cs.pop_element()
+        if cs.tag_level_of() <> (0 as u32)
+            return -18
+
+        ; lookupCreateUndefinedElement registers + grows the count arrays.
+        let u cs.lookup_create_undefined_element(host, StringC("unk"), Location(), dtd, true)
+        if dtd.lookup_element_type(StringC("unk")) <> u
+            return -19
+        if u.undefined() = false
+            return -20
+        if cs.element_is_open(u)
+            return -21
+
+        0
+    }
+}

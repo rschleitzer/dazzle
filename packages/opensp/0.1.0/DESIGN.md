@@ -505,6 +505,55 @@ linearization anyway); `Dtd.setDefaultEntity`'s LPD/defaulted-entity fan-out
 before interning — `intern_shortref` is the pure table op). The `Dtd` data
 structures + their construction/lookup API are complete and unit-tested here.
 
+### Landed (Stage 3, Increment — content-state)
+
+JIT-green (`tests/opensp/run.sh` → `PASS`), emission-neutral (`cycle.sh`
+IDENTICAL). Ports the content-model runtime + open-element stack — the last
+standalone data structures before the parser god-object. `OpenElement.cs` (160)
++ `ContentState.cs` (216), plus three `MatchState` helpers.
+
+- **`ContentToken.scaly` (three helpers added)** — `ms_current_position`
+  (the cursor's leaf `Node`), `as_equals` (AndState `operator==`: equal up to
+  the point where both have cleared), `ms_equals` (MatchState `operator==`:
+  same position pointer + AndState + min-and-depth). Needed by
+  `ContentState.checkImplyLoop`.
+- **`OpenElement.scaly`** — one entry on the open-element stack: element type,
+  net-enabling / included flags, the content cursor (`MatchState`), the cached
+  declared content (the empty/cdata/rcdata fast paths dodge the model group),
+  the active shortref map, the start location, and the serial index. `type`/
+  `netEnabling`/`included`/`matchState`/`isFinished`/`tryTransition`/
+  `tryTransitionPcdata`/`mode`/`currentPosition`/`requiresSpecialParse`/
+  `declaredEmpty`/`setConref`/`index` ported.
+- **`ContentState.scaly`** — the open-element stack + the per-element-type
+  open/include/exclude counts, `startContent` (builds the synthetic
+  document-element container's compiled model), `push`/`pop`,
+  `currentElement`, `elementIsOpen`/`Included`/`Excluded`, `contentMode`,
+  `afterDocumentElement`, `checkImplyLoop`, `lookupCreateUndefinedElement`.
+
+**Port-shape decisions:**
+- **`OpenElement : Link` → plain payload.** C++'s intrusive-list base drops: the
+  stack lives in ContentState (an `Array[pointer[OpenElement]]` + a live
+  `depth`; Array cannot shrink, so `pop` decrements and reuses slots). The
+  `Vector<uint>` count arrays are `Array[u32]`, rebuilt by `startContent` and
+  grown one slot at a time by `lookupCreateUndefinedElement` (C++ `push_back`).
+- **`ContentState : AttributeContext` linearization → composition.** The C#
+  port linearized the C++ `ParserState : ContentState + AttributeContext` so
+  ParserState could single-inherit; Scaly has neither MI nor that base, so
+  ContentState is a STANDALONE concept (stack + counts) and the eventual
+  ParserState will COMPOSE a ContentState and an AttributeContext (disjoint
+  state). ContentState is concrete here (C# made it abstract only to defer the
+  Messenger to ParserState — irrelevant to the data structure).
+
+**Deferred to the Parser increment** (need the un-ported RECOVERY half of the
+content-model automaton — `LeafContentToken::impliedStartTag`/`transitionToken`/
+`doRequiredTransition`/`possibleTransitions`, driven by tag-omission inference
+and error recovery, which the Parser drives directly): `OpenElement`'s
+`invalidExclusion`/`doRequiredTransition`/`impliedStartTag`, and
+`ContentState::getOpenElementInfo` (open-element context for diagnostics — needs
+an `OpenElementInfo` record + the `rniPcdata` name, both message-formatting
+surface). ContentState needs none of these; they land with the recovery
+automaton in the Parser increment.
+
 ### Landed (Stage 3, Increment A)
 
 JIT-green (`tests/opensp/run.sh` → `PASS`):
