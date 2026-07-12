@@ -1,0 +1,257 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.ISet.ISet
+
+; Partition — the character equivalence-code map (Partition.cs). The scanner
+; never indexes its trie by raw character (that would need a 2^16+ wide array);
+; instead every char that behaves identically to the lexer collapses to one
+; EquivCode. Partition computes the coarsest such classification consistent
+; with (a) each specific delimiter/function char being distinguishable and
+; (b) each required character SET being a union of whole classes.
+;
+; SCOPE (Increment-B, the reference 8-bit concrete syntax — same convention as
+; Increment A's category table): characters are classified over 0..255; chars
+; >= 256 and the end-of-entity sentinel both map to code 0 (tokenEe's code).
+; The corpus DTDs are ASCII; extend the char range on demand.
+;
+; The equivalence CODE integers are internal labels — any correct refinement
+; produces identical tokenization — so this port uses an O(256) class-id
+; refinement (a `class_of[256]` table split by a distinguisher each round)
+; rather than C++'s interval-list `EquivClass` machinery; the observable
+; result (map + per-set code lists) is the same. Delimiter namecase folding is
+; not applied: delimiters match as spelled (the corpus uses canonical
+; spelling), matching the ASCII scope note.
+
+define Partition
+(
+    class_of: pointer[u16]              ; class id per char (0..255)
+    n_classes: u16                      ; number of classes; codes are class+1
+    n_sets: int                         ; number of input sets
+    set_codes: pointer[pointer[Array[u16]]]  ; per used-set: the EquivCodes in it
+)
+{
+    ; chars = specific chars to distinguish; sets = the n_sets char sets (used
+    ; positions), each a pointer[ISet].
+    init(chars: pointer[ISet], sets: pointer[pointer[ISet]], n_sets: int)
+    {
+        let host Page.get(this as pointer[void])
+        set n_sets: n_sets
+        set class_of: host.allocate(256 * (2 as size_t), 2) as pointer[u16]
+
+        ; in_sets[class] = bitmask of the input-set positions this class lies in
+        var in_sets: pointer[u32] host.allocate(256 * (4 as size_t), 4) as pointer[u32]
+        var dist: pointer[u8] host.allocate(256, 1) as pointer[u8]
+
+        ; one class over all 256 chars
+        var c: size_t 0
+        while c < (256 as size_t)
+        {
+            set *(class_of + c): (0 as u16)
+            set c: c + 1
+        }
+        set *(in_sets + (0 as size_t)): (0 as u32)
+        set n_classes: (1 as u16)
+
+        ; refine so each specific char is its own class (set_flag 0). The
+        ; distinguished chars are delimiter/function chars — all ASCII, so the
+        ; ranges are tiny and ch never approaches u32 wraparound.
+        var ci: size_t 0
+        while ci < chars.get_count()
+        {
+            var ch chars.range_min(ci)
+            let hi chars.range_max(ci)
+            while ch <= hi
+            {
+                var k: size_t 0
+                while k < (256 as size_t)
+                {
+                    set *(dist + k): (0 as u8)
+                    set k: k + 1
+                }
+                if ch < (256 as u32)
+                    set *(dist + (ch as size_t)): (1 as u8)
+                resplit(dist, in_sets, 0 as u32)
+                set ch: ch + 1
+            }
+            set ci: ci + 1
+        }
+
+        ; refine by each set's membership, tagging the in-part with 1<<i
+        var i: int 0
+        while i < n_sets
+        {
+            let s *(sets + (i as size_t))
+            var k: size_t 0
+            while k < (256 as size_t)
+            {
+                if s.contains(k as u32)
+                    set *(dist + k): (1 as u8)
+                else
+                    set *(dist + k): (0 as u8)
+                set k: k + 1
+            }
+            resplit(dist, in_sets, (1 as u32) << (i as u32))
+            set i: i + 1
+        }
+
+        ; build the per-set code lists
+        set set_codes: host.allocate((n_sets as size_t) * (sizeof pointer[void]), alignof pointer[void]) as pointer[pointer[Array[u16]]]
+        set i: 0
+        while i < n_sets
+        {
+            let arr Array[u16]^host()
+            var cls: u16 0
+            while cls < n_classes
+            {
+                if ((*(in_sets + (cls as size_t)) >> (i as u32)) & (1 as u32)) <> (0 as u32)
+                    arr.add(cls + (1 as u16))
+                set cls: cls + 1
+            }
+            set *(set_codes + (i as size_t)): arr
+            set i: i + 1
+        }
+    }
+
+    ; Split every class by `dist` (a 0/1 flag per char): chars with the same
+    ; (old class, dist bit) stay together; the dist-1 part of each class gains
+    ; `set_flag` in its membership mask.
+    function resplit(this: Partition, dist: pointer[u8], in_sets: pointer[u32], set_flag: u32)
+    {
+        let host Page.get(this as pointer[void])
+        let old_n n_classes
+        let keymap host.allocate(((old_n as size_t) * (2 as size_t)) * (4 as size_t), 4) as pointer[i32]
+        let new_in host.allocate((256 as size_t) * (4 as size_t), 4) as pointer[u32]
+        let new_class host.allocate(256 * (2 as size_t), 2) as pointer[u16]
+
+        var k: size_t 0
+        while k < ((old_n as size_t) * (2 as size_t))
+        {
+            set *(keymap + k): -1
+            set k: k + 1
+        }
+
+        var n_new: u16 0
+        var c: size_t 0
+        while c < (256 as size_t)
+        {
+            let d *(dist + c) as size_t
+            let key ((*(class_of + c)) as size_t) * (2 as size_t) + d
+            if *(keymap + key) < 0
+            {
+                set *(keymap + key): n_new as i32
+                var flags *(in_sets + ((*(class_of + c)) as size_t))
+                if d = (1 as size_t)
+                    set flags: flags | set_flag
+                set *(new_in + (n_new as size_t)): flags
+                set n_new: n_new + 1
+            }
+            set *(new_class + c): *(keymap + key) as u16
+            set c: c + 1
+        }
+
+        set c: 0
+        while c < (256 as size_t)
+        {
+            set *(class_of + c): *(new_class + c)
+            set c: c + 1
+        }
+        set c: 0
+        while c < (n_new as size_t)
+        {
+            set *(in_sets + c): *(new_in + c)
+            set c: c + 1
+        }
+        set n_classes: n_new
+    }
+
+    function max_code(this: Partition) returns u16
+        n_classes
+
+    ; EquivCode of a Char (0..255); other chars fall in code 0 (== eE code).
+    function char_code(this: Partition, c: u32) returns u16
+    {
+        if c >= (256 as u32)
+            return (0 as u16)
+
+        *(class_of + (c as size_t)) + (1 as u16)
+    }
+
+    ; EquivCode of an Xchar: the end-of-entity sentinel (< 0) is code 0.
+    function code_of_xchar(this: Partition, x: i32) returns u16
+    {
+        if x < 0
+            return (0 as u16)
+
+        char_code(x as u32)
+    }
+
+    function ee_code(this: Partition) returns u16
+        (0 as u16)
+
+    function set_code_count(this: Partition, pos: int) returns size_t
+        (*(set_codes + (pos as size_t))).get_length()
+
+    function set_code(this: Partition, pos: int, k: size_t) returns u16
+        *((*(set_codes + (pos as size_t))).get_buffer() + k)
+
+    function set_codes_buffer(this: Partition, pos: int) returns pointer[u16]
+        (*(set_codes + (pos as size_t))).get_buffer()
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+
+        ; distinguish '<' and '>'; set 0 = {A..Z} (a name-start-like set)
+        let chars ISet^host()
+        chars.add(0x3C as u32)   ; '<'
+        chars.add(0x3E as u32)   ; '>'
+
+        let letters ISet^host()
+        letters.add_range(0x41 as u32, 0x5A as u32)   ; A..Z
+
+        let sets host.allocate(1 * (sizeof pointer[void]), alignof pointer[void]) as pointer[pointer[ISet]]
+        set *(sets + (0 as size_t)): letters
+
+        let p Partition^host(chars, sets, 1)
+
+        ; '<' and '>' must be distinct codes, both nonzero
+        let lt p.char_code(0x3C as u32)
+        let gt p.char_code(0x3E as u32)
+        if lt = (0 as u16)
+            return -1
+        if gt = (0 as u16)
+            return -2
+        if lt = gt
+            return -3
+
+        ; all letters share ONE code (indistinguishable), != '<','>'
+        let ca p.char_code(0x41 as u32)
+        let cz p.char_code(0x5A as u32)
+        if ca <> cz
+            return -4
+        if (ca = lt) or (ca = gt)
+            return -5
+
+        ; that shared code is exactly the one listed in set 0
+        if p.set_code_count(0) <> (1 as size_t)
+            return -6
+        if p.set_code(0, 0 as size_t) <> ca
+            return -7
+
+        ; eE and out-of-range chars are code 0
+        if p.code_of_xchar(-1) <> (0 as u16)
+            return -8
+        if p.char_code(0x1000 as u32) <> (0 as u16)
+            return -9
+
+        ; a char in no set and not distinguished shares the "everything else"
+        ; class, distinct from letters and the delimiters
+        let other p.char_code(0x20 as u32)   ; space (not in letters, not '<'/'>')
+        if (other = lt) or (other = gt) or (other = ca)
+            return -10
+
+        0
+    }
+}

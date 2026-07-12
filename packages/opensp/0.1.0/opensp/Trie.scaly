@@ -1,0 +1,231 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+
+; Trie + TrieBuilder — the recognizer's decision tree (Trie.cs / TrieBuilder.cs).
+;
+; A Trie node has one child per EquivCode (`next`, an array of n_codes child
+; Nodes, or null at a leaf) plus the token/length/priority recognized at that
+; node. TrieBuilder threads each delimiter's code sequence into the tree
+; (`extend`/`force_next`) and stamps the token with longest-match / priority
+; arbitration (`set_token`), recording lexical ambiguities. `recognize_ee`
+; installs the end-of-entity transition on code 0.
+;
+; PORT SHAPE: the C++ Trie/BlankTrie pair is flattened to one page-hosted
+; `Node` struct (as with ContentToken's graph) mutated through a pointer via
+; plain `.`. Priority is a u8: data=0, function=2, delim=255 (Priority.cs).
+;
+; DEFERRED (lands with the Dtd increment, which brings shortrefs): the
+; BlankTrie / B-sequence machinery (`doB`/`recognizeB`/`copyInto` and the
+; blank fields). It is reached ONLY when compiling shortref delimiters against
+; a DTD; the scanner's mode recognizers (no DTD) never build a blank node, so
+; `blank` stays null and the recognizer takes the plain path.
+
+define PRI_DATA: u8 0
+define PRI_FUNCTION: u8 2
+define PRI_DELIM: u8 255
+
+define Node
+(
+    token: u32
+    token_length: u8
+    priority: u8
+    n_codes: int
+    next: pointer[pointer[Node]]     ; array[n_codes] of child Node*, or null
+    blank: pointer[Node]             ; always null until shortrefs land
+)
+{
+    function has_next(this: Node) returns bool
+        next <> null
+
+    ; const Trie *next(int i)
+    function child(this: Node, i: int) returns pointer[Node]
+    {
+        if next = null
+            return null
+
+        *(next + (i as size_t))
+    }
+
+    function get_token(this: Node) returns u32
+        token
+
+    function get_token_length(this: Node) returns int
+        token_length as int
+
+    function get_blank(this: Node) returns pointer[Node]
+        blank
+
+    ; Boolean includeBlanks() const { return Priority::isBlank(priority_); }
+    function include_blanks(this: Node) returns bool
+        (priority > PRI_FUNCTION) and (priority < PRI_DELIM)
+}
+
+define TrieBuilder (root: pointer[Node], n_codes: int)
+{
+    init(n_codes: int)
+    {
+        let host Page.get(this as pointer[void])
+        set n_codes: n_codes
+        set root: new_node(host, n_codes)
+        set root.priority: PRI_DATA
+    }
+
+    function new_node(host: pointer[Page], n_codes: int) returns pointer[Node]
+    {
+        let p host.allocate(sizeof Node, alignof Node) as pointer[Node]
+        set p.token: (0 as u32)
+        set p.token_length: (0 as u8)
+        set p.priority: PRI_DATA
+        set p.n_codes: n_codes
+        set p.next: null
+        set p.blank: null
+        p
+    }
+
+    function extract_trie(this: TrieBuilder) returns pointer[Node]
+        root
+
+    ; void recognize(const String<EquivCode> &chars, Token, Priority, ambiguities)
+    function recognize(this: TrieBuilder, codes: pointer[u16], n: size_t, token: u32, priority: u8, amb: pointer[Array[u32]])
+    {
+        let trie extend_trie(root, codes, n)
+        set_token(trie, n as int, token, priority, amb)
+    }
+
+    ; void recognize(chars, set, Token, Priority, ambiguities): each set char
+    ; forms a one-longer delimiter-in-context.
+    function recognize_set(this: TrieBuilder, codes: pointer[u16], n: size_t, set_codes: pointer[u16], set_n: size_t, token: u32, priority: u8, amb: pointer[Array[u32]])
+    {
+        let trie extend_trie(root, codes, n)
+        var i: size_t 0
+        while i < set_n
+        {
+            let t force_next(trie, *(set_codes + i))
+            set_token(t, (n as int) + 1, token, priority, amb)
+            set i: i + 1
+        }
+    }
+
+    ; void recognizeEE(EquivCode code, Token t)
+    function recognize_ee(this: TrieBuilder, code: u16, token: u32)
+    {
+        let trie force_next(root, code)
+        set trie.token_length: (0 as u8)
+        set trie.token: token
+        set trie.priority: PRI_DATA
+    }
+
+    function extend_trie(this: TrieBuilder, start: pointer[Node], codes: pointer[u16], n: size_t) returns pointer[Node]
+    {
+        var trie start
+        var i: size_t 0
+        while i < n
+        {
+            set trie: force_next(trie, *(codes + i))
+            set i: i + 1
+        }
+        trie
+    }
+
+    ; void setToken(Trie *, int tokenLength, Token, Priority, ambiguities)
+    function set_token(this: TrieBuilder, trie: pointer[Node], token_length: int, token: u32, pri: u8, amb: pointer[Array[u32]])
+    {
+        if (token_length > (trie.token_length as int)) or ((token_length = (trie.token_length as int)) and (pri > trie.priority))
+        {
+            set trie.token_length: token_length as u8
+            set trie.token: token
+            set trie.priority: pri
+        }
+        else if ((trie.token_length as int) = token_length) and (trie.priority = pri) and (trie.token <> token) and (trie.token <> (0 as u32))
+        {
+            amb.add(trie.token)
+            amb.add(token)
+        }
+        if trie.has_next()
+        {
+            var i: int 0
+            while i < n_codes
+            {
+                set_token(trie.child(i), token_length, token, pri, amb)
+                set i: i + 1
+            }
+        }
+    }
+
+    ; Trie *forceNext(Trie *trie, EquivCode c) — materialize the child array,
+    ; inheriting this node's token/length/priority into each child.
+    function force_next(this: TrieBuilder, trie: pointer[Node], c: u16) returns pointer[Node]
+    {
+        if trie.has_next() = false
+        {
+            let host Page.get(this as pointer[void])
+            let arr host.allocate((n_codes as size_t) * (sizeof pointer[Node]), alignof pointer[Node]) as pointer[pointer[Node]]
+            var i: int 0
+            while i < n_codes
+            {
+                let ch new_node(host, n_codes)
+                set ch.token: trie.token
+                set ch.token_length: trie.token_length
+                set ch.priority: trie.priority
+                set *(arr + (i as size_t)): ch
+                set i: i + 1
+            }
+            set trie.next: arr
+        }
+        trie.child(c as int)
+    }
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+
+        ; nCodes = 4 (codes 0..3, 0 = eE)
+        let tb TrieBuilder^host(4)
+        var amb Array[u32]^host()
+
+        ; end-of-entity on code 0
+        tb.recognize_ee(0 as u16, 1 as u32)
+
+        ; a two-code delimiter [2,3] -> token 55
+        var d1 u16[2]
+        let pd1 d1 as pointer[u16]
+        set *(pd1 + (0 as size_t)): (2 as u16)
+        set *(pd1 + (1 as size_t)): (3 as u16)
+        tb.recognize(pd1, 2 as size_t, 55 as u32, PRI_DELIM, amb)
+
+        ; a one-code delimiter [2] -> token 30 (prefix of the above)
+        tb.recognize(pd1, 1 as size_t, 30 as u32, PRI_DELIM, amb)
+
+        let r tb.extract_trie()
+
+        ; root -> code 0 : EE token 1, no further
+        let ee r.child(0)
+        if ee.get_token() <> (1 as u32)
+            return -1
+
+        ; root -> 2 : token 30, has a child (the [2,3] continuation)
+        let n2 r.child(2)
+        if n2.get_token() <> (30 as u32)
+            return -2
+        if n2.has_next() = false
+            return -3
+
+        ; root -> 2 -> 3 : token 55 (longest match wins)
+        let n23 n2.child(3)
+        if n23.get_token() <> (55 as u32)
+            return -4
+
+        ; root -> 2 -> 1 : inherits the [2] token 30 (fallback)
+        let n21 n2.child(1)
+        if n21.get_token() <> (30 as u32)
+            return -5
+
+        ; no ambiguities recorded
+        if amb.get_length() <> (0 as size_t)
+            return -6
+
+        0
+    }
+}

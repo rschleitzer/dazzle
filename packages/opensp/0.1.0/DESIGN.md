@@ -283,12 +283,52 @@ followed here: `ElementType : Named + Attributed` → an `Attributed` member;
   `SdParam`(111), `SdBuilder`(36), `ParserOptions`(235).
 
 Port order (map's): Tokens → Sd+Syntax (**Increment A**) → content-model DFA
-(**Increment C**, taken next as the strongest self-contained island — no
-InputSource/delimiter integration, cleanly unit-testable) → scanner (**B**,
-deferred: needs the Syntax delimiter tables + InputSource token primitives) →
-attributes → Notation → Dtd → ContentState → ParserState → Parser (by section:
-parseSd → parseParam → parseDecl → prolog). Dtd/ParserState/Parser are the
-integration tail, last.
+(**Increment C**) → scanner (**Increment B**, done) → attributes → Notation →
+Dtd → ContentState → ParserState → Parser (by section: parseSd → parseParam →
+parseDecl → prolog). Dtd/ParserState/Parser are the integration tail, last.
+
+### Landed (Stage 3, Increment B — scanner)
+
+JIT-green (`tests/opensp/run.sh`), emission-neutral (`cycle.sh` IDENTICAL):
+- **`ISet.scaly`** — `ISet<Char>` interval set (sorted, coalesced, disjoint
+  ranges) over u32, live-count backed (Array cannot shrink; addRange/remove
+  delete ranges).
+- **`Syntax` (extended)** — DelimGeneral/Set/StandardFunction enums, the
+  reference concrete-syntax general delimiters (const `DELIM_LEN`/`DELIM_CHARS`
+  tables, incl. WWW HCRO/NESTC), reference standard functions (RE=13/RS=10/
+  SPACE=32), and the 11 reference character sets (`char_set(i)`). These are the
+  reference SEED; the SD-declaration parser overrides them per custom syntax.
+- **`Sd` (extended)** — reference/SHORTTAG feature-flag accessors
+  (`start_tag_empty`/`concur`/`link`/`keeprsre`) that ModeInfo consults.
+- **`InputSource` (extended)** — the token-scanning cursor
+  (`start_token_no_multicode`/`token_char` [Xchar eE=-1]/`end_token`/
+  `current_token_length`), multicode=false path only.
+- **`Partition.scaly`** — the char→EquivCode map. Scope: 0..255 (the reference
+  8-bit syntax, Increment-A's convention); an O(256) class-id refinement
+  (`resplit`) replaces C++'s interval-list EquivClass machinery — the observable
+  map/per-set code lists are identical (codes are internal labels). Delimiter
+  namecase folding is not applied (match-as-spelled).
+- **`Trie.scaly`** — flat page-hosted `Node` (C++ Trie/BlankTrie folded to one
+  tagged struct) + `TrieBuilder` (recognize / recognize_set / recognize_ee /
+  extend / force_next / set_token). DEFERRED with the Dtd increment: the
+  BlankTrie / B-sequence machinery (reached only via shortref delimiters
+  against a DTD).
+- **`ModeInfo.scaly`** — the 45 scanner Modes, the 62-entry master token table
+  (`PackedTokenInfo`, mode membership as a u64 bit vector) and its per-mode
+  `next_token` iterator; `missing_requirements` drops feature-gated tokens.
+- **`Recognizer.scaly`** — the trie-driven `recognize(InputSource)` (greedy
+  walk + `end_token` longest-prefix commit) and the `build_recognizer` driver
+  (Parser::compileModes for one mode, no DTD/shortref): two ModeInfo passes →
+  Partition + TrieBuilder → Recognizer. Integration test tokenizes a
+  content-model group (grpMode), a start-tag / data / `<`-as-data / whitespace
+  in element content (econMode), and markup-declaration pieces (mdMode).
+
+**Traps hit:** array-literal globals need a trailing comma before `]`
+(`u8[]`/`u32[]` both fine); TokenInfo fields `type`/`set`/`function` collide
+with keywords (renamed `kind`/`set_idx`/`func_idx`); `^_rp` cannot name the
+caller page (leading `_` won't lex) — page-host tests via a `StringC` anchor +
+`Page.get`. Sibling-module `define` constants (tokens, delimiter/set indices,
+mode ordinals) are visible unqualified across the package.
 
 ### Landed (Stage 3, Increment C — content-model DFA)
 
