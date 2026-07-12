@@ -554,6 +554,87 @@ an `OpenElementInfo` record + the `rniPcdata` name, both message-formatting
 surface). ContentState needs none of these; they land with the recovery
 automaton in the Parser increment.
 
+### Landed (Stage 3, Increment — parser-state)
+
+JIT-green (`tests/opensp/run.sh` → `PASS`), emission-neutral (`cycle.sh`
+IDENTICAL). The pivot from standalone data structures to the live parser's
+running state: a deliberate SLICE of `ParserState.cs` (the 1627-LOC god-object)
+— the state scaffold plus the pieces that don't need the event-emission or LINK
+machinery — plus its two small dependencies. Ports `ParserState.cs` (slice),
+`Id.cs` (65), `XcharMap.cs` (120).
+
+- **`XcharMap.scaly`** — a map from Xchar (`i32`: any Char + the `-1` EOF
+  sentinel) to a value, specialized to the sole instantiation
+  `XcharMap<PackedBoolean>` (the `normalMap_` data-char bitmap, T = `u8`). C++'s
+  SharedXcharMap of `2 + 0xFFFF` entries with `ptr()` at `v[1]` (so index `-1` →
+  `v[0]`) is a single region-allocated `u8` buffer with the `+1` offset;
+  `get`/`setRange`/`setChar`/`setEe`. Chars above `0xFFFF` (C++'s separate
+  `hiMap_`) are out of the reference/XML 8-bit scope (matching Partition's
+  0..255) and clamp to the default — documented deferral.
+- **`Id.scaly`** — the id-table record: name, defining `Location`, and the
+  `Array[Location]` of pending IDREFs recorded before definition. `Id : Named`
+  base → a `name` field; `defined()` = def-location origin non-null. `define`
+  (the C++ method) renamed **`mark_defined`** (`define` is a Scaly keyword).
+- **`ParserState.scaly`** — the scaffold. **Composition, not MI:** C++
+  `ParserState : ContentState + AttributeContext` → a page-hosted flat struct
+  that COMPOSES a `ContentState` and an `AttributeContext` (disjoint state), the
+  resolution the content-state increment recorded. Holds: the Sd + prolog/
+  instance Syntax, the DTD stack (`current_dtd`/`def_dtd`/`dtd_stack`) +
+  `instantiate_dtd`, EntityManager/EntityCatalog handles, `current_mode`, the
+  phase + tag flags (`in_instance`/`in_start_tag`/`in_end_tag`/`enter_tag`/
+  `leave_tag`/`in_tag`). The **input stack** (`push_input`/`pop_input_stack`/
+  `current_input`/`current_location`/`input_level`/`input_level_element_index`)
+  threads the Stage-1 `InputSource` nesting in — the C++ intrusive
+  `IList<InputSource>` → `Array[pointer[InputSource]]` + a live `input_level`
+  (the OpenElement-stack pattern), and the push/pop mode transitions that read
+  the deferred special-parse / marked-section state fields are ported. The
+  **mode/recognizer table** (`set_recognizer`/`recognizers[N_MODES]`/`get_token`
+  + `set_normal_map`/`normal_map`), and the **token buffer**
+  (`current_token` / `current_token_subst` for the `getCurrentToken(SubstTable)`
+  overload — the SubstTable is the syntax's namecase `fold`).
+  - **AttributeContext live half — the attribute increment's deferral, now
+    closed.** `get_attribute_notation`/`get_attribute_entity` (lookup through the
+    current DTD's notation/entity tables), `define_id`/`note_idref` (the id
+    table + `Id`), `note_current_attribute`/`get_current_attribute` (the
+    current-value store), `attribute_syntax`. The composed `AttributeContext`'s
+    `validate`/`may_default` flags + cached implied value are wired from the Sd
+    (`set_sd`: `mayDefault = omittag||attributeDefault`, `validate = typeValid`)
+    and the syntax (`set_syntax`).
+  - **Messenger half — minimal.** `init_message` (stamps `current_location`) /
+    `dispatch_message` + the message + error counters, accumulating a simple
+    `Message` queue (`Array[Message]`). NO EventHandler sink.
+
+**Port-shape / seam notes:**
+- Small support added to existing modules (emission-neutral): `InputSource`
+  gained `here_location` (scan-cursor location) + `current_token_string`; `Sd`
+  gained the `setSd` flags (`omittag`/`attribute_default`/`type_valid`/
+  `implydef_element`/`implydef_attlist`, reference/XML defaults);
+  `AttributeContext` gained `set_validate`/`set_may_default`/`set_syntax`.
+- The `Message` record (type + loc) lives in the ParserState module, not
+  `Message.scaly`, because it needs `Location` whose module is declared **after**
+  `Message` (concept `use` is order-independent, but keeping the backward
+  reference out of the early module sidesteps the question entirely).
+- The parse-flow methods that would normally SET this state (`startInstance`/
+  `startDtd`) are deferred, so the increment exposes direct state setters
+  (`set_current_dtd`/`set_in_instance`/`set_current_mode`/`set_phase`/`push_dtd`)
+  — the parser drives them in the final increment.
+
+**Deferred (documented, each needs the event/parse machinery of the Parser
+increment):** the whole `Event.cs` ESIS-emission path (EventHandler/EventQueue/
+OutputState — `queueRe`/`note*`/`eventQueue*`); Lpd + LINK processing and Markup
+capture (LINK absent from the corpus; markup is wantMarkup-gated event surface);
+Pass1/Pass2 (so `lookupEntity`'s pass1/pass2 base-DTD reconciliation +
+defaulted-entity copy/events collapse to a plain current-DTD lookup); the
+parse-FLOW methods (`startInstance`, `startDtd`/`endDtd`, `startLpd`/`endLpd`,
+the marked-section state machine, `pcdataRecover`, `referenceDsEntity`,
+`checkEntityStability`, `noteReferencedEntity`) — their state fields exist here,
+the driving logic is the Parser's; the `Allocator` (arena → no-op, dropped);
+`get_attribute_notation`'s `implydefNotation` auto-create (needs catalog-backed
+`generateSystemId`). NEXT and last: the **Parser** parse-methods (11801 LOC,
+by section: `parseSgmlDecl` → `parseParam` → `parseElementDecl`/`Attlist`/
+`Entity`/`Notation`/`Shortref` → `doProlog`/`doDeclSubset`, the content-model
+recovery automaton, and the event emission).
+
 ### Landed (Stage 3, Increment A)
 
 JIT-green (`tests/opensp/run.sh` → `PASS`):

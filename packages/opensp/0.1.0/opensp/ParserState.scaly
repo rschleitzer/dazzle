@@ -1,0 +1,841 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.Location.Origin
+use opensp.Location.InputSource
+use opensp.Sd.Sd
+use opensp.Syntax.Syntax
+use opensp.Dtd.Dtd
+use opensp.Notation.Notation
+use opensp.Entity.Entity
+use opensp.Entity.InternalEntity
+use opensp.ContentState.ContentState
+use opensp.OpenElement.OpenElement
+use opensp.ElementType.ElementType
+use opensp.Attribute.AttributeContext
+use opensp.Attribute.AttributeValue
+use opensp.Recognizer.Recognizer
+use opensp.ModeInfo.ModeInfo
+use opensp.XcharMap.XcharMap
+use opensp.Id.Id
+use opensp.EntityManager.EntityManager
+use opensp.EntityCatalog.EntityCatalog
+use opensp.Message.MessageType
+use opensp.Message.MessageFragment
+use opensp.Message.Severity
+
+; ParserState — a slice of ParserState.cs (the 1627-LOC parser god-object). This
+; increment ports the STATE SCAFFOLD the parse methods read and mutate — the
+; pivot from standalone data structures (unit-tested programmatically) to the
+; live parser's running state — without the event-emission or LINK machinery.
+;
+; COMPOSITION, NOT INHERITANCE. C++ builds ParserState : ContentState +
+; AttributeContext (multiple inheritance). Scaly has neither MI nor those bases,
+; so ParserState is a page-hosted flat struct that COMPOSES a ContentState and an
+; AttributeContext (their state is disjoint — the content-state increment already
+; recorded this resolution). The content-model open-element stack lives on the
+; composed ContentState; the attribute-defaulting flags + cached implied value
+; live on the composed AttributeContext. The DTD-backed AttributeContext "live
+; half" (id table, notation/entity lookup, current-attribute store) — deferred by
+; the attributes increment as "the live parser subclass" — lands here as
+; ParserState methods (they need the DTD / id table that live on ParserState).
+;
+; PORTED SLICE:
+;  - scaffold: Sd/prolog+instance Syntax, DTD stack (currentDtd/defDtd/dtd_) +
+;    instantiateDtd, EntityManager/EntityCatalog handles, currentMode, phase +
+;    tag flags (inInstance/inStartTag/inEndTag/enterTag/leaveTag/inTag).
+;  - input stack: pushInput/popInputStack/currentInput/currentLocation/
+;    inputLevel/inputLevelElementIndex (InputSource nesting threaded in; the
+;    C++ intrusive IList<InputSource> -> Array[pointer[InputSource]] + live
+;    input_level, the OpenElement-stack pattern).
+;  - mode/recognizer table: setRecognizer/recognizers_[nModes]/getToken +
+;    setNormalMap/normalMap_ (XcharMap ported alongside).
+;  - token buffer: currentToken / getCurrentToken(SubstTable).
+;  - AttributeContext live half: getAttributeNotation/getAttributeEntity (through
+;    the current DTD), defineId/noteIdref (id table, Id ported alongside),
+;    noteCurrentAttribute/getCurrentAttribute (current-value store),
+;    attributeSyntax; the validate/mayDefault flags + implied value wired from Sd.
+;  - Messenger half: initMessage/dispatchMessage + message counter / severity
+;    tracking, accumulating a simple Message queue. NO EventHandler sink.
+;
+; DEFERRED (each needs the event/parse machinery that lands with the Parser
+; increment; where the state field is cheap it exists here, only the driving
+; logic is deferred):
+;  - EventHandler/EventQueue/OutputState/Event.cs ESIS emission — the parser
+;    emits events; this increment builds the state the emitter reads. queueRe/
+;    noteMarkup/noteStartElement/noteEndElement/noteData/eventQueue* omitted.
+;  - Lpd + LINK processing and Markup capture (LINK is absent from the XML/model-
+;    DTD corpus; markup recording is a wantMarkup-gated event surface). The
+;    allLpd_/lpd_/defLpd_/activeLinkTypes_ fields + startLpd/endLpd/
+;    activateLinkType/checkEntityStability/noteReferencedEntity are omitted.
+;  - Pass1/Pass2 (maybeStartPass2/setPass2Start/pass1Handler) — a two-pass
+;    optimization, not needed for correctness; pass2()/pass1Dtd_ omitted, so
+;    lookupEntity's pass1/pass2 base-DTD reconciliation collapses to a plain
+;    current-DTD lookup (see getAttributeEntity).
+;  - parse-FLOW methods a Parser drives: startInstance, startDtd/endDtd,
+;    startMarkedSection/endMarkedSection/the special-parse state machine,
+;    pcdataRecover, referenceDsEntity, checkEntityStability, noteReferencedEntity.
+;    Their STATE fields (special_parse_input_level/mode, marked_section_level/
+;    special_level, in_instance) exist here and the push/pop mode transitions
+;    that read them are ported; the driving logic belongs to the Parser.
+;  - Allocator — the arena makes it a no-op (allocate on the run page); dropped.
+
+; Phase (ParserState.Phase enum) — modelled as int constants.
+define PHASE_NONE: int 0
+define PHASE_INIT: int 1
+define PHASE_PROLOG: int 2
+define PHASE_DECL_SUBSET: int 3
+define PHASE_INSTANCE_START: int 4
+define PHASE_CONTENT: int 5
+
+; Message (Message.cs, minimal) — a dispatched diagnostic: its type
+; (fragment + severity) and the source location where it occurred. The full C++
+; Message also carries the MessageArg vector + auxiliary/open-element info; the
+; parser stage fills those. Defined in this module (rather than Message.scaly)
+; because it needs Location, whose module is declared after Message.
+define Message (type: MessageType, loc: Location)
+{
+    init(type: MessageType, loc: Location)
+    {
+        set type: type
+        set loc: loc
+    }
+
+    function get_type(this: Message) returns MessageType
+        type
+
+    function get_loc(this: Message) returns Location
+        loc
+}
+
+define ParserState
+(
+    host: pointer[Page]
+    ; --- composition ---
+    content_state: pointer[ContentState]
+    attribute_context: pointer[AttributeContext]
+    ; --- entity layer handles ---
+    entity_manager: pointer[EntityManager]
+    entity_catalog: pointer[EntityCatalog]
+    ; --- SGML declaration + concrete syntaxes ---
+    sd: pointer[Sd]
+    syntax: pointer[Syntax]
+    prolog_syntax: pointer[Syntax]
+    instance_syntax: pointer[Syntax]
+    ; --- DTD stack ---
+    current_dtd: pointer[Dtd]
+    def_dtd: pointer[Dtd]
+    dtd_stack: pointer[Array[pointer[Dtd]]]
+    instantiated_dtds: u32
+    ; --- phase + tag flags ---
+    phase: int
+    final_phase: int
+    subdoc_level: u32
+    in_instance: bool
+    in_start_tag: bool
+    in_end_tag: bool
+    ; --- scanner mode + deferred special-parse/marked-section state ---
+    current_mode: int
+    special_parse_input_level: u32
+    special_parse_mode: int
+    marked_section_level: u32
+    marked_section_special_level: u32
+    ; --- input stack (Array + live input_level, the OpenElement-stack pattern) ---
+    input_stack: pointer[Array[pointer[InputSource]]]
+    input_level: u32
+    input_level_element_index: pointer[Array[u32]]
+    n_input_level_element_index: size_t
+    ; --- mode/recognizer table + normal map ---
+    recognizers: pointer[Array[pointer[Recognizer]]]
+    normal_map: pointer[XcharMap]
+    ; --- AttributeContext live half ---
+    id_table: pointer[Array[pointer[Id]]]
+    current_attributes: pointer[Array[pointer[AttributeValue]]]
+    n_current_attributes: size_t
+    ; --- Messenger half ---
+    messages: pointer[Array[Message]]
+    n_messages: u32
+    n_errors: u32
+    ; --- IMPLYDEF (set from Sd) ---
+    implydef_element: int
+    implydef_attlist: bool
+)
+{
+    function make(host: pointer[Page], entity_manager: pointer[EntityManager], subdoc_level: u32, final_phase: int) returns pointer[ParserState]
+    {
+        let ps host.allocate(sizeof ParserState, alignof ParserState) as pointer[ParserState]
+        set ps.host: host
+        set ps.content_state: ContentState.make(host)
+        set ps.attribute_context: AttributeContext.make(host, null, false, false)
+        set ps.entity_manager: entity_manager
+        set ps.entity_catalog: null
+        set ps.sd: null
+        set ps.syntax: null
+        set ps.prolog_syntax: null
+        set ps.instance_syntax: null
+        set ps.current_dtd: null
+        set ps.def_dtd: null
+        set ps.dtd_stack: Array[pointer[Dtd]]^host()
+        set ps.instantiated_dtds: 0 as u32
+        set ps.phase: PHASE_NONE
+        set ps.final_phase: final_phase
+        set ps.subdoc_level: subdoc_level
+        set ps.in_instance: false
+        set ps.in_start_tag: false
+        set ps.in_end_tag: false
+        set ps.current_mode: proMode
+        set ps.special_parse_input_level: 0 as u32
+        set ps.special_parse_mode: proMode
+        set ps.marked_section_level: 0 as u32
+        set ps.marked_section_special_level: 0 as u32
+        set ps.input_stack: Array[pointer[InputSource]]^host()
+        set ps.input_level: 0 as u32
+        set ps.input_level_element_index: Array[u32]^host()
+        set ps.n_input_level_element_index: 0
+        set ps.recognizers: Array[pointer[Recognizer]]^host()
+        var i: int 0
+        while i < N_MODES
+        {
+            ps.recognizers.add(null as pointer[Recognizer])
+            set i: i + 1
+        }
+        set ps.normal_map: null
+        set ps.id_table: Array[pointer[Id]]^host()
+        set ps.current_attributes: Array[pointer[AttributeValue]]^host()
+        set ps.n_current_attributes: 0
+        set ps.messages: Array[Message]^host()
+        set ps.n_messages: 0 as u32
+        set ps.n_errors: 0 as u32
+        set ps.implydef_element: 0
+        set ps.implydef_attlist: false
+        ps
+    }
+
+    ; ---- composition accessors -------------------------------------------
+    function get_content_state(this: ParserState) returns pointer[ContentState]
+        content_state
+
+    function get_attribute_context(this: ParserState) returns pointer[AttributeContext]
+        attribute_context
+
+    ; ---- Sd / Syntax ------------------------------------------------------
+    ; setSd derives the attribute-defaulting + validation flags and the IMPLYDEF
+    ; state (Sd.cs), wiring them into the composed AttributeContext.
+    function set_sd(this: pointer[ParserState], sd: pointer[Sd])
+    {
+        set this.sd: sd
+        this.attribute_context.set_may_default(sd.omittag() or sd.attribute_default())
+        this.attribute_context.set_validate(sd.type_valid())
+        set this.implydef_element: sd.implydef_element()
+        set this.implydef_attlist: sd.implydef_attlist()
+    }
+
+    function set_syntax(this: pointer[ParserState], syntax: pointer[Syntax])
+    {
+        set this.syntax: syntax
+        set this.prolog_syntax: syntax
+        set this.instance_syntax: syntax
+        this.attribute_context.set_syntax(syntax)
+    }
+
+    function set_syntaxes(this: pointer[ParserState], prolog: pointer[Syntax], instance: pointer[Syntax])
+    {
+        set this.syntax: prolog
+        set this.prolog_syntax: prolog
+        set this.instance_syntax: instance
+        this.attribute_context.set_syntax(prolog)
+    }
+
+    function get_sd(this: ParserState) returns pointer[Sd]
+        sd
+
+    function get_syntax(this: ParserState) returns pointer[Syntax]
+        syntax
+
+    function get_instance_syntax(this: ParserState) returns pointer[Syntax]
+        instance_syntax
+
+    ; attributeSyntax() (AttributeContext) — the current syntax.
+    function attribute_syntax(this: ParserState) returns pointer[Syntax]
+        syntax
+
+    ; ---- entity layer handles --------------------------------------------
+    function get_entity_manager(this: ParserState) returns pointer[EntityManager]
+        entity_manager
+
+    function set_entity_catalog(this: pointer[ParserState], cat: pointer[EntityCatalog])
+        set this.entity_catalog: cat
+
+    function get_entity_catalog(this: ParserState) returns pointer[EntityCatalog]
+        entity_catalog
+
+    ; ---- DTD stack --------------------------------------------------------
+    function have_current_dtd(this: ParserState) returns bool
+        current_dtd <> null
+
+    function get_current_dtd(this: ParserState) returns pointer[Dtd]
+        current_dtd
+
+    ; State setter — startInstance/startDtd (the parse-flow methods that select
+    ; the current DTD) are deferred, so the current DTD is set directly here.
+    function set_current_dtd(this: pointer[ParserState], dtd: pointer[Dtd])
+        set this.current_dtd: dtd
+
+    function get_def_dtd(this: ParserState) returns pointer[Dtd]
+        def_dtd
+
+    function set_def_dtd(this: pointer[ParserState], dtd: pointer[Dtd])
+        set this.def_dtd: dtd
+
+    function push_dtd(this: pointer[ParserState], dtd: pointer[Dtd])
+        this.dtd_stack.add(dtd)
+
+    function had_dtd(this: ParserState) returns bool
+        dtd_stack.get_length() > (0 as size_t)
+
+    function lookup_dtd(this: ParserState, name: StringC) returns pointer[Dtd]
+    {
+        let n dtd_stack.get_length()
+        let buf dtd_stack.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let p *(buf + i)
+            if p <> null
+            {
+                if p.get_name().equals(name)
+                    return p
+            }
+            set i: i + 1
+        }
+        null
+    }
+
+    ; instantiateDtd — mark instantiated; warn once the concurrent-instance
+    ; quantity (sd().concur()) is reached; return the running count.
+    function instantiate_dtd(this: pointer[ParserState], dtd: pointer[Dtd]) returns u32
+    {
+        if dtd.get_is_instantiated() = false
+        {
+            dtd.instantiate()
+            if this.instantiated_dtds = (this.sd.concur() as u32)
+                this.message(MessageType(MessageFragment(0 as u32, StringC("concurrent instances")), Severity.QuantityError))
+            set this.instantiated_dtds: this.instantiated_dtds + (1 as u32)
+        }
+        this.instantiated_dtds
+    }
+
+    ; ---- phase + tag flags ------------------------------------------------
+    function set_phase(this: pointer[ParserState], phase: int)
+        set this.phase: phase
+
+    function get_phase(this: ParserState) returns int
+        phase
+
+    function get_final_phase(this: ParserState) returns int
+        final_phase
+
+    function get_subdoc_level(this: ParserState) returns u32
+        subdoc_level
+
+    function is_in_instance(this: ParserState) returns bool
+        in_instance
+
+    ; startInstance sets inInstance_; it is deferred, so the flag is set directly.
+    function set_in_instance(this: pointer[ParserState], b: bool)
+        set this.in_instance: b
+
+    function enter_tag(this: pointer[ParserState], start: bool)
+    {
+        if start
+            set this.in_start_tag: true
+        else
+            set this.in_end_tag: true
+    }
+
+    function leave_tag(this: pointer[ParserState])
+    {
+        set this.in_start_tag: false
+        set this.in_end_tag: false
+    }
+
+    ; inTag(ref start): true if in a start OR end tag; `start` out-param says which.
+    function in_tag(this: ParserState, start: pointer[bool]) returns bool
+    {
+        set *start: in_start_tag
+        in_start_tag || in_end_tag
+    }
+
+    ; ---- input stack ------------------------------------------------------
+    function current_input(this: ParserState) returns pointer[InputSource]
+    {
+        if input_level = (0 as u32)
+            return null
+        *(input_stack.get_buffer() + ((input_level - (1 as u32)) as size_t))
+    }
+
+    ; currentLocation() — the scan-cursor location of the top input (a null
+    ; location when the stack is empty), resolving through nested sources via
+    ; the origin chain (parent()).
+    function current_location(this: ParserState) returns Location
+    {
+        let ins this.current_input()
+        if ins = null
+            return Location()
+        ins.here_location()
+    }
+
+    function get_input_level(this: ParserState) returns u32
+        input_level
+
+    function push_input(this: pointer[ParserState], ins: pointer[InputSource])
+    {
+        if ins = null
+            return
+
+        ; (handler.inputOpened + the multicode markup-scan-table install are
+        ; event/streaming surface -> deferred; no EventHandler sink here.)
+        if this.input_level < (this.input_stack.get_length() as u32)
+            this.input_stack.put(this.input_level as size_t, ins)
+        else
+            this.input_stack.add(ins)
+        set this.input_level: this.input_level + (1 as u32)
+
+        if (this.special_parse_input_level > (0 as u32)) && (this.input_level > this.special_parse_input_level)
+            set this.current_mode: rcconeMode
+        else if this.current_mode = dsMode
+            set this.current_mode: dsiMode
+
+        ; inputLevelElementIndex: C++ gates on inInstance_ && integrallyStored();
+        ; integrallyStored is not on the minimal Sd, so the gate is inInstance
+        ; only (documented). tagLevel()>0 ? currentElement().index() : 0.
+        if this.in_instance
+        {
+            var idx: u32 0
+            if this.content_state.tag_level_of() > (0 as u32)
+                set idx: this.content_state.current_element().get_index() as u32
+            if this.n_input_level_element_index < this.input_level_element_index.get_length()
+                this.input_level_element_index.put(this.n_input_level_element_index, idx)
+            else
+                this.input_level_element_index.add(idx)
+            set this.n_input_level_element_index: this.n_input_level_element_index + (1 as size_t)
+        }
+    }
+
+    function pop_input_stack(this: pointer[ParserState])
+    {
+        ; ASSERT(inputLevel_ > 0). handler.inputClosed -> deferred.
+        set this.input_level: this.input_level - (1 as u32)
+        if (this.special_parse_input_level > (0 as u32)) && (this.input_level = this.special_parse_input_level)
+            set this.current_mode: this.special_parse_mode
+        if (this.current_mode = dsiMode) && (this.input_level = (1 as u32)) && (this.marked_section_level = (0 as u32))
+            set this.current_mode: dsMode
+        if this.n_input_level_element_index > (0 as size_t)
+            set this.n_input_level_element_index: this.n_input_level_element_index - (1 as size_t)
+    }
+
+    function current_input_element_index(this: ParserState) returns u32
+    {
+        if n_input_level_element_index = (0 as size_t)
+            return 0 as u32
+        *(input_level_element_index.get_buffer() + (n_input_level_element_index - (1 as size_t)))
+    }
+
+    ; ---- mode / recognizer table + normal map ----------------------------
+    function get_current_mode(this: ParserState) returns int
+        current_mode
+
+    ; The parser drives currentMode directly at several sites (start of prolog/
+    ; instance/dtd); exposed as a setter (the flow methods are deferred).
+    function set_current_mode(this: pointer[ParserState], mode: int)
+        set this.current_mode: mode
+
+    function set_recognizer(this: pointer[ParserState], mode: int, r: pointer[Recognizer])
+        this.recognizers.put(mode as size_t, r)
+
+    ; getToken(mode) — the scanner choke point: run the mode's recognizer over
+    ; the top input source.
+    function get_token(this: ParserState, mode: int) returns u32
+    {
+        let r *(recognizers.get_buffer() + (mode as size_t))
+        r.recognize(this.current_input())
+    }
+
+    function set_normal_map(this: pointer[ParserState], map: pointer[XcharMap])
+        set this.normal_map: map
+
+    function get_normal_map(this: ParserState) returns pointer[XcharMap]
+        normal_map
+
+    ; ---- token buffer -----------------------------------------------------
+    function current_token(this: ParserState) returns StringC
+    {
+        let ins this.current_input()
+        if ins = null
+            return StringC()
+        ins.current_token_string()
+    }
+
+    ; getCurrentToken(const SubstTable*): the SubstTable in OpenSP is the syntax's
+    ; namecase substitution (Syntax.fold); fold each Char of the current token.
+    function current_token_subst(this: ParserState, syn: pointer[Syntax]) returns StringC
+    {
+        let ins this.current_input()
+        if ins = null
+            return StringC()
+        let raw ins.current_token_string()
+        let n raw.get_size()
+        if n = (0 as size_t)
+            return StringC()
+        let buf host.allocate(n * (4 as size_t), 4) as pointer[u32]
+        var i: size_t 0
+        while i < n
+        {
+            set *(buf + i): syn.fold(raw.get(i))
+            set i: i + 1
+        }
+        StringC(buf, n)
+    }
+
+    ; ---- AttributeContext live half ---------------------------------------
+    function validate(this: ParserState) returns bool
+        this.attribute_context.validate()
+
+    function may_default_attribute(this: ParserState) returns bool
+        this.attribute_context.may_default_attribute()
+
+    function make_implied_attribute_value(this: ParserState) returns pointer[AttributeValue]
+        this.attribute_context.make_implied_attribute_value()
+
+    ; getAttributeNotation — look up a notation in the current DTD. The
+    ; implydefNotation auto-creation branch (setExternalId + generateSystemId +
+    ; implicitNotationAttributeDef) needs catalog-backed generateSystemId and is
+    ; driven by the parser stage -> deferred.
+    function get_attribute_notation(this: ParserState, name: StringC, loc: Location) returns pointer[Notation]
+    {
+        if this.have_current_dtd() = false
+            return null
+        this.current_dtd.lookup_notation(name)
+    }
+
+    ; getAttributeEntity — a general-entity lookup through the current DTD. The
+    ; full lookupEntity (pass1/pass2 base-DTD reconciliation, defaulted-entity
+    ; copy + entityDefaulted events, warnDefaultEntityReference) needs the
+    ; pass2/LPD/event machinery and lands with the parser stage.
+    function get_attribute_entity(this: ParserState, name: StringC, loc: Location) returns pointer[Entity]
+    {
+        if this.have_current_dtd() = false
+            return null
+        this.current_dtd.lookup_entity(false, name)
+    }
+
+    ; lookupCreateId — find or insert an Id by name in the id table.
+    function lookup_create_id(this: pointer[ParserState], name: StringC) returns pointer[Id]
+    {
+        let n this.id_table.get_length()
+        let buf this.id_table.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let p *(buf + i)
+            if p <> null
+            {
+                if p.get_name().equals(name)
+                    return p
+            }
+            set i: i + 1
+        }
+        let id Id.make(this.host, name)
+        this.id_table.add(id)
+        id
+    }
+
+    ; defineId(str, loc, ref prevLoc) — outside an instance or a non-validating
+    ; parse, IDs are not tracked (return true). Otherwise: first define wins
+    ; (true); a duplicate reports the previous location (out-param) and fails.
+    function define_id(this: pointer[ParserState], name: StringC, loc: Location, prev_loc: pointer[Location]) returns bool
+    {
+        if (this.in_instance = false) || (this.validate() = false)
+            return true
+        let id this.lookup_create_id(name)
+        if id.defined()
+        {
+            set *prev_loc: id.def_location()
+            return false
+        }
+        id.mark_defined(loc)
+        true
+    }
+
+    ; noteIdref — record a forward IDREF while the target ID is undefined. C++
+    ; also gates on options().errorIdref; ParserOptions is deferred, so the option
+    ; gate is dropped (inInstance + validate only).
+    function note_idref(this: pointer[ParserState], name: StringC, loc: Location)
+    {
+        if (this.in_instance = false) || (this.validate() = false)
+            return
+        let id this.lookup_create_id(name)
+        if id.defined() = false
+            id.add_pending_ref(loc)
+    }
+
+    ; startInstance does currentAttributes_.clear(); .resize(nCurrentAttribute).
+    ; The flow method is deferred; this rebuilds the store as n null slots.
+    function resize_current_attributes(this: pointer[ParserState], n: size_t)
+    {
+        let pg this.host
+        let fresh Array[pointer[AttributeValue]]^pg()
+        var i: size_t 0
+        while i < n
+        {
+            fresh.add(null as pointer[AttributeValue])
+            set i: i + 1
+        }
+        set this.current_attributes: fresh
+        set this.n_current_attributes: n
+    }
+
+    function note_current_attribute(this: pointer[ParserState], i: size_t, value: pointer[AttributeValue])
+    {
+        if this.in_instance
+            this.current_attributes.put(i, value)
+    }
+
+    function get_current_attribute(this: ParserState, i: size_t) returns pointer[AttributeValue]
+    {
+        if in_instance = false
+            return null
+        *(current_attributes.get_buffer() + i)
+    }
+
+    ; ---- Messenger half ---------------------------------------------------
+    ; initMessage(msg) — stamp the message location (currentLocation). The
+    ; open-element-info fill (inInstance) is message-formatting surface -> deferred.
+    function init_message(this: pointer[ParserState], msg: pointer[Message])
+        set msg.loc: this.current_location()
+
+    ; dispatchMessage(msg) — queue it (no EventHandler sink) and track counts.
+    function dispatch_message(this: pointer[ParserState], msg: Message)
+    {
+        this.messages.add(msg)
+        set this.n_messages: this.n_messages + (1 as u32)
+        if msg.get_type().is_error()
+            set this.n_errors: this.n_errors + (1 as u32)
+    }
+
+    ; message(type) — build a Message, init its location, dispatch it (the
+    ; Messenger::message entry the parse methods call, minus the arg vector).
+    function message(this: pointer[ParserState], type: MessageType)
+    {
+        var msg Message(type, Location())
+        this.init_message(&msg)
+        this.dispatch_message(msg)
+    }
+
+    function get_n_messages(this: ParserState) returns u32
+        n_messages
+
+    function get_n_errors(this: ParserState) returns u32
+        n_errors
+
+    ; ---- self-test --------------------------------------------------------
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+
+        let ps ParserState.make(host, null as pointer[EntityManager], 0 as u32, PHASE_CONTENT)
+
+        ; --- Sd wiring: setSd derives validate/mayDefault (typeValid=true,
+        ;     omittag||attributeDefault=false) ---
+        let sd host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
+        set *sd: Sd()
+        ps.set_sd(sd)
+        if ps.validate() = false
+            return -1
+        if ps.may_default_attribute()
+            return -2
+
+        ; --- Syntax wiring ---
+        let syn Syntax^host(Sd())
+        ps.set_syntax(syn)
+        if ps.get_syntax() <> syn
+            return -3
+        if ps.attribute_syntax() <> syn
+            return -4
+
+        ; --- phase + tag flags ---
+        if ps.get_phase() <> PHASE_NONE
+            return -5
+        ps.set_phase(PHASE_PROLOG)
+        if ps.get_phase() <> PHASE_PROLOG
+            return -6
+        var st false
+        if ps.in_tag(&st)
+            return -7
+        ps.enter_tag(true)
+        if ps.in_tag(&st) = false
+            return -8
+        if st = false
+            return -9
+        ps.leave_tag()
+        if ps.in_tag(&st)
+            return -10
+
+        ; --- input stack + currentLocation through nesting ---
+        var org_a Origin()
+        var ca u32[5]
+        let pca ca as pointer[u32]
+        set *(pca + (0 as size_t)): (0x68 as u32)
+        set *(pca + (1 as size_t)): (0x65 as u32)
+        set *(pca + (2 as size_t)): (0x6C as u32)
+        set *(pca + (3 as size_t)): (0x6C as u32)
+        set *(pca + (4 as size_t)): (0x6F as u32)
+        var src_a InputSource(&org_a, pca, 5 as size_t)
+        ps.push_input(&src_a)
+        if ps.get_input_level() <> (1 as u32)
+            return -11
+        if ps.current_input() <> (&src_a)
+            return -12
+
+        ; push B, referenced at A index 2.
+        let ref_in_a src_a.current_location(2 as size_t)
+        var org_b Origin(ref_in_a)
+        var cb u32[2]
+        let pcb cb as pointer[u32]
+        set *(pcb + (0 as size_t)): (0x58 as u32)
+        set *(pcb + (1 as size_t)): (0x59 as u32)
+        var src_b InputSource(&org_b, pcb, 2 as size_t)
+        ps.push_input(&src_b)
+        if ps.get_input_level() <> (2 as u32)
+            return -13
+        let cl ps.current_location()
+        if cl.get_origin() <> (&org_b)
+            return -14
+        let up cl.parent()
+        if up.get_index() <> (2 as u32)
+            return -15
+        if up.get_origin() <> (&org_a)
+            return -16
+        ps.pop_input_stack()
+        if ps.get_input_level() <> (1 as u32)
+            return -17
+        if ps.current_input() <> (&src_a)
+            return -18
+
+        ; --- scanner mode + recognizer table + getToken + currentToken ---
+        if ps.get_current_mode() <> proMode
+            return -19
+        ps.set_current_mode(econMode)
+        if ps.get_current_mode() <> econMode
+            return -20
+
+        let table ModeInfo.build_table(host)
+        let sdv Sd()
+        let synv Syntax^host(sdv)
+        let grp Recognizer.build_recognizer(host, grpMode, sdv, synv, table)
+        ps.set_recognizer(grpMode, grp)
+
+        var gbuf u32[3]
+        let pg gbuf as pointer[u32]
+        set *(pg + (0 as size_t)): (0x28 as u32)   ; (
+        set *(pg + (1 as size_t)): (0x61 as u32)   ; a
+        set *(pg + (2 as size_t)): (0x29 as u32)   ; )
+        var org_g Origin()
+        var gsrc InputSource(&org_g, pg, 3 as size_t)
+        ps.push_input(&gsrc)
+        if ps.get_token(grpMode) <> tokenGrpo
+            return -21
+        let tok ps.current_token()
+        if tok.get_size() <> (1 as size_t)
+            return -22
+        if tok.get(0 as size_t) <> (0x28 as u32)
+            return -23
+        if ps.get_token(grpMode) <> tokenNameStart
+            return -24
+        ps.pop_input_stack()
+
+        ; --- normal map ---
+        let nm XcharMap.make(host, 0 as u8)
+        nm.set_char(0x41 as u32, 1 as u8)
+        ps.set_normal_map(nm)
+        if ps.get_normal_map().get(0x41 as i32) <> (1 as u8)
+            return -25
+
+        ; --- DTD-backed AttributeContext: notation + entity lookup ---
+        let dtd Dtd.make(host, StringC("doc"), true)
+        let gif Notation.make(host, StringC("gif"), StringC("doc"), true)
+        dtd.insert_notation(gif)
+        let ent host.allocate(sizeof Entity, alignof Entity) as pointer[Entity]
+        set *ent: Entity.Internal(InternalEntity(StringC("amp"), StringC("&"), DT_SGML))
+        dtd.insert_entity(ent, false, false)
+
+        if ps.have_current_dtd()
+            return -26
+        ps.set_current_dtd(dtd)
+        if ps.have_current_dtd() = false
+            return -27
+        if ps.get_attribute_notation(StringC("gif"), Location()) <> gif
+            return -28
+        if ps.get_attribute_notation(StringC("nope"), Location()) <> null
+            return -29
+        if ps.get_attribute_entity(StringC("amp"), Location()) <> ent
+            return -30
+
+        ; --- id table: defineId / noteIdref ---
+        var prev Location()
+        ; outside an instance -> IDs untracked (defineId returns true).
+        if ps.define_id(StringC("a"), Location(), &prev) = false
+            return -31
+        ps.set_in_instance(true)
+        var org_i Origin()
+        var ib u32[1]
+        set *(ib as pointer[u32]): (0x41 as u32)
+        var isrc InputSource(&org_i, ib as pointer[u32], 1 as size_t)
+        let loc1 isrc.current_location(1 as size_t)
+        if ps.define_id(StringC("x"), loc1, &prev) = false
+            return -32
+        ; duplicate define fails and reports the previous location.
+        let loc2 isrc.current_location(5 as size_t)
+        if ps.define_id(StringC("x"), loc2, &prev)
+            return -33
+        if prev.get_index() <> (1 as u32)
+            return -34
+
+        ; --- current-attribute store round-trip ---
+        ps.resize_current_attributes(3 as size_t)
+        if ps.get_current_attribute(1 as size_t) <> null
+            return -35
+        let av AttributeValue.make_implied(host)
+        ps.note_current_attribute(1 as size_t, av)
+        if ps.get_current_attribute(1 as size_t) <> av
+            return -36
+
+        ; --- messenger: dispatch bumps message + error counters ---
+        if ps.get_n_messages() <> (0 as u32)
+            return -37
+        ps.message(MessageType(MessageFragment(1 as u32, StringC("info")), Severity.Info))
+        ps.message(MessageType(MessageFragment(2 as u32, StringC("boom")), Severity.Error))
+        if ps.get_n_messages() <> (2 as u32)
+            return -38
+        if ps.get_n_errors() <> (1 as u32)
+            return -39
+
+        ; --- dtd stack + instantiateDtd ---
+        ps.push_dtd(dtd)
+        if ps.had_dtd() = false
+            return -40
+        if ps.lookup_dtd(StringC("doc")) <> dtd
+            return -41
+        if ps.lookup_dtd(StringC("zzz")) <> null
+            return -42
+        let r1 ps.instantiate_dtd(dtd)
+        if dtd.get_is_instantiated() = false
+            return -43
+        if r1 <> (1 as u32)
+            return -44
+
+        0
+    }
+}
