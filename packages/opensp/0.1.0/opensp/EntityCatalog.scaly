@@ -1,0 +1,302 @@
+use scaly.memory.Page
+use scaly.io.Path
+use opensp.ExternalId.ExternalId
+
+; SGML Open catalog resolution — EntityCatalog.cs / SOEntityCatalog.cs /
+; CatalogParser.
+;
+; CatalogParser tokenizes an SGML Open catalog (a byte String) and builds an
+; EntityCatalog of entries; EntityCatalog.lookup_* maps a PUBLIC id / SYSTEM id /
+; DOCTYPE or ENTITY name to a resolved system id (file path), resolved relative
+; to the catalog's own directory, honouring OVERRIDE. All ids/paths are byte
+; String (I/O-boundary identifiers; see ExternalId).
+;
+; Stage-2 scope: PUBLIC / SYSTEM / DOCTYPE / ENTITY / SGMLDECL / OVERRIDE /
+; CATALOG entries; first-match lookup. Nested CATALOG following, DELEGATE,
+; DTDDECL and BASE re-basing are recorded/deferred (the corpus's dsssl catalog
+; uses PUBLIC only; the Billing catalog adds a DOCTYPE map).
+
+define CAT_PUBLIC: int 0
+define CAT_SYSTEM: int 1
+define CAT_DOCTYPE: int 2
+define CAT_ENTITY: int 3
+define CAT_SGMLDECL: int 4
+define CAT_CATALOG: int 5
+
+define TOK_EOF: int 0
+define TOK_NAME: int 1
+define TOK_LITERAL: int 2
+
+define TokenResult (kind: int, token: String, next_pos: size_t)
+{
+    init(kind: int, token: String, next_pos: size_t)
+    {
+        set kind: kind
+        set token: token
+        set next_pos: next_pos
+    }
+}
+
+define CatalogEntry (decl_type: int, key: String, target: String, is_override: bool)
+{
+    init(decl_type: int, key: String, target: String, is_override: bool)
+    {
+        set decl_type: decl_type
+        set key: key
+        set target: target
+        set is_override: is_override
+    }
+}
+
+define EntityCatalog (entries: List[CatalogEntry], base_dir: String)
+{
+    init(entries: List[CatalogEntry], base_dir: String)
+    {
+        set entries: entries
+        set base_dir: base_dir
+    }
+
+    ; Resolve a catalog target (relative to the catalog's directory).
+    function resolve(this: EntityCatalog, target: String) returns String
+    {
+        if base_dir.get_length() = (0 as size_t)
+            return target
+
+        Path.join(base_dir, target)
+    }
+
+    function lookup_of(this: EntityCatalog, decl_type: int, key: String) returns String
+    {
+        var it entries.get_iterator()
+        while true
+        {
+            let e it.next()
+            if e = null
+                break
+
+            if (*e).decl_type = decl_type
+                if (*e).key = key
+                    return resolve((*e).target)
+        }
+        String()
+    }
+
+    function lookup_public(this: EntityCatalog, public_id: String) returns String
+        lookup_of(CAT_PUBLIC, public_id)
+
+    function lookup_system(this: EntityCatalog, system_id: String) returns String
+        lookup_of(CAT_SYSTEM, system_id)
+
+    function lookup_doctype(this: EntityCatalog, name: String) returns String
+        lookup_of(CAT_DOCTYPE, name)
+
+    function lookup_entity(this: EntityCatalog, name: String) returns String
+        lookup_of(CAT_ENTITY, name)
+
+    ; EntityCatalog.lookup(EntityDecl): prefer PUBLIC, then SYSTEM, else the
+    ; entity's own system id resolved relative to the catalog dir.
+    function lookup(this: EntityCatalog, id: ExternalId) returns String
+    {
+        if id.has_public_id()
+        {
+            let bypub lookup_public(id.get_public_id())
+            if bypub.get_length() <> (0 as size_t)
+                return bypub
+        }
+        if id.has_system_id()
+        {
+            let bysys lookup_system(id.get_system_id())
+            if bysys.get_length() <> (0 as size_t)
+                return bysys
+
+            ; SYSTEM fallback: the id's own system id, catalog-relative.
+            return resolve(id.get_system_id())
+        }
+        String()
+    }
+}
+
+define CatalogParser
+{
+    function is_ws(this: CatalogParser, c: u8) returns bool
+        (c = (0x20 as u8)) or (c = (0x09 as u8)) or (c = (0x0A as u8)) or (c = (0x0D as u8))
+
+    ; Scan one token from buf[pos..len): a "quoted" / 'quoted' literal, or an
+    ; unquoted name, skipping whitespace and `--…--` comments.
+    function scan(this: CatalogParser, buf: pointer[u8], len: size_t, pos: size_t) returns TokenResult
+    {
+        var i pos
+        while i < len
+        {
+            let c *(buf + i)
+            if is_ws(c)
+            {
+                set i: i + 1
+            }
+            else if (c = (0x2D as u8)) and (i + (1 as size_t) < len) and (*(buf + i + (1 as size_t)) = (0x2D as u8))
+            {
+                ; `--` comment: skip through the closing `--`
+                set i: i + (2 as size_t)
+                while (i + (1 as size_t) < len) and ((*(buf + i) <> (0x2D as u8)) or (*(buf + i + (1 as size_t)) <> (0x2D as u8)))
+                    set i: i + 1
+                set i: i + (2 as size_t)
+            }
+            else
+                break
+        }
+
+        if i >= len
+            return TokenResult(TOK_EOF, String(), i)
+
+        let c *(buf + i)
+        if (c = (0x22 as u8)) or (c = (0x27 as u8))
+        {
+            let quote c
+            set i: i + 1
+            let start i
+            while (i < len) and (*(buf + i) <> quote)
+                set i: i + 1
+
+            let tok String((buf + start) as pointer[const_char], i - start)
+            if i < len
+                set i: i + 1
+
+            return TokenResult(TOK_LITERAL, tok, i)
+        }
+
+        let start i
+        while (i < len) and (is_ws(*(buf + i)) = false)
+            set i: i + 1
+
+        TokenResult(TOK_NAME, String((buf + start) as pointer[const_char], i - start), i)
+    }
+
+    ; Parse a catalog's text into an EntityCatalog rooted at base_dir.
+    function parse(this: CatalogParser, text: String, base_dir: String) returns EntityCatalog
+    {
+        var entries List[CatalogEntry]()
+        let buf text.get_buffer()
+        let len text.get_length()
+        var pos: size_t 0
+        var override_flag: bool false
+
+        if buf <> null
+        {
+            while true
+            {
+                let kw scan(buf, len, pos)
+                set pos: kw.next_pos
+                if kw.kind = TOK_EOF
+                    break
+
+                if kw.kind <> TOK_NAME
+                    ; stray literal at top level — skip
+                    continue
+
+                let word kw.token
+                if word = "OVERRIDE"
+                {
+                    let a scan(buf, len, pos)
+                    set pos: a.next_pos
+                    set override_flag: a.token = "YES"
+                }
+                else if word = "PUBLIC"
+                {
+                    let k scan(buf, len, pos)
+                    set pos: k.next_pos
+                    let v scan(buf, len, pos)
+                    set pos: v.next_pos
+                    entries.add(CatalogEntry(CAT_PUBLIC, k.token, v.token, override_flag))
+                }
+                else if word = "SYSTEM"
+                {
+                    let k scan(buf, len, pos)
+                    set pos: k.next_pos
+                    let v scan(buf, len, pos)
+                    set pos: v.next_pos
+                    entries.add(CatalogEntry(CAT_SYSTEM, k.token, v.token, override_flag))
+                }
+                else if word = "DOCTYPE"
+                {
+                    let k scan(buf, len, pos)
+                    set pos: k.next_pos
+                    let v scan(buf, len, pos)
+                    set pos: v.next_pos
+                    entries.add(CatalogEntry(CAT_DOCTYPE, k.token, v.token, override_flag))
+                }
+                else if word = "ENTITY"
+                {
+                    let k scan(buf, len, pos)
+                    set pos: k.next_pos
+                    let v scan(buf, len, pos)
+                    set pos: v.next_pos
+                    entries.add(CatalogEntry(CAT_ENTITY, k.token, v.token, override_flag))
+                }
+                else if word = "SGMLDECL"
+                {
+                    let v scan(buf, len, pos)
+                    set pos: v.next_pos
+                    entries.add(CatalogEntry(CAT_SGMLDECL, String(), v.token, override_flag))
+                }
+                else if word = "CATALOG"
+                {
+                    let v scan(buf, len, pos)
+                    set pos: v.next_pos
+                    entries.add(CatalogEntry(CAT_CATALOG, String(), v.token, override_flag))
+                }
+                else
+                {
+                    ; unknown keyword: consume its single argument to stay in sync
+                    let a scan(buf, len, pos)
+                    set pos: a.next_pos
+                }
+            }
+        }
+
+        EntityCatalog(entries, base_dir)
+    }
+
+    function test() returns int
+    {
+        let src "-- catalog --\nOVERRIDE YES\nPUBLIC \"-//Example//DTD Model v1//EN\" model.dtd\nSYSTEM \"grammar.dtd\" grammar/grammar.dtd\nDOCTYPE ACTIVITY-PROTOCOL empty.dtd\nENTITY logo images/logo.gif\nSGMLDECL xml.dcl\n"
+        let parser CatalogParser()
+        let cat parser.parse(src, "/base")
+
+        ; PUBLIC resolves relative to the catalog dir
+        let p cat.lookup_public("-//Example//DTD Model v1//EN")
+        if (p = "/base/model.dtd") = false
+            return -1
+
+        ; SYSTEM
+        let s cat.lookup_system("grammar.dtd")
+        if (s = "/base/grammar/grammar.dtd") = false
+            return -2
+
+        ; DOCTYPE
+        let d cat.lookup_doctype("ACTIVITY-PROTOCOL")
+        if (d = "/base/empty.dtd") = false
+            return -3
+
+        ; ENTITY
+        let e cat.lookup_entity("logo")
+        if (e = "/base/images/logo.gif") = false
+            return -4
+
+        ; miss returns empty
+        let miss cat.lookup_public("-//nobody//EN")
+        if miss.get_length() <> (0 as size_t)
+            return -5
+
+        ; lookup(ExternalId): PUBLIC hit
+        let byid cat.lookup(ExternalId(true, "-//Example//DTD Model v1//EN", true, "ignored.dtd"))
+        if (byid = "/base/model.dtd") = false
+            return -6
+
+        ; lookup(ExternalId): no PUBLIC match -> SYSTEM fallback, catalog-relative
+        let byfallback cat.lookup(ExternalId(false, String(), true, "local.dtd"))
+        if (byfallback = "/base/local.dtd") = false
+            return -7
+
+        0
+    }
+}
