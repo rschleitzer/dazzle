@@ -1,25 +1,433 @@
 use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.ContentToken.CompiledModelGroup
+use opensp.AttributeList.AttributeDefinitionList
+use opensp.ShortReferenceMap.ShortReferenceMap
 
-; ElementType — minimal seed (ElementType.cs is 389 LOC, lands whole in the
-; Dtd increment). The content-model DFA (ContentToken) references an element
-; type only by IDENTITY (pointer equality in the transition tables) and by its
-; dense INDEX (elementTransition/nextTypeIndex arrays), so those two fields are
-; all the DFA needs. The declaration/attributed machinery is added later.
+; ElementType — ElementType.cs (389 LOC). The full element-type layer: an
+; `ElementDefinition` (owns the compiled model group, the omit-tag flags,
+; declared content, inclusions/exclusions/rank stems), the `RankStem`, and
+; `ElementType` itself (name + dense index + attributed member + a borrowed
+; definition pointer). This GROWS the minimal Increment-C seed in place: the
+; content-model DFA (ContentToken) references an element type only by IDENTITY
+; and by its dense `index`, so those two fields — and their construction shape
+; (`ElementType^host(name, index)`) — stay byte-stable.
 ;
-; ElementTypes are page-hosted so pointer identity is stable for the run
-; (one-region-per-run doctrine): construct with `ElementType^host(name, index)`.
+; PORT SHAPE: the C++ ref-counted graph (ConstPtr<ElementDefinition>,
+; Owner<CompiledModelGroup>, ConstPtr<ElementDefinition> rank defs) collapses to
+; plain borrowed pointers in the one-region-per-run arena; ElementType /
+; ElementDefinition / RankStem are page-hosted flat structs mutated through a
+; pointer via plain `.`. Names are StringC (u32) — the scanner produces StringC
+; names and the attribute/notation lookups key on StringC; this reconciles the
+; earlier byte-String seed.
+;
+; MI resolution (C++ `ElementType : Named + Attributed`): following the C# port
+; and Notation's lead, the `Attributed` member is FOLDED INLINE as a single
+; `attribute_def` pointer.
 
-define ElementType (name: String, index: size_t)
+; ElementDefinition::DeclaredContent.
+define DC_MODEL_GROUP: int 0
+define DC_ANY: int 1
+define DC_CDATA: int 2
+define DC_RCDATA: int 3
+define DC_EMPTY: int 4
+
+; ElementDefinition::OmitFlags (C++ octal 01/02/04).
+define OMIT_START: u8 1
+define OMIT_END: u8 2
+define OMIT_SPEC: u8 4
+
+; size_t(undefinedIndex) — an element declared only by reference (implicit).
+define ELEMENT_UNDEFINED_INDEX: size_t 0xFFFFFFFFFFFFFFFF
+
+; --- ElementDefinition ----------------------------------------------------
+; The shared definition body of one or more element types. Owns the compiled
+; model group and the content-mode bookkeeping computed from the declared
+; content. inclusions/exclusions/rank_stems are Array pointers (null = empty),
+; set once via set_* (C++ swaps a Vector in; the arena just stores the pointer).
+define ElementDefinition
+(
+    location: Location
+    index: size_t
+    omit_flags: u8
+    declared_content: int
+    allow_immediate_recursion: bool
+    model_group: pointer[CompiledModelGroup]
+    inclusions: pointer[Array[pointer[ElementType]]]
+    exclusions: pointer[Array[pointer[ElementType]]]
+    rank_stems: pointer[Array[pointer[RankStem]]]
+    rank_suffix: StringC
+    mode_normal: int
+    mode_net: int
+)
 {
-    init(name: String, index: size_t)
+    ; ElementDefinition(location, index, omitFlags, declaredContent,
+    ;                   allowImmediateRecursion = 1) — no model group.
+    function make(host: pointer[Page], location: Location, index: size_t, omit_flags: u8, declared_content: int, allow_immediate_recursion: bool) returns pointer[ElementDefinition]
     {
+        let d host.allocate(sizeof ElementDefinition, alignof ElementDefinition) as pointer[ElementDefinition]
+        set d.location: location
+        set d.index: index
+        set d.omit_flags: omit_flags
+        set d.declared_content: declared_content
+        set d.allow_immediate_recursion: allow_immediate_recursion
+        set d.model_group: null
+        set d.inclusions: null
+        set d.exclusions: null
+        set d.rank_stems: null
+        set d.rank_suffix: StringC()
+        set d.mode_normal: 0
+        set d.mode_net: 0
+        d.compute_mode()
+        d
+    }
+
+    ; ElementDefinition(location, index, omitFlags, declaredContent, modelGroup).
+    function make_with_model(host: pointer[Page], location: Location, index: size_t, omit_flags: u8, declared_content: int, model_group: pointer[CompiledModelGroup]) returns pointer[ElementDefinition]
+    {
+        let d host.allocate(sizeof ElementDefinition, alignof ElementDefinition) as pointer[ElementDefinition]
+        set d.location: location
+        set d.index: index
+        set d.omit_flags: omit_flags
+        set d.declared_content: declared_content
+        set d.allow_immediate_recursion: true
+        set d.model_group: model_group
+        set d.inclusions: null
+        set d.exclusions: null
+        set d.rank_stems: null
+        set d.rank_suffix: StringC()
+        set d.mode_normal: 0
+        set d.mode_net: 0
+        d.compute_mode()
+        d
+    }
+
+    function compiled_model_group(this: ElementDefinition) returns pointer[CompiledModelGroup]
+        model_group
+
+    function get_declared_content(this: ElementDefinition) returns int
+        declared_content
+
+    function omitted_tag_spec(this: ElementDefinition) returns bool
+        (omit_flags & OMIT_SPEC) <> (0 as u8)
+
+    function can_omit_start_tag(this: ElementDefinition) returns bool
+        (omit_flags & OMIT_START) <> (0 as u8)
+
+    function can_omit_end_tag(this: ElementDefinition) returns bool
+        (omit_flags & OMIT_END) <> (0 as u8)
+
+    function n_rank_stems(this: ElementDefinition) returns size_t
+    {
+        if rank_stems = null
+            return 0 as size_t
+        rank_stems.get_length()
+    }
+
+    function rank_stem(this: ElementDefinition, i: size_t) returns pointer[RankStem]
+    {
+        if rank_stems = null
+            return null
+        *(rank_stems.get_buffer() + i)
+    }
+
+    function get_rank_suffix(this: ElementDefinition) returns StringC
+        rank_suffix
+
+    function n_inclusions(this: ElementDefinition) returns size_t
+    {
+        if inclusions = null
+            return 0 as size_t
+        inclusions.get_length()
+    }
+
+    function inclusion(this: ElementDefinition, i: size_t) returns pointer[ElementType]
+    {
+        if inclusions = null
+            return null
+        *(inclusions.get_buffer() + i)
+    }
+
+    function n_exclusions(this: ElementDefinition) returns size_t
+    {
+        if exclusions = null
+            return 0 as size_t
+        exclusions.get_length()
+    }
+
+    function exclusion(this: ElementDefinition, i: size_t) returns pointer[ElementType]
+    {
+        if exclusions = null
+            return null
+        *(exclusions.get_buffer() + i)
+    }
+
+    function undefined(this: ElementDefinition) returns bool
+        index = ELEMENT_UNDEFINED_INDEX
+
+    function get_allow_immediate_recursion(this: ElementDefinition) returns bool
+        allow_immediate_recursion
+
+    function set_inclusions(this: pointer[ElementDefinition], inclusions: pointer[Array[pointer[ElementType]]])
+        set this.inclusions: inclusions
+
+    function set_exclusions(this: pointer[ElementDefinition], exclusions: pointer[Array[pointer[ElementType]]])
+        set this.exclusions: exclusions
+
+    function set_rank(this: pointer[ElementDefinition], rank_suffix: StringC, rank_stems: pointer[Array[pointer[RankStem]]])
+    {
+        set this.rank_suffix: rank_suffix
+        set this.rank_stems: rank_stems
+    }
+
+    ; Mode mode(Boolean netEnabled) const.
+    function mode(this: ElementDefinition, net_enabled: bool) returns int
+    {
+        if net_enabled
+            return mode_net
+        mode_normal
+    }
+
+    function get_location(this: ElementDefinition) returns Location
+        location
+
+    ; computeMode — derive the two content modes from the declared content,
+    ; consulting the compiled model group for PCDATA reachability.
+    function compute_mode(this: pointer[ElementDefinition])
+    {
+        if this.declared_content = DC_MODEL_GROUP
+        {
+            if this.model_group <> null
+            {
+                if this.model_group.contains_pcdata = false
+                {
+                    set this.mode_net: econnetMode
+                    set this.mode_normal: econMode
+                    return
+                }
+            }
+            ; fall through: pcdata-reachable model group behaves like ANY.
+            set this.mode_net: mconnetMode
+            set this.mode_normal: mconMode
+            return
+        }
+        if this.declared_content = DC_ANY
+        {
+            set this.mode_net: mconnetMode
+            set this.mode_normal: mconMode
+            return
+        }
+        if this.declared_content = DC_CDATA
+        {
+            set this.mode_net: cconnetMode
+            set this.mode_normal: cconMode
+            return
+        }
+        if this.declared_content = DC_RCDATA
+        {
+            set this.mode_net: rcconnetMode
+            set this.mode_normal: rcconMode
+            return
+        }
+        ; DC_EMPTY: no content mode.
+    }
+}
+
+; --- RankStem -------------------------------------------------------------
+; A rank stem groups the element definitions that share a ranked declaration.
+define RankStem
+(
+    name: StringC
+    index: size_t
+    defs: pointer[Array[pointer[ElementDefinition]]]
+)
+{
+    init(name: StringC, index: size_t)
+    {
+        let host Page.get(this as pointer[void])
         set name: name
         set index: index
+        set defs: Array[pointer[ElementDefinition]]^host()
     }
+
+    function get_name(this: RankStem) returns StringC
+        name
+
+    function get_index(this: RankStem) returns size_t
+        index
+
+    function add_definition(this: pointer[RankStem], p: pointer[ElementDefinition])
+        this.defs.add(p)
+
+    function n_definitions(this: RankStem) returns size_t
+        defs.get_length()
+
+    function definition(this: RankStem, i: size_t) returns pointer[ElementDefinition]
+        *(defs.get_buffer() + i)
+}
+
+; --- ElementType ----------------------------------------------------------
+define ElementType
+(
+    name: StringC
+    orig_name: StringC
+    index: size_t
+    def_index: size_t
+    element_def: pointer[ElementDefinition]
+    short_ref_map: pointer[ShortReferenceMap]
+    attribute_def: pointer[AttributeDefinitionList]
+)
+{
+    init(name: StringC, index: size_t)
+    {
+        set name: name
+        set orig_name: StringC()
+        set index: index
+        set def_index: 0
+        set element_def: null
+        set short_ref_map: null
+        set attribute_def: null
+    }
+
+    function get_name(this: ElementType) returns StringC
+        name
 
     function get_index(this: ElementType) returns size_t
         index
 
-    function get_name(this: ElementType) returns String
-        name
+    function get_orig_name(this: ElementType) returns StringC
+        orig_name
+
+    function set_orig_name(this: pointer[ElementType], orig_name: StringC)
+        set this.orig_name: orig_name
+
+    ; setElementDefinition(def, defIndex) — defIndex = position in the ranked
+    ; group sharing this definition.
+    function set_element_definition(this: pointer[ElementType], def: pointer[ElementDefinition], def_index: size_t)
+    {
+        set this.element_def: def
+        set this.def_index: def_index
+    }
+
+    function get_definition(this: ElementType) returns pointer[ElementDefinition]
+        element_def
+
+    function undefined(this: ElementType) returns bool
+    {
+        if element_def = null
+            return true
+        element_def.undefined()
+    }
+
+    function is_ranked_element(this: ElementType) returns bool
+    {
+        if element_def = null
+            return false
+        element_def.n_rank_stems() > (0 as size_t)
+    }
+
+    function ranked_element_rank_stem(this: ElementType) returns pointer[RankStem]
+    {
+        if element_def = null
+            return null
+        element_def.rank_stem(def_index)
+    }
+
+    function set_map(this: pointer[ElementType], map: pointer[ShortReferenceMap])
+        set this.short_ref_map: map
+
+    function get_map(this: ElementType) returns pointer[ShortReferenceMap]
+        short_ref_map
+
+    ; Attributed (folded inline).
+    function get_attribute_def(this: ElementType) returns pointer[AttributeDefinitionList]
+        attribute_def
+
+    function set_attribute_def(this: pointer[ElementType], def: pointer[AttributeDefinitionList])
+        set this.attribute_def: def
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+
+        ; a document element type "doc" at dense index 1.
+        let doc ElementType^host(StringC("doc"), 1 as size_t)
+        if doc.get_name().equals(StringC("doc")) = false
+            return -1
+        if doc.get_index() <> (1 as size_t)
+            return -2
+        ; no definition yet -> undefined, not ranked, no attributes/map.
+        if doc.undefined() = false
+            return -3
+        if doc.is_ranked_element()
+            return -4
+        if doc.get_attribute_def() <> null
+            return -5
+        if doc.get_map() <> null
+            return -6
+
+        ; an EMPTY element definition -> defined, no content mode.
+        let emptyDef ElementDefinition.make(host, Location(), 0 as size_t, OMIT_END, DC_EMPTY, true)
+        if emptyDef.undefined()
+            return -7
+        if emptyDef.can_omit_end_tag() = false
+            return -8
+        if emptyDef.can_omit_start_tag()
+            return -9
+
+        ; a CDATA element -> ccon modes.
+        let cdef ElementDefinition.make(host, Location(), 1 as size_t, 0 as u8, DC_CDATA, true)
+        if cdef.mode(false) <> cconMode
+            return -10
+        if cdef.mode(true) <> cconnetMode
+            return -11
+
+        ; an ANY element -> mcon modes.
+        let anyDef ElementDefinition.make(host, Location(), 2 as size_t, 0 as u8, DC_ANY, true)
+        if anyDef.mode(false) <> mconMode
+            return -12
+
+        ; attach the CDATA def to "doc" -> defined, mode reflects it.
+        doc.set_element_definition(cdef, 0 as size_t)
+        if doc.undefined()
+            return -13
+        if doc.get_definition().mode(false) <> cconMode
+            return -14
+
+        ; an undefined-index definition reads back undefined.
+        let undef ElementDefinition.make(host, Location(), ELEMENT_UNDEFINED_INDEX, OMIT_END, DC_ANY, true)
+        if undef.undefined() = false
+            return -15
+
+        ; inclusions: build an Array of one element type, attach, read back.
+        var incl Array[pointer[ElementType]]^host()
+        let note ElementType^host(StringC("note"), 2 as size_t)
+        incl.add(note)
+        cdef.set_inclusions(incl)
+        if cdef.n_inclusions() <> (1 as size_t)
+            return -16
+        if cdef.inclusion(0 as size_t) <> note
+            return -17
+        if cdef.n_exclusions() <> (0 as size_t)
+            return -18
+
+        ; a rank stem grouping one definition.
+        let rs RankStem^host(StringC("chap"), 0 as size_t)
+        rs.add_definition(cdef)
+        if rs.n_definitions() <> (1 as size_t)
+            return -19
+        if rs.definition(0 as size_t) <> cdef
+            return -20
+
+        ; attributed by identity.
+        let adl AttributeDefinitionList.make(host, 0 as size_t)
+        doc.set_attribute_def(adl)
+        if doc.get_attribute_def() <> adl
+            return -21
+
+        0
+    }
 }

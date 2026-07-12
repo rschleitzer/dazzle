@@ -436,6 +436,75 @@ entity-side decl metadata land with the Dtd/entity-table increment;
 `generateSystemId` (catalog lookup of a notation system id) needs the live
 `ParserState` + `EntityCatalog` and lands with the parser stage.
 
+### Landed (Stage 3, Increment — dtd)
+
+JIT-green (`tests/opensp/run.sh` → `PASS`), emission-neutral (`cycle.sh`
+IDENTICAL). The convergence increment: the `Dtd` tables + the pieces they own.
+Ports `Dtd.cs` (451), the full `ElementType.cs` (389), `ShortReferenceMap.cs`
+(105), and the deferred `Trie`/`TrieBuilder` BlankTrie machinery.
+
+- **`ElementType.scaly` (grown from the Increment-C seed)** — the full element
+  layer: `ElementDefinition` (owns the `CompiledModelGroup`, omit-tag flags,
+  declared content, inclusions/exclusions/rank stems; `computeMode` derives the
+  two content modes from the declared content + PCDATA reachability, reading
+  ModeInfo's mode constants), `RankStem` (name + dense index + definition list),
+  and `ElementType` itself (StringC name, dense `index`, `def_index`, borrowed
+  `ElementDefinition` pointer, `ShortReferenceMap` pointer, inline `Attributed`
+  member). The DFA's identity + `index` contract is byte-stable: the
+  construction shape `ElementType^host(name, index)` and `get_index` are
+  unchanged (only `name` moved byte-String → StringC — see the name seam below).
+- **`ShortReferenceMap.scaly`** — a named SHORTREF map: per shortref index a
+  general-entity NAME (`name_map`) and, once resolved, the borrowed `Entity`
+  (`entity_map`); `defined`/`used`/`defLocation` bookkeeping. `defined()`
+  mirrors the C++ `nameMap_.size() > 0` (a set-but-empty map counts).
+- **`Dtd.scaly`** — the run's central tables: element types, entities (split
+  general/parameter), notations, rank stems, shortref maps, plus the shortref
+  string-interning table and the dense-index allocators (element type /
+  definition / current attribute / attribute-definition list). The document
+  element type takes index 1 (0 reserved for #PCDATA) and is auto-inserted by
+  the ctor. Full lookup/insert/remove API + `is_base`/`instantiate` + implicit
+  element/notation attribute defs.
+- **`Trie.scaly` (BlankTrie machinery, un-deferred)** — the `blank`
+  fields (`additional_length`/`max_blanks_to_scan`/`code_is_blank`) fold into
+  the flat `Node`; `recognize_b`/`do_b`/`copy_into` build a shortref B-sequence
+  (blank-run) branch, and `force_next` pushes a BlankTrie down into its
+  blank-code children (first child moves it, the rest deep-copy via `copy_node`)
+  and grafts its token structure back with `copy_into`. Unit-tested
+  programmatically (a `"B"` shortref → token, then a manual `force_next` to
+  observe the migration), not via SGML text.
+
+**Port-shape decisions:**
+- **Tables = flat Array-of-pointers, linear scan by StringC name.** The C++
+  `NamedTable`/`NamedResourceTable` use a hash for scale; the `NamedTableIter`
+  is not load-bearing for the lookup/insert API this increment unit-tests on
+  small hand-built DTDs (the perf path is the Parser increment's concern, where
+  real corpus DTDs land). Insertion-order iteration (C++'s is hash-bucket
+  order) is not semantically observable through lookups. `remove` tombstones
+  the slot (`Array` cannot shrink); lookups skip null slots.
+- **EntityDecl base stays FOLDED; the entity table keys on explicit
+  `is_parameter`.** Resolving the notation increment's open question: no shared
+  `EntityDecl` concept is introduced. C++'s `lookupEntity`/`removeEntity`
+  already take `isParameter` explicitly; only `insertEntity` derived it from
+  `declType()`. Since the `Entity` union carries no declType, `insert_entity`
+  ALSO takes `is_parameter` explicitly (the parser knows it — it parsed the
+  `%`), faithful to the two-table param/general split.
+- **Name seam reconciled to StringC.** `ElementType`, `RankStem`, and the
+  `Entity` union's names moved byte-String → StringC (Notation was already
+  StringC), so every DTD table keys uniformly on StringC — matching the
+  scanner (which produces StringC names) and the attribute/notation lookups.
+  `Entity.get_name` (choose over the arms) was added; the 4 `ElementType^host`
+  construction sites in `ContentToken`'s test now pass `StringC(...)`.
+
+**Deferred to the ParserState/Parser increment (need the live parser to drive
+them):** `ContentState` (open-element stack — it constructs a `ContentToken`
+model group, builds an `ElementDefinition`, and depends on the not-yet-ported
+`OpenElement`, and is the `AttributeContext → ContentState → ParserState`
+linearization anyway); `Dtd.setDefaultEntity`'s LPD/defaulted-entity fan-out
+(needs the entity-decl `defaulted` flag + `generateSystemId`); the
+`Syntax::isValidShortref` gate on shortref interning (the parser validates
+before interning — `intern_shortref` is the pure table op). The `Dtd` data
+structures + their construction/lookup API are complete and unit-tested here.
+
 ### Landed (Stage 3, Increment A)
 
 JIT-green (`tests/opensp/run.sh` → `PASS`):

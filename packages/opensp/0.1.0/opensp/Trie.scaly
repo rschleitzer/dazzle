@@ -15,15 +15,22 @@ use opensp.StringC.StringC
 ; `Node` struct (as with ContentToken's graph) mutated through a pointer via
 ; plain `.`. Priority is a u8: data=0, function=2, delim=255 (Priority.cs).
 ;
-; DEFERRED (lands with the Dtd increment, which brings shortrefs): the
-; BlankTrie / B-sequence machinery (`doB`/`recognizeB`/`copyInto` and the
-; blank fields). It is reached ONLY when compiling shortref delimiters against
-; a DTD; the scanner's mode recognizers (no DTD) never build a blank node, so
-; `blank` stays null and the recognizer takes the plain path.
+; SHORTREF B-SEQUENCE (landed with the Dtd increment, which brings shortrefs):
+; the BlankTrie machinery (`recognize_b`/`do_b`/`copy_into` + the blank fields).
+; A "B" in a shortref delimiter matches a run of blank characters; the trie
+; hangs a BlankTrie off a node (`blank`) that, once entered, scans up to
+; `max_blanks_to_scan` blank codes (those flagged in `code_is_blank`) before
+; matching the delimiter's continuation. It is reached ONLY when compiling
+; shortref delimiters against a DTD; the plain mode recognizers never build one,
+; so `blank` stays null and the recognizer takes the plain path.
 
 define PRI_DATA: u8 0
 define PRI_FUNCTION: u8 2
 define PRI_DELIM: u8 255
+
+; Priority::blank(n) = n + function — a longer B-sequence outranks a shorter.
+function pri_blank(n: int) returns u8
+    (n as u8) + PRI_FUNCTION
 
 define Node
 (
@@ -32,7 +39,11 @@ define Node
     priority: u8
     n_codes: int
     next: pointer[pointer[Node]]     ; array[n_codes] of child Node*, or null
-    blank: pointer[Node]             ; always null until shortrefs land
+    blank: pointer[Node]             ; the BlankTrie subtree, or null
+    ; BlankTrie fields (meaningful only on a node reached via `blank`):
+    additional_length: u8            ; delimiter chars consumed before the B-run
+    max_blanks_to_scan: size_t       ; upper bound on blanks in the run
+    code_is_blank: pointer[u8]       ; per-EquivCode 0/1 blank flags, or null
 )
 {
     function has_next(this: Node) returns bool
@@ -59,6 +70,20 @@ define Node
     ; Boolean includeBlanks() const { return Priority::isBlank(priority_); }
     function include_blanks(this: Node) returns bool
         (priority > PRI_FUNCTION) and (priority < PRI_DELIM)
+
+    ; BlankTrie accessors.
+    function get_additional_length(this: Node) returns int
+        additional_length as int
+
+    function get_max_blanks_to_scan(this: Node) returns size_t
+        max_blanks_to_scan
+
+    function code_is_blank_at(this: Node, i: int) returns bool
+    {
+        if code_is_blank = null
+            return false
+        *(code_is_blank + (i as size_t)) <> (0 as u8)
+    }
 }
 
 define TrieBuilder (root: pointer[Node], n_codes: int)
@@ -80,6 +105,9 @@ define TrieBuilder (root: pointer[Node], n_codes: int)
         set p.n_codes: n_codes
         set p.next: null
         set p.blank: null
+        set p.additional_length: (0 as u8)
+        set p.max_blanks_to_scan: (0 as size_t)
+        set p.code_is_blank: null
         p
     }
 
@@ -154,13 +182,25 @@ define TrieBuilder (root: pointer[Node], n_codes: int)
     }
 
     ; Trie *forceNext(Trie *trie, EquivCode c) — materialize the child array,
-    ; inheriting this node's token/length/priority into each child.
+    ; inheriting this node's token/length/priority into each child. When `trie`
+    ; carries a BlankTrie, it is pushed down: its length/scan bounds are advanced
+    ; by one, it is moved into the first blank-code child (deep-copied into the
+    ; rest), and its token structure is copied back via copy_into.
     function force_next(this: TrieBuilder, trie: pointer[Node], c: u16) returns pointer[Node]
     {
         if trie.has_next() = false
         {
             let host Page.get(this as pointer[void])
             let arr host.allocate((n_codes as size_t) * (sizeof pointer[Node]), alignof pointer[Node]) as pointer[pointer[Node]]
+            ; advance the blank bounds before distributing (C++: before extract).
+            let b trie.blank
+            if b <> null
+            {
+                set b.additional_length: b.additional_length + (1 as u8)
+                set b.max_blanks_to_scan: b.max_blanks_to_scan - (1 as size_t)
+            }
+            set trie.blank: null
+            var moved false
             var i: int 0
             while i < n_codes
             {
@@ -168,12 +208,141 @@ define TrieBuilder (root: pointer[Node], n_codes: int)
                 set ch.token: trie.token
                 set ch.token_length: trie.token_length
                 set ch.priority: trie.priority
+                if b <> null
+                {
+                    if b.code_is_blank_at(i)
+                    {
+                        if moved = false
+                        {
+                            set ch.blank: b
+                            set moved: true
+                        }
+                        else
+                            set ch.blank: copy_node(host, b)
+                    }
+                }
                 set *(arr + (i as size_t)): ch
                 set i: i + 1
             }
             set trie.next: arr
+            if b <> null
+                copy_into(trie, b, (b.additional_length as int) - 1)
         }
         trie.child(c as int)
+    }
+
+    ; A full recursive Node-subtree copy (C++ new BlankTrie(other)) — used when a
+    ; BlankTrie has to be shared into more than one blank-code child. code_is_blank
+    ; is immutable after construction, so the flag buffer is shared.
+    function copy_node(this: TrieBuilder, host: pointer[Page], from: pointer[Node]) returns pointer[Node]
+    {
+        let n new_node(host, from.n_codes)
+        set n.token: from.token
+        set n.token_length: from.token_length
+        set n.priority: from.priority
+        set n.additional_length: from.additional_length
+        set n.max_blanks_to_scan: from.max_blanks_to_scan
+        set n.code_is_blank: from.code_is_blank
+        if from.has_next()
+        {
+            let arr host.allocate((from.n_codes as size_t) * (sizeof pointer[Node]), alignof pointer[Node]) as pointer[pointer[Node]]
+            var i: int 0
+            while i < from.n_codes
+            {
+                set *(arr + (i as size_t)): copy_node(host, from.child(i))
+                set i: i + 1
+            }
+            set n.next: arr
+        }
+        if from.blank <> null
+            set n.blank: copy_node(host, from.blank)
+        n
+    }
+
+    ; void copyInto(Trie *into, const Trie *from, int additionalLength) — graft
+    ; `from`'s token structure onto `into`, adding additionalLength to lengths.
+    function copy_into(this: TrieBuilder, into: pointer[Node], from: pointer[Node], additional_length: int)
+    {
+        if from.token <> (0 as u32)
+        {
+            let host Page.get(into as pointer[void])
+            let dummy Array[u32]^host()
+            set_token(into, (from.get_token_length()) + additional_length, from.token, from.priority, dummy)
+        }
+        if from.has_next()
+        {
+            var i: int 0
+            while i < n_codes
+            {
+                let ci force_next(into, i as u16)
+                copy_into(ci, from.child(i), additional_length)
+                set i: i + 1
+            }
+        }
+    }
+
+    ; void recognizeB(chars, bSequenceLength, maxBlankSequence, blankCodes,
+    ;                 chars2, Token, ambiguities) — a shortref delimiter with an
+    ; embedded "B" (blank run) of length >= bSequenceLength, up to
+    ; maxBlankSequence, followed by chars2.
+    function recognize_b(this: TrieBuilder, codes: pointer[u16], n: size_t, b_sequence_length: int, max_blank_sequence: size_t, blank_codes: pointer[u16], n_blank: size_t, chars2: pointer[u16], n_chars2: size_t, token: u32, amb: pointer[Array[u32]])
+    {
+        let start extend_trie(root, codes, n)
+        do_b(start, n as int, b_sequence_length, max_blank_sequence, blank_codes, n_blank, chars2, n_chars2, token, pri_blank(b_sequence_length), amb)
+    }
+
+    function do_b(this: TrieBuilder, trie: pointer[Node], token_length: int, min_b_length: int, max_length: size_t, blank_codes: pointer[u16], n_blank: size_t, chars2: pointer[u16], n_chars2: size_t, token: u32, pri: u8, amb: pointer[Array[u32]])
+    {
+        if (min_b_length = 0) and (trie.has_next() = false)
+        {
+            if trie.blank = null
+            {
+                let host Page.get(this as pointer[void])
+                let b new_node(host, n_codes)
+                set b.max_blanks_to_scan: max_length
+                set b.additional_length: token_length as u8
+                let cib host.allocate((n_codes as size_t) * (sizeof u8), alignof u8) as pointer[u8]
+                var k: int 0
+                while k < n_codes
+                {
+                    set *(cib + (k as size_t)): (0 as u8)
+                    set k: k + 1
+                }
+                var j: size_t 0
+                while j < n_blank
+                {
+                    set *(cib + (*(blank_codes + j) as size_t)): (1 as u8)
+                    set j: j + 1
+                }
+                set b.code_is_blank: cib
+                set trie.blank: b
+            }
+            if n_chars2 = (0 as size_t)
+                set_token(trie, token_length, token, pri, amb)
+            else
+            {
+                let t extend_trie(trie.blank, chars2, n_chars2)
+                set_token(t, n_chars2 as int, token, pri, amb)
+            }
+        }
+        else
+        {
+            if min_b_length = 0
+            {
+                let t extend_trie(trie, chars2, n_chars2)
+                set_token(t, token_length + (n_chars2 as int), token, pri, amb)
+            }
+            var next_min: int 0
+            if min_b_length <> 0
+                set next_min: min_b_length - 1
+            var j: size_t 0
+            while j < n_blank
+            {
+                let nxt force_next(trie, *(blank_codes + j))
+                do_b(nxt, token_length + 1, next_min, max_length - (1 as size_t), blank_codes, n_blank, chars2, n_chars2, token, pri, amb)
+                set j: j + 1
+            }
+        }
     }
 
     function test() returns int
@@ -225,6 +394,60 @@ define TrieBuilder (root: pointer[Node], n_codes: int)
         ; no ambiguities recorded
         if amb.get_length() <> (0 as size_t)
             return -6
+
+        ; ---- BlankTrie / shortref B-sequence ----
+        ; nCodes = 3, code 1 = a blank character. A shortref "B" (one blank run,
+        ; up to 3 blanks) -> token 77. chars/chars2 empty (n=0, ptr unread).
+        var amb2 Array[u32]^host()
+        let tb2 TrieBuilder^host(3)
+        var bc u16[1]
+        let pbc bc as pointer[u16]
+        set *pbc: (1 as u16)
+        tb2.recognize_b(pbc, 0 as size_t, 1, 3 as size_t, pbc, 1 as size_t, pbc, 0 as size_t, 77 as u32, amb2)
+
+        let r2 tb2.extract_trie()
+        let c1 r2.child(1)
+        if c1.get_token() <> (77 as u32)
+            return -7
+        if c1.get_token_length() <> 1
+            return -8
+        let bl c1.get_blank()
+        if bl = null
+            return -9
+        if bl.get_max_blanks_to_scan() <> (2 as size_t)
+            return -10
+        if bl.get_additional_length() <> 1
+            return -11
+        if bl.code_is_blank_at(1) = false
+            return -12
+        if bl.code_is_blank_at(0)
+            return -13
+        if amb2.get_length() <> (0 as size_t)
+            return -14
+
+        ; push the trie one blank code deeper: the BlankTrie migrates to the
+        ; blank-code child, its bounds advance (additionalLength 1->2,
+        ; maxBlanksToScan 2->1), and the source node's blank is extracted.
+        let gc tb2.force_next(c1, 1 as u16)
+        if c1.get_blank() <> null
+            return -15
+        let ch1 c1.child(1)
+        let bl2 ch1.get_blank()
+        if bl2 = null
+            return -16
+        if bl2.get_max_blanks_to_scan() <> (1 as size_t)
+            return -17
+        if bl2.get_additional_length() <> 2
+            return -18
+        ; the inherited token rides along.
+        if ch1.get_token() <> (77 as u32)
+            return -19
+        if ch1.get_token_length() <> 1
+            return -20
+        ; a non-blank sibling carries no BlankTrie.
+        let ch0 c1.child(0)
+        if ch0.get_blank() <> null
+            return -21
 
         0
     }
