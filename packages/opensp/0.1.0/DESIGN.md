@@ -412,6 +412,30 @@ IDENTICAL). Ports `Attribute.cs` (1824), `AttributeList.cs` (587),
 **Trap hit:** `StringC.substr` added (needed by `token(i)`) — allocates the
 slice on the returned value's own page, clamping out-of-range slices to empty.
 
+### Landed (Stage 3, Increment — notation)
+
+JIT-green (`tests/opensp/run.sh` → `PASS`), emission-neutral (`cycle.sh`
+IDENTICAL). Ports `Notation.cs` (92) + the `EntityDecl.cs` metadata a notation
+needs:
+- **`Notation.scaly`** — a NOTATION declaration: name, optional `ExternalId`,
+  `defined` flag, declaration location, and (because a notation is `Attributed`)
+  its data-attribute `AttributeDefinitionList`. `setExternalId` records the id +
+  marks defined + stamps the location; `systemId`/`publicId` presence+value come
+  from the external id; the `Attributed` half (`get`/`setAttributeDef`) is inline.
+
+**MI resolution** — C++ `Notation : EntityDecl + Attributed`. Following the C#
+port's lead, the `EntityDecl` declaration metadata (declType/dataType/dtd-scope/
+defLocation) and the `Attributed` member are FOLDED INLINE. A notation's declType
+is always `notation` (new `DCL_*` constants) and dataType always `ndata`
+(`DT_NDATA`, reused from the Entity module), so those are fixed accessors, not
+stored fields. Notations are page-hosted (referenced by identity from
+`NotationAttributeSemantics` and the DTD notation table).
+
+**Deferrals:** the full shared `EntityDecl` base (reused by the entity table) +
+entity-side decl metadata land with the Dtd/entity-table increment;
+`generateSystemId` (catalog lookup of a notation system id) needs the live
+`ParserState` + `EntityCatalog` and lands with the parser stage.
+
 ### Landed (Stage 3, Increment A)
 
 JIT-green (`tests/opensp/run.sh` → `PASS`):
