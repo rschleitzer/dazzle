@@ -19,7 +19,9 @@ use opensp.Attribute.DeclaredValue
 use opensp.Attribute.AttributeDefinition
 use opensp.Attribute.AttributeValue
 use opensp.Attribute.Text
+use opensp.Attribute.AttributeContext
 use opensp.AttributeList.AttributeDefinitionList
+use opensp.AttributeList.AttributeList
 use opensp.Notation.Notation
 use opensp.Entity.Entity
 use opensp.Entity.InternalEntity
@@ -422,6 +424,14 @@ define GroupToken
         g
     }
 }
+
+; AttributeParameter::Type — the classification parse_attribute_parameter returns
+; for each token it reads inside a start-tag attribute specification.
+define APT_END: int 0
+define APT_NAME: int 1
+define APT_NAMETOKEN: int 2
+define APT_VI: int 3
+define APT_RECOVER_UNQUOTED: int 4
 
 define Parser (host: pointer[Page], ps: pointer[ParserState])
 {
@@ -2290,6 +2300,198 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         def.get_declared_content() = DC_EMPTY
     }
 
+    ; ---- attribute-spec parsing (parseAttribute.cxx) ---------------------
+    ; The quoted/unquoted attribute-value path. DEFERRED: SHORTTAG name-token
+    ; minimization (handleAttributeNameToken), the data-attribute / newAttDef
+    ; branch (undeclared attrs), recoverUnquoted recovery, piPasMode, Markup
+    ; capture, and the full makeValue validation (folding/category/id/idref/
+    ; entity/notation — see AttributeList.set_value).
+
+    function parse_attribute_value_literal(this: Parser, lita: bool, out_text: pointer[Text]) returns bool
+    {
+        var m alitMode
+        if lita
+            set m: alitaMode
+        this.parse_literal(m, false, out_text)
+    }
+
+    function parse_tokenized_attribute_value_literal(this: Parser, lita: bool, out_text: pointer[Text]) returns bool
+    {
+        var m talitMode
+        if lita
+            set m: talitaMode
+        this.parse_literal(m, true, out_text)
+    }
+
+    ; parseAttributeParameter — read the next attribute-spec token, classify it,
+    ; and skip separators. allow_vi permits a value-indicator (`=`).
+    function parse_attribute_parameter(this: Parser, mode: int, allow_vi: bool, result: pointer[int], net: pointer[bool]) returns bool
+    {
+        var token ps.get_token(mode)
+        while token = tokenS
+            set token: ps.get_token(mode)
+        if token = tokenEe
+        {
+            this.err(0)
+            return false
+        }
+        else if (token = tokenEtago) or (token = tokenStago)
+        {
+            let ins ps.current_input()
+            ins.unget_token()
+            set *net: false
+            set *result: APT_END
+        }
+        else if token = tokenNestc
+        {
+            set *net: true
+            set *result: APT_END
+        }
+        else if token = tokenTagc
+        {
+            set *net: false
+            set *result: APT_END
+        }
+        else if token = tokenDsc
+            set *result: APT_END
+        else if token = tokenNameStart
+        {
+            this.extend_name_token(this.namelen())
+            set *result: APT_NAME
+        }
+        else if (token = tokenDigit) or (token = tokenLcUcNmchar)
+        {
+            this.extend_name_token(this.namelen())
+            set *result: APT_NAMETOKEN
+        }
+        else if (token = tokenLit) or (token = tokenLita)
+        {
+            this.err(0)
+            return false
+        }
+        else if token = tokenVi
+        {
+            if allow_vi = false
+            {
+                this.err(0)
+                return false
+            }
+            set *result: APT_VI
+        }
+        else
+        {
+            this.err(0)
+            return false
+        }
+        true
+    }
+
+    ; parseAttributeValueSpec — after a VI, resolve the attribute and read its
+    ; value (quoted literal, or an unquoted name token via SHORTTAG).
+    function parse_attribute_value_spec(this: Parser, mode: int, name: StringC, atts: pointer[AttributeList], spec_length: pointer[size_t]) returns bool
+    {
+        var token ps.get_token(mode)
+        while token = tokenS
+            set token: ps.get_token(mode)
+        let idx atts.attribute_index(name)
+        if idx < 0
+        {
+            ; undeclared attribute / data-attribute path deferred.
+            this.err(0)
+            return false
+        }
+        let index idx as size_t
+        let ctx ps.get_attribute_context()
+        atts.set_spec(index, ctx)
+        let text host.allocate(sizeof Text, alignof Text) as pointer[Text]
+        set *text: Text(StringC())
+        var ok true
+        if (token = tokenLit) or (token = tokenLita)
+        {
+            let lita token = tokenLita
+            if atts.tokenized(index)
+                set ok: this.parse_tokenized_attribute_value_literal(lita, text)
+            else
+                set ok: this.parse_attribute_value_literal(lita, text)
+        }
+        else if (token = tokenNameStart) or (token = tokenDigit) or (token = tokenLcUcNmchar)
+        {
+            ; unquoted (SHORTTAG) value — extend over name-token characters.
+            this.extend_name_token(this.namelen())
+            let ins ps.current_input()
+            let ts ins.current_token_string()
+            set *text: Text(ts)
+        }
+        else
+        {
+            this.err(0)
+            return false
+        }
+        if ok = false
+            return false
+        let tlen (*text).size()
+        set *spec_length: *spec_length + tlen
+        atts.set_value(host, index, text, ctx)
+    }
+
+    ; parseAttributeSpec — the attribute-spec loop: (name VI value)* up to the
+    ; close delimiter, then finish the list (fill defaults).
+    function parse_attribute_spec(this: Parser, mode: int, atts: pointer[AttributeList], net: pointer[bool]) returns bool
+    {
+        var spec_length: size_t 0
+        var cur_parm: int 0
+        if this.parse_attribute_parameter(mode, false, &cur_parm, net) = false
+            return false
+        var running true
+        var ok true
+        while running
+        {
+            if cur_parm = APT_END
+                set running: false
+            else if cur_parm = APT_NAME
+            {
+                let nm this.name_folded()
+                if this.parse_attribute_parameter(mode, true, &cur_parm, net) = false
+                {
+                    set ok: false
+                    set running: false
+                }
+                else if cur_parm = APT_VI
+                {
+                    if this.parse_attribute_value_spec(mode, nm, atts, &spec_length) = false
+                    {
+                        set ok: false
+                        set running: false
+                    }
+                    else if this.parse_attribute_parameter(mode, false, &cur_parm, net) = false
+                    {
+                        set ok: false
+                        set running: false
+                    }
+                }
+                else
+                {
+                    ; SHORTTAG value-as-name (attribute name omitted) — deferred.
+                    this.err(0)
+                    set ok: false
+                    set running: false
+                }
+            }
+            else
+            {
+                ; SHORTTAG unnamed name-token / recoverUnquoted — deferred.
+                this.err(0)
+                set ok: false
+                set running: false
+            }
+        }
+        if ok = false
+            return false
+        let ctx ps.get_attribute_context()
+        atts.finish(ctx)
+        true
+    }
+
     function do_parse_start_tag(this: Parser) returns pointer[Event]
     {
         let ins ps.current_input()
@@ -2305,11 +2507,22 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             set e: cs.lookup_create_undefined_element(host, name, uloc, dtd, true)
         }
         let loc ps.current_location()
-        ; close delimiter (TAGC) or an attribute spec (deferred: leave it).
+        let adl e.get_attribute_def()
+        let atts AttributeList.make(host, adl)
+        let ctx ps.get_attribute_context()
+        var net false
         let close_token ps.get_token(tagMode)
-        if close_token <> tokenTagc
+        if close_token = tokenTagc
+            atts.finish(ctx)
+        else
+        {
             ins.unget_token()
-        Event.make_start(host, e, loc)
+            let okatt this.parse_attribute_spec(tagMode, atts, &net)
+            ; parse_attribute_spec finishes the list (mirrors C++ parseAttributeSpec).
+        }
+        let ev Event.make_start(host, e, loc)
+        ev.set_attributes(atts)
+        ev
     }
 
     function parse_start_tag(this: Parser)
@@ -2493,7 +2706,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     {
         let sdv *ps.get_sd()
         let synv *ps.get_syntax()
-        var modes int[7]
+        var modes int[11]
         let mp modes as pointer[int]
         set *(mp + (0 as size_t)): econMode
         set *(mp + (1 as size_t)): econnetMode
@@ -2502,8 +2715,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         set *(mp + (4 as size_t)): tagMode
         set *(mp + (5 as size_t)): cconMode
         set *(mp + (6 as size_t)): rcconMode
+        set *(mp + (7 as size_t)): alitMode
+        set *(mp + (8 as size_t)): alitaMode
+        set *(mp + (9 as size_t)): talitMode
+        set *(mp + (10 as size_t)): talitaMode
         var i: int 0
-        while i < 7
+        while i < 11
         {
             let m *(mp + (i as size_t))
             let r Recognizer.build_recognizer(host, m, sdv, synv, table)
@@ -2634,7 +2851,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; event stream for  <doc><title>Hi</title><para>X</para></doc>  (names
         ; fold to uppercase): START DOC, START TITLE, "Hi", END TITLE, START
         ; PARA, "X", END PARA, END DOC.
-        let itext StringC("<doc><title>Hi</title><para>X</para></doc>")
+        let itext StringC("<doc id=\"D1\"><title>Hi</title><para>X</para></doc>")
         let ni itext.get_size()
         let ibuf host.allocate(ni * (4 as size_t), 4) as pointer[u32]
         var ii: size_t 0
@@ -2733,6 +2950,21 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return -44
         if data_total <> (3 as size_t)
             return -45
+
+        ; --- assert the attribute on the <doc> start event ---
+        let ev0 ps.get_event(0 as size_t)
+        let atts0 ev0.get_attributes()
+        if atts0 = null
+            return -46
+        let ai atts0.attribute_index(StringC("ID"))
+        if ai < 0
+            return -47
+        let av atts0.value(ai as size_t)
+        if av = null
+            return -48
+        let avs av.get_string()
+        if avs.equals(StringC("D1")) = false
+            return -49
 
         0
     }
