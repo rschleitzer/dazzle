@@ -1,0 +1,2351 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.Location.Origin
+use opensp.Location.InputSource
+use opensp.Sd.Sd
+use opensp.Syntax.Syntax
+use opensp.Dtd.Dtd
+use opensp.ElementType.ElementType
+use opensp.ElementType.ElementDefinition
+use opensp.ContentToken.ContentToken
+use opensp.ContentToken.CmNode
+use opensp.ContentToken.CompiledModelGroup
+use opensp.ContentToken.MatchState
+use opensp.ContentToken.Ambiguity
+use opensp.Attribute.DeclaredValue
+use opensp.Attribute.AttributeDefinition
+use opensp.Attribute.AttributeValue
+use opensp.Attribute.Text
+use opensp.AttributeList.AttributeDefinitionList
+use opensp.Notation.Notation
+use opensp.Entity.Entity
+use opensp.Entity.InternalEntity
+use opensp.Entity.ExternalTextEntity
+use opensp.ExternalId.ExternalId
+use opensp.ShortReferenceMap.ShortReferenceMap
+use opensp.ParserState.ParserState
+use opensp.Recognizer.Recognizer
+use opensp.ModeInfo.ModeInfo
+use opensp.ModeInfo.PackedTokenInfo
+use opensp.Message.MessageType
+use opensp.Message.MessageFragment
+use opensp.Message.Severity
+
+; Parser — the FIRST slice of Parser.cs (the 11801-LOC integration tail): the
+; prolog + DTD declaration-subset parser. It drives ParserState.get_token(mode)
+; over real markup-declaration text and builds a Dtd, exercising the whole
+; declaration stack end-to-end for the first time (scanner -> Sd/Syntax ->
+; parseParam -> the markup-declaration parsers -> Dtd tables + content-model
+; compile + attribute-def build).
+;
+; COMPOSITION: C++ Parser : ParserState. Here a Parser HOLDS a pointer[ParserState]
+; (+ the run page); every currentInput()/getToken()/message() delegates to it.
+;
+; PORTED SLICE (doDeclSubset drive + the declaration parsers):
+;  - the declaration-subset driver (doDeclSubset, scoped): the dsMode/dsiMode
+;    token loop that dispatches each <!...> markup declaration, + tokenEe/tokenDsc/
+;    tokenS and declSubsetRecover.
+;  - parseParam — the parameter workhorse (Param.cs / parseParam.cxx): names,
+;    name tokens, literals, numbers, reserved-name/indicated-reserved-name and
+;    delimiter parameters, each declaration's AllowedParams.
+;  - the group parser (Group.cs / parseGroup*): parseGroupToken / parseGroupConnector
+;    / parseGroup / parseModelGroup / getOccurrenceIndicator / parseNameGroup /
+;    parseNameTokenGroup / parseElementNameGroup, building the ContentToken node
+;    graph that ContentToken.compile consumes.
+;  - the markup-declaration parsers: parseElementDecl (+parseExceptions),
+;    parseAttlistDecl (+parseAttributed), parseDeclaredValue, parseDefaultValue,
+;    parseNotationDecl, parseEntityDecl (+parseExternalEntity), parseShortrefDecl.
+;  - parseExternalId, parseDeclarationName, the literal parsers (parseLiteral).
+;
+; DEFERRED (documented; each needs machinery a later Parser sub-increment lands):
+;  - Instance/content parsing (doContent, start/end-tag + attribute-spec parsing,
+;    the content-model transition + tag-omission recovery automaton, marked
+;    sections, pcdataRecover) -> Increment 2.
+;  - Event.cs ESIS emission (eventHandler().*/currentMarkup()); declarations
+;    produce Dtd state, not ESIS output. All currentMarkup()!=null branches drop.
+;  - Lpd + LINK + Markup capture, Pass1/Pass2 (haveDefLpd() is always false here).
+;  - ParserOptions warnings (options().warn*): all dropped (advisory).
+;  - PARAMETER-ENTITY REFERENCES inside declarations/groups/literals
+;    (tokenPero*/entity.declReference/litReference) and COMMENTS inside markup
+;    declarations (tokenCom / parseComment): a decl-subset with %-refs or PS
+;    comments recovers rather than resolving. Corpus DTDs that need them light up
+;    with the entity-stacking drive in Increment 2.
+;  - value NORMALISATION/VALIDATION (DeclaredValue.makeValue's category/length
+;    checks, allowed-value/entity/notation/id resolution): make_attribute_value
+;    here is the PURE part (CDATA -> cdata value; tokenized -> space-split value);
+;    the message-emitting validation lands with instance parsing.
+;  - data attributes (rDATA / NDATA DSO attribute-spec), rank stems, exotic
+;    bracketed entities, generateSystemId (catalog): each recovers/defers loudly.
+;  - the reserved-name table lives HERE (lookup_reserved_name), not in the Syntax
+;    value type, to keep Syntax's init untouched (faithful behavior, different
+;    residence — cf. the Message record living in the ParserState module).
+
+; ---- Param types (Param.cs) -------------------------------------------------
+define P_INVALID: int 0
+define P_SILENT: int 1
+define P_DSO: int 2
+define P_MDC: int 3
+define P_MINUS: int 4
+define P_PERO: int 5
+define P_INCLUSIONS: int 6
+define P_EXCLUSIONS: int 7
+define P_NAMEGROUP: int 8
+define P_NAMETOKENGROUP: int 9
+define P_MODELGROUP: int 10
+define P_NUMBER: int 11
+define P_MINIMUMLITERAL: int 12
+define P_ATTRIBUTEVALUELITERAL: int 13
+define P_TOKENIZEDATTRIBUTEVALUELITERAL: int 14
+define P_SYSTEMIDENTIFIER: int 15
+define P_PARAMLITERAL: int 16
+define P_NAME: int 17
+define P_ENTITYNAME: int 18
+define P_PARAMENTITYNAME: int 19
+define P_ATTRIBUTEVALUE: int 20
+define P_RESERVED_NAME: int 21
+; Syntax.ReservedName ordinals (the enum order; nNames = 58).
+define N_NAMES: int 58
+define P_INDICATED_RESERVED_NAME: int 79
+
+; Syntax.ReservedName (rALL..rUSEMAP).
+define R_ALL: int 0
+define R_ANY: int 1
+define R_ATTLIST: int 2
+define R_CDATA: int 3
+define R_CONREF: int 4
+define R_CURRENT: int 5
+define R_DATA: int 6
+define R_DEFAULT: int 7
+define R_DOCTYPE: int 8
+define R_ELEMENT: int 9
+define R_EMPTY: int 10
+define R_ENDTAG: int 11
+define R_ENTITIES: int 12
+define R_ENTITY: int 13
+define R_FIXED: int 14
+define R_ID: int 15
+define R_IDLINK: int 16
+define R_IDREF: int 17
+define R_IDREFS: int 18
+define R_IGNORE: int 19
+define R_IMPLICIT: int 20
+define R_IMPLIED: int 21
+define R_INCLUDE: int 22
+define R_INITIAL: int 23
+define R_LINK: int 24
+define R_LINKTYPE: int 25
+define R_MD: int 26
+define R_MS: int 27
+define R_NAME: int 28
+define R_NAMES: int 29
+define R_NDATA: int 30
+define R_NMTOKEN: int 31
+define R_NMTOKENS: int 32
+define R_NOTATION: int 33
+define R_NUMBER: int 34
+define R_NUMBERS: int 35
+define R_NUTOKEN: int 36
+define R_NUTOKENS: int 37
+define R_O: int 38
+define R_PCDATA: int 39
+define R_PI: int 40
+define R_POSTLINK: int 41
+define R_PUBLIC: int 42
+define R_RCDATA: int 43
+define R_RE: int 44
+define R_REQUIRED: int 45
+define R_RESTORE: int 46
+define R_RS: int 47
+define R_SDATA: int 48
+define R_SHORTREF: int 49
+define R_SIMPLE: int 50
+define R_SPACE: int 51
+define R_STARTTAG: int 52
+define R_SUBDOC: int 53
+define R_SYSTEM: int 54
+define R_TEMP: int 55
+define R_USELINK: int 56
+define R_USEMAP: int 57
+
+; GroupToken.Type (Group.cs).
+define GT_INVALID: int 0
+define GT_NAMETOKEN: int 1
+define GT_NAME: int 2
+define GT_DATATAGLITERAL: int 3
+define GT_DATATAGGROUP: int 4
+define GT_ELEMENTTOKEN: int 5
+define GT_MODELGROUP: int 6
+define GT_PCDATA: int 7
+define GT_DATATAGTEMPLATEGROUP: int 8
+define GT_ALL: int 9
+define GT_IMPLICIT: int 10
+
+; GroupConnector.Type (Group.cs).
+define GC_AND: int 0
+define GC_OR: int 1
+define GC_SEQ: int 2
+define GC_GRPC: int 3
+define GC_DTGC: int 4
+
+; A group member of a name/name-token group (with its original spelling + loc).
+define NameToken (name: StringC, orig_name: StringC, loc: Location)
+{
+    init(name: StringC, orig_name: StringC, loc: Location)
+    {
+        set this.name: name
+        set this.orig_name: orig_name
+        set this.loc: loc
+    }
+}
+
+; Param — the workhorse's output (Param.cs), reused/mutated across parseParam
+; calls, so page-hosted.
+define Param
+(
+    kind: int
+    token: StringC
+    orig_token: StringC
+    literal_text: pointer[Text]
+    lita: bool
+    model_group: pointer[CmNode]
+    name_tokens: pointer[Array[NameToken]]
+    elements: pointer[Array[pointer[ElementType]]]
+)
+{
+    function make(host: pointer[Page]) returns pointer[Param]
+    {
+        let p host.allocate(sizeof Param, alignof Param) as pointer[Param]
+        set p.kind: P_INVALID
+        set p.token: StringC()
+        set p.orig_token: StringC()
+        set p.literal_text: null
+        set p.lita: false
+        set p.model_group: null
+        set p.name_tokens: Array[NameToken]^host()
+        set p.elements: Array[pointer[ElementType]]^host()
+        p
+    }
+}
+
+; AllowedParams (Param.cs) — the per-call allowed-parameter set. Built by make +
+; allow() (mirroring the C++ ctor). Page-hosted (holds a reserved-name bitset).
+define AllowedParams
+(
+    silent: bool
+    mdc_ok: bool
+    rni_ok: bool
+    dso_ok: bool
+    inclusions_ok: bool
+    exclusions_ok: bool
+    extra_delimiter: int
+    group_type: int
+    name_start_type: int
+    digit_type: int
+    nmchar_type: int
+    literal_type: int
+    reserved_names: pointer[u8]
+    main_mode: int
+)
+{
+    function make(host: pointer[Page]) returns pointer[AllowedParams]
+    {
+        let a host.allocate(sizeof AllowedParams, alignof AllowedParams) as pointer[AllowedParams]
+        set a.silent: false
+        set a.mdc_ok: false
+        set a.rni_ok: false
+        set a.dso_ok: false
+        set a.inclusions_ok: false
+        set a.exclusions_ok: false
+        set a.extra_delimiter: P_INVALID
+        set a.group_type: P_INVALID
+        set a.name_start_type: P_INVALID
+        set a.digit_type: P_INVALID
+        set a.nmchar_type: P_INVALID
+        set a.literal_type: P_INVALID
+        set a.main_mode: mdMode
+        let rn host.allocate(N_NAMES as size_t, 1) as pointer[u8]
+        var i: size_t 0
+        while i < (N_NAMES as size_t)
+        {
+            set *(rn + i): (0 as u8)
+            set i: i + 1
+        }
+        set a.reserved_names: rn
+        a
+    }
+
+    function allow(this: pointer[AllowedParams], p: int)
+    {
+        if p = P_INVALID
+            return
+        if p = P_SILENT
+            set this.silent: true
+        else if p = P_DSO
+            set this.dso_ok: true
+        else if p = P_MDC
+            set this.mdc_ok: true
+        else if p = P_MINUS
+        {
+            set this.main_mode: mdMinusMode
+            set this.extra_delimiter: p
+        }
+        else if p = P_PERO
+        {
+            set this.main_mode: mdPeroMode
+            set this.extra_delimiter: p
+        }
+        else if p = P_INCLUSIONS
+            set this.inclusions_ok: true
+        else if p = P_EXCLUSIONS
+            set this.exclusions_ok: true
+        else if (p = P_NAMEGROUP) or (p = P_NAMETOKENGROUP) or (p = P_MODELGROUP)
+            set this.group_type: p
+        else if p = P_NUMBER
+            set this.digit_type: p
+        else if (p = P_MINIMUMLITERAL) or (p = P_TOKENIZEDATTRIBUTEVALUELITERAL) or (p = P_ATTRIBUTEVALUELITERAL) or (p = P_SYSTEMIDENTIFIER) or (p = P_PARAMLITERAL)
+            set this.literal_type: p
+        else if (p = P_NAME) or (p = P_ENTITYNAME) or (p = P_PARAMENTITYNAME)
+            set this.name_start_type: p
+        else if p = P_ATTRIBUTEVALUE
+        {
+            set this.name_start_type: p
+            set this.digit_type: p
+            set this.nmchar_type: p
+        }
+        else if p < P_INDICATED_RESERVED_NAME
+        {
+            set this.name_start_type: P_RESERVED_NAME
+            set *(this.reserved_names + ((p - P_RESERVED_NAME) as size_t)): (1 as u8)
+        }
+        else
+        {
+            set this.rni_ok: true
+            set *(this.reserved_names + ((p - P_INDICATED_RESERVED_NAME) as size_t)): (1 as u8)
+        }
+    }
+
+    function reserved_name_allowed(this: AllowedParams, i: int) returns bool
+        *(reserved_names + (i as size_t)) <> (0 as u8)
+
+    ; convenience builders (fixed arity; the C++ ctor takes up to 10 codes)
+    function a1(host: pointer[Page], p1: int) returns pointer[AllowedParams]
+    {
+        let a make(host)
+        a.allow(p1)
+        a
+    }
+    function a2(host: pointer[Page], p1: int, p2: int) returns pointer[AllowedParams]
+    {
+        let a make(host)
+        a.allow(p1)
+        a.allow(p2)
+        a
+    }
+    function a3(host: pointer[Page], p1: int, p2: int, p3: int) returns pointer[AllowedParams]
+    {
+        let a make(host)
+        a.allow(p1)
+        a.allow(p2)
+        a.allow(p3)
+        a
+    }
+    function a5(host: pointer[Page], p1: int, p2: int, p3: int, p4: int, p5: int) returns pointer[AllowedParams]
+    {
+        let a make(host)
+        a.allow(p1)
+        a.allow(p2)
+        a.allow(p3)
+        a.allow(p4)
+        a.allow(p5)
+        a
+    }
+    function a7(host: pointer[Page], p1: int, p2: int, p3: int, p4: int, p5: int, p6: int, p7: int) returns pointer[AllowedParams]
+    {
+        let a make(host)
+        a.allow(p1)
+        a.allow(p2)
+        a.allow(p3)
+        a.allow(p4)
+        a.allow(p5)
+        a.allow(p6)
+        a.allow(p7)
+        a
+    }
+    function a8(host: pointer[Page], p1: int, p2: int, p3: int, p4: int, p5: int, p6: int, p7: int, p8: int) returns pointer[AllowedParams]
+    {
+        let a make(host)
+        a.allow(p1)
+        a.allow(p2)
+        a.allow(p3)
+        a.allow(p4)
+        a.allow(p5)
+        a.allow(p6)
+        a.allow(p7)
+        a.allow(p8)
+        a
+    }
+    function an(host: pointer[Page], codes: pointer[int], n: int) returns pointer[AllowedParams]
+    {
+        let a make(host)
+        var i: int 0
+        while i < n
+        {
+            a.allow(*(codes + (i as size_t)))
+            set i: i + 1
+        }
+        a
+    }
+}
+
+; A parsed group token (Group.cs GroupToken, scoped: no data-tag templates).
+define GroupToken
+(
+    kind: int
+    token: StringC
+    model: pointer[CmNode]
+    content_token: pointer[CmNode]
+)
+{
+    function make(host: pointer[Page]) returns pointer[GroupToken]
+    {
+        let g host.allocate(sizeof GroupToken, alignof GroupToken) as pointer[GroupToken]
+        set g.kind: GT_INVALID
+        set g.token: StringC()
+        set g.model: null
+        set g.content_token: null
+        g
+    }
+}
+
+define Parser (host: pointer[Page], ps: pointer[ParserState])
+{
+    function make(host: pointer[Page], ps: pointer[ParserState]) returns Parser
+        Parser(host, ps)
+
+    ; ---- delegating helpers ----------------------------------------------
+    function err(this: Parser, code: int)
+        ps.message(MessageType(MessageFragment(code as u32, StringC()), Severity.Error))
+
+    function namelen(this: Parser) returns size_t
+        ps.get_syntax().get_quantity(qNAMELEN) as size_t
+
+    ; void extendNameToken(maxLength, tooLong): grow the current token over
+    ; name characters (the quantity-limit "too long" message is deferred).
+    function extend_name_token(this: Parser, maxlen: size_t)
+    {
+        let ins ps.current_input()
+        if ins = null
+            return
+        var length ins.current_token_length()
+        let syn ps.get_syntax()
+        var scanning true
+        while scanning
+        {
+            let ch ins.token_char()
+            if syn.is_name_character(ch as u32) = false
+                set scanning: false
+            else
+                set length: length + (1 as size_t)
+        }
+        ins.end_token(length)
+    }
+
+    ; folded (namecase general) current token / its original spelling.
+    function name_folded(this: Parser) returns StringC
+        ps.current_token_subst#(ps.get_syntax())
+
+    ; ---- reserved-name lookup (Syntax.lookupReservedName, resident here) ---
+    ; Returns the ReservedName ordinal, or -1 if the (folded) name is not one.
+    function lookup_reserved_name(this: Parser, name: StringC) returns int
+    {
+        if name.equals(StringC("ALL"))
+            return R_ALL
+        if name.equals(StringC("ANY"))
+            return R_ANY
+        if name.equals(StringC("ATTLIST"))
+            return R_ATTLIST
+        if name.equals(StringC("CDATA"))
+            return R_CDATA
+        if name.equals(StringC("CONREF"))
+            return R_CONREF
+        if name.equals(StringC("CURRENT"))
+            return R_CURRENT
+        if name.equals(StringC("DATA"))
+            return R_DATA
+        if name.equals(StringC("DEFAULT"))
+            return R_DEFAULT
+        if name.equals(StringC("DOCTYPE"))
+            return R_DOCTYPE
+        if name.equals(StringC("ELEMENT"))
+            return R_ELEMENT
+        if name.equals(StringC("EMPTY"))
+            return R_EMPTY
+        if name.equals(StringC("ENDTAG"))
+            return R_ENDTAG
+        if name.equals(StringC("ENTITIES"))
+            return R_ENTITIES
+        if name.equals(StringC("ENTITY"))
+            return R_ENTITY
+        if name.equals(StringC("FIXED"))
+            return R_FIXED
+        if name.equals(StringC("ID"))
+            return R_ID
+        if name.equals(StringC("IDLINK"))
+            return R_IDLINK
+        if name.equals(StringC("IDREF"))
+            return R_IDREF
+        if name.equals(StringC("IDREFS"))
+            return R_IDREFS
+        if name.equals(StringC("IGNORE"))
+            return R_IGNORE
+        if name.equals(StringC("IMPLICIT"))
+            return R_IMPLICIT
+        if name.equals(StringC("IMPLIED"))
+            return R_IMPLIED
+        if name.equals(StringC("INCLUDE"))
+            return R_INCLUDE
+        if name.equals(StringC("INITIAL"))
+            return R_INITIAL
+        if name.equals(StringC("LINK"))
+            return R_LINK
+        if name.equals(StringC("LINKTYPE"))
+            return R_LINKTYPE
+        if name.equals(StringC("MD"))
+            return R_MD
+        if name.equals(StringC("MS"))
+            return R_MS
+        if name.equals(StringC("NAME"))
+            return R_NAME
+        if name.equals(StringC("NAMES"))
+            return R_NAMES
+        if name.equals(StringC("NDATA"))
+            return R_NDATA
+        if name.equals(StringC("NMTOKEN"))
+            return R_NMTOKEN
+        if name.equals(StringC("NMTOKENS"))
+            return R_NMTOKENS
+        if name.equals(StringC("NOTATION"))
+            return R_NOTATION
+        if name.equals(StringC("NUMBER"))
+            return R_NUMBER
+        if name.equals(StringC("NUMBERS"))
+            return R_NUMBERS
+        if name.equals(StringC("NUTOKEN"))
+            return R_NUTOKEN
+        if name.equals(StringC("NUTOKENS"))
+            return R_NUTOKENS
+        if name.equals(StringC("O"))
+            return R_O
+        if name.equals(StringC("PCDATA"))
+            return R_PCDATA
+        if name.equals(StringC("PI"))
+            return R_PI
+        if name.equals(StringC("POSTLINK"))
+            return R_POSTLINK
+        if name.equals(StringC("PUBLIC"))
+            return R_PUBLIC
+        if name.equals(StringC("RCDATA"))
+            return R_RCDATA
+        if name.equals(StringC("RE"))
+            return R_RE
+        if name.equals(StringC("REQUIRED"))
+            return R_REQUIRED
+        if name.equals(StringC("RESTORE"))
+            return R_RESTORE
+        if name.equals(StringC("RS"))
+            return R_RS
+        if name.equals(StringC("SDATA"))
+            return R_SDATA
+        if name.equals(StringC("SHORTREF"))
+            return R_SHORTREF
+        if name.equals(StringC("SIMPLE"))
+            return R_SIMPLE
+        if name.equals(StringC("SPACE"))
+            return R_SPACE
+        if name.equals(StringC("STARTTAG"))
+            return R_STARTTAG
+        if name.equals(StringC("SUBDOC"))
+            return R_SUBDOC
+        if name.equals(StringC("SYSTEM"))
+            return R_SYSTEM
+        if name.equals(StringC("TEMP"))
+            return R_TEMP
+        if name.equals(StringC("USELINK"))
+            return R_USELINK
+        if name.equals(StringC("USEMAP"))
+            return R_USEMAP
+        -1
+    }
+
+    ; ---- build a StringC from a growing u32 buffer ------------------------
+    function build_stringc(this: Parser, buf: pointer[Array[u32]]) returns StringC
+    {
+        let n buf.get_length()
+        if n = (0 as size_t)
+            return StringC()
+        let cb host.allocate(n * (4 as size_t), 4) as pointer[u32]
+        let src buf.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            set *(cb + i): *(src + i)
+            set i: i + 1
+        }
+        StringC(cb, n)
+    }
+
+    ; StringC (u32 content) -> byte String (ASCII narrowing for external ids).
+    function stringc_to_bytes(this: Parser, sc: StringC) returns String
+    {
+        let n sc.get_size()
+        let buf host.allocate(n + (1 as size_t), 1) as pointer[u8]
+        var i: size_t 0
+        while i < n
+        {
+            set *(buf + i): sc.get(i) as u8
+            set i: i + 1
+        }
+        set *(buf + n): (0 as u8)
+        String(buf as pointer[const_char], n)
+    }
+
+    ; ---- lookup-create helpers (Parser::lookupCreate*) --------------------
+    function lookup_create_element(this: Parser, name: StringC) returns pointer[ElementType]
+    {
+        let dtd ps.get_def_dtd()
+        let existing dtd.lookup_element_type(name)
+        if existing <> null
+            return existing
+        let idx dtd.alloc_element_type_index()
+        let e ElementType^host(name, idx)
+        dtd.insert_element_type(e)
+        e
+    }
+
+    function lookup_create_notation(this: Parser, name: StringC) returns pointer[Notation]
+    {
+        let dtd ps.get_def_dtd()
+        let existing dtd.lookup_notation(name)
+        if existing <> null
+            return existing
+        let nt Notation.make(host, name, dtd.get_name(), dtd.get_is_base())
+        dtd.insert_notation(nt)
+        nt
+    }
+
+    function lookup_create_map(this: Parser, name: StringC) returns pointer[ShortReferenceMap]
+    {
+        let dtd ps.get_def_dtd()
+        let existing dtd.lookup_short_reference_map(name)
+        if existing <> null
+            return existing
+        let map ShortReferenceMap.make(host, name)
+        dtd.insert_short_reference_map(map)
+        map
+    }
+
+    ; ---- literal parsing (parseLiteral, scoped) ---------------------------
+    ; Accumulates literal content; single_space collapses runs of space to one.
+    ; Entity/char references inside literals are DEFERRED (recover + false).
+    function parse_literal(this: Parser, lit_mode: int, single_space: bool, out_text: pointer[Text]) returns bool
+    {
+        let start_level ps.get_input_level()
+        let buf Array[u32]^host()
+        let space (0x20 as u32)
+        var running true
+        var ok true
+        while running
+        {
+            let token ps.get_token(lit_mode)
+            if (token = tokenLit) or (token = tokenLita)
+                set running: false
+            else if token = tokenEe
+            {
+                if ps.get_input_level() = start_level
+                {
+                    this.err(1)
+                    set ok: false
+                    set running: false
+                }
+                else
+                    ps.pop_input_stack()
+            }
+            else if token = tokenRs
+            {
+                ; ignore record start
+            }
+            else if (token = tokenRe) or (token = tokenSepchar)
+            {
+                if single_space and ((buf.get_length() = (0 as size_t)) or (this.last_char(buf) = space))
+                {
+                    ; ignore
+                }
+                else
+                    buf.add(space)
+            }
+            else if token = tokenSpace
+            {
+                if single_space and ((buf.get_length() = (0 as size_t)) or (this.last_char(buf) = space))
+                {
+                    ; ignore
+                }
+                else
+                    buf.add(ps.current_input().current_char())
+            }
+            else if token = tokenChar
+                buf.add(ps.current_input().current_char())
+            else if (token = tokenCroDigit) or (token = tokenHcroHexDigit) or (token = tokenCroNameStart) or (token = tokenEroNameStart) or (token = tokenEroGrpo) or (token = tokenPeroNameStart)
+            {
+                ; DEFERRED: char/entity references inside literals.
+                this.err(2)
+                set ok: false
+                set running: false
+            }
+            else if token = tokenUnrecognized
+                buf.add(ps.current_input().current_char())
+            else
+            {
+                ; other tokens in literal context: treat first char as data.
+                buf.add(ps.current_input().current_char())
+            }
+        }
+        if ok = false
+            return false
+        let sc this.build_stringc(buf)
+        set *out_text: Text(sc)
+        true
+    }
+
+    function last_char(this: Parser, buf: pointer[Array[u32]]) returns u32
+    {
+        let n buf.get_length()
+        if n = (0 as size_t)
+            return 0 as u32
+        *(buf.get_buffer() + (n - (1 as size_t)))
+    }
+
+    ; ---- parseParam (parseParam.cxx) --------------------------------------
+    function parse_param(this: Parser, allow: pointer[AllowedParams], decl_input_level: u32, parm: pointer[Param]) returns bool
+    {
+        var looping true
+        while looping
+        {
+            let token ps.get_token(allow.main_mode)
+            if token = tokenUnrecognized
+            {
+                this.err(3)
+                return false
+            }
+            else if token = tokenEe
+            {
+                if ps.get_input_level() <= decl_input_level
+                {
+                    this.err(4)
+                    return false
+                }
+                ps.pop_input_stack()
+            }
+            else if token = tokenCom
+            {
+                ; DEFERRED: comments inside markup declarations.
+                this.err(5)
+                return false
+            }
+            else if token = tokenDso
+            {
+                if allow.dso_ok = false
+                {
+                    this.err(6)
+                    return false
+                }
+                set parm.kind: P_DSO
+                return true
+            }
+            else if token = tokenGrpo
+            {
+                if allow.group_type = P_MODELGROUP
+                {
+                    var grp: pointer[CmNode] null
+                    if this.parse_model_group((1 as u32), decl_input_level, &grp, grpsufMode) = false
+                        return false
+                    set parm.model_group: grp
+                    set parm.kind: P_MODELGROUP
+                    return true
+                }
+                else if allow.group_type = P_NAMEGROUP
+                {
+                    if this.parse_name_group(decl_input_level, parm) = false
+                        return false
+                    set parm.kind: P_NAMEGROUP
+                    return true
+                }
+                else if allow.group_type = P_NAMETOKENGROUP
+                {
+                    if this.parse_name_token_group(decl_input_level, parm) = false
+                        return false
+                    set parm.kind: P_NAMETOKENGROUP
+                    return true
+                }
+                else
+                {
+                    this.err(7)
+                    return false
+                }
+            }
+            else if (token = tokenLit) or (token = tokenLita)
+            {
+                set parm.kind: allow.literal_type
+                set parm.lita: token = tokenLita
+                if allow.literal_type = P_INVALID
+                {
+                    this.err(8)
+                    return false
+                }
+                let txt host.allocate(sizeof Text, alignof Text) as pointer[Text]
+                var lmode: int mlitMode
+                var single false
+                if allow.literal_type = P_MINIMUMLITERAL
+                {
+                    set lmode: mlitMode
+                    if parm.lita
+                        set lmode: mlitaMode
+                    set single: true
+                }
+                else if allow.literal_type = P_SYSTEMIDENTIFIER
+                {
+                    set lmode: slitMode
+                    if parm.lita
+                        set lmode: slitaMode
+                }
+                else if allow.literal_type = P_PARAMLITERAL
+                {
+                    set lmode: plitMode
+                    if parm.lita
+                        set lmode: plitaMode
+                }
+                else if allow.literal_type = P_ATTRIBUTEVALUELITERAL
+                {
+                    set lmode: alitMode
+                    if parm.lita
+                        set lmode: alitaMode
+                }
+                else if allow.literal_type = P_TOKENIZEDATTRIBUTEVALUELITERAL
+                {
+                    set lmode: talitMode
+                    if parm.lita
+                        set lmode: talitaMode
+                    set single: true
+                }
+                if this.parse_literal(lmode, single, txt) = false
+                    return false
+                set parm.literal_text: txt
+                return true
+            }
+            else if token = tokenMdc
+            {
+                if allow.mdc_ok = false
+                {
+                    this.err(9)
+                    return false
+                }
+                set parm.kind: P_MDC
+                return true
+            }
+            else if token = tokenMinus
+            {
+                set parm.kind: P_MINUS
+                return true
+            }
+            else if token = tokenMinusGrpo
+            {
+                if allow.exclusions_ok = false
+                {
+                    this.err(10)
+                    return false
+                }
+                set parm.kind: P_EXCLUSIONS
+                return this.parse_element_name_group(decl_input_level, parm)
+            }
+            else if token = tokenPero
+            {
+                set parm.kind: P_PERO
+                return true
+            }
+            else if (token = tokenPeroNameStart) or (token = tokenPeroGrpo)
+            {
+                ; DEFERRED: parameter-entity references in declarations.
+                this.err(11)
+                return false
+            }
+            else if token = tokenPlusGrpo
+            {
+                if allow.inclusions_ok = false
+                {
+                    this.err(12)
+                    return false
+                }
+                set parm.kind: P_INCLUSIONS
+                return this.parse_element_name_group(decl_input_level, parm)
+            }
+            else if token = tokenRni
+            {
+                if allow.rni_ok = false
+                {
+                    this.err(13)
+                    return false
+                }
+                return this.parse_indicated_reserved_name(allow, parm)
+            }
+            else if token = tokenS
+            {
+                ; whitespace between parameters: skip
+            }
+            else if token = tokenNameStart
+            {
+                if allow.name_start_type = P_INVALID
+                {
+                    this.err(14)
+                    return false
+                }
+                else if allow.name_start_type = P_RESERVED_NAME
+                    return this.parse_reserved_name(allow, parm)
+                else if allow.name_start_type = P_NAME
+                {
+                    this.extend_name_token(this.namelen())
+                    set parm.kind: P_NAME
+                    set parm.orig_token: ps.current_token^host()
+                    set parm.token: this.name_folded^host()
+                    return true
+                }
+                else if allow.name_start_type = P_ENTITYNAME
+                {
+                    this.extend_name_token(this.namelen())
+                    set parm.kind: P_ENTITYNAME
+                    set parm.token: this.name_folded^host()
+                    return true
+                }
+                else if allow.name_start_type = P_PARAMENTITYNAME
+                {
+                    this.extend_name_token(this.namelen())
+                    set parm.kind: P_PARAMENTITYNAME
+                    set parm.token: this.name_folded^host()
+                    return true
+                }
+                else if allow.name_start_type = P_ATTRIBUTEVALUE
+                    return this.parse_attribute_value_param(parm)
+                else
+                {
+                    this.err(15)
+                    return false
+                }
+            }
+            else if token = tokenDigit
+            {
+                if allow.digit_type = P_NUMBER
+                {
+                    this.extend_number(this.namelen())
+                    set parm.kind: P_NUMBER
+                    set parm.token: ps.current_token^host()
+                    return true
+                }
+                else if allow.digit_type = P_ATTRIBUTEVALUE
+                    return this.parse_attribute_value_param(parm)
+                else
+                {
+                    this.err(16)
+                    return false
+                }
+            }
+            else if token = tokenLcUcNmchar
+            {
+                if allow.nmchar_type = P_ATTRIBUTEVALUE
+                    return this.parse_attribute_value_param(parm)
+                else
+                {
+                    this.err(17)
+                    return false
+                }
+            }
+            else
+            {
+                this.err(18)
+                return false
+            }
+        }
+        false
+    }
+
+    function extend_number(this: Parser, maxlen: size_t)
+    {
+        let ins ps.current_input()
+        if ins = null
+            return
+        var length ins.current_token_length()
+        let syn ps.get_syntax()
+        var scanning true
+        while scanning
+        {
+            let ch ins.token_char()
+            if syn.is_digit(ch as u32) = false
+                set scanning: false
+            else
+                set length: length + (1 as size_t)
+        }
+        ins.end_token(length)
+    }
+
+    ; parseAttributeValueParam — an unquoted attribute value (name/number/nmchar).
+    function parse_attribute_value_param(this: Parser, parm: pointer[Param]) returns bool
+    {
+        this.extend_name_token(this.namelen())
+        set parm.kind: P_ATTRIBUTEVALUE
+        let sc ps.current_token()
+        let txt host.allocate(sizeof Text, alignof Text) as pointer[Text]
+        set *txt: Text(sc)
+        set parm.literal_text: txt
+        true
+    }
+
+    ; parseReservedName — a plain reserved name in name-start position.
+    function parse_reserved_name(this: Parser, allow: pointer[AllowedParams], parm: pointer[Param]) returns bool
+    {
+        var rn: int 0
+        if this.get_reserved_name(&rn) = false
+            return false
+        if allow.reserved_name_allowed(rn) = false
+        {
+            this.err(19)
+            return false
+        }
+        set parm.kind: P_RESERVED_NAME + rn
+        true
+    }
+
+    function get_reserved_name(this: Parser, out_rn: pointer[int]) returns bool
+    {
+        this.extend_name_token(this.namelen())
+        let buffer this.name_folded()
+        let rn this.lookup_reserved_name(buffer)
+        if rn < 0
+        {
+            this.err(20)
+            return false
+        }
+        set *out_rn: rn
+        true
+    }
+
+    ; parseIndicatedReservedName — after RNI (`#`), the reserved name.
+    function parse_indicated_reserved_name(this: Parser, allow: pointer[AllowedParams], parm: pointer[Param]) returns bool
+    {
+        var rn: int 0
+        if this.get_indicated_reserved_name(&rn) = false
+            return false
+        if allow.reserved_name_allowed(rn) = false
+        {
+            this.err(21)
+            return false
+        }
+        set parm.kind: P_INDICATED_RESERVED_NAME + rn
+        true
+    }
+
+    function get_indicated_reserved_name(this: Parser, out_rn: pointer[int]) returns bool
+    {
+        let ins ps.current_input()
+        ins.start_token()
+        let first ins.token_char()
+        if ps.get_syntax().is_name_start_character(first as u32) = false
+        {
+            this.err(22)
+            return false
+        }
+        this.extend_name_token(this.namelen())
+        let buffer this.name_folded()
+        let rn this.lookup_reserved_name(buffer)
+        if rn < 0
+        {
+            this.err(23)
+            return false
+        }
+        set *out_rn: rn
+        true
+    }
+
+    ; ---- group parser (Group.cs) ------------------------------------------
+    function has_gt(this: Parser, allow: int, t: int) returns bool
+        (allow & (1 << t)) <> 0
+
+    function gt_group(this: Parser, allow: int) returns int
+    {
+        if this.has_gt(allow, GT_MODELGROUP)
+            return GT_MODELGROUP
+        if this.has_gt(allow, GT_DATATAGTEMPLATEGROUP)
+            return GT_DATATAGTEMPLATEGROUP
+        GT_INVALID
+    }
+
+    function gt_name_start(this: Parser, allow: int) returns int
+    {
+        if this.has_gt(allow, GT_ELEMENTTOKEN)
+            return GT_ELEMENTTOKEN
+        if this.has_gt(allow, GT_NAMETOKEN)
+            return GT_NAMETOKEN
+        if this.has_gt(allow, GT_NAME)
+            return GT_NAME
+        GT_INVALID
+    }
+
+    function has_gc(this: Parser, allow: int, c: int) returns bool
+        (allow & (1 << c)) <> 0
+
+    ; getOccurrenceIndicator(oiMode)
+    function get_occurrence_indicator(this: Parser, oi_mode: int) returns int
+    {
+        let token ps.get_token(oi_mode)
+        if token = tokenPlus
+            return OI_PLUS
+        if token = tokenOpt
+            return OI_OPT
+        if token = tokenRep
+            return OI_REP
+        ps.current_input().unget_token()
+        OI_NONE
+    }
+
+    ; parseGroupToken(allow, nestingLevel, declInputLevel, groupInputLevel, gt)
+    function parse_group_token(this: Parser, allow: int, nesting_level: u32, decl_input_level: u32, group_input_level: u32, gt: pointer[GroupToken]) returns bool
+    {
+        var looping true
+        while looping
+        {
+            let token ps.get_token(grpMode)
+            if token = tokenEe
+            {
+                if ps.get_input_level() <= group_input_level
+                {
+                    this.err(30)
+                    if ps.get_input_level() <= decl_input_level
+                        return false
+                }
+                ps.pop_input_stack()
+            }
+            else if (token = tokenPeroNameStart) or (token = tokenPeroGrpo)
+            {
+                ; DEFERRED: parameter-entity references in groups.
+                this.err(31)
+                return false
+            }
+            else if token = tokenUnrecognized
+            {
+                this.err(32)
+                return false
+            }
+            else if token = tokenDtgo
+            {
+                ; DEFERRED: data-tag groups (rare SGML, absent from corpus).
+                this.err(33)
+                return false
+            }
+            else if token = tokenGrpo
+            {
+                if this.gt_group(allow) = GT_MODELGROUP
+                {
+                    var mg: pointer[CmNode] null
+                    if this.parse_model_group(nesting_level + (1 as u32), decl_input_level, &mg, grpMode) = false
+                        return false
+                    set gt.model: mg
+                    set gt.kind: GT_MODELGROUP
+                    return true
+                }
+                else
+                {
+                    this.err(34)
+                    return false
+                }
+            }
+            else if token = tokenRni
+            {
+                if (this.has_gt(allow, GT_PCDATA) = false) and (this.has_gt(allow, GT_ALL) = false) and (this.has_gt(allow, GT_IMPLICIT) = false)
+                {
+                    this.err(35)
+                    return false
+                }
+                var rn: int 0
+                if this.get_indicated_reserved_name(&rn) = false
+                    return false
+                if (rn = R_PCDATA) and this.has_gt(allow, GT_PCDATA)
+                {
+                    set gt.kind: GT_PCDATA
+                    set gt.content_token: ContentToken.make_leaf(host, null as pointer[ElementType], OI_NONE, true, false)
+                    return true
+                }
+                else
+                {
+                    this.err(36)
+                    return false
+                }
+            }
+            else if token = tokenS
+            {
+                ; whitespace in group: skip
+            }
+            else if token = tokenNameStart
+            {
+                let ns this.gt_name_start(allow)
+                if ns = GT_ELEMENTTOKEN
+                {
+                    this.extend_name_token(this.namelen())
+                    let buffer this.name_folded()
+                    let e this.lookup_create_element(buffer)
+                    let oi this.get_occurrence_indicator(grpMode)
+                    set gt.kind: GT_ELEMENTTOKEN
+                    set gt.content_token: ContentToken.make_leaf(host, e, oi, false, false)
+                    return true
+                }
+                else if (ns = GT_NAME) or (ns = GT_NAMETOKEN)
+                {
+                    this.extend_name_token(this.namelen())
+                    set gt.token: this.name_folded^host()
+                    set gt.kind: ns
+                    return true
+                }
+                else
+                {
+                    this.err(37)
+                    return false
+                }
+            }
+            else if (token = tokenDigit) or (token = tokenLcUcNmchar)
+            {
+                if this.has_gt(allow, GT_NAMETOKEN) = false
+                {
+                    this.err(38)
+                    return false
+                }
+                this.extend_name_token(this.namelen())
+                set gt.token: this.name_folded^host()
+                set gt.kind: GT_NAMETOKEN
+                return true
+            }
+            else
+            {
+                ; connectors and occurrence indicators are not group tokens here
+                this.err(39)
+                return false
+            }
+        }
+        false
+    }
+
+    ; parseGroupConnector(allow, declInputLevel, groupInputLevel, gc)
+    function parse_group_connector(this: Parser, allow: int, decl_input_level: u32, group_input_level: u32, out_gc: pointer[int]) returns bool
+    {
+        var looping true
+        while looping
+        {
+            let token ps.get_token(grpMode)
+            if token = tokenEe
+            {
+                if ps.get_input_level() <= group_input_level
+                {
+                    this.err(40)
+                    if ps.get_input_level() <= decl_input_level
+                        return false
+                }
+                ps.pop_input_stack()
+            }
+            else if token = tokenS
+            {
+                ; skip
+            }
+            else if (token = tokenPeroNameStart) or (token = tokenPeroGrpo)
+            {
+                this.err(41)
+                return false
+            }
+            else if token = tokenUnrecognized
+            {
+                this.err(42)
+                return false
+            }
+            else if token = tokenAnd
+            {
+                if this.has_gc(allow, GC_AND) = false
+                {
+                    this.err(43)
+                    return false
+                }
+                set *out_gc: GC_AND
+                return true
+            }
+            else if token = tokenSeq
+            {
+                if this.has_gc(allow, GC_SEQ) = false
+                {
+                    this.err(44)
+                    return false
+                }
+                set *out_gc: GC_SEQ
+                return true
+            }
+            else if token = tokenOr
+            {
+                if this.has_gc(allow, GC_OR) = false
+                {
+                    this.err(45)
+                    return false
+                }
+                set *out_gc: GC_OR
+                return true
+            }
+            else if token = tokenGrpc
+            {
+                if this.has_gc(allow, GC_GRPC) = false
+                {
+                    this.err(46)
+                    return false
+                }
+                set *out_gc: GC_GRPC
+                return true
+            }
+            else
+            {
+                this.err(47)
+                return false
+            }
+        }
+        false
+    }
+
+    ; parseModelGroup(nestingLevel, declInputLevel, group, oiMode)
+    function parse_model_group(this: Parser, nesting_level: u32, decl_input_level: u32, out_group: pointer[pointer[CmNode]], oi_mode: int) returns bool
+    {
+        let group_input_level ps.get_input_level()
+        let members ContentToken.new_node_vec(host)
+        var connector: int GC_GRPC
+        let gt GroupToken.make(host)
+        ; allowed content tokens: pcdata, elementToken, modelGroup (data-tag deferred).
+        let allow_content (1 << GT_PCDATA) | ((1 << GT_ELEMENTTOKEN) | (1 << GT_MODELGROUP))
+        ; connector allow-sets
+        let allow_any ((1 << GC_OR) | (1 << GC_AND)) | ((1 << GC_SEQ) | (1 << GC_GRPC))
+        let allow_or (1 << GC_OR) | (1 << GC_GRPC)
+        let allow_and (1 << GC_AND) | (1 << GC_GRPC)
+        let allow_seq (1 << GC_SEQ) | (1 << GC_GRPC)
+        var connectorp: int allow_any
+        var gc: int GC_GRPC
+        var first true
+        var running true
+        while running
+        {
+            if this.parse_group_token(allow_content, nesting_level, decl_input_level, group_input_level, gt) = false
+                return false
+            var content_token: pointer[CmNode] null
+            if gt.kind = GT_MODELGROUP
+                set content_token: gt.model
+            else
+                set content_token: gt.content_token
+            members.add(content_token)
+            if this.parse_group_connector(connectorp, decl_input_level, group_input_level, &gc) = false
+                return false
+            if first
+            {
+                set first: false
+                set connector: gc
+                if gc = GC_OR
+                    set connectorp: allow_or
+                else if gc = GC_SEQ
+                    set connectorp: allow_seq
+                else if gc = GC_AND
+                    set connectorp: allow_and
+            }
+            if gc = GC_GRPC
+                set running: false
+        }
+        let oi this.get_occurrence_indicator(oi_mode)
+        var conn: int CONN_SEQ
+        if connector = GC_OR
+            set conn: CONN_OR
+        else if connector = GC_AND
+            set conn: CONN_AND
+        else
+            set conn: CONN_SEQ
+        set *out_group: ContentToken.make_group(host, conn, members, oi)
+        true
+    }
+
+    ; parseGroup(allowToken, declInputLevel, parm) — a name/nametoken group.
+    function parse_group(this: Parser, allow_token: int, decl_input_level: u32, parm: pointer[Param]) returns bool
+    {
+        let group_input_level ps.get_input_level()
+        let vec Array[NameToken]^host()
+        let gt GroupToken.make(host)
+        var running true
+        while running
+        {
+            if this.parse_group_token(allow_token, 0 as u32, decl_input_level, group_input_level, gt) = false
+                return false
+            if this.group_contains(vec, gt.token) = false
+                vec.add(NameToken(gt.token, ps.current_token(), ps.current_location()))
+            var gc: int GC_GRPC
+            let allow_any ((1 << GC_OR) | (1 << GC_AND)) | ((1 << GC_SEQ) | (1 << GC_GRPC))
+            if this.parse_group_connector(allow_any, decl_input_level, group_input_level, &gc) = false
+                return false
+            if gc = GC_GRPC
+                set running: false
+        }
+        set parm.name_tokens: vec
+        true
+    }
+
+    function group_contains(this: Parser, vec: pointer[Array[NameToken]], str: StringC) returns bool
+    {
+        let n vec.get_length()
+        let buf vec.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let nt *(buf + i)
+            if nt.name.equals(str)
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
+    function parse_name_group(this: Parser, decl_input_level: u32, parm: pointer[Param]) returns bool
+        this.parse_group(1 << GT_NAME, decl_input_level, parm)
+
+    function parse_name_token_group(this: Parser, decl_input_level: u32, parm: pointer[Param]) returns bool
+        this.parse_group(1 << GT_NAMETOKEN, decl_input_level, parm)
+
+    ; parseElementNameGroup — a name group, then resolve to element types.
+    function parse_element_name_group(this: Parser, decl_input_level: u32, parm: pointer[Param]) returns bool
+    {
+        if this.parse_group(1 << GT_NAME, decl_input_level, parm) = false
+            return false
+        let elems Array[pointer[ElementType]]^host()
+        let nt parm.name_tokens
+        let n nt.get_length()
+        let buf nt.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let entry *(buf + i)
+            elems.add(this.lookup_create_element(entry.name))
+            set i: i + 1
+        }
+        set parm.elements: elems
+        true
+    }
+
+    ; ---- parseExternalId (scoped) -----------------------------------------
+    function parse_external_id(this: Parser, sysid_allow: pointer[AllowedParams], end_allow: pointer[AllowedParams], decl_input_level: u32, parm: pointer[Param], out_id: pointer[ExternalId]) returns bool
+    {
+        var has_public false
+        var public_str String()
+        if parm.kind = (P_RESERVED_NAME + R_PUBLIC)
+        {
+            let allow_min AllowedParams.a1(host, P_MINIMUMLITERAL)
+            if this.parse_param(allow_min, decl_input_level, parm) = false
+                return false
+            set has_public: true
+            set public_str: this.stringc_to_bytes(parm.literal_text.string())
+        }
+        if this.parse_param(sysid_allow, decl_input_level, parm) = false
+            return false
+        var has_system false
+        var system_str String()
+        if parm.kind = P_SYSTEMIDENTIFIER
+        {
+            set has_system: true
+            set system_str: this.stringc_to_bytes(parm.literal_text.string())
+            if this.parse_param(end_allow, decl_input_level, parm) = false
+                return false
+        }
+        set *out_id: ExternalId(has_public, public_str, has_system, system_str)
+        true
+    }
+
+    ; ---- parseElementDecl --------------------------------------------------
+    function parse_element_decl(this: Parser) returns bool
+    {
+        let decl_input_level ps.get_input_level()
+        let parm Param.make(host)
+        let allow_name_namegroup AllowedParams.a2(host, P_NAME, P_NAMEGROUP)
+        if this.parse_param(allow_name_namegroup, decl_input_level, parm) = false
+            return false
+
+        let names Array[NameToken]^host()
+        if parm.kind = P_NAMEGROUP
+        {
+            let src parm.name_tokens
+            let n src.get_length()
+            let buf src.get_buffer()
+            var i: size_t 0
+            while i < n
+            {
+                names.add(*(buf + i))
+                set i: i + 1
+            }
+        }
+        else
+            names.add(NameToken(parm.token, parm.orig_token, ps.current_location()))
+
+        let allow_roc AllowedParams.a8(host, P_NUMBER, P_RESERVED_NAME + R_O, P_MINUS, P_RESERVED_NAME + R_CDATA, P_RESERVED_NAME + R_RCDATA, P_RESERVED_NAME + R_EMPTY, P_RESERVED_NAME + R_ANY, P_MODELGROUP)
+        if this.parse_param(allow_roc, decl_input_level, parm) = false
+            return false
+
+        if parm.kind = P_NUMBER
+        {
+            ; DEFERRED: rank stems.
+            this.err(50)
+            return false
+        }
+
+        ; resolve element types.
+        let elements Array[pointer[ElementType]]^host()
+        let nn names.get_length()
+        let nbuf names.get_buffer()
+        var k: size_t 0
+        while k < nn
+        {
+            let entry *(nbuf + k)
+            let e this.lookup_create_element(entry.name)
+            e.set_orig_name(entry.orig_name)
+            elements.add(e)
+            set k: k + 1
+        }
+
+        ; omitted-tag minimization.
+        var omit_flags: u8 0
+        if (parm.kind = P_MINUS) or (parm.kind = (P_RESERVED_NAME + R_O))
+        {
+            set omit_flags: OMIT_SPEC
+            if parm.kind <> P_MINUS
+                set omit_flags: omit_flags | OMIT_START
+            let allow_omission AllowedParams.a2(host, P_RESERVED_NAME + R_O, P_MINUS)
+            if this.parse_param(allow_omission, decl_input_level, parm) = false
+                return false
+            if parm.kind <> P_MINUS
+                set omit_flags: omit_flags | OMIT_END
+            let allow_content AllowedParams.a5(host, P_RESERVED_NAME + R_CDATA, P_RESERVED_NAME + R_RCDATA, P_RESERVED_NAME + R_EMPTY, P_RESERVED_NAME + R_ANY, P_MODELGROUP)
+            if this.parse_param(allow_content, decl_input_level, parm) = false
+                return false
+        }
+
+        let dtd ps.get_def_dtd()
+        let loc ps.current_location()
+        let allow_mdc AllowedParams.a1(host, P_MDC)
+        var def: pointer[ElementDefinition] null
+
+        if parm.kind = (P_RESERVED_NAME + R_CDATA)
+        {
+            set def: ElementDefinition.make(host, loc, dtd.alloc_element_definition_index(), omit_flags, DC_CDATA, false)
+            if this.parse_param(allow_mdc, decl_input_level, parm) = false
+                return false
+        }
+        else if parm.kind = (P_RESERVED_NAME + R_RCDATA)
+        {
+            set def: ElementDefinition.make(host, loc, dtd.alloc_element_definition_index(), omit_flags, DC_RCDATA, false)
+            if this.parse_param(allow_mdc, decl_input_level, parm) = false
+                return false
+        }
+        else if parm.kind = (P_RESERVED_NAME + R_EMPTY)
+        {
+            set def: ElementDefinition.make(host, loc, dtd.alloc_element_definition_index(), omit_flags, DC_EMPTY, false)
+            if this.parse_param(allow_mdc, decl_input_level, parm) = false
+                return false
+        }
+        else if parm.kind = (P_RESERVED_NAME + R_ANY)
+        {
+            set def: ElementDefinition.make(host, loc, dtd.alloc_element_definition_index(), omit_flags, DC_ANY, false)
+            if this.parse_exceptions(decl_input_level, def) = false
+                return false
+        }
+        else if parm.kind = P_MODELGROUP
+        {
+            let ambiguities ContentToken.new_amb_vec(host)
+            var pcdata_unreachable false
+            let compiled ContentToken.compile(host, parm.model_group, dtd.n_element_type_index(), ambiguities, &pcdata_unreachable)
+            set def: ElementDefinition.make_with_model(host, loc, dtd.alloc_element_definition_index(), omit_flags, DC_MODEL_GROUP, compiled)
+            if this.parse_exceptions(decl_input_level, def) = false
+                return false
+        }
+        else
+        {
+            this.err(51)
+            return false
+        }
+
+        def.compute_mode()
+
+        var e_index: size_t 0
+        let ecount elements.get_length()
+        let ebuf elements.get_buffer()
+        while e_index < ecount
+        {
+            let e *(ebuf + e_index)
+            if e.get_definition() = null
+                e.set_element_definition(def, e_index)
+            set e_index: e_index + 1
+        }
+        true
+    }
+
+    ; parseExceptions(declInputLevel, def)
+    function parse_exceptions(this: Parser, decl_input_level: u32, def: pointer[ElementDefinition]) returns bool
+    {
+        let parm Param.make(host)
+        let allow_exc AllowedParams.a3(host, P_MDC, P_EXCLUSIONS, P_INCLUSIONS)
+        if this.parse_param(allow_exc, decl_input_level, parm) = false
+            return false
+        if parm.kind = P_EXCLUSIONS
+        {
+            def.set_exclusions(parm.elements)
+            let allow_inc AllowedParams.a2(host, P_MDC, P_INCLUSIONS)
+            if this.parse_param(allow_inc, decl_input_level, parm) = false
+                return false
+        }
+        if parm.kind = P_INCLUSIONS
+        {
+            def.set_inclusions(parm.elements)
+            let allow_mdc AllowedParams.a1(host, P_MDC)
+            if this.parse_param(allow_mdc, decl_input_level, parm) = false
+                return false
+        }
+        true
+    }
+
+    ; ---- parseAttlistDecl (scoped: no Lpd/notation-fanout/afdr/events) ----
+    function parse_attlist_decl(this: Parser) returns bool
+    {
+        let decl_input_level ps.get_input_level()
+        let parm Param.make(host)
+        let attributed Array[pointer[void]]^host()
+        var is_notation false
+        if this.parse_attributed(decl_input_level, parm, attributed, &is_notation) = false
+            return false
+
+        let defs Array[pointer[AttributeDefinition]]^host()
+        var any_current false
+        let allow_name AllowedParams.a1(host, P_NAME)
+        if this.parse_param(allow_name, decl_input_level, parm) = false
+            return false
+
+        while parm.kind <> P_MDC
+        {
+            let attribute_name parm.token
+            let orig_attribute_name parm.orig_token
+
+            let declared_value this.parse_declared_value(decl_input_level, is_notation, parm)
+            if declared_value = null
+                return false
+
+            var def: pointer[AttributeDefinition] null
+            if this.parse_default_value(decl_input_level, is_notation, parm, attribute_name, declared_value, &def, &any_current) = false
+                return false
+            def.set_orig_name(orig_attribute_name)
+            defs.add(def)
+
+            let allow_name_mdc AllowedParams.a2(host, P_NAME, P_MDC)
+            if this.parse_param(allow_name_mdc, decl_input_level, parm) = false
+                return false
+        }
+
+        let dtd ps.get_def_dtd()
+        let adl AttributeDefinitionList.make(host, dtd.alloc_attribute_definition_list_index())
+        let nd defs.get_length()
+        let dbuf defs.get_buffer()
+        var i: size_t 0
+        while i < nd
+        {
+            adl.append(*(dbuf + i))
+            set i: i + 1
+        }
+
+        let na attributed.get_length()
+        let abuf attributed.get_buffer()
+        var j: size_t 0
+        while j < na
+        {
+            let a *(abuf + j)
+            if is_notation
+            {
+                let nt a as pointer[Notation]
+                nt.set_attribute_def(adl)
+            }
+            else
+            {
+                let e a as pointer[ElementType]
+                if e.get_attribute_def() = null
+                    e.set_attribute_def(adl)
+            }
+            set j: j + 1
+        }
+        true
+    }
+
+    ; parseAttributed(declInputLevel, parm, attributed, isNotation) — scoped:
+    ; NOTATION data-attributes + element (name / name group). ALL / IMPLICIT and
+    ; the Lpd branches are deferred.
+    function parse_attributed(this: Parser, decl_input_level: u32, parm: pointer[Param], attributed: pointer[Array[pointer[void]]], out_is_notation: pointer[bool]) returns bool
+    {
+        let ind_notation P_INDICATED_RESERVED_NAME + R_NOTATION
+        let allow AllowedParams.a3(host, P_NAME, P_NAMEGROUP, ind_notation)
+        if this.parse_param(allow, decl_input_level, parm) = false
+        {
+            set *out_is_notation: false
+            return false
+        }
+        if parm.kind = ind_notation
+        {
+            set *out_is_notation: true
+            let allow2 AllowedParams.a2(host, P_NAME, P_NAMEGROUP)
+            if this.parse_param(allow2, decl_input_level, parm) = false
+                return false
+            if parm.kind = P_NAMEGROUP
+            {
+                let nt parm.name_tokens
+                let n nt.get_length()
+                let buf nt.get_buffer()
+                var i: size_t 0
+                while i < n
+                {
+                    let entry *(buf + i)
+                    attributed.add(this.lookup_create_notation(entry.name) as pointer[void])
+                    set i: i + 1
+                }
+            }
+            else
+                attributed.add(this.lookup_create_notation(parm.token) as pointer[void])
+        }
+        else
+        {
+            set *out_is_notation: false
+            if parm.kind = P_NAMEGROUP
+            {
+                let nt parm.name_tokens
+                let n nt.get_length()
+                let buf nt.get_buffer()
+                var i: size_t 0
+                while i < n
+                {
+                    let entry *(buf + i)
+                    attributed.add(this.lookup_create_element(entry.name) as pointer[void])
+                    set i: i + 1
+                }
+            }
+            else
+                attributed.add(this.lookup_create_element(parm.token) as pointer[void])
+        }
+        true
+    }
+
+    ; parseDeclaredValue -> a DeclaredValue (null on failure). rDATA deferred.
+    function parse_declared_value(this: Parser, decl_input_level: u32, is_notation: bool, parm: pointer[Param]) returns pointer[DeclaredValue]
+    {
+        var codes int[17]
+        let cp codes as pointer[int]
+        set *(cp + (0 as size_t)): P_RESERVED_NAME + R_CDATA
+        set *(cp + (1 as size_t)): P_RESERVED_NAME + R_ENTITY
+        set *(cp + (2 as size_t)): P_RESERVED_NAME + R_ENTITIES
+        set *(cp + (3 as size_t)): P_RESERVED_NAME + R_ID
+        set *(cp + (4 as size_t)): P_RESERVED_NAME + R_IDREF
+        set *(cp + (5 as size_t)): P_RESERVED_NAME + R_IDREFS
+        set *(cp + (6 as size_t)): P_RESERVED_NAME + R_NAME
+        set *(cp + (7 as size_t)): P_RESERVED_NAME + R_NAMES
+        set *(cp + (8 as size_t)): P_RESERVED_NAME + R_NMTOKEN
+        set *(cp + (9 as size_t)): P_RESERVED_NAME + R_NMTOKENS
+        set *(cp + (10 as size_t)): P_RESERVED_NAME + R_NUMBER
+        set *(cp + (11 as size_t)): P_RESERVED_NAME + R_NUMBERS
+        set *(cp + (12 as size_t)): P_RESERVED_NAME + R_NUTOKEN
+        set *(cp + (13 as size_t)): P_RESERVED_NAME + R_NUTOKENS
+        set *(cp + (14 as size_t)): P_RESERVED_NAME + R_NOTATION
+        set *(cp + (15 as size_t)): P_NAMETOKENGROUP
+        set *(cp + (16 as size_t)): P_RESERVED_NAME + R_DATA
+        let allow AllowedParams.an(host, cp, 16)
+        if this.parse_param(allow, decl_input_level, parm) = false
+            return null
+
+        let k parm.kind
+        if k = (P_RESERVED_NAME + R_CDATA)
+            return DeclaredValue.make_cdata(host)
+        if k = (P_RESERVED_NAME + R_ENTITY)
+            return DeclaredValue.make_entity(host, false)
+        if k = (P_RESERVED_NAME + R_ENTITIES)
+            return DeclaredValue.make_entity(host, true)
+        if k = (P_RESERVED_NAME + R_ID)
+            return DeclaredValue.make_id(host)
+        if k = (P_RESERVED_NAME + R_IDREF)
+            return DeclaredValue.make_idref(host, false)
+        if k = (P_RESERVED_NAME + R_IDREFS)
+            return DeclaredValue.make_idref(host, true)
+        if k = (P_RESERVED_NAME + R_NAME)
+            return DeclaredValue.make_tokenized(host, TT_NAME, false)
+        if k = (P_RESERVED_NAME + R_NAMES)
+            return DeclaredValue.make_tokenized(host, TT_NAME, true)
+        if k = (P_RESERVED_NAME + R_NMTOKEN)
+            return DeclaredValue.make_tokenized(host, TT_NAMETOKEN, false)
+        if k = (P_RESERVED_NAME + R_NMTOKENS)
+            return DeclaredValue.make_tokenized(host, TT_NAMETOKEN, true)
+        if k = (P_RESERVED_NAME + R_NUMBER)
+            return DeclaredValue.make_tokenized(host, TT_NUMBER, false)
+        if k = (P_RESERVED_NAME + R_NUMBERS)
+            return DeclaredValue.make_tokenized(host, TT_NUMBER, true)
+        if k = (P_RESERVED_NAME + R_NUTOKEN)
+            return DeclaredValue.make_tokenized(host, TT_NUMBERTOKEN, false)
+        if k = (P_RESERVED_NAME + R_NUTOKENS)
+            return DeclaredValue.make_tokenized(host, TT_NUMBERTOKEN, true)
+        if k = (P_RESERVED_NAME + R_NOTATION)
+        {
+            let allow_ng AllowedParams.a1(host, P_NAMEGROUP)
+            if this.parse_param(allow_ng, decl_input_level, parm) = false
+                return null
+            let group this.group_names(parm)
+            return DeclaredValue.make_notation(host, group)
+        }
+        if k = P_NAMETOKENGROUP
+        {
+            let group this.group_names(parm)
+            return DeclaredValue.make_name_token_group(host, group)
+        }
+        ; rDATA and anything else: deferred.
+        this.err(52)
+        null
+    }
+
+    function group_names(this: Parser, parm: pointer[Param]) returns pointer[Array[StringC]]
+    {
+        let out Array[StringC]^host()
+        let nt parm.name_tokens
+        let n nt.get_length()
+        let buf nt.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let entry *(buf + i)
+            out.add(entry.name)
+            set i: i + 1
+        }
+        out
+    }
+
+    ; parseDefaultValue -> writes *out_def. scoped makeValue (pure part only).
+    function parse_default_value(this: Parser, decl_input_level: u32, is_notation: bool, parm: pointer[Param], attribute_name: StringC, declared_value: pointer[DeclaredValue], out_def: pointer[pointer[AttributeDefinition]], any_current: pointer[bool]) returns bool
+    {
+        let ind_fixed P_INDICATED_RESERVED_NAME + R_FIXED
+        let ind_required P_INDICATED_RESERVED_NAME + R_REQUIRED
+        let ind_current P_INDICATED_RESERVED_NAME + R_CURRENT
+        let ind_conref P_INDICATED_RESERVED_NAME + R_CONREF
+        let ind_implied P_INDICATED_RESERVED_NAME + R_IMPLIED
+        var lit_type: int P_ATTRIBUTEVALUELITERAL
+        if declared_value.tokenized()
+            set lit_type: P_TOKENIZEDATTRIBUTEVALUELITERAL
+        let allow AllowedParams.a7(host, ind_fixed, ind_required, ind_current, ind_conref, ind_implied, P_ATTRIBUTEVALUE, lit_type)
+        if this.parse_param(allow, decl_input_level, parm) = false
+            return false
+
+        let dtd ps.get_def_dtd()
+        if parm.kind = ind_fixed
+        {
+            let allow_val AllowedParams.a2(host, P_ATTRIBUTEVALUE, lit_type)
+            if this.parse_param(allow_val, decl_input_level, parm) = false
+                return false
+            let value this.make_attribute_value(declared_value, parm.literal_text)
+            set *out_def: AttributeDefinition.make_fixed(host, attribute_name, declared_value, value)
+        }
+        else if (parm.kind = P_ATTRIBUTEVALUE) or (parm.kind = P_ATTRIBUTEVALUELITERAL) or (parm.kind = P_TOKENIZEDATTRIBUTEVALUELITERAL)
+        {
+            let value this.make_attribute_value(declared_value, parm.literal_text)
+            set *out_def: AttributeDefinition.make_default(host, attribute_name, declared_value, value)
+        }
+        else if parm.kind = ind_required
+            set *out_def: AttributeDefinition.make_required(host, attribute_name, declared_value)
+        else if parm.kind = ind_current
+        {
+            set *any_current: true
+            set *out_def: AttributeDefinition.make_current(host, attribute_name, declared_value, dtd.alloc_current_attribute_index())
+        }
+        else if parm.kind = ind_conref
+            set *out_def: AttributeDefinition.make_conref(host, attribute_name, declared_value)
+        else if parm.kind = ind_implied
+            set *out_def: AttributeDefinition.make_implied(host, attribute_name, declared_value)
+        else
+        {
+            this.err(53)
+            return false
+        }
+        true
+    }
+
+    ; makeValue (pure part): CDATA -> cdata value; tokenized -> space-split value.
+    ; Full normalisation/validation (category/length checks, allowed-value/entity/
+    ; notation/id resolution) is deferred to instance parsing.
+    function make_attribute_value(this: Parser, dv: pointer[DeclaredValue], text: pointer[Text]) returns pointer[AttributeValue]
+    {
+        if dv.tokenized() = false
+            return AttributeValue.make_cdata(host, text)
+        ; tokenized: record the single-space separator positions.
+        let sc text.string()
+        let n sc.get_size()
+        let space_index Array[size_t]^host()
+        var i: size_t 0
+        while i < n
+        {
+            if sc.get(i) = (0x20 as u32)
+                space_index.add(i)
+            set i: i + 1
+        }
+        AttributeValue.make_tokenized(host, text, space_index)
+    }
+
+    ; ---- parseNotationDecl -------------------------------------------------
+    function parse_notation_decl(this: Parser) returns bool
+    {
+        let decl_input_level ps.get_input_level()
+        let parm Param.make(host)
+        let allow_name AllowedParams.a1(host, P_NAME)
+        if this.parse_param(allow_name, decl_input_level, parm) = false
+            return false
+        let nt this.lookup_create_notation(parm.token)
+        let allow_pub_sys AllowedParams.a2(host, P_RESERVED_NAME + R_PUBLIC, P_RESERVED_NAME + R_SYSTEM)
+        if this.parse_param(allow_pub_sys, decl_input_level, parm) = false
+            return false
+        let allow_sys_mdc AllowedParams.a2(host, P_SYSTEMIDENTIFIER, P_MDC)
+        let allow_mdc AllowedParams.a1(host, P_MDC)
+        var id ExternalId()
+        if this.parse_external_id(allow_sys_mdc, allow_mdc, decl_input_level, parm, &id) = false
+            return false
+        if nt.is_defined() = false
+            nt.set_external_id(id, ps.current_location())
+        true
+    }
+
+    ; ---- parseEntityDecl ---------------------------------------------------
+    function parse_entity_decl(this: Parser) returns bool
+    {
+        let decl_input_level ps.get_input_level()
+        let parm Param.make(host)
+        let ind_default P_INDICATED_RESERVED_NAME + R_DEFAULT
+        let allow_start AllowedParams.a3(host, P_ENTITYNAME, ind_default, P_PERO)
+        if this.parse_param(allow_start, decl_input_level, parm) = false
+            return false
+
+        var is_parameter false
+        var name StringC()
+        if parm.kind = P_PERO
+        {
+            set is_parameter: true
+            let allow_pen AllowedParams.a1(host, P_PARAMENTITYNAME)
+            if this.parse_param(allow_pen, decl_input_level, parm) = false
+                return false
+            set name: parm.token
+        }
+        else if parm.kind = P_ENTITYNAME
+            set name: parm.token
+        ; (indDEFAULT -> empty name, the default entity)
+
+        let allow_text AllowedParams.a8(host, P_PARAMLITERAL, P_RESERVED_NAME + R_CDATA, P_RESERVED_NAME + R_SDATA, P_RESERVED_NAME + R_PI, P_RESERVED_NAME + R_SYSTEM, P_RESERVED_NAME + R_PUBLIC, P_RESERVED_NAME + R_STARTTAG, P_RESERVED_NAME + R_ENDTAG)
+        if this.parse_param(allow_text, decl_input_level, parm) = false
+            return false
+
+        if (parm.kind = (P_RESERVED_NAME + R_SYSTEM)) or (parm.kind = (P_RESERVED_NAME + R_PUBLIC))
+            return this.parse_external_entity(name, is_parameter, decl_input_level, parm)
+
+        var data_type: int DT_SGML
+        if parm.kind = (P_RESERVED_NAME + R_CDATA)
+            set data_type: DT_CDATA
+        else if parm.kind = (P_RESERVED_NAME + R_SDATA)
+            set data_type: DT_SDATA
+        else if parm.kind = (P_RESERVED_NAME + R_PI)
+            set data_type: DT_PI
+        else if (parm.kind = (P_RESERVED_NAME + R_STARTTAG)) or (parm.kind = (P_RESERVED_NAME + R_ENDTAG))
+        {
+            ; DEFERRED: bracketed (STARTTAG/ENDTAG/MS/MD) entities.
+            this.err(60)
+            return false
+        }
+
+        if parm.kind <> P_PARAMLITERAL
+        {
+            let allow_pl AllowedParams.a1(host, P_PARAMLITERAL)
+            if this.parse_param(allow_pl, decl_input_level, parm) = false
+                return false
+        }
+        let text_sc parm.literal_text.string()
+
+        let allow_mdc AllowedParams.a1(host, P_MDC)
+        if this.parse_param(allow_mdc, decl_input_level, parm) = false
+            return false
+
+        let ent host.allocate(sizeof Entity, alignof Entity) as pointer[Entity]
+        set *ent: Entity.Internal(InternalEntity(name, text_sc, data_type))
+        this.maybe_define_entity(ent, is_parameter)
+        true
+    }
+
+    ; parseExternalEntity(name, isParameter, declInputLevel, parm)
+    function parse_external_entity(this: Parser, name: StringC, is_parameter: bool, decl_input_level: u32, parm: pointer[Param]) returns bool
+    {
+        let allow_sys AllowedParams.a5(host, P_SYSTEMIDENTIFIER, P_RESERVED_NAME + R_CDATA, P_RESERVED_NAME + R_SDATA, P_RESERVED_NAME + R_NDATA, P_MDC)
+        let allow_end AllowedParams.a3(host, P_RESERVED_NAME + R_CDATA, P_RESERVED_NAME + R_NDATA, P_MDC)
+        var id ExternalId()
+        if this.parse_external_id(allow_sys, allow_end, decl_input_level, parm, &id) = false
+            return false
+
+        if parm.kind = P_MDC
+        {
+            let ent host.allocate(sizeof Entity, alignof Entity) as pointer[Entity]
+            set *ent: Entity.ExternalText(ExternalTextEntity(name, id))
+            this.maybe_define_entity(ent, is_parameter)
+            return true
+        }
+
+        if parm.kind = (P_RESERVED_NAME + R_NDATA)
+        {
+            let allow_notname AllowedParams.a1(host, P_NAME)
+            if this.parse_param(allow_notname, decl_input_level, parm) = false
+                return false
+            ; (notation reference recorded; ExternalDataEntity variant deferred)
+            let allow_dso_mdc AllowedParams.a2(host, P_DSO, P_MDC)
+            if this.parse_param(allow_dso_mdc, decl_input_level, parm) = false
+                return false
+            if parm.kind = P_DSO
+            {
+                ; DEFERRED: data-attribute spec on an external data entity.
+                this.err(61)
+                return false
+            }
+            ; DEFERRED: ExternalDataEntity (NDATA) entity object.
+            this.err(62)
+            return true
+        }
+        ; CDATA/SDATA external entities: deferred (data-entity events).
+        this.err(63)
+        true
+    }
+
+    ; maybeDefineEntity (scoped): insert into the def DTD (Lpd/defaulted/events/
+    ; generateSystemId deferred).
+    function maybe_define_entity(this: Parser, entity: pointer[Entity], is_parameter: bool)
+    {
+        let dtd ps.get_def_dtd()
+        let name entity.get_name()
+        if name.get_size() = (0 as size_t)
+            dtd.set_default_entity(entity)
+        else
+            dtd.insert_entity(entity, is_parameter, false)
+    }
+
+    ; ---- parseShortrefDecl -------------------------------------------------
+    function parse_shortref_decl(this: Parser) returns bool
+    {
+        let decl_input_level ps.get_input_level()
+        let parm Param.make(host)
+        let allow_name AllowedParams.a1(host, P_NAME)
+        if this.parse_param(allow_name, decl_input_level, parm) = false
+            return false
+        let map this.lookup_create_map(parm.token)
+        if map.defined() = false
+            map.set_def_location(ps.current_location())
+
+        let allow_pl AllowedParams.a1(host, P_PARAMLITERAL)
+        if this.parse_param(allow_pl, decl_input_level, parm) = false
+            return false
+
+        let dtd ps.get_def_dtd()
+        let vec Array[StringC]^host()
+        var running true
+        while running
+        {
+            let delim parm.literal_text.string()
+            let sr_index dtd.intern_shortref(delim)
+            ; grow vec to sr_index+1
+            while vec.get_length() <= sr_index
+                vec.add(StringC())
+            let allow_ent AllowedParams.a1(host, P_ENTITYNAME)
+            if this.parse_param(allow_ent, decl_input_level, parm) = false
+                return false
+            vec.put(sr_index, parm.token)
+            let allow_pl_mdc AllowedParams.a2(host, P_PARAMLITERAL, P_MDC)
+            if this.parse_param(allow_pl_mdc, decl_input_level, parm) = false
+                return false
+            if parm.kind = P_MDC
+                set running: false
+        }
+        map.set_name_map(vec)
+        true
+    }
+
+    ; ---- parseDeclarationName (after MDO) ---------------------------------
+    function parse_declaration_name(this: Parser, out_rn: pointer[int]) returns bool
+    {
+        ps.current_input().discard_initial()
+        this.extend_name_token(this.namelen())
+        let name this.name_folded()
+        let rn this.lookup_reserved_name(name)
+        if rn < 0
+        {
+            this.err(70)
+            return false
+        }
+        set *out_rn: rn
+        true
+    }
+
+    ; ---- doDeclSubset (scoped driver) -------------------------------------
+    ; Returns 0 at end of subset. Comments / PIs / PE-refs / marked sections
+    ; recover rather than resolving (deferred).
+    function parse_decl_subset(this: Parser) returns int
+    {
+        ps.set_current_mode(dsMode)
+        var running true
+        var rc: int 0
+        while running
+        {
+            let token ps.get_token(ps.get_current_mode())
+            let start_level ps.get_input_level()
+            if token = tokenEe
+            {
+                if ps.get_input_level() = (1 as u32)
+                {
+                    ps.pop_input_stack()
+                    set running: false
+                }
+                else
+                    ps.pop_input_stack()
+            }
+            else if token = tokenDsc
+                set running: false
+            else if token = tokenMdoNameStart
+            {
+                var decl_name: int 0
+                if this.parse_declaration_name(&decl_name)
+                {
+                    var result false
+                    if decl_name = R_ELEMENT
+                        set result: this.parse_element_decl()
+                    else if decl_name = R_ATTLIST
+                        set result: this.parse_attlist_decl()
+                    else if decl_name = R_ENTITY
+                        set result: this.parse_entity_decl()
+                    else if decl_name = R_NOTATION
+                        set result: this.parse_notation_decl()
+                    else if decl_name = R_SHORTREF
+                        set result: this.parse_shortref_decl()
+                    else
+                    {
+                        this.err(71)
+                        set result: false
+                    }
+                    if result = false
+                        this.decl_subset_recover(start_level)
+                }
+                else
+                    this.decl_subset_recover(start_level)
+            }
+            else if token = tokenS
+            {
+                ; whitespace between declarations: skip
+            }
+            else if token = tokenMdoMdc
+            {
+                ; empty comment declaration: skip
+            }
+            else
+                this.decl_subset_recover(start_level)
+        }
+        rc
+    }
+
+    ; declSubsetRecover(startLevel) — skip to the next declaration boundary.
+    function decl_subset_recover(this: Parser, start_level: u32)
+    {
+        var running true
+        while running
+        {
+            let token ps.get_token(ps.get_current_mode())
+            if token = tokenEe
+            {
+                if ps.get_input_level() <= start_level
+                    set running: false
+                else
+                    ps.pop_input_stack()
+            }
+            else if (token = tokenMdoCom) or (token = tokenDsc) or (token = tokenMdoNameStart) or (token = tokenMdoMdc) or (token = tokenMdoDso) or (token = tokenMscMdc) or (token = tokenPio)
+            {
+                if ps.get_input_level() = start_level
+                {
+                    ps.current_input().unget_token()
+                    set running: false
+                }
+            }
+            else if token = tokenUnrecognized
+            {
+                ; consume one char to make progress.
+                var advc ps.current_input().token_char()
+                ps.current_input().end_token(1 as size_t)
+            }
+            else
+            {
+                ; other tokens already consumed; keep scanning.
+            }
+        }
+    }
+
+    ; ---- mode setup: install the recognizers the decl parser drives -------
+    function install_recognizers(this: Parser, table: pointer[Array[PackedTokenInfo]])
+    {
+        let sdv *ps.get_sd()
+        let synv *ps.get_syntax()
+        var modes int[16]
+        let mp modes as pointer[int]
+        set *(mp + (0 as size_t)): dsMode
+        set *(mp + (1 as size_t)): dsiMode
+        set *(mp + (2 as size_t)): mdMode
+        set *(mp + (3 as size_t)): mdMinusMode
+        set *(mp + (4 as size_t)): mdPeroMode
+        set *(mp + (5 as size_t)): grpMode
+        set *(mp + (6 as size_t)): grpsufMode
+        set *(mp + (7 as size_t)): plitMode
+        set *(mp + (8 as size_t)): plitaMode
+        set *(mp + (9 as size_t)): slitMode
+        set *(mp + (10 as size_t)): slitaMode
+        set *(mp + (11 as size_t)): mlitMode
+        set *(mp + (12 as size_t)): mlitaMode
+        set *(mp + (13 as size_t)): proMode
+        set *(mp + (14 as size_t)): comMode
+        set *(mp + (15 as size_t)): refMode
+        var i: int 0
+        while i < 16
+        {
+            let m *(mp + (i as size_t))
+            let r Recognizer.build_recognizer(host, m, sdv, synv, table)
+            ps.set_recognizer(m, r)
+            set i: i + 1
+        }
+    }
+
+    ; ---- self-test: parse a synthetic DTD subset, assert the built Dtd -----
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+
+        ; --- assemble the DTD subset text as an in-memory InputSource ---
+        ;   <!ELEMENT doc (title, para+)>
+        ;   <!ELEMENT title (#PCDATA)>
+        ;   <!ELEMENT para (#PCDATA)>
+        ;   <!ATTLIST doc id ID #IMPLIED>
+        ;   <!ENTITY logo "LOGO">
+        ;   <!NOTATION gif SYSTEM "gif.exe">
+        let dtext StringC("<!ELEMENT doc (title, para+)> <!ELEMENT title (#PCDATA)> <!ELEMENT para (#PCDATA)> <!ATTLIST doc id ID #IMPLIED> <!ENTITY logo \"LOGO\"> <!NOTATION gif SYSTEM \"gif.exe\"> ]")
+        let n dtext.get_size()
+        let buf host.allocate(n * (4 as size_t), 4) as pointer[u32]
+        var ci: size_t 0
+        while ci < n
+        {
+            set *(buf + ci): dtext.get(ci)
+            set ci: ci + 1
+        }
+
+        ; --- ParserState + Sd + Syntax ---
+        let ps ParserState.make(host, null, 0 as u32, PHASE_DECL_SUBSET)
+        let sd host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
+        set *sd: Sd()
+        ps.set_sd(sd)
+        let syn Syntax^host(*sd)
+        ps.set_syntax(syn)
+
+        ; --- the def/current DTD (document element "doc" auto-inserted at 1) ---
+        let dtd Dtd.make(host, StringC("doc"), true)
+        ps.set_def_dtd(dtd)
+        ps.set_current_dtd(dtd)
+
+        ; --- recognizers + input source ---
+        let parser Parser.make(host, ps)
+        let table ModeInfo.build_table(host)
+        parser.install_recognizers(table)
+
+        let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+        set *org: Origin()
+        let src host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
+        set *src: InputSource(org, buf, n)
+        ps.push_input(src)
+
+        ; --- drive the declaration-subset parser ---
+        let rc parser.parse_decl_subset()
+        if rc <> 0
+            return -1
+        if ps.get_n_errors() <> (0 as u32)
+            return -2
+
+        ; --- assert element types + declared content ---
+        let doc dtd.lookup_element_type(StringC("doc"))
+        if doc = null
+            return -3
+        let title dtd.lookup_element_type(StringC("title"))
+        if title = null
+            return -4
+        let para dtd.lookup_element_type(StringC("para"))
+        if para = null
+            return -5
+        let doc_def doc.get_definition()
+        if doc_def = null
+            return -6
+        if doc_def.get_declared_content() <> DC_MODEL_GROUP
+            return -7
+        let title_def title.get_definition()
+        if title_def = null
+            return -8
+        if title_def.get_declared_content() <> DC_MODEL_GROUP
+            return -9
+
+        ; --- drive the compiled content model of doc: (title, para+) ---
+        let cmg doc_def.compiled_model_group()
+        if cmg = null
+            return -10
+        let ms ContentToken.make_match_state(host, cmg)
+        if ContentToken.ms_try_transition(ms, title) = false
+            return -11
+        if ContentToken.ms_try_transition(ms, para) = false
+            return -12
+        if ContentToken.ms_is_finished(ms) = false
+            return -13
+        ; para+ repeats
+        if ContentToken.ms_try_transition(ms, para) = false
+            return -14
+
+        ; --- assert the ATTLIST on doc ---
+        let adl doc.get_attribute_def()
+        if adl = null
+            return -15
+        if adl.size() <> (1 as size_t)
+            return -16
+        let iddef adl.def(0 as size_t)
+        if iddef = null
+            return -17
+        if iddef.get_name().equals(StringC("id")) = false
+            return -18
+
+        ; --- assert the ENTITY ---
+        let logo dtd.lookup_entity(false, StringC("logo"))
+        if logo = null
+            return -19
+
+        ; --- assert the NOTATION ---
+        let gif dtd.lookup_notation(StringC("gif"))
+        if gif = null
+            return -20
+        if gif.is_defined() = false
+            return -21
+        if gif.has_system_id() = false
+            return -22
+
+        0
+    }
+}
