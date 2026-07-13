@@ -2484,6 +2484,19 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
         else if token = tokenNestc
         {
+            ; NESTC (`/`) closes a net-enabling start tag. Under NETENABL IMMEDNET
+            ; the NET (`>`) must immediately follow (`/>`): peek it and unget so
+            ; do_content sees the tokenNet that closes the element. NETENABL ALL
+            ; net-enables with no immediate requirement; NETENABL NO is illegal.
+            let ne ps.get_sd().start_tag_net_enable()
+            if ne = NET_ENABLE_NO
+                this.err(0)
+            else if ne = NET_ENABLE_IMMEDNET
+            {
+                if ps.get_token(econnetMode) <> tokenNet
+                    this.err(0)
+                ps.current_input().unget_token()
+            }
             set *net: true
             set *result: APT_END
         }
@@ -2692,7 +2705,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         true
     }
 
-    function do_parse_start_tag(this: Parser) returns pointer[Event]
+    function do_parse_start_tag(this: Parser, out_net: pointer[bool]) returns pointer[Event]
     {
         let ins ps.current_input()
         ins.discard_initial()
@@ -2720,6 +2733,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             let okatt this.parse_attribute_spec(tagMode, atts, &net)
             ; parse_attribute_spec finishes the list (mirrors C++ parseAttributeSpec).
         }
+        set *out_net: net
         let ev Event.make_start(host, e, loc)
         ev.set_attributes(atts)
         ev
@@ -2727,9 +2741,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
     function parse_start_tag(this: Parser)
     {
-        let event this.do_parse_start_tag()
+        var net false
+        let event this.do_parse_start_tag(&net)
         let e event.get_element_type()
-        this.accept_start_tag(e, event)
+        this.accept_start_tag(e, event, net)
     }
 
     ; tryImplyTag — one OMITTAG inference step at the current position. Either
@@ -2779,23 +2794,23 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         set *start_implied: *start_implied + (1 as u32)
         let stev Event.make_start(host, e, loc)
         stev.set_attributes(atts)
-        this.push_element_check(e, stev)
+        this.push_element_check(e, stev, false)
         true
     }
 
-    function accept_start_tag(this: Parser, e: pointer[ElementType], event: pointer[Event])
+    function accept_start_tag(this: Parser, e: pointer[ElementType], event: pointer[Event], net: bool)
     {
         let cs ps.get_content_state()
         let ce cs.current_element()
         if ce.try_transition(e)
         {
-            this.push_element_check(e, event)
+            this.push_element_check(e, event, net)
             return
         }
         if cs.element_is_included(e)
         {
             event.set_included()
-            this.push_element_check(e, event)
+            this.push_element_check(e, event, net)
             return
         }
         ; OMITTAG: imply end/start tags until e is admissible.
@@ -2806,13 +2821,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             let cei cs.current_element()
             if cei.try_transition(e)
             {
-                this.push_element_check(e, event)
+                this.push_element_check(e, event, net)
                 return
             }
             if cs.element_is_included(e)
             {
                 event.set_included()
-                this.push_element_check(e, event)
+                this.push_element_check(e, event, net)
                 return
             }
             set guard: guard + 1
@@ -2823,21 +2838,33 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; transition and pushing so parsing continues. Diagnostic deferred.
         let ce3 cs.current_element()
         let discard ce3.try_transition(e)
-        this.push_element_check(e, event)
+        this.push_element_check(e, event, net)
     }
 
-    function push_element_check(this: Parser, e: pointer[ElementType], event: pointer[Event])
+    function push_element_check(this: Parser, e: pointer[ElementType], event: pointer[Event], net: bool)
     {
         ps.note_start_element(event.is_included())
         if this.must_omit_end(e)
         {
-            ; EMPTY element: emit start immediately followed by an implied end.
-            ps.note_end_element(event.is_included())
-            ps.queue_event(event)
-            let endev Event.make_end(host, e, event.get_loc())
-            if event.is_included()
-                endev.set_included()
-            ps.queue_event(endev)
+            if ps.get_sd().empty_element_normal()
+            {
+                ; EMPTYNRM: emit start, then consume the empty-element tag's
+                ; closing NET (`<x/>`) / end tag before implying the end.
+                let included event.is_included()
+                let sloc event.get_loc()
+                ps.queue_event(event)
+                this.end_tag_empty_element(e, net, included, sloc)
+            }
+            else
+            {
+                ; EMPTY element: emit start immediately followed by an implied end.
+                ps.note_end_element(event.is_included())
+                ps.queue_event(event)
+                let endev Event.make_end(host, e, event.get_loc())
+                if event.is_included()
+                    endev.set_included()
+                ps.queue_event(endev)
+            }
             return
         }
         let cs ps.get_content_state()
@@ -2845,7 +2872,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         var map e.get_map()
         if map = null
             set map: ce.get_map()
-        let oe OpenElement.make(host, e, false, event.is_included(), map, event.get_loc())
+        let oe OpenElement.make(host, e, net, event.is_included(), map, event.get_loc())
         ps.push_element_mode(oe)
         ps.queue_event(event)
     }
@@ -2867,6 +2894,62 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         Event.make_end(host, e, loc)
     }
 
+    ; endTagEmptyElement (EMPTYNRM) — an EMPTY element's start tag is immediately
+    ; followed by the tag that ends it: a NET (`<x/>`), an empty end tag (`</>`)
+    ; or a matching `</x>`. Consume that token and emit the end; anything else
+    ; is ungotten and the end implied. (Mismatch-recovery is scoped to the
+    ; conforming corpus: an implied end at the start location.)
+    function end_tag_empty_element(this: Parser, e: pointer[ElementType], net: bool, included: bool, start_loc: Location)
+    {
+        var m econMode
+        if net
+            set m: econnetMode
+        let token ps.get_token(m)
+        if (token = tokenNet) and net
+        {
+            let endev Event.make_end(host, e, ps.current_location())
+            if included
+                endev.set_included()
+            ps.queue_event(endev)
+            ps.note_end_element(included)
+            return
+        }
+        if token = tokenEtagoTagc
+        {
+            let endev Event.make_end(host, e, ps.current_location())
+            if included
+                endev.set_included()
+            ps.queue_event(endev)
+            ps.note_end_element(included)
+            return
+        }
+        if token = tokenEtagoNameStart
+        {
+            let end this.parse_end_tag()
+            if (end <> null) and (end.get_element_type() = e)
+            {
+                if included
+                    end.set_included()
+                ps.queue_event(end)
+                ps.note_end_element(included)
+                return
+            }
+            let endev2 Event.make_end(host, e, start_loc)
+            if included
+                endev2.set_included()
+            ps.queue_event(endev2)
+            ps.note_end_element(included)
+            return
+        }
+        ; not the element's end: unget and imply the end at the start location.
+        ps.current_input().unget_token()
+        let endev3 Event.make_end(host, e, start_loc)
+        if included
+            endev3.set_included()
+        ps.queue_event(endev3)
+        ps.note_end_element(included)
+    }
+
     ; implyCurrentElementEnd — emit an implied end for the current element and
     ; pop it (used when an end tag or document end closes elements above it whose
     ; own end tags were omitted). omitEndTag diagnostics deferred.
@@ -2881,6 +2964,28 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             endev.set_included()
         ps.queue_event(endev)
         ps.pop_element_mode()
+    }
+
+    ; parseNullEndTag — a NET delimiter (`>` under the XML/scaly syntax) closes
+    ; the nearest net-enabling element on the stack, implying ends of any
+    ; intervening open elements first. For an IMMEDNET `<x .../>` empty element
+    ; the net-enabling element IS the current one, so this emits its end
+    ; immediately. (elementNotFinished / markup diagnostics deferred.)
+    function parse_null_end_tag(this: Parser)
+    {
+        let cs ps.get_content_state()
+        var guard: int 0
+        var running true
+        while running and (cs.tag_level_of() > (0 as u32))
+        {
+            let net cs.current_element().get_net_enabling()
+            this.imply_current_element_end(ps.current_location())
+            if net
+                set running: false
+            set guard: guard + 1
+            if guard > 100000
+                set running: false
+        }
     }
 
     function accept_end_tag(this: Parser, event: pointer[Event])
@@ -3129,6 +3234,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if (token = tokenEroNameStart) or (token = tokenEroGrpo)
                 this.parse_entity_reference()
+            else if token = tokenNet
+                this.parse_null_end_tag()
             else if (token = tokenCroDigit) or (token = tokenHcroHexDigit)
             {
                 let loc ps.current_location()
