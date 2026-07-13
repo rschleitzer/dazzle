@@ -3053,6 +3053,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.queue_event(ev)
     }
 
+    ; endAllElements (parseInstance.cxx:1118). Closes every still-open element,
+    ; complaining about each one whose content model is unsatisfied, and then —
+    ; once the stack is back down to the synthetic document-element container —
+    ; complains if even THAT is unfinished, i.e. the document element never
+    ; appeared. That last check is what makes a prolog-only document (a DOCTYPE
+    ; and nothing else) non-conforming: `E: no document element`, exit 1, and an
+    ; empty ESIS because the `C` marker is gated on conformance.
     function end_all_elements(this: Parser)
     {
         let cs ps.get_content_state()
@@ -3064,6 +3071,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             else
             {
                 let ce cs.current_element()
+                if ce.is_finished() = false
+                    this.err(82)   ; elementNotFinishedDocumentEnd
                 let e ce.get_type()
                 ps.note_end_element(ce.get_included())
                 let ev Event.make_end(host, e, ps.current_location())
@@ -3071,6 +3080,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 ps.pop_element_mode()
             }
         }
+        let root cs.current_element()
+        if root.is_finished() = false
+            if ps.validate()
+                this.err(83)   ; noDocumentElement
     }
 
     function end_instance(this: Parser)
@@ -3343,28 +3356,118 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; (generateSystemId), an implied DTD from the first start tag (implyDtd),
     ; LINKTYPE, prolog PIs/comments, the startDtd/endProlog markup events.
 
-    ; Build an InputSource from raw entity bytes: ASCII/identity-widen to Char and
+    ; Build an InputSource from raw entity bytes: DECODE them as UTF-8 to Chars and
     ; apply the `lf` record normalization (prepend one RS 0x0A, translate each LF
-    ; 0x0A to RE 0x0D) exactly as the document entity, so declaration-subset
-    ; whitespace tokenizes as separators. The Char buffer lives on `host`.
+    ; 0x0A to RE 0x0D), so declaration-subset whitespace tokenizes as separators.
+    ; The Char buffer lives on `host`.
+    ;
+    ; onsgmls under SP_ENCODING=XML decodes EVERY entity as UTF-8 (XMLCodingSystem
+    ; -> UTF8CodingSystem): a well-formed sequence yields its Char, a byte that
+    ; cannot start or continue one yields U+FFFD and is consumed ALONE (so a
+    ; Latin-1 `ü` in an otherwise-ASCII file becomes exactly one U+FFFD and the
+    ; following chars still scan normally), and a leading BOM is stripped. That
+    ; U+FFFD is the only Char >= 256 the corpus produces; see Partition's high-char
+    ; slot for how it stays a DATA char rather than colliding with the eE sentinel.
+    ;
+    ; Continuation bytes are all >= 0x80, so no multibyte sequence can hide an LF —
+    ; the record normalization stays correct after decoding.
     function make_char_source(host: pointer[Page], bytes: String, org: pointer[Origin]) returns pointer[InputSource]
     {
         let n bytes.get_length()
-        let nb n + (1 as size_t)
-        let buf host.allocate(nb * (4 as size_t), 4) as pointer[u32]
+        ; upper bound: the RS + at most one Char per input byte (multibyte
+        ; sequences only ever shrink), + one slot of slack.
+        let buf host.allocate((n + (2 as size_t)) * (4 as size_t), 4) as pointer[u32]
         set *(buf + (0 as size_t)): 0x0A as u32
-        var ci: size_t 0
-        while ci < n
+        var out: size_t 1
+
+        var i: size_t 0
+        ; strip a leading UTF-8 BOM (EF BB BF).
+        if n >= (3 as size_t)
         {
-            let b bytes.get(ci) as u32
-            var ch b
-            if b = (0x0A as u32)
-                set ch: 0x0D as u32
-            set *(buf + (ci + (1 as size_t))): ch
-            set ci: ci + 1
+            if bytes.get(0 as size_t) = (0xEF as u8)
+            {
+                if bytes.get(1 as size_t) = (0xBB as u8)
+                {
+                    if bytes.get(2 as size_t) = (0xBF as u8)
+                        set i: 3 as size_t
+                }
+            }
         }
+
+        while i < n
+        {
+            let b0 bytes.get(i) as u32
+            ; default: an invalid byte decodes to U+FFFD and consumes just itself.
+            var ch: u32 0xFFFD as u32
+            var len: size_t 1
+            if b0 < (0x80 as u32)
+            {
+                set ch: b0
+            }
+            else
+            {
+                ; lead byte -> how many continuations follow, and its payload bits.
+                ; 0xC0/0xC1 (overlong) and > 0xF4 (out of range) are not leads.
+                var need: size_t 0
+                var acc: u32 0
+                if b0 >= (0xC2 as u32)
+                {
+                    if b0 <= (0xDF as u32)
+                    {
+                        set need: 1 as size_t
+                        set acc: b0 & (0x1F as u32)
+                    }
+                }
+                if b0 >= (0xE0 as u32)
+                {
+                    if b0 <= (0xEF as u32)
+                    {
+                        set need: 2 as size_t
+                        set acc: b0 & (0x0F as u32)
+                    }
+                }
+                if b0 >= (0xF0 as u32)
+                {
+                    if b0 <= (0xF4 as u32)
+                    {
+                        set need: 3 as size_t
+                        set acc: b0 & (0x07 as u32)
+                    }
+                }
+                if need > (0 as size_t)
+                {
+                    var ok true
+                    var k: size_t 1
+                    while k <= need
+                    {
+                        if (i + k) >= n
+                            set ok: false
+                        else
+                        {
+                            let bc bytes.get(i + k) as u32
+                            if (bc & (0xC0 as u32)) <> (0x80 as u32)
+                                set ok: false
+                            else
+                                set acc: (acc << (6 as u32)) | (bc & (0x3F as u32))
+                        }
+                        set k: k + 1
+                    }
+                    if ok
+                    {
+                        set ch: acc
+                        set len: need + (1 as size_t)
+                    }
+                }
+            }
+            if ch = (0x0A as u32)
+                set ch: 0x0D as u32
+            set *(buf + out): ch
+            set out: out + (1 as size_t)
+            set i: i + len
+        }
+
         let src host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
-        set *src: InputSource(org, buf, nb)
+        set *src: InputSource(org, buf, out)
         src
     }
 
