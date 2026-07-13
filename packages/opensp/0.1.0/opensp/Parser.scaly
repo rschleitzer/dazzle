@@ -32,6 +32,7 @@ use opensp.ParserState.ParserState
 use opensp.ContentState.ContentState
 use opensp.OpenElement.OpenElement
 use opensp.Event.Event
+use opensp.Esis.Esis
 use opensp.Recognizer.Recognizer
 use opensp.ModeInfo.ModeInfo
 use opensp.ModeInfo.PackedTokenInfo
@@ -2729,6 +2730,132 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
     }
 
+    ; ======================================================================
+    ; Prolog + full-document driver — Stage 4, Increment 3.
+    ;
+    ; A SCOPED port of doProlog + parseDoctypeDeclStart (Parser.cs): drives the
+    ; document from the first token through the DOCTYPE declaration into content
+    ; parsing, so a whole SGML document (one InputSource) parses end-to-end and
+    ; the event queue feeds the ESIS writer (Esis.write) — the tests/sgml corpus
+    ; harness. Scoped to an INTERNAL DTD subset (`<!DOCTYPE name [ ... ]>`):
+    ;
+    ; DEFERRED: PUBLIC/SYSTEM external subset + catalog (needs generateSystemId /
+    ; EntityManager drive), an implied DTD from the first start tag (implyDtd),
+    ; LINKTYPE, prolog PIs/comments, the startDtd/endProlog markup events.
+
+    ; parseDoctypeDeclStart (scoped): name -> def/current Dtd; then the internal
+    ; subset (DSO -> parse_decl_subset -> MDC) or an empty DTD (MDC directly).
+    function parse_doctype_decl_start(this: Parser) returns bool
+    {
+        let decl_input_level ps.get_input_level()
+        let parm Param.make(host)
+        let allow_name AllowedParams.a1(host, P_NAME)
+        if this.parse_param(allow_name, decl_input_level, parm) = false
+            return false
+        let docname parm.token
+        let dtd Dtd.make(host, docname, true)
+        ps.set_def_dtd(dtd)
+        ps.set_current_dtd(dtd)
+
+        let allow_ext AllowedParams.a3(host, P_DSO, P_MDC, P_RESERVED_NAME + R_SYSTEM)
+        if this.parse_param(allow_ext, decl_input_level, parm) = false
+            return false
+
+        if parm.kind = P_DSO
+        {
+            ps.set_phase(PHASE_DECL_SUBSET)
+            let rc this.parse_decl_subset()
+            if rc <> 0
+                return false
+            ; the DSC (`]`) is consumed; the MDC (`>`) closes the declaration.
+            let allow_mdc AllowedParams.a1(host, P_MDC)
+            if this.parse_param(allow_mdc, decl_input_level, parm) = false
+                return false
+            return true
+        }
+        else if parm.kind = P_MDC
+            ; empty DTD (no declaration subset).
+            return true
+        else
+        {
+            ; PUBLIC/SYSTEM external subset — deferred.
+            this.err(80)
+            return false
+        }
+    }
+
+    ; doProlog (scoped): skip separators, dispatch the DOCTYPE declaration, and
+    ; leave the input positioned at the first instance token.
+    function parse_prolog(this: Parser) returns bool
+    {
+        ps.set_current_mode(proMode)
+        ps.set_phase(PHASE_PROLOG)
+        var running true
+        var ok true
+        while running
+        {
+            let token ps.get_token(proMode)
+            if token = tokenS
+            {
+                ; separator between prolog constructs: skip
+            }
+            else if (token = tokenRe) or (token = tokenRs)
+            {
+                ; record boundary in the prolog: ignore
+            }
+            else if token = tokenMdoNameStart
+            {
+                var decl_name: int 0
+                if this.parse_declaration_name(&decl_name) = false
+                {
+                    set ok: false
+                    set running: false
+                }
+                else if decl_name = R_DOCTYPE
+                {
+                    set ok: this.parse_doctype_decl_start()
+                    set running: false
+                }
+                else
+                {
+                    ; only DOCTYPE is handled in the prolog here.
+                    this.err(81)
+                    set ok: false
+                    set running: false
+                }
+            }
+            else if token = tokenEe
+            {
+                ; end of the document before any content.
+                set running: false
+            }
+            else
+            {
+                ; the instance begins (a start tag / data): unget and stop.
+                ps.current_input().unget_token()
+                set running: false
+            }
+        }
+        ok
+    }
+
+    ; the full document drive: prolog (DOCTYPE) -> content events.
+    ; The caller installs the prolog/decl recognizers (install_recognizers) and
+    ; pushes the document InputSource; parse_document adds the content-mode
+    ; recognizers, enters the instance, and runs doContent over the SAME input.
+    function parse_document(this: Parser, table: pointer[Array[PackedTokenInfo]]) returns bool
+    {
+        if this.parse_prolog() = false
+            return false
+        let dtd ps.get_current_dtd()
+        if dtd = null
+            return false
+        this.install_content_recognizers(table)
+        ps.start_instance(host, dtd)
+        this.do_content()
+        true
+    }
+
     ; ---- self-test: parse a synthetic DTD subset, assert the built Dtd -----
     function test() returns int
     {
@@ -2966,6 +3093,57 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         if avs.equals(StringC("D1")) = false
             return -49
 
+        ; ============= Stage 4 Increment 3: full document -> ESIS ==========
+        ; Drive a whole SGML document (prolog DOCTYPE + internal subset +
+        ; instance, ONE InputSource) through parse_document and assert the ESIS
+        ; dump is byte-identical to the reference onsgmls output.
+        let esis_rc parser_esis_check()
+        if esis_rc <> 0
+            return esis_rc
+
+        0
+    }
+
+    ; a fresh-ParserState full-document drive + ESIS byte comparison.
+    function parser_esis_check() returns int
+    {
+        let anchor StringC("y")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+
+        let doc StringC("<!DOCTYPE doc [<!ELEMENT doc - - (title, para+)> <!ELEMENT title - - (#PCDATA)> <!ELEMENT para - - (#PCDATA)> <!ATTLIST doc id ID #IMPLIED>]><doc id=\"D1\"><title>Hi</title><para>X</para></doc>")
+        let n doc.get_size()
+        let buf host.allocate(n * (4 as size_t), 4) as pointer[u32]
+        var ci: size_t 0
+        while ci < n
+        {
+            set *(buf + ci): doc.get(ci)
+            set ci: ci + 1
+        }
+
+        let ps ParserState.make(host, null, 0 as u32, PHASE_PROLOG)
+        let sd host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
+        set *sd: Sd()
+        ps.set_sd(sd)
+        let syn Syntax^host(*sd)
+        ps.set_syntax(syn)
+
+        let parser Parser.make(host, ps)
+        let table ModeInfo.build_table(host)
+        parser.install_recognizers(table)
+
+        let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+        set *org: Origin()
+        let src host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
+        set *src: InputSource(org, buf, n)
+        ps.push_input(src)
+
+        if parser.parse_document(table) = false
+            return -60
+
+        let got Esis.write(host, ps)
+        let want String("AID TOKEN D1\n(DOC\n(TITLE\n-Hi\n)TITLE\n(PARA\n-X\n)PARA\n)DOC\nC\n")
+        if got.equals(want) = false
+            return -61
         0
     }
 }
