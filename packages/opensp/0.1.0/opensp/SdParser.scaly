@@ -1,0 +1,270 @@
+use scaly.memory.Page
+use scaly.containers.String
+use opensp.Sd.Sd
+use opensp.Syntax.Syntax
+
+; SdParser — a scoped reader for the SGML declaration (parseSd.cxx).
+;
+; The full SD parser (charset/capacity/quantity/delim/entities, the ordered
+; FEATURES table) is a later increment; this reader extracts exactly the parts
+; the corpus's declarations vary from the reference implied declaration:
+;
+;   - NAMECASE GENERAL / ENTITY  (fold on/off — Syntax's general subst table)
+;   - NAMESTRT / NAMECHAR ranges (naming extensions — e.g. XML's `_`, `:`)
+;   - SHORTTAG ATTRIB OMITNAME    (attribute-name minimization legality)
+;   - the WWW version flag         (from the `<!SGML "… (WWW)"` version literal)
+;
+; It scans the declaration as whitespace-separated words / quoted literals
+; (skipping `--…--` comments, like the catalog parser) and acts only on the
+; keywords above; every other section token is ignored. Two passes: pass A
+; settles NAMECASE/OMITNAME/WWW into the Sd BEFORE the Syntax is built (the fold
+; table is fixed at construction), pass B applies the naming ranges to it.
+; Sd()'s defaults (GENERAL YES, OMITNAME YES) match the reference syntax, so a
+; catalog-less document is parsed exactly as before.
+
+define SD_EOF: int 0
+define SD_WORD: int 1
+define SD_LIT: int 2
+
+define SdToken (kind: int, start: size_t, len: size_t, next_pos: size_t)
+{
+    init(kind: int, start: size_t, len: size_t, next_pos: size_t)
+    {
+        set this.kind: kind
+        set this.start: start
+        set this.len: len
+        set this.next_pos: next_pos
+    }
+}
+
+define SdSyntax (sd: pointer[Sd], syn: pointer[Syntax])
+{
+    init(sd: pointer[Sd], syn: pointer[Syntax])
+    {
+        set this.sd: sd
+        set this.syn: syn
+    }
+}
+
+define SdParser ()
+{
+    function is_ws(this: SdParser, c: u8) returns bool
+        (c = (0x20 as u8)) or (c = (0x09 as u8)) or (c = (0x0A as u8)) or (c = (0x0D as u8))
+
+    function is_digit_byte(this: SdParser, c: u8) returns bool
+        (c >= (0x30 as u8)) and (c <= (0x39 as u8))
+
+    ; scan one token from buf[pos..len): a "quoted"/'quoted' literal or an
+    ; unquoted word, skipping whitespace and `--…--` comments. start/len index
+    ; the byte buffer (no copy — the caller reads numbers/keywords in place).
+    function scan(this: SdParser, buf: pointer[u8], len: size_t, pos: size_t) returns SdToken
+    {
+        var i pos
+        while i < len
+        {
+            let c *(buf + i)
+            if is_ws(c)
+                set i: i + 1
+            else if (c = (0x2D as u8)) and (i + (1 as size_t) < len) and (*(buf + i + (1 as size_t)) = (0x2D as u8))
+            {
+                set i: i + (2 as size_t)
+                while (i + (1 as size_t) < len) and ((*(buf + i) <> (0x2D as u8)) or (*(buf + i + (1 as size_t)) <> (0x2D as u8)))
+                    set i: i + 1
+                set i: i + (2 as size_t)
+            }
+            else
+                break
+        }
+
+        if i >= len
+            return SdToken(SD_EOF, i, 0 as size_t, i)
+
+        let c *(buf + i)
+        if (c = (0x22 as u8)) or (c = (0x27 as u8))
+        {
+            let quote c
+            set i: i + 1
+            let start i
+            while (i < len) and (*(buf + i) <> quote)
+                set i: i + 1
+            let tlen i - start
+            if i < len
+                set i: i + 1
+            return SdToken(SD_LIT, start, tlen, i)
+        }
+
+        let start i
+        while (i < len) and (is_ws(*(buf + i)) = false)
+            set i: i + 1
+        SdToken(SD_WORD, start, i - start, i)
+    }
+
+    ; case-sensitive equality of the word buf[start..start+len) with an ASCII
+    ; keyword (SD reserved names are always uppercase in the declaration).
+    function word_eq(this: SdParser, buf: pointer[u8], start: size_t, len: size_t, s: pointer[const_char]) returns bool
+    {
+        let sn strlen s
+        if sn <> len
+            return false
+        var j: size_t 0
+        while j < len
+        {
+            if *(buf + start + j) <> (*((s as pointer[u8]) + j))
+                return false
+            set j: j + 1
+        }
+        true
+    }
+
+    ; does the version literal contain "WWW" (Web SGML adaptations)?
+    function lit_has_www(this: SdParser, buf: pointer[u8], start: size_t, len: size_t) returns bool
+    {
+        if len < (3 as size_t)
+            return false
+        var j: size_t 0
+        while (j + (3 as size_t)) <= len
+        {
+            if (*(buf + start + j) = (0x57 as u8)) and (*(buf + start + j + (1 as size_t)) = (0x57 as u8)) and (*(buf + start + j + (2 as size_t)) = (0x57 as u8))
+                return true
+            set j: j + 1
+        }
+        false
+    }
+
+    function parse_uint(this: SdParser, buf: pointer[u8], start: size_t, len: size_t) returns u32
+    {
+        var v: u32 0
+        var j: size_t 0
+        while j < len
+        {
+            let c *(buf + start + j)
+            if is_digit_byte(c) = false
+                break
+            set v: (v * (10 as u32)) + ((c - (0x30 as u8)) as u32)
+            set j: j + 1
+        }
+        v
+    }
+
+    ; consume a run of `number` / `number-number` range tokens, adding each to
+    ; the syntax as name-start (is_start) or name characters, until a non-numeric
+    ; token — which is left unconsumed for the main loop (the next SD keyword).
+    function consume_ranges(this: SdParser, buf: pointer[u8], len: size_t, pos: pointer[size_t], syn: pointer[Syntax], is_start: bool)
+    {
+        while true
+        {
+            let save *pos
+            let t scan(buf, len, save)
+            if t.kind <> SD_WORD
+                return
+            if is_digit_byte(*(buf + t.start)) = false
+                return
+            set *pos: t.next_pos
+
+            var dash: size_t t.len
+            var k: size_t 0
+            while k < t.len
+            {
+                if *(buf + t.start + k) = (0x2D as u8)
+                {
+                    set dash: k
+                    break
+                }
+                set k: k + 1
+            }
+
+            var lo: u32 0
+            var hi: u32 0
+            if dash < t.len
+            {
+                set lo: parse_uint(buf, t.start, dash)
+                set hi: parse_uint(buf, t.start + dash + (1 as size_t), t.len - dash - (1 as size_t))
+            }
+            else
+            {
+                set lo: parse_uint(buf, t.start, t.len)
+                set hi: lo
+            }
+
+            if is_start
+                syn.add_name_start_characters(lo, hi)
+            else
+                syn.add_name_characters(lo, hi)
+        }
+    }
+
+    ; build — parse an SGML declaration's byte text into an Sd + Syntax pair.
+    function build(this: SdParser, host: pointer[Page], text: String) returns SdSyntax
+    {
+        let sd host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
+        set *sd: Sd()
+        let buf text.get_buffer()
+        let len text.get_length()
+
+        ; pass A — NAMECASE / OMITNAME / WWW (before Syntax build: the general
+        ; fold table is chosen from namecase_general at construction).
+        if buf <> null
+        {
+            var pos: size_t 0
+            var first_lit true
+            while true
+            {
+                let t scan(buf, len, pos)
+                set pos: t.next_pos
+                if t.kind = SD_EOF
+                    break
+                if t.kind = SD_LIT
+                {
+                    if first_lit
+                    {
+                        set first_lit: false
+                        if lit_has_www(buf, t.start, t.len)
+                            sd.set_www(true)
+                    }
+                }
+                else if word_eq(buf, t.start, t.len, "NAMECASE")
+                {
+                    let g1 scan(buf, len, pos)
+                    set pos: g1.next_pos
+                    let gv scan(buf, len, pos)
+                    set pos: gv.next_pos
+                    sd.set_namecase_general(word_eq(buf, gv.start, gv.len, "YES"))
+                    let e1 scan(buf, len, pos)
+                    set pos: e1.next_pos
+                    let ev scan(buf, len, pos)
+                    set pos: ev.next_pos
+                }
+                else if word_eq(buf, t.start, t.len, "OMITNAME")
+                {
+                    let v scan(buf, len, pos)
+                    set pos: v.next_pos
+                    sd.set_attribute_omit_name(word_eq(buf, v.start, v.len, "YES"))
+                }
+            }
+        }
+
+        let syn Syntax^host(*sd)
+
+        ; pass B — NAMESTRT / NAMECHAR ranges applied to the built syntax.
+        if buf <> null
+        {
+            var pos: size_t 0
+            while true
+            {
+                let t scan(buf, len, pos)
+                set pos: t.next_pos
+                if t.kind = SD_EOF
+                    break
+                if t.kind = SD_WORD
+                {
+                    if word_eq(buf, t.start, t.len, "NAMESTRT")
+                        consume_ranges(buf, len, &pos, syn, true)
+                    else if word_eq(buf, t.start, t.len, "NAMECHAR")
+                        consume_ranges(buf, len, &pos, syn, false)
+                }
+            }
+        }
+
+        SdSyntax(sd, syn)
+    }
+}

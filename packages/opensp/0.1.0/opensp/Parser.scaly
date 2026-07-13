@@ -40,6 +40,12 @@ use opensp.ModeInfo.PackedTokenInfo
 use opensp.Message.MessageType
 use opensp.Message.MessageFragment
 use opensp.Message.Severity
+use opensp.EntityCatalog.CatalogParser
+use opensp.EntityCatalog.EntityCatalog
+use opensp.SdParser.SdParser
+use opensp.SdParser.SdSyntax
+use scaly.io.File
+use scaly.io.Path
 
 ; Parser — the FIRST slice of Parser.cs (the 11801-LOC integration tail): the
 ; prolog + DTD declaration-subset parser. It drives ParserState.get_token(mode)
@@ -2540,10 +2546,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         else if (token = tokenNameStart) or (token = tokenDigit) or (token = tokenLcUcNmchar)
         {
             ; unquoted (SHORTTAG) value — extend over name-token characters.
+            ; Copy the token onto the run page: current_token_string's buffer is
+            ; transient, and a CDATA value is stored verbatim (no fold-copy in
+            ; set_value), so it would dangle and read as later token bytes.
             this.extend_name_token(this.namelen())
             let ins ps.current_input()
             let ts ins.current_token_string()
-            set *text: Text(ts)
+            set *text: Text(StringC^host(ts.data_ptr(), ts.get_size()))
         }
         else
         {
@@ -2554,6 +2563,43 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return false
         let tlen (*text).size()
         set *spec_length: *spec_length + tlen
+        atts.set_value(host, index, text, ctx)
+    }
+
+    ; handleAttributeNameToken (parseAttribute.cxx) — SHORTTAG attribute-name
+    ; minimization: a bare token whose attribute name was omitted (`<content
+    ; multiple optional>`). Resolve the attribute whose declared enumerated /
+    ; notation / nametoken value set contains `token` and record it as that
+    ; attribute's value. First-match; under WebSGML a non-unique token is an
+    ; error. `token` is the already-folded current name.
+    function handle_attribute_name_token(this: Parser, token: StringC, atts: pointer[AttributeList], spec_length: pointer[size_t]) returns bool
+    {
+        let idx atts.token_index(token)
+        if idx < 0
+        {
+            ; noSuchAttributeToken — no attribute declares this value.
+            this.err(0)
+            return false
+        }
+        if ps.get_sd().www()
+        {
+            if atts.token_index_unique(token, idx) = false
+            {
+                ; attributeTokenNotUnique (WebSGML).
+                this.err(0)
+                return false
+            }
+        }
+        let index idx as size_t
+        ; attributeNameShorttag: OMITNAME disabled makes the shorthand illegal
+        ; (the reference/scaly declarations enable it).
+        if ps.get_sd().attribute_omit_name() = false
+            this.err(0)
+        let ctx ps.get_attribute_context()
+        atts.set_spec(index, ctx)
+        let text host.allocate(sizeof Text, alignof Text) as pointer[Text]
+        set *text: Text(token)
+        set *spec_length: *spec_length + token.get_size()
         atts.set_value(host, index, text, ctx)
     }
 
@@ -2594,15 +2640,35 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else
                 {
-                    ; SHORTTAG value-as-name (attribute name omitted) — deferred.
-                    this.err(0)
+                    ; SHORTTAG name value shorthand: `nm` was a NAME not followed
+                    ; by a VI, so it is a value with the attribute name omitted.
+                    ; The lookahead parameter (cur_parm) is reused as-is.
+                    if this.handle_attribute_name_token(nm, atts, &spec_length) = false
+                    {
+                        set ok: false
+                        set running: false
+                    }
+                }
+            }
+            else if cur_parm = APT_NAMETOKEN
+            {
+                ; a NAMETOKEN can never be an attribute name -> always an omitted-
+                ; name value; read the next parameter afterwards.
+                let nt this.name_folded()
+                if this.handle_attribute_name_token(nt, atts, &spec_length) = false
+                {
+                    set ok: false
+                    set running: false
+                }
+                else if this.parse_attribute_parameter(mode, false, &cur_parm, net) = false
+                {
                     set ok: false
                     set running: false
                 }
             }
             else
             {
-                ; SHORTTAG unnamed name-token / recoverUnquoted — deferred.
+                ; a VI with no preceding name — genuine syntax error.
                 this.err(0)
                 set ok: false
                 set running: false
@@ -3362,10 +3428,40 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; A raw CR (0x0D) already IS the RE char and passes through. (crlf / cr-only
         ; record types are deferred; the corpus is LF.)
         let ps ParserState.make(host, null, 0 as u32, PHASE_PROLOG)
-        let sd host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
-        set *sd: Sd()
+
+        ; SGML declaration binding (onsgmls behavior): look for a `catalog` file
+        ; in the document's directory; if it names an SGMLDECL, parse that
+        ; declaration into the Sd + Syntax (e.g. scaly.sgm's catalog -> scaly.dcl,
+        ; NAMECASE GENERAL NO + SHORTTAG OMITNAME). No catalog / no SGMLDECL ->
+        ; the reference implied declaration (Sd() + reference Syntax), byte-
+        ; identical to the previous behavior for every catalog-less corpus model.
+        var sd: pointer[Sd] null
+        var syn: pointer[Syntax] null
+        var cat_path base_dir
+        if base_dir.get_length() = (0 as size_t)
+            set cat_path: String("catalog")
+        else
+            set cat_path: Path.join(base_dir, String("catalog"))
+        if File.exists(cat_path)
+        {
+            let cat_text File.read_to_string(cat_path)
+            let catalog CatalogParser().parse(cat_text, base_dir)
+            let decl_path catalog.lookup_sgmldecl()
+            if (decl_path.get_length() <> (0 as size_t)) and File.exists(decl_path)
+            {
+                let decl_text File.read_to_string(decl_path)
+                let pair SdParser().build(host, decl_text)
+                set sd: pair.sd
+                set syn: pair.syn
+            }
+        }
+        if sd = null
+        {
+            set sd: host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
+            set *sd: Sd()
+            set syn: Syntax^host(*sd)
+        }
         ps.set_sd(sd)
-        let syn Syntax^host(*sd)
         ps.set_syntax(syn)
 
         let parser Parser.make(host, ps)
