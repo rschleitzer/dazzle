@@ -27,6 +27,9 @@ use opensp.Entity.ExternalTextEntity
 use opensp.ExternalId.ExternalId
 use opensp.ShortReferenceMap.ShortReferenceMap
 use opensp.ParserState.ParserState
+use opensp.ContentState.ContentState
+use opensp.OpenElement.OpenElement
+use opensp.Event.Event
 use opensp.Recognizer.Recognizer
 use opensp.ModeInfo.ModeInfo
 use opensp.ModeInfo.PackedTokenInfo
@@ -2257,6 +2260,258 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
     }
 
+    ; ======================================================================
+    ; Instance / content parsing — Stage 4, Increment 1 (the well-formed path).
+    ;
+    ; Ports the core of parseInstance.cxx doContent: the token-dispatch loop that
+    ; walks instance content, drives the ContentState transition automaton
+    ; (already ported), and appends StartElement/EndElement/characterData events
+    ; in document order. Scoped to the well-formed, explicit-markup case that the
+    ; simplest corpus models and the self-test exercise.
+    ;
+    ; DEFERRED to later increments (each a distinct parseInstance.cxx region):
+    ;  - tag MINIMIZATION: OMITTAG (tryImplyTag imply loop), SHORTTAG empty
+    ;    start/end tags, NET, ranked elements, group tags.
+    ;  - attribute-spec parsing in start tags (parseAttributeSpec); events carry
+    ;    no attribute payload yet — a start tag with an attribute spec is left
+    ;    unconsumed (ungetToken) for the attribute increment.
+    ;  - entity/character references in content, PIs, comments, marked sections,
+    ;    shortref (handleShortref), CDATA/RCDATA special parse.
+    ;  - ID/IDREF checking (checkIdrefs), inclusion/exclusion recovery, the RS/RE
+    ;    record-boundary event semantics (Re/Rs are treated as ignorable seps).
+
+    ; must this element's end tag be omitted (EMPTY content)? CONREF check
+    ; deferred (needs the attribute list on the event).
+    function must_omit_end(this: Parser, e: pointer[ElementType]) returns bool
+    {
+        let def e.get_definition()
+        if def = null
+            return false
+        def.get_declared_content() = DC_EMPTY
+    }
+
+    function do_parse_start_tag(this: Parser) returns pointer[Event]
+    {
+        let ins ps.current_input()
+        ins.discard_initial()
+        this.extend_name_token(this.namelen())
+        let name this.name_folded()
+        let dtd ps.get_current_dtd()
+        var e dtd.lookup_element_type(name)
+        if e = null
+        {
+            let cs ps.get_content_state()
+            let uloc ps.current_location()
+            set e: cs.lookup_create_undefined_element(host, name, uloc, dtd, true)
+        }
+        let loc ps.current_location()
+        ; close delimiter (TAGC) or an attribute spec (deferred: leave it).
+        let close_token ps.get_token(tagMode)
+        if close_token <> tokenTagc
+            ins.unget_token()
+        Event.make_start(host, e, loc)
+    }
+
+    function parse_start_tag(this: Parser)
+    {
+        let event this.do_parse_start_tag()
+        let e event.get_element_type()
+        this.accept_start_tag(e, event)
+    }
+
+    function accept_start_tag(this: Parser, e: pointer[ElementType], event: pointer[Event])
+    {
+        let cs ps.get_content_state()
+        let ce cs.current_element()
+        if ce.try_transition(e)
+        {
+            this.push_element_check(e, event)
+            return
+        }
+        if cs.element_is_included(e)
+        {
+            event.set_included()
+            this.push_element_check(e, event)
+            return
+        }
+        ; Not allowed by the current content model. Minimization/tag-imply
+        ; recovery (tryImplyTag) is deferred; recover by forcing the transition
+        ; and pushing so parsing continues (the well-formed path never reaches
+        ; here). No diagnostic is raised yet (would perturb n_errors).
+        let discard ce.try_transition(e)
+        this.push_element_check(e, event)
+    }
+
+    function push_element_check(this: Parser, e: pointer[ElementType], event: pointer[Event])
+    {
+        if this.must_omit_end(e)
+        {
+            ; EMPTY element: emit start immediately followed by an implied end.
+            ps.queue_event(event)
+            let endev Event.make_end(host, e, event.get_loc())
+            if event.is_included()
+                endev.set_included()
+            ps.queue_event(endev)
+            return
+        }
+        let cs ps.get_content_state()
+        let ce cs.current_element()
+        var map e.get_map()
+        if map = null
+            set map: ce.get_map()
+        let oe OpenElement.make(host, e, false, event.is_included(), map, event.get_loc())
+        ps.push_element_mode(oe)
+        ps.queue_event(event)
+    }
+
+    function parse_end_tag(this: Parser) returns pointer[Event]
+    {
+        let ins ps.current_input()
+        ins.discard_initial()
+        this.extend_name_token(this.namelen())
+        let name this.name_folded()
+        let dtd ps.get_current_dtd()
+        let e dtd.lookup_element_type(name)
+        let loc ps.current_location()
+        let close_token ps.get_token(tagMode)
+        if close_token <> tokenTagc
+            ins.unget_token()
+        if e = null
+            return null
+        Event.make_end(host, e, loc)
+    }
+
+    function accept_end_tag(this: Parser, event: pointer[Event])
+    {
+        if event = null
+            return
+        let e event.get_element_type()
+        let cs ps.get_content_state()
+        if cs.element_is_open(e) = false
+            return
+        let ce cs.current_element()
+        let cur ce.get_type()
+        if cur = e
+        {
+            ps.queue_event(event)
+            ps.pop_element_mode()
+        }
+        ; else: an end tag for an open but non-current element (needs implied
+        ; end tags for the elements above it) — the minimization increment.
+    }
+
+    function accept_pcdata(this: Parser)
+    {
+        let cs ps.get_content_state()
+        let ce cs.current_element()
+        let discard ce.try_transition_pcdata()
+        ; pcdataRecover (mode switch to mconMode + recovery) deferred.
+    }
+
+    function parse_pcdata(this: Parser)
+    {
+        this.accept_pcdata()
+        let ins ps.current_input()
+        let ts ins.current_token_string()
+        let loc ps.current_location()
+        let ev Event.make_data(host, ts, loc)
+        ps.queue_event(ev)
+    }
+
+    function end_all_elements(this: Parser)
+    {
+        let cs ps.get_content_state()
+        var running true
+        while running
+        {
+            if cs.tag_level_of() = (0 as u32)
+                set running: false
+            else
+            {
+                let ce cs.current_element()
+                let e ce.get_type()
+                let ev Event.make_end(host, e, ps.current_location())
+                ps.queue_event(ev)
+                ps.pop_element_mode()
+            }
+        }
+    }
+
+    function end_instance(this: Parser)
+    {
+        this.end_all_elements()
+        ; checkIdrefs + unclosed-marked-section cleanup deferred.
+        ps.pop_input_stack()
+    }
+
+    ; doContent — the instance token-dispatch loop (well-formed subset).
+    function do_content(this: Parser)
+    {
+        var running true
+        while running
+        {
+            let token ps.get_token(ps.get_current_mode())
+            if token = tokenEe
+            {
+                if ps.get_input_level() = (1 as u32)
+                {
+                    this.end_instance()
+                    set running: false
+                }
+                else
+                    ps.pop_input_stack()
+            }
+            else if token = tokenStagoNameStart
+                this.parse_start_tag()
+            else if token = tokenEtagoNameStart
+            {
+                let ee this.parse_end_tag()
+                this.accept_end_tag(ee)
+            }
+            else if token = tokenChar
+                this.parse_pcdata()
+            else if token = tokenCharDelim
+                this.parse_pcdata()
+            else if token = tokenS
+                set running: running
+            else if token = tokenRe
+                set running: running
+            else if token = tokenRs
+                set running: running
+            else
+                ; Unhandled token in this increment (references, PIs, comments,
+                ; marked sections, shortref, empty/net/group tags). Bail rather
+                ; than risk a non-advancing loop; later increments handle these.
+                set running: false
+        }
+    }
+
+    ; install the content-mode recognizers doContent drives (in addition to the
+    ; declaration/prolog modes install_recognizers builds). Kept separate so the
+    ; declaration-parser path stays byte-identical.
+    function install_content_recognizers(this: Parser, table: pointer[Array[PackedTokenInfo]])
+    {
+        let sdv *ps.get_sd()
+        let synv *ps.get_syntax()
+        var modes int[7]
+        let mp modes as pointer[int]
+        set *(mp + (0 as size_t)): econMode
+        set *(mp + (1 as size_t)): econnetMode
+        set *(mp + (2 as size_t)): mconMode
+        set *(mp + (3 as size_t)): mconnetMode
+        set *(mp + (4 as size_t)): tagMode
+        set *(mp + (5 as size_t)): cconMode
+        set *(mp + (6 as size_t)): rcconMode
+        var i: int 0
+        while i < 7
+        {
+            let m *(mp + (i as size_t))
+            let r Recognizer.build_recognizer(host, m, sdv, synv, table)
+            ps.set_recognizer(m, r)
+            set i: i + 1
+        }
+    }
+
     ; ---- self-test: parse a synthetic DTD subset, assert the built Dtd -----
     function test() returns int
     {
@@ -2373,6 +2628,111 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return -21
         if gif.has_system_id() = false
             return -22
+
+        ; ================= Stage 4: instance parsing =====================
+        ; Parse a well-formed instance against the DTD just built and assert the
+        ; event stream for  <doc><title>Hi</title><para>X</para></doc>  (names
+        ; fold to uppercase): START DOC, START TITLE, "Hi", END TITLE, START
+        ; PARA, "X", END PARA, END DOC.
+        let itext StringC("<doc><title>Hi</title><para>X</para></doc>")
+        let ni itext.get_size()
+        let ibuf host.allocate(ni * (4 as size_t), 4) as pointer[u32]
+        var ii: size_t 0
+        while ii < ni
+        {
+            set *(ibuf + ii): itext.get(ii)
+            set ii: ii + 1
+        }
+
+        ; content-mode recognizers, then enter the instance
+        parser.install_content_recognizers(table)
+        ; drop the (exhausted) declaration-subset input so the instance parses at
+        ; input level 1 (end-of-entity there ends the instance).
+        ps.pop_input_stack()
+        ps.start_instance(host, dtd)
+
+        let iorg host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+        set *iorg: Origin()
+        let isrc host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
+        set *isrc: InputSource(iorg, ibuf, ni)
+        ps.push_input(isrc)
+
+        parser.do_content()
+
+        if ps.get_n_errors() <> (0 as u32)
+            return -30
+
+        ; walk the event queue: match the 6 structural events in order, and sum
+        ; the total character-data length (robust to data-token coalescing).
+        let n_ev ps.n_events()
+        var si: int 0
+        var data_total: size_t 0
+        var k: size_t 0
+        while k < n_ev
+        {
+            let ev ps.get_event(k)
+            let ty ev.get_type()
+            if ty = EV_DATA
+            {
+                let d ev.get_data()
+                set data_total: data_total + d.get_size()
+            }
+            else
+            {
+                let et ev.get_element_type()
+                let nm et.get_name()
+                if si = 0
+                {
+                    if ty <> EV_START_ELEMENT
+                        return -31
+                    if nm.equals(StringC("DOC")) = false
+                        return -32
+                }
+                else if si = 1
+                {
+                    if ty <> EV_START_ELEMENT
+                        return -33
+                    if nm.equals(StringC("TITLE")) = false
+                        return -34
+                }
+                else if si = 2
+                {
+                    if ty <> EV_END_ELEMENT
+                        return -35
+                    if nm.equals(StringC("TITLE")) = false
+                        return -36
+                }
+                else if si = 3
+                {
+                    if ty <> EV_START_ELEMENT
+                        return -37
+                    if nm.equals(StringC("PARA")) = false
+                        return -38
+                }
+                else if si = 4
+                {
+                    if ty <> EV_END_ELEMENT
+                        return -39
+                    if nm.equals(StringC("PARA")) = false
+                        return -40
+                }
+                else if si = 5
+                {
+                    if ty <> EV_END_ELEMENT
+                        return -41
+                    if nm.equals(StringC("DOC")) = false
+                        return -42
+                }
+                else
+                    return -43
+                set si: si + 1
+            }
+            set k: k + 1
+        }
+        if si <> 6
+            return -44
+        if data_total <> (3 as size_t)
+            return -45
 
         0
     }
