@@ -734,9 +734,36 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if token = tokenChar
                 buf.add(ps.current_input().current_char())
-            else if (token = tokenCroDigit) or (token = tokenHcroHexDigit) or (token = tokenCroNameStart) or (token = tokenEroNameStart) or (token = tokenEroGrpo) or (token = tokenPeroNameStart)
+            else if (token = tokenEroNameStart) or (token = tokenEroGrpo)
             {
-                ; DEFERRED: char/entity references inside literals.
+                ; Entity::litReference — a general entity reference in a literal
+                ; STACKS the entity like a content reference; its chars then scan
+                ; as literal content (the tokenEe arm above pops it). This is how
+                ; `&lt;` inside an attribute value becomes a literal `<`.
+                if ps.get_current_dtd() = null
+                {
+                    this.err(2)
+                    set ok: false
+                    set running: false
+                }
+                else
+                    this.parse_entity_reference()
+            }
+            else if (token = tokenCroDigit) or (token = tokenHcroHexDigit)
+            {
+                var ch: u32 0
+                if this.parse_numeric_char_ref(&ch)
+                    buf.add(ch)
+                else
+                {
+                    this.err(2)
+                    set ok: false
+                    set running: false
+                }
+            }
+            else if (token = tokenCroNameStart) or (token = tokenPeroNameStart)
+            {
+                ; DEFERRED: named char refs / parameter-entity refs inside literals.
                 this.err(2)
                 set ok: false
                 set running: false
@@ -2091,8 +2118,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
         if parm.kind = P_MDC
         {
+            ; the entity is referenced LATER: pin its system/public id to the run
+            ; page (ExternalId.make) — `id` still points into the literal buffer
+            ; the next declaration reuses.
+            let hid ExternalId.make(host, id)
             let ent host.allocate(sizeof Entity, alignof Entity) as pointer[Entity]
-            set *ent: Entity.ExternalText(ExternalTextEntity(name, id))
+            set *ent: Entity.ExternalText(ExternalTextEntity(name, *hid))
             this.maybe_define_entity(ent, is_parameter)
             return true
         }
@@ -3169,10 +3200,17 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     }
 
     ; parseEntityReference (parseCommon.cxx, scoped): `&name;` in content. Read the
-    ; entity name (NAMECASE ENTITY NO -> raw), consume the REFC, look it up, and —
-    ; for an internal text entity — push its replacement text as a new input source
-    ; (contentReference -> InternalInputSource). External / char-data / undefined
-    ; entities (createUndefinedEntity + diagnostics) are deferred.
+    ; entity name (NAMECASE ENTITY NO -> raw), consume the REFC, look it up, and
+    ; push its text as a new input source (contentReference -> normalReference):
+    ; an internal entity stacks its replacement text, an external text entity is
+    ; opened from disk. Char-data (CDATA/SDATA/NDATA/subdoc) entities emit events
+    ; instead of stacking and are deferred.
+    ;
+    ; Entity::checkEntlvl + checkNotOpen guard the two ways a reference can fail to
+    ; terminate: nesting deeper than ENTLVL, and an entity that (transitively)
+    ; references itself — the latter is caught by identity against the open input
+    ; stack (ParserState.entity_is_open), so the entity's decl travels in the
+    ; source's Origin.
     function parse_entity_reference(this: Parser) returns bool
     {
         let ins ps.current_input()
@@ -3185,20 +3223,60 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; consume the REFC (`;`) or record-end that terminates the reference.
         let refc ps.get_token(refMode)
         if ent = null
+        {
+            ; entityUndefined: not declared and no default entity. onsgmls reports
+            ; it (exit 1) but keeps parsing, dropping the reference.
+            if ps.get_sd().implydef_entity() = false
+                this.err(86)
             return true
+        }
+
+        ; checkEntlvl: nesting deeper than ENTLVL is a diagnostic only — the entity
+        ; is still stacked (C++ Entity::checkEntlvl messages and falls through; the
+        ; document entity is not counted). Recursion stays bounded by checkNotOpen,
+        ; which cannot let the same entity open twice.
+        let entlvl ps.get_syntax().get_quantity(qENTLVL)
+        if (ps.get_input_level() - (1 as u32)) = entlvl
+            this.err(82)
+        ; checkNotOpen: a recursive entity reference.
+        if ps.entity_is_open(ent as pointer[void])
+        {
+            this.err(83)
+            return true
+        }
+
+        let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+        set *org: Origin(start_loc, ent as pointer[void])
         choose *ent
             when i: Internal
             {
                 let itext i.get_text()
-                let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
-                set *org: Origin(start_loc)
                 let isrc host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
                 set *isrc: InputSource(org, itext.data_ptr(), itext.get_size())
                 ps.push_input(isrc)
             }
-            else
-                ; external / non-text entity in content: deferred.
-                this.err(0)
+            when e: ExternalText
+            {
+                ; ExternalTextEntity::normalReference — open the effective system
+                ; id (resolved against the document's directory) and stack it. An
+                ; external TEXT entity produces NO ESIS event: its content is
+                ; included inline (only external DATA entities emit `&name`).
+                let id e.get_external_id()
+                if id.has_system_id() = false
+                {
+                    ; nonExistentEntityRef (no system id to open).
+                    this.err(84)
+                    return true
+                }
+                let esrc this.open_external_text(id.get_system_id(), org)
+                if esrc = null
+                {
+                    ; the entity's file could not be opened.
+                    this.err(85)
+                    return true
+                }
+                ps.push_input(esrc)
+            }
         true
     }
 
@@ -3357,9 +3435,27 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; LINKTYPE, prolog PIs/comments, the startDtd/endProlog markup events.
 
     ; Build an InputSource from raw entity bytes: DECODE them as UTF-8 to Chars and
-    ; apply the `lf` record normalization (prepend one RS 0x0A, translate each LF
-    ; 0x0A to RE 0x0D), so declaration-subset whitespace tokenizes as separators.
-    ; The Char buffer lives on `host`.
+    ; apply the `lf` record normalization, so declaration-subset whitespace
+    ; tokenizes as separators. The Char buffer lives on `host`.
+    ;
+    ; RECORD NORMALIZATION (ExtendEntityManager.cxx, ExternalInputSource::fill +
+    ; init): a source's records are RS-delimited. `insertRS_` starts TRUE for EVERY
+    ; external input source — the document entity, the external DTD subset AND a
+    ; text entity included in content — and is re-armed after every record end, so
+    ; the Char stream is
+    ;
+    ;     RS line1 RE RS line2 RE RS line3 ...
+    ;
+    ; i.e. one RS (0x0A) before the first record, each source LF (0x0A) translated
+    ; to RE (0x0D), and one RS inserted before the NEXT char after each RE. A
+    ; pending RS at end of entity is dropped (fill returns eE without flushing it),
+    ; so a file ending in a newline ends with RE, not RE RS.
+    ;
+    ; The inserted RSs are load-bearing under KEEPRSRE YES (xml.dcl): RS and RE are
+    ; then ordinary DATA chars, and onsgmls prints them in ESIS as `\012` and `\n`
+    ; respectively (SgmlsEventHandler::outputString) — so `x<LF>y` in mixed content
+    ; is the data `x` RE RS `y`. Under KEEPRSRE NO they tokenize as tokenRs and the
+    ; OutputState machine drops them.
     ;
     ; onsgmls under SP_ENCODING=XML decodes EVERY entity as UTF-8 (XMLCodingSystem
     ; -> UTF8CodingSystem): a well-formed sequence yields its Char, a byte that
@@ -3374,11 +3470,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     function make_char_source(host: pointer[Page], bytes: String, org: pointer[Origin]) returns pointer[InputSource]
     {
         let n bytes.get_length()
-        ; upper bound: the RS + at most one Char per input byte (multibyte
-        ; sequences only ever shrink), + one slot of slack.
-        let buf host.allocate((n + (2 as size_t)) * (4 as size_t), 4) as pointer[u32]
-        set *(buf + (0 as size_t)): 0x0A as u32
-        var out: size_t 1
+        ; upper bound: at most one Char per input byte (multibyte sequences only
+        ; ever shrink) plus its inserted RS (an all-LF source doubles), + slack.
+        let buf host.allocate(((n * (2 as size_t)) + (2 as size_t)) * (4 as size_t), 4) as pointer[u32]
+        var out: size_t 0
+        ; the leading RS: armed at entity start, flushed before the first Char.
+        var pending_rs true
 
         var i: size_t 0
         ; strip a leading UTF-8 BOM (EF BB BF).
@@ -3459,8 +3556,20 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     }
                 }
             }
+            ; flush the RS armed by the entity start / the previous record end.
+            if pending_rs
+            {
+                set *(buf + out): 0x0A as u32
+                set out: out + (1 as size_t)
+                set pending_rs: false
+            }
+            ; an LF ends the record: it becomes RE and arms the next record's RS
+            ; (which stays unflushed — and so is dropped — at end of entity).
             if ch = (0x0A as u32)
+            {
                 set ch: 0x0D as u32
+                set pending_rs: true
+            }
             set *(buf + out): ch
             set out: out + (1 as size_t)
             set i: i + len
@@ -3485,6 +3594,46 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         Parser.make_char_source(host, bytes, org)
     }
 
+    ; EntityManager::open for an external TEXT entity: resolve its (relative)
+    ; system id against the document's base directory and decode the file into an
+    ; InputSource carrying `org` (whose entity_decl arms the recursion guard). The
+    ; SAME record normalization as the document entity applies — an included text
+    ; entity is an external input source like any other. Null if not readable.
+    function open_external_text(this: Parser, system_id: String, org: pointer[Origin]) returns pointer[InputSource]
+    {
+        let storage Storage.OsFile(ps.get_base_dir())
+        let bytes storage.read(system_id)
+        if bytes.get_length() = (0 as size_t)
+            return null
+        Parser.make_char_source(host, bytes, org)
+    }
+
+    ; ParserState::startDtd's PredefinedEntity loop: every entity the SGML
+    ; declaration's SYNTAX ENTITIES section names (xml.dcl: "amp" 38, "lt" 60,
+    ; "gt" 62, "quot" 34, "apos" 39) is inserted into the new DTD as an internal
+    ; text entity whose replacement text is that one Char. `&lt;` in content then
+    ; resolves through the ordinary entity path. The reference declaration names
+    ; none, so a catalog-less document is unaffected.
+    function insert_predefined_entities(this: Parser, dtd: pointer[Dtd])
+    {
+        let syn ps.get_syntax()
+        let n syn.n_entities()
+        var i: size_t 0
+        while i < n
+        {
+            var ch: u32 0
+            set ch: syn.entity_char(i)
+            let nm syn.entity_name(i)
+            let text StringC^host(&ch, 1 as size_t)
+            let iep InternalEntity.make(host, nm, text, DT_SGML)
+            let iev *iep
+            let ent host.allocate(sizeof Entity, alignof Entity) as pointer[Entity]
+            set *ent: Entity.Internal(iev)
+            dtd.insert_entity(ent, false, false)
+            set i: i + 1
+        }
+    }
+
     ; parseDoctypeDeclStart (scoped): name -> def/current Dtd; an optional external
     ; identifier (PUBLIC/SYSTEM), then the internal subset (`[ ... ]`), then the
     ; external subset (parsed AFTER the internal one — SGML order), then the MDC.
@@ -3499,6 +3648,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let dtd Dtd.make(host, docname, true)
         ps.set_def_dtd(dtd)
         ps.set_current_dtd(dtd)
+        this.insert_predefined_entities(dtd)
 
         let allow_ext AllowedParams.a4(host, P_DSO, P_MDC, P_RESERVED_NAME + R_SYSTEM, P_RESERVED_NAME + R_PUBLIC)
         if this.parse_param(allow_ext, decl_input_level, parm) = false
@@ -3649,6 +3799,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; A raw CR (0x0D) already IS the RE char and passes through. (crlf / cr-only
         ; record types are deferred; the corpus is LF.)
         let ps ParserState.make(host, null, 0 as u32, PHASE_PROLOG)
+        ; the document's directory: every relative SYSTEM id (external DTD subset,
+        ; external text entity in content) resolves against it.
+        ps.set_base_dir(base_dir)
 
         ; SGML declaration binding (onsgmls behavior): look for a `catalog` file
         ; in the document's directory; if it names an SGMLDECL, parse that
