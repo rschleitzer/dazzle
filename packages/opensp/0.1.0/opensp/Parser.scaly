@@ -1197,7 +1197,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 if (rn = R_PCDATA) and this.has_gt(allow, GT_PCDATA)
                 {
                     set gt.kind: GT_PCDATA
-                    set gt.content_token: ContentToken.make_leaf(host, null as pointer[ElementType], OI_NONE, true, false)
+                    ; PcdataToken() : LeafContentToken(0, rep) — pcdata is
+                    ; inherently optional AND repeatable (the self-loop that lets
+                    ; (#PCDATA) admit any run of data). OI_REP, never OI_NONE.
+                    set gt.content_token: ContentToken.make_leaf(host, null as pointer[ElementType], OI_REP, true, false)
                     return true
                 }
                 else
@@ -2280,9 +2283,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; in document order. Scoped to the well-formed, explicit-markup case that the
     ; simplest corpus models and the self-test exercise.
     ;
+    ; OMITTAG minimization (tryImplyTag imply loop — end- and start-tag omission)
+    ; landed Stage 4 Inc 4; the speculative Undo/eventList rollback is still
+    ; deferred (see try_imply_tag — unreachable for conforming documents).
     ; DEFERRED to later increments (each a distinct parseInstance.cxx region):
-    ;  - tag MINIMIZATION: OMITTAG (tryImplyTag imply loop), SHORTTAG empty
-    ;    start/end tags, NET, ranked elements, group tags.
+    ;  - tag MINIMIZATION: SHORTTAG empty start/end tags, NET, ranked elements,
+    ;    group tags; the tryImplyTag undo rollback for invalid documents.
     ;  - attribute-spec parsing in start tags (parseAttributeSpec); events carry
     ;    no attribute payload yet — a start tag with an attribute spec is left
     ;    unconsumed (ungetToken) for the attribute increment.
@@ -2533,6 +2539,56 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         this.accept_start_tag(e, event)
     }
 
+    ; tryImplyTag — one OMITTAG inference step at the current position. Either
+    ; implies an END tag (current element finished + its end tag omissible: emit
+    ; end, pop) or a START tag (a uniquely-required next element with an omissible
+    ; start tag: advance the parent cursor, push the implied element). Returns
+    ; true if a tag was implied (retry the pending token), false otherwise.
+    ;
+    ; SCOPE: events are queued DIRECTLY. The reference speculatively pushes onto
+    ; Undo/eventList lists and rolls back (undo) when the implied chain fails to
+    ; admit the pending token — that rollback is DEFERRED. It is unreachable for
+    ; a conforming document: every implied tag on valid content leads to a
+    ; successful transition, so nothing needs undoing. Invalid documents (whose
+    ; expected exit is non-zero) may therefore diverge until the undo lands.
+    function try_imply_tag(this: Parser, loc: Location, start_implied: pointer[u32]) returns bool
+    {
+        let cs ps.get_content_state()
+        let ce cs.current_element()
+        if ce.is_finished()
+        {
+            if cs.tag_level_of() = (0 as u32)
+                return false
+            let def ce.get_type().get_definition()
+            if def <> null
+                if def.can_omit_end_tag() = false
+                    return false
+            if *start_implied > (0 as u32)
+                set *start_implied: *start_implied - (1 as u32)
+            let e ce.get_type()
+            let endev Event.make_end(host, e, loc)
+            if ce.get_included()
+                endev.set_included()
+            ps.queue_event(endev)
+            ps.pop_element_mode()
+            return true
+        }
+        let e ce.implied_start_tag()
+        if e = null
+            return false
+        ce.do_required_transition()
+        ; (declared-content / canOmitStartTag / undefined diagnostics deferred)
+        let adl e.get_attribute_def()
+        let atts AttributeList.make(host, adl)
+        let ctx ps.get_attribute_context()
+        atts.finish(ctx)
+        set *start_implied: *start_implied + (1 as u32)
+        let stev Event.make_start(host, e, loc)
+        stev.set_attributes(atts)
+        this.push_element_check(e, stev)
+        true
+    }
+
     function accept_start_tag(this: Parser, e: pointer[ElementType], event: pointer[Event])
     {
         let cs ps.get_content_state()
@@ -2548,11 +2604,31 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             this.push_element_check(e, event)
             return
         }
-        ; Not allowed by the current content model. Minimization/tag-imply
-        ; recovery (tryImplyTag) is deferred; recover by forcing the transition
-        ; and pushing so parsing continues (the well-formed path never reaches
-        ; here). No diagnostic is raised yet (would perturb n_errors).
-        let discard ce.try_transition(e)
+        ; OMITTAG: imply end/start tags until e is admissible.
+        var start_implied: u32 0
+        var guard: int 0
+        while this.try_imply_tag(event.get_loc(), &start_implied)
+        {
+            let cei cs.current_element()
+            if cei.try_transition(e)
+            {
+                this.push_element_check(e, event)
+                return
+            }
+            if cs.element_is_included(e)
+            {
+                event.set_included()
+                this.push_element_check(e, event)
+                return
+            }
+            set guard: guard + 1
+            if guard > 100
+                return
+        }
+        ; Not admissible even after minimization. Recover by forcing the
+        ; transition and pushing so parsing continues. Diagnostic deferred.
+        let ce3 cs.current_element()
+        let discard ce3.try_transition(e)
         this.push_element_check(e, event)
     }
 
@@ -2595,6 +2671,21 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         Event.make_end(host, e, loc)
     }
 
+    ; implyCurrentElementEnd — emit an implied end for the current element and
+    ; pop it (used when an end tag or document end closes elements above it whose
+    ; own end tags were omitted). omitEndTag diagnostics deferred.
+    function imply_current_element_end(this: Parser, loc: Location)
+    {
+        let cs ps.get_content_state()
+        let ce cs.current_element()
+        let e ce.get_type()
+        let endev Event.make_end(host, e, loc)
+        if ce.get_included()
+            endev.set_included()
+        ps.queue_event(endev)
+        ps.pop_element_mode()
+    }
+
     function accept_end_tag(this: Parser, event: pointer[Event])
     {
         if event = null
@@ -2603,31 +2694,57 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let cs ps.get_content_state()
         if cs.element_is_open(e) = false
             return
-        let ce cs.current_element()
-        let cur ce.get_type()
-        if cur = e
+        ; Close intervening open elements (OMITTAG end-tag omission) until the
+        ; current element is the one this end tag names.
+        var guard: int 0
+        var running true
+        while running
         {
-            ps.queue_event(event)
-            ps.pop_element_mode()
+            let ce cs.current_element()
+            if ce.get_type() = e
+                set running: false
+            else
+            {
+                this.imply_current_element_end(event.get_loc())
+                set guard: guard + 1
+                if guard > 100000
+                    return
+            }
         }
-        ; else: an end tag for an open but non-current element (needs implied
-        ; end tags for the elements above it) — the minimization increment.
+        let cef cs.current_element()
+        if cef.get_included()
+            event.set_included()
+        ps.queue_event(event)
+        ps.pop_element_mode()
     }
 
-    function accept_pcdata(this: Parser)
+    function accept_pcdata(this: Parser, loc: Location)
     {
         let cs ps.get_content_state()
         let ce cs.current_element()
-        let discard ce.try_transition_pcdata()
-        ; pcdataRecover (mode switch to mconMode + recovery) deferred.
+        if ce.try_transition_pcdata()
+            return
+        ; OMITTAG: imply end/start tags until #PCDATA is admissible.
+        var start_implied: u32 0
+        var guard: int 0
+        while this.try_imply_tag(loc, &start_implied)
+        {
+            let cei cs.current_element()
+            if cei.try_transition_pcdata()
+                return
+            set guard: guard + 1
+            if guard > 100
+                return
+        }
+        ; pcdataNotAllowed diagnostic + pcdataRecover deferred.
     }
 
     function parse_pcdata(this: Parser)
     {
-        this.accept_pcdata()
         let ins ps.current_input()
         let ts ins.current_token_string()
         let loc ps.current_location()
+        this.accept_pcdata(loc)
         let ev Event.make_data(host, ts, loc)
         ps.queue_event(ev)
     }
