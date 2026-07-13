@@ -27,6 +27,7 @@ use opensp.Entity.Entity
 use opensp.Entity.InternalEntity
 use opensp.Entity.ExternalTextEntity
 use opensp.ExternalId.ExternalId
+use opensp.Storage.Storage
 use opensp.ShortReferenceMap.ShortReferenceMap
 use opensp.ParserState.ParserState
 use opensp.ContentState.ContentState
@@ -365,6 +366,15 @@ define AllowedParams
         a.allow(p3)
         a
     }
+    function a4(host: pointer[Page], p1: int, p2: int, p3: int, p4: int) returns pointer[AllowedParams]
+    {
+        let a make(host)
+        a.allow(p1)
+        a.allow(p2)
+        a.allow(p3)
+        a.allow(p4)
+        a
+    }
     function a5(host: pointer[Page], p1: int, p2: int, p3: int, p4: int, p5: int) returns pointer[AllowedParams]
     {
         let a make(host)
@@ -607,15 +617,15 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let n buf.get_length()
         if n = (0 as size_t)
             return StringC()
-        let cb host.allocate(n * (4 as size_t), 4) as pointer[u32]
-        let src buf.get_buffer()
-        var i: size_t 0
-        while i < n
-        {
-            set *(cb + i): *(src + i)
-            set i: i + 1
-        }
-        StringC(cb, n)
+        ; Build the StringC page-resident on `host` (^host) so its init's
+        ; Page.get(this) resolves to a valid region page. Constructing it as a
+        ; by-VALUE return (StringC(cb, n)) instead puts `this` on a stack sret
+        ; slot whose Page.get masks to a bogus, per-call-IDENTICAL header — so
+        ; every literal's buffer aliased the same address (the Page.get-on-by-
+        ; value hazard). ^host copies buf into a fresh host buffer; *scp returns
+        ; the {data,size} value pointing at it.
+        let scp StringC^host(buf.get_buffer(), n)
+        *scp
     }
 
     ; StringC (u32 content) -> byte String (ASCII narrowing for external ids).
@@ -1026,7 +1036,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     {
         this.extend_name_token(this.namelen())
         set parm.kind: P_ATTRIBUTEVALUE
-        let sc ps.current_token()
+        ; Copy the token onto the stable run region (^host), not the transient
+        ; caller page: a default attribute value parsed here is stored in the DTD
+        ; and read back at instance time, long after this DTD-parsing frame's
+        ; region is reclaimed — ps.current_token() alone would dangle.
+        let sc ps.current_token^host()
         let txt host.allocate(sizeof Text, alignof Text) as pointer[Text]
         set *txt: Text(sc)
         set parm.literal_text: txt
@@ -1929,7 +1943,24 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     {
         if dv.tokenized() = false
             return AttributeValue.make_cdata(host, text)
-        ; tokenized: record the single-space separator positions.
+        ; tokenized: NAMECASE-fold the value (general subst — TokenizedDeclaredValue
+        ; ::makeTokenizedValue), then record the single-space separator positions.
+        ; A default/fixed value is built here (not through set_value), so its fold
+        ; happens here (e.g. an enumerated default `a` -> `A`).
+        let raw text.string()
+        let rn raw.get_size()
+        if rn > (0 as size_t)
+        {
+            let syn ps.get_syntax()
+            let fbuf host.allocate(rn * (4 as size_t), 4) as pointer[u32]
+            var fi: size_t 0
+            while fi < rn
+            {
+                set *(fbuf + fi): syn.fold(raw.get(fi))
+                set fi: fi + 1
+            }
+            set *text: Text(StringC^host(fbuf, rn))
+        }
         let sc text.string()
         let n sc.get_size()
         let space_index Array[size_t]^host()
@@ -2152,10 +2183,75 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         true
     }
 
+    ; parseComment (parseCommon.cxx): read a comment body up to the closing COM
+    ; (`--`). The markup capture is not wanted for ESIS; just consume the chars.
+    ; tokenEe inside a comment is an error.
+    function parse_comment(this: Parser, mode: int) returns bool
+    {
+        var running true
+        var ok true
+        while running
+        {
+            let token ps.get_token(mode)
+            if token = tokenCom
+                set running: false
+            else if token = tokenEe
+            {
+                this.err(0)
+                set ok: false
+                set running: false
+            }
+            ; else: a comment character (already consumed by get_token) — continue
+        }
+        ok
+    }
+
+    ; parseCommentDecl (parseDecl.cxx): a `<!-- ... -->` comment declaration. The
+    ; opening MDO+COM (tokenMdoCom `<!--`) is already consumed; read the first
+    ; comment body, then in mdMode allow whitespace / further comments before the
+    ; closing MDC (`>`).
+    function parse_comment_decl(this: Parser) returns bool
+    {
+        if this.parse_comment(comMode) = false
+            return false
+        var running true
+        var ok true
+        while running
+        {
+            let token ps.get_token(mdMode)
+            if token = tokenS
+            {
+                ; whitespace between comments / before the MDC: skip
+            }
+            else if token = tokenCom
+            {
+                if this.parse_comment(comMode) = false
+                {
+                    set ok: false
+                    set running: false
+                }
+            }
+            else if token = tokenMdc
+                set running: false
+            else
+            {
+                ; tokenEe or an invalid token in a comment declaration.
+                this.err(0)
+                set ok: false
+                set running: false
+            }
+        }
+        ok
+    }
+
     ; ---- doDeclSubset (scoped driver) -------------------------------------
-    ; Returns 0 at end of subset. Comments / PIs / PE-refs / marked sections
-    ; recover rather than resolving (deferred).
-    function parse_decl_subset(this: Parser) returns int
+    ; Drives a declaration subset (internal or external). `subset_level` is the
+    ; input level the subset itself occupies (1 for the document's internal
+    ; subset; the pushed entity's level for an external subset); an end-of-entity
+    ; that pops BELOW that level ends the subset. `external` selects the external
+    ; subset's termination (end-of-entity, no DSC). Returns 0 at end of subset.
+    ; PIs / PE-refs / marked sections recover rather than resolving (deferred).
+    function parse_decl_subset(this: Parser, subset_level: u32, external: bool) returns int
     {
         ps.set_current_mode(dsMode)
         var running true
@@ -2166,16 +2262,25 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             let start_level ps.get_input_level()
             if token = tokenEe
             {
-                if ps.get_input_level() = (1 as u32)
-                {
-                    ps.pop_input_stack()
+                ; end of an entity: pop it. When we drop below the subset's own
+                ; level the subset is finished (an external subset ends here; a
+                ; nested parameter entity just returns to the subset).
+                ps.pop_input_stack()
+                if ps.get_input_level() < subset_level
                     set running: false
-                }
-                else
-                    ps.pop_input_stack()
             }
             else if token = tokenDsc
-                set running: false
+            {
+                if external
+                    this.decl_subset_recover(start_level)
+                else
+                    set running: false
+            }
+            else if token = tokenMdoCom
+            {
+                if this.parse_comment_decl() = false
+                    this.decl_subset_recover(start_level)
+            }
             else if token = tokenMdoNameStart
             {
                 var decl_name: int 0
@@ -2902,6 +3007,32 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         true
     }
 
+    ; parseNumericCharRef (parseCommon.cxx, scoped): a decimal `&#NN;` reference
+    ; in content -> the referenced Char (returned via out_ch). discard_initial
+    ; drops the CRO; extend_number grows the digits; the digits fold to a value;
+    ; the REFC (`;`) or record-end terminating the reference is consumed. HEX
+    ; refs (`&#xNN;`), charset/non-SGML validation and the markup capture are
+    ; deferred (the corpus's char refs are decimal into ASCII, e.g. `&#60;`=`<`).
+    function parse_numeric_char_ref(this: Parser, out_ch: pointer[u32]) returns bool
+    {
+        let ins ps.current_input()
+        ins.discard_initial()
+        this.extend_number(this.namelen())
+        let tok ps.current_token()
+        let n tok.get_size()
+        var c: u32 0
+        var i: size_t 0
+        while i < n
+        {
+            let d tok.get(i) - (0x30 as u32)
+            set c: c * (10 as u32) + d
+            set i: i + 1
+        }
+        set *out_ch: c
+        let refc ps.get_token(refMode)
+        true
+    }
+
     ; doContent — the instance token-dispatch loop (well-formed subset).
     function do_content(this: Parser)
     {
@@ -2921,6 +3052,19 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if (token = tokenEroNameStart) or (token = tokenEroGrpo)
                 this.parse_entity_reference()
+            else if (token = tokenCroDigit) or (token = tokenHcroHexDigit)
+            {
+                let loc ps.current_location()
+                var ch: u32 0
+                if this.parse_numeric_char_ref(&ch)
+                {
+                    this.accept_pcdata(loc)
+                    ps.note_data()
+                    let scp StringC^host(&ch, 1 as size_t)
+                    let cev Event.make_data(host, *scp, loc)
+                    ps.queue_event(cev)
+                }
+            }
             else if token = tokenStagoNameStart
                 this.parse_start_tag()
             else if token = tokenEtagoNameStart
@@ -3001,21 +3145,63 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     }
 
     ; ======================================================================
-    ; Prolog + full-document driver — Stage 4, Increment 3.
+    ; Prolog + full-document driver — Stage 4, Increment 3 (external subset: 6).
     ;
     ; A SCOPED port of doProlog + parseDoctypeDeclStart (Parser.cs): drives the
     ; document from the first token through the DOCTYPE declaration into content
-    ; parsing, so a whole SGML document (one InputSource) parses end-to-end and
-    ; the event queue feeds the ESIS writer (Esis.write) — the tests/sgml corpus
-    ; harness. Scoped to an INTERNAL DTD subset (`<!DOCTYPE name [ ... ]>`):
+    ; parsing, so a whole SGML document parses end-to-end and the event queue
+    ; feeds the ESIS writer (Esis.write) — the tests/sgml corpus harness. Handles
+    ; both an INTERNAL DTD subset (`<!DOCTYPE name [ ... ]>`) and an EXTERNAL one
+    ; (`<!DOCTYPE name SYSTEM "sub.dtd">` / `PUBLIC "..." "sub.dtd"`), resolved
+    ; relative to the document's base directory.
     ;
-    ; DEFERRED: PUBLIC/SYSTEM external subset + catalog (needs generateSystemId /
-    ; EntityManager drive), an implied DTD from the first start tag (implyDtd),
+    ; DEFERRED: catalog resolution of a PUBLIC id with no system id
+    ; (generateSystemId), an implied DTD from the first start tag (implyDtd),
     ; LINKTYPE, prolog PIs/comments, the startDtd/endProlog markup events.
 
-    ; parseDoctypeDeclStart (scoped): name -> def/current Dtd; then the internal
-    ; subset (DSO -> parse_decl_subset -> MDC) or an empty DTD (MDC directly).
-    function parse_doctype_decl_start(this: Parser) returns bool
+    ; Build an InputSource from raw entity bytes: ASCII/identity-widen to Char and
+    ; apply the `lf` record normalization (prepend one RS 0x0A, translate each LF
+    ; 0x0A to RE 0x0D) exactly as the document entity, so declaration-subset
+    ; whitespace tokenizes as separators. The Char buffer lives on `host`.
+    function make_char_source(host: pointer[Page], bytes: String, org: pointer[Origin]) returns pointer[InputSource]
+    {
+        let n bytes.get_length()
+        let nb n + (1 as size_t)
+        let buf host.allocate(nb * (4 as size_t), 4) as pointer[u32]
+        set *(buf + (0 as size_t)): 0x0A as u32
+        var ci: size_t 0
+        while ci < n
+        {
+            let b bytes.get(ci) as u32
+            var ch b
+            if b = (0x0A as u32)
+                set ch: 0x0D as u32
+            set *(buf + (ci + (1 as size_t))): ch
+            set ci: ci + 1
+        }
+        let src host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
+        set *src: InputSource(org, buf, nb)
+        src
+    }
+
+    ; Load an external DTD subset named by a system id, resolved relative to the
+    ; document's base directory (Storage.OsFile), into an InputSource (not yet
+    ; pushed). Returns null if the file is missing / empty.
+    function load_external_subset(this: Parser, base_dir: String, system_id: String) returns pointer[InputSource]
+    {
+        let storage Storage.OsFile(base_dir)
+        let bytes storage.read(system_id)
+        if bytes.get_length() = (0 as size_t)
+            return null
+        let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+        set *org: Origin()
+        Parser.make_char_source(host, bytes, org)
+    }
+
+    ; parseDoctypeDeclStart (scoped): name -> def/current Dtd; an optional external
+    ; identifier (PUBLIC/SYSTEM), then the internal subset (`[ ... ]`), then the
+    ; external subset (parsed AFTER the internal one — SGML order), then the MDC.
+    function parse_doctype_decl_start(this: Parser, base_dir: String) returns bool
     {
         let decl_input_level ps.get_input_level()
         let parm Param.make(host)
@@ -3027,36 +3213,68 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.set_def_dtd(dtd)
         ps.set_current_dtd(dtd)
 
-        let allow_ext AllowedParams.a3(host, P_DSO, P_MDC, P_RESERVED_NAME + R_SYSTEM)
+        let allow_ext AllowedParams.a4(host, P_DSO, P_MDC, P_RESERVED_NAME + R_SYSTEM, P_RESERVED_NAME + R_PUBLIC)
         if this.parse_param(allow_ext, decl_input_level, parm) = false
             return false
 
+        ; ---- external identifier (PUBLIC/SYSTEM), if present ----
+        var ext_src: pointer[InputSource] null
+        if (parm.kind = (P_RESERVED_NAME + R_SYSTEM)) or (parm.kind = (P_RESERVED_NAME + R_PUBLIC))
+        {
+            var id ExternalId()
+            let allow_sys AllowedParams.a3(host, P_SYSTEMIDENTIFIER, P_DSO, P_MDC)
+            let allow_end AllowedParams.a2(host, P_DSO, P_MDC)
+            if this.parse_external_id(allow_sys, allow_end, decl_input_level, parm, &id) = false
+                return false
+            if id.has_system_id()
+            {
+                set ext_src: this.load_external_subset(base_dir, id.get_system_id())
+                if ext_src = null
+                {
+                    ; the external subset file could not be opened.
+                    this.err(80)
+                    return false
+                }
+            }
+            ; parm.kind is now P_DSO or P_MDC (the end token).
+        }
+
+        ps.set_phase(PHASE_DECL_SUBSET)
+
+        ; ---- internal subset (`[ ... ]`), if a DSO opened it ----
+        var has_internal false
         if parm.kind = P_DSO
         {
-            ps.set_phase(PHASE_DECL_SUBSET)
-            let rc this.parse_decl_subset()
+            let inner_level ps.get_input_level()
+            let rc this.parse_decl_subset(inner_level, false)
             if rc <> 0
                 return false
-            ; the DSC (`]`) is consumed; the MDC (`>`) closes the declaration.
+            set has_internal: true
+        }
+
+        ; ---- external subset, parsed AFTER the internal subset (SGML order) ----
+        if ext_src <> null
+        {
+            ps.push_input(ext_src)
+            let ext_level ps.get_input_level()
+            this.parse_decl_subset(ext_level, true)
+        }
+
+        ; ---- the closing MDC ----
+        ; In the MDC-only case (no internal subset) the MDC was already consumed
+        ; by allow_ext / parse_external_id; otherwise it follows the DSC.
+        if has_internal
+        {
             let allow_mdc AllowedParams.a1(host, P_MDC)
             if this.parse_param(allow_mdc, decl_input_level, parm) = false
                 return false
-            return true
         }
-        else if parm.kind = P_MDC
-            ; empty DTD (no declaration subset).
-            return true
-        else
-        {
-            ; PUBLIC/SYSTEM external subset — deferred.
-            this.err(80)
-            return false
-        }
+        true
     }
 
     ; doProlog (scoped): skip separators, dispatch the DOCTYPE declaration, and
     ; leave the input positioned at the first instance token.
-    function parse_prolog(this: Parser) returns bool
+    function parse_prolog(this: Parser, base_dir: String) returns bool
     {
         ps.set_current_mode(proMode)
         ps.set_phase(PHASE_PROLOG)
@@ -3083,7 +3301,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else if decl_name = R_DOCTYPE
                 {
-                    set ok: this.parse_doctype_decl_start()
+                    set ok: this.parse_doctype_decl_start(base_dir)
                     set running: false
                 }
                 else
@@ -3113,9 +3331,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; The caller installs the prolog/decl recognizers (install_recognizers) and
     ; pushes the document InputSource; parse_document adds the content-mode
     ; recognizers, enters the instance, and runs doContent over the SAME input.
-    function parse_document(this: Parser, table: pointer[Array[PackedTokenInfo]]) returns bool
+    function parse_document(this: Parser, table: pointer[Array[PackedTokenInfo]], base_dir: String) returns bool
     {
-        if this.parse_prolog() = false
+        if this.parse_prolog(base_dir) = false
             return false
         let dtd ps.get_current_dtd()
         if dtd = null
@@ -3131,8 +3349,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; input bytes to Char (identity/ASCII), set up ParserState (reference Sd +
     ; Syntax), drive parse_document, and return the ESIS text. *out_conforming
     ; is true iff the parse produced no errors (the onsgmls exit-0 condition).
-    ; A concept STATIC so a user program resolves it across packages.
-    function parse_to_esis(host: pointer[Page], doc_bytes: String, out_conforming: pointer[bool]) returns String
+    ; A concept STATIC so a user program resolves it across packages. `base_dir`
+    ; is the document's directory — external DTD subsets (SYSTEM/PUBLIC) resolve
+    ; their (relative) system ids against it.
+    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, out_conforming: pointer[bool]) returns String
     {
         ; Record normalization (ExtendEntityManager, `lf` record type — the whole
         ; Unix corpus): insert one RS (0x0A) at the entity start, and translate
@@ -3141,21 +3361,6 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; leading RS + declaration-subset newlines are separators in prolog modes.
         ; A raw CR (0x0D) already IS the RE char and passes through. (crlf / cr-only
         ; record types are deferred; the corpus is LF.)
-        let n doc_bytes.get_length()
-        let nb n + (1 as size_t)
-        let buf host.allocate(nb * (4 as size_t), 4) as pointer[u32]
-        set *(buf + (0 as size_t)): 0x0A as u32
-        var ci: size_t 0
-        while ci < n
-        {
-            let b doc_bytes.get(ci) as u32
-            var ch b
-            if b = (0x0A as u32)
-                set ch: 0x0D as u32
-            set *(buf + (ci + (1 as size_t))): ch
-            set ci: ci + 1
-        }
-
         let ps ParserState.make(host, null, 0 as u32, PHASE_PROLOG)
         let sd host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
         set *sd: Sd()
@@ -3169,11 +3374,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
         let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
         set *org: Origin()
-        let src host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
-        set *src: InputSource(org, buf, nb)
+        let src Parser.make_char_source(host, doc_bytes, org)
         ps.push_input(src)
 
-        let ok parser.parse_document(table)
+        let ok parser.parse_document(table, base_dir)
         set *out_conforming: ok and (ps.get_n_errors() = (0 as u32))
         Esis.write(host, ps)
     }
@@ -3226,8 +3430,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         set *src: InputSource(org, buf, n)
         ps.push_input(src)
 
-        ; --- drive the declaration-subset parser ---
-        let rc parser.parse_decl_subset()
+        ; --- drive the declaration-subset parser (internal subset at level 1) ---
+        let rc parser.parse_decl_subset(1 as u32, false)
         if rc <> 0
             return -1
         if ps.get_n_errors() <> (0 as u32)
@@ -3459,7 +3663,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         set *src: InputSource(org, buf, n)
         ps.push_input(src)
 
-        if parser.parse_document(table) = false
+        if parser.parse_document(table, String()) = false
             return -60
 
         let got Esis.write(host, ps)
