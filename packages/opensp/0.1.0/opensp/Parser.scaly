@@ -116,6 +116,13 @@ define P_RESERVED_NAME: int 21
 define N_NAMES: int 58
 define P_INDICATED_RESERVED_NAME: int 79
 
+; MarkedSectionEvent::Status (parseDecl.cxx) — ordered so the parser can take the
+; MAX status seen across the keyword list (include < cdata < rcdata < ignore).
+define MS_INCLUDE: int 0
+define MS_CDATA: int 1
+define MS_RCDATA: int 2
+define MS_IGNORE: int 3
+
 ; Syntax.ReservedName (rALL..rUSEMAP).
 define R_ALL: int 0
 define R_ANY: int 1
@@ -2018,12 +2025,16 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
         let lt parm.literal_text
         let text_sc lt.string()
+        ; DEEP-COPY the replacement text onto the host page — like the name — so it
+        ; does not alias the transient literal buffer (which later parsing reuses;
+        ; a shallow store corrupted it to a later token by reference time).
+        set iep.text: StringC^host(text_sc.data_ptr(), text_sc.get_size())
 
         let allow_mdc AllowedParams.a1(host, P_MDC)
         if this.parse_param(allow_mdc, decl_input_level, parm) = false
             return false
 
-        set iep.text: text_sc
+        set iep.data_type: data_type
         set iep.data_type: data_type
         let ent host.allocate(sizeof Entity, alignof Entity) as pointer[Entity]
         let iev *iep
@@ -2566,6 +2577,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             if *start_implied > (0 as u32)
                 set *start_implied: *start_implied - (1 as u32)
             let e ce.get_type()
+            ps.note_end_element(ce.get_included())
             let endev Event.make_end(host, e, loc)
             if ce.get_included()
                 endev.set_included()
@@ -2634,9 +2646,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
     function push_element_check(this: Parser, e: pointer[ElementType], event: pointer[Event])
     {
+        ps.note_start_element(event.is_included())
         if this.must_omit_end(e)
         {
             ; EMPTY element: emit start immediately followed by an implied end.
+            ps.note_end_element(event.is_included())
             ps.queue_event(event)
             let endev Event.make_end(host, e, event.get_loc())
             if event.is_included()
@@ -2679,6 +2693,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let cs ps.get_content_state()
         let ce cs.current_element()
         let e ce.get_type()
+        ps.note_end_element(ce.get_included())
         let endev Event.make_end(host, e, loc)
         if ce.get_included()
             endev.set_included()
@@ -2714,6 +2729,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let cef cs.current_element()
         if cef.get_included()
             event.set_included()
+        ps.note_end_element(event.is_included())
         ps.queue_event(event)
         ps.pop_element_mode()
     }
@@ -2745,6 +2761,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let ts ins.current_token_string()
         let loc ps.current_location()
         this.accept_pcdata(loc)
+        ps.note_data()
         let ev Event.make_data(host, ts, loc)
         ps.queue_event(ev)
     }
@@ -2761,6 +2778,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 let ce cs.current_element()
                 let e ce.get_type()
+                ps.note_end_element(ce.get_included())
                 let ev Event.make_end(host, e, ps.current_location())
                 ps.queue_event(ev)
                 ps.pop_element_mode()
@@ -2773,6 +2791,115 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         this.end_all_elements()
         ; checkIdrefs + unclosed-marked-section cleanup deferred.
         ps.pop_input_stack()
+    }
+
+    ; parseMarkedSectionDeclStart (parseDecl.cxx) — after tokenMdoDso, read the
+    ; status keywords up to the DSO that opens the section body, then enter the
+    ; section: INCLUDE parses normally; CDATA/RCDATA/IGNORE switch to a special
+    ; parse mode until the matching `]]>` (handleMarkedSectionEnd). A `<![` nested
+    ; inside an already-special (ignored) section is itself ignored content.
+    function parse_marked_section_decl_start(this: Parser) returns bool
+    {
+        if ps.get_marked_section_special_level() > (0 as u32)
+        {
+            ps.start_marked_section()
+            return true
+        }
+        let decl_input_level ps.get_input_level()
+        let parm Param.make(host)
+        var codes int[6]
+        let cp codes as pointer[int]
+        set *(cp + (0 as size_t)): P_DSO
+        set *(cp + (1 as size_t)): P_RESERVED_NAME + R_CDATA
+        set *(cp + (2 as size_t)): P_RESERVED_NAME + R_RCDATA
+        set *(cp + (3 as size_t)): P_RESERVED_NAME + R_IGNORE
+        set *(cp + (4 as size_t)): P_RESERVED_NAME + R_INCLUDE
+        set *(cp + (5 as size_t)): P_RESERVED_NAME + R_TEMP
+        let allow AllowedParams.an(host, cp, 6)
+        if this.parse_param(allow, decl_input_level, parm) = false
+            return false
+        var status: int MS_INCLUDE
+        var running true
+        while running
+        {
+            if parm.kind = P_DSO
+                set running: false
+            else
+            {
+                if parm.kind = (P_RESERVED_NAME + R_CDATA)
+                {
+                    if status < MS_CDATA
+                        set status: MS_CDATA
+                }
+                else if parm.kind = (P_RESERVED_NAME + R_RCDATA)
+                {
+                    if status < MS_RCDATA
+                        set status: MS_RCDATA
+                }
+                else if parm.kind = (P_RESERVED_NAME + R_IGNORE)
+                {
+                    if status < MS_IGNORE
+                        set status: MS_IGNORE
+                }
+                ; INCLUDE / TEMP: no status bump (include is the minimum).
+                if this.parse_param(allow, decl_input_level, parm) = false
+                    return false
+            }
+        }
+        if status = MS_INCLUDE
+            ps.start_marked_section()
+        else if status = MS_CDATA
+            ps.start_special_marked_section(cmsMode)
+        else if status = MS_RCDATA
+            ps.start_special_marked_section(rcmsMode)
+        else
+            ps.start_special_marked_section(imsMode)
+        true
+    }
+
+    ; handleMarkedSectionEnd (parseDecl.cxx) — a `]]>`: close the innermost open
+    ; marked section (the state machine restores the enclosing mode). The markup /
+    ; ignored-chars events are not wanted for ESIS.
+    function handle_marked_section_end(this: Parser)
+    {
+        if ps.get_marked_section_level() = (0 as u32)
+            this.err(0)
+        else
+            ps.end_marked_section()
+    }
+
+    ; parseEntityReference (parseCommon.cxx, scoped): `&name;` in content. Read the
+    ; entity name (NAMECASE ENTITY NO -> raw), consume the REFC, look it up, and —
+    ; for an internal text entity — push its replacement text as a new input source
+    ; (contentReference -> InternalInputSource). External / char-data / undefined
+    ; entities (createUndefinedEntity + diagnostics) are deferred.
+    function parse_entity_reference(this: Parser) returns bool
+    {
+        let ins ps.current_input()
+        let start_loc ps.current_location()
+        ins.discard_initial()
+        this.extend_name_token(this.namelen())
+        let name ps.current_token^host()
+        let dtd ps.get_current_dtd()
+        var ent dtd.lookup_entity(false, name)
+        ; consume the REFC (`;`) or record-end that terminates the reference.
+        let refc ps.get_token(refMode)
+        if ent = null
+            return true
+        choose *ent
+            when i: Internal
+            {
+                let itext i.get_text()
+                let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+                set *org: Origin(start_loc)
+                let isrc host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
+                set *isrc: InputSource(org, itext.data_ptr(), itext.get_size())
+                ps.push_input(isrc)
+            }
+            else
+                ; external / non-text entity in content: deferred.
+                this.err(0)
+        true
     }
 
     ; doContent — the instance token-dispatch loop (well-formed subset).
@@ -2792,6 +2919,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 else
                     ps.pop_input_stack()
             }
+            else if (token = tokenEroNameStart) or (token = tokenEroGrpo)
+                this.parse_entity_reference()
             else if token = tokenStagoNameStart
                 this.parse_start_tag()
             else if token = tokenEtagoNameStart
@@ -2799,20 +2928,39 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 let ee this.parse_end_tag()
                 this.accept_end_tag(ee)
             }
+            else if token = tokenMdoDso
+            {
+                this.parse_marked_section_decl_start()
+                ps.note_markup()
+            }
+            else if token = tokenMscMdc
+            {
+                this.handle_marked_section_end()
+                ps.note_markup()
+            }
+            else if token = tokenRe
+            {
+                this.accept_pcdata(ps.current_location())
+                ps.queue_re()
+            }
+            else if token = tokenRs
+            {
+                this.accept_pcdata(ps.current_location())
+                ps.note_rs()
+            }
             else if token = tokenChar
                 this.parse_pcdata()
             else if token = tokenCharDelim
                 this.parse_pcdata()
+            else if token = tokenIgnoredChar
+                ; content of an IGNORE marked section: extend + discard.
+                set running: running
             else if token = tokenS
                 set running: running
-            else if token = tokenRe
-                set running: running
-            else if token = tokenRs
-                set running: running
             else
-                ; Unhandled token in this increment (references, PIs, comments,
-                ; marked sections, shortref, empty/net/group tags). Bail rather
-                ; than risk a non-advancing loop; later increments handle these.
+                ; Unhandled token in this increment (PIs, comments, shortref,
+                ; empty/net/group tags, char refs). Bail rather than risk a
+                ; non-advancing loop; later increments handle these.
                 set running: false
         }
     }
@@ -2824,7 +2972,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     {
         let sdv *ps.get_sd()
         let synv *ps.get_syntax()
-        var modes int[11]
+        var modes int[16]
         let mp modes as pointer[int]
         set *(mp + (0 as size_t)): econMode
         set *(mp + (1 as size_t)): econnetMode
@@ -2837,8 +2985,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         set *(mp + (8 as size_t)): alitaMode
         set *(mp + (9 as size_t)): talitMode
         set *(mp + (10 as size_t)): talitaMode
+        set *(mp + (11 as size_t)): imsMode
+        set *(mp + (12 as size_t)): cmsMode
+        set *(mp + (13 as size_t)): rcmsMode
+        set *(mp + (14 as size_t)): refMode
+        set *(mp + (15 as size_t)): rcconeMode
         var i: int 0
-        while i < 11
+        while i < 16
         {
             let m *(mp + (i as size_t))
             let r Recognizer.build_recognizer(host, m, sdv, synv, table)
@@ -2981,12 +3134,25 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; A concept STATIC so a user program resolves it across packages.
     function parse_to_esis(host: pointer[Page], doc_bytes: String, out_conforming: pointer[bool]) returns String
     {
+        ; Record normalization (ExtendEntityManager, `lf` record type — the whole
+        ; Unix corpus): insert one RS (0x0A) at the entity start, and translate
+        ; each source LF (0x0A) to RE (0x0D). Content newlines then tokenize as
+        ; tokenRe (record ends the OutputState machine shapes into data); the
+        ; leading RS + declaration-subset newlines are separators in prolog modes.
+        ; A raw CR (0x0D) already IS the RE char and passes through. (crlf / cr-only
+        ; record types are deferred; the corpus is LF.)
         let n doc_bytes.get_length()
-        let buf host.allocate(n * (4 as size_t), 4) as pointer[u32]
+        let nb n + (1 as size_t)
+        let buf host.allocate(nb * (4 as size_t), 4) as pointer[u32]
+        set *(buf + (0 as size_t)): 0x0A as u32
         var ci: size_t 0
         while ci < n
         {
-            set *(buf + ci): doc_bytes.get(ci) as u32
+            let b doc_bytes.get(ci) as u32
+            var ch b
+            if b = (0x0A as u32)
+                set ch: 0x0D as u32
+            set *(buf + (ci + (1 as size_t))): ch
             set ci: ci + 1
         }
 
@@ -3004,7 +3170,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
         set *org: Origin()
         let src host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
-        set *src: InputSource(org, buf, n)
+        set *src: InputSource(org, buf, nb)
         ps.push_input(src)
 
         let ok parser.parse_document(table)
