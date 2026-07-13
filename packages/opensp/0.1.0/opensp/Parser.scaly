@@ -457,6 +457,15 @@ define APT_NAMETOKEN: int 2
 define APT_VI: int 3
 define APT_RECOVER_UNQUOTED: int 4
 
+; ExternalInputSource::RecordType — how an entity's records are delimited. Detected
+; from its first CR/LF (make_char_source); see the record-normalization comment
+; there. `unknown`/`crUnknown` are the reference's streaming-only intermediates: a
+; whole-buffer source decides in one look.
+define RT_LF: int 0
+define RT_CRLF: int 1
+define RT_CR: int 2
+define RT_ASIS: int 3
+
 define Parser (host: pointer[Page], ps: pointer[ParserState])
 {
     function make(host: pointer[Page], ps: pointer[ParserState]) returns Parser
@@ -2572,19 +2581,48 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
     ; parseAttributeValueSpec — after a VI, resolve the attribute and read its
     ; value (quoted literal, or an unquoted name token via SHORTTAG).
-    function parse_attribute_value_spec(this: Parser, mode: int, name: StringC, atts: pointer[AttributeList], spec_length: pointer[size_t]) returns bool
+    ; `new_att_def` is the reference's `Ptr<AttributeDefinitionList> &newAttDef`:
+    ; null until an undeclared attribute forces a private, grown copy of the
+    ; element's definition list. It is threaded through the whole start tag (all
+    ; its undeclared attributes append to the same copy) and installed on the
+    ; element type by do_parse_start_tag.
+    function parse_attribute_value_spec(this: Parser, mode: int, name: StringC, atts: pointer[AttributeList], spec_length: pointer[size_t], new_att_def: pointer[pointer[AttributeDefinitionList]]) returns bool
     {
         var token ps.get_token(mode)
         while token = tokenS
             set token: ps.get_token(mode)
         let idx atts.attribute_index(name)
+        var index: size_t 0
         if idx < 0
         {
-            ; undeclared attribute / data-attribute path deferred.
-            this.err(0)
-            return false
+            ; An attribute no ATTLIST declares. Under IMPLYDEF ATTLIST (which
+            ; enableImplydef turns on for a document with no DOCTYPE) it is not an
+            ; error: it gets an implied CDATA definition appended to a COPY of the
+            ; element's definition list. Because the copy is installed on the
+            ; element type afterwards, a LATER occurrence of the same element finds
+            ; the attribute declared — and if that occurrence omits it, ESIS reports
+            ; `A <name> IMPLIED`, exactly as onsgmls does. (The data-attribute
+            ; branch — an undeclared attribute in a NOTATION's spec — is deferred.)
+            if ps.get_implydef_attlist() = false
+            {
+                ; noSuchAttribute
+                this.err(0)
+                return false
+            }
+            if *new_att_def = null
+            {
+                let cur atts.get_def()
+                set *new_att_def: AttributeDefinitionList.copy(host, cur)
+            }
+            let nad *new_att_def
+            let cdv DeclaredValue.make_cdata(host)
+            let nd AttributeDefinition.make_implied(host, name, cdv)
+            nad.append(nd)
+            atts.change_def(host, nad)
+            set index: atts.size() - (1 as size_t)
         }
-        let index idx as size_t
+        else
+            set index: idx as size_t
         let ctx ps.get_attribute_context()
         atts.set_spec(index, ctx)
         let text host.allocate(sizeof Text, alignof Text) as pointer[Text]
@@ -2660,7 +2698,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
     ; parseAttributeSpec — the attribute-spec loop: (name VI value)* up to the
     ; close delimiter, then finish the list (fill defaults).
-    function parse_attribute_spec(this: Parser, mode: int, atts: pointer[AttributeList], net: pointer[bool]) returns bool
+    function parse_attribute_spec(this: Parser, mode: int, atts: pointer[AttributeList], net: pointer[bool], new_att_def: pointer[pointer[AttributeDefinitionList]]) returns bool
     {
         var spec_length: size_t 0
         var cur_parm: int 0
@@ -2682,7 +2720,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else if cur_parm = APT_VI
                 {
-                    if this.parse_attribute_value_spec(mode, nm, atts, &spec_length) = false
+                    if this.parse_attribute_value_spec(mode, nm, atts, &spec_length, new_att_def) = false
                     {
                         set ok: false
                         set running: false
@@ -2755,14 +2793,25 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let atts AttributeList.make(host, adl)
         let ctx ps.get_attribute_context()
         var net false
+        ; grown by an undeclared attribute (IMPLYDEF ATTLIST) — see
+        ; parse_attribute_value_spec.
+        var new_att_def: pointer[AttributeDefinitionList] null
         let close_token ps.get_token(tagMode)
         if close_token = tokenTagc
             atts.finish(ctx)
         else
         {
             ins.unget_token()
-            let okatt this.parse_attribute_spec(tagMode, atts, &net)
+            let okatt this.parse_attribute_spec(tagMode, atts, &net, &new_att_def)
             ; parse_attribute_spec finishes the list (mirrors C++ parseAttributeSpec).
+        }
+        ; doParseStartTag: give the grown definition list its own DTD index and
+        ; install it on the element type, so it survives this start tag.
+        if new_att_def <> null
+        {
+            let didx dtd.alloc_attribute_definition_list_index()
+            new_att_def.set_index(didx)
+            e.set_attribute_def(new_att_def)
         }
         set *out_net: net
         let ev Event.make_start(host, e, loc)
@@ -3347,6 +3396,18 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 let ee this.parse_end_tag()
                 this.accept_end_tag(ee)
             }
+            else if token = tokenMdoCom
+            {
+                ; a comment declaration in the instance (doContent): markup, no
+                ; event — the data on either side of it is ONE data run.
+                this.parse_comment_decl()
+                ps.note_markup()
+            }
+            else if token = tokenMdoMdc
+            {
+                ; the empty comment declaration `<!>` (emptyCommentDecl).
+                ps.note_markup()
+            }
             else if token = tokenMdoDso
             {
                 this.parse_marked_section_decl_start()
@@ -3451,6 +3512,19 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; pending RS at end of entity is dropped (fill returns eE without flushing it),
     ; so a file ending in a newline ends with RE, not RE RS.
     ;
+    ; That is the `lf` RECORD TYPE. The reference DETECTS the type per entity from
+    ; its first CR/LF (recordType_ starts `unknown`), and the three types reach the
+    ; same RE-RS shape by different routes — note that RS *is* LF and RE *is* CR:
+    ;   lf     LF -> RE, an RS is INSERTED after it        (Unix)
+    ;   crlf   CR already IS the RE, LF already IS the RS  (Windows) — nothing is
+    ;          translated or inserted at all; a final LF at end of entity is dropped
+    ;          (the reference deletes the RS "not followed by anything"), so a CRLF
+    ;          file also ends with RE.
+    ;   cr     CR already IS the RE, an RS is INSERTED     (classic Mac)
+    ; A source with no CR and no LF at all is `asis`: no records, nothing inserted
+    ; but the leading RS. Getting this wrong on a CRLF file emits RE RE RS per line
+    ; (the CR passing through as a second record end).
+    ;
     ; The inserted RSs are load-bearing under KEEPRSRE YES (xml.dcl): RS and RE are
     ; then ordinary DATA chars, and onsgmls prints them in ESIS as `\012` and `\n`
     ; respectively (SgmlsEventHandler::outputString) — so `x<LF>y` in mixed content
@@ -3489,6 +3563,34 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                         set i: 3 as size_t
                 }
             }
+        }
+
+        ; recordType_: the first CR or LF in the entity decides it (CR and LF are
+        ; ASCII, so the raw bytes answer this — no multibyte sequence can hide one).
+        var rt: int RT_ASIS
+        var s i
+        while s < n
+        {
+            let b bytes.get(s) as u32
+            if b = (0x0A as u32)
+            {
+                set rt: RT_LF
+                set s: n
+            }
+            else if b = (0x0D as u32)
+            {
+                ; a CR with nothing after it is the reference's crUnknown -> cr.
+                set rt: RT_CR
+                if (s + (1 as size_t)) < n
+                {
+                    let b2 bytes.get(s + (1 as size_t)) as u32
+                    if b2 = (0x0A as u32)
+                        set rt: RT_CRLF
+                }
+                set s: n
+            }
+            else
+                set s: s + (1 as size_t)
         }
 
         while i < n
@@ -3563,16 +3665,37 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 set out: out + (1 as size_t)
                 set pending_rs: false
             }
-            ; an LF ends the record: it becomes RE and arms the next record's RS
-            ; (which stays unflushed — and so is dropped — at end of entity).
-            if ch = (0x0A as u32)
+            ; the record end, per record type. `lf`: the LF becomes RE and arms the
+            ; next record's RS (which stays unflushed — and so is dropped — at end
+            ; of entity). `cr`: the CR already IS the RE, it only arms the RS.
+            ; `crlf` / `asis`: nothing — CR and LF are already RE and RS.
+            if rt = RT_LF
             {
-                set ch: 0x0D as u32
-                set pending_rs: true
+                if ch = (0x0A as u32)
+                {
+                    set ch: 0x0D as u32
+                    set pending_rs: true
+                }
+            }
+            else if rt = RT_CR
+            {
+                if ch = (0x0D as u32)
+                    set pending_rs: true
             }
             set *(buf + out): ch
             set out: out + (1 as size_t)
             set i: i + len
+        }
+
+        ; crlf: "Need to delete final RS if not followed by anything" — a source
+        ; ending in CRLF ends with the RE, like every other record type.
+        if rt = RT_CRLF
+        {
+            if out > (0 as size_t)
+            {
+                if *(buf + (out - (1 as size_t))) = (0x0A as u32)
+                    set out: out - (1 as size_t)
+            }
         }
 
         let src host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
@@ -3709,6 +3832,119 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         true
     }
 
+    ; lookingAtStartTag (parseDecl.cxx) — "This is harder than might be expected
+    ; since we may not have compiled the recognizers for the instance yet": in the
+    ; prolog a start tag is NOT a token (proMode has no STAGO), so the unrecognized
+    ; token at the cursor is peeked by hand — does the input read STAGO followed by
+    ; a name-start character? If so the general identifier is collected (folded
+    ; through the instance syntax's substitution table, like every element name).
+    ; The scan cursor is left where the peek stopped; the caller ungets the token.
+    ; Returns the general identifier, EMPTY when the input is not a start tag (an
+    ; out-parameter would make the escape checker reject the store — the returned
+    ; StringC's characters live on `host`, but the checker is field-insensitive).
+    function looking_at_start_tag(this: Parser) returns StringC
+    {
+        let ins ps.current_input()
+        if ins = null
+            return StringC()
+        let syn ps.get_instance_syntax()
+        let dlen syn.delim_general_len(dSTAGO)
+        if dlen = (0 as size_t)
+            return StringC()
+        var i: size_t 0
+        while i < dlen
+        {
+            let c ins.token_char()
+            if c < 0
+                return StringC()
+            let f syn.fold(c as u32)
+            if f <> syn.delim_general_char(dSTAGO, i)
+                return StringC()
+            set i: i + 1
+        }
+        var c2 ins.token_char()
+        if c2 < 0
+            return StringC()
+        if syn.is_name_start_character(c2 as u32) = false
+            return StringC()
+        let buf Array[u32]^host()
+        var scanning true
+        while scanning
+        {
+            let f2 syn.fold(c2 as u32)
+            buf.add(f2)
+            set c2: ins.token_char()
+            if c2 < 0
+                set scanning: false
+            else if syn.is_name_character(c2 as u32) = false
+                set scanning: false
+        }
+        this.build_stringc(buf)
+    }
+
+    ; checkDtd (parseDecl.cxx), reduced to the half an implied DTD needs: every
+    ; element type that was only ever REFERENCED (no <!ELEMENT> declared it) gets
+    ; the undefined definition — ANY content, end tag omissible, undefined index —
+    ; so the content checker admits it instead of tripping over a null definition.
+    ; For an implied DTD that is exactly the document element. The shortref-map /
+    ; ID / notation checks of the full checkDtd land with their declarations.
+    function check_dtd(this: Parser, dtd: pointer[Dtd])
+    {
+        let allow_recursion ps.get_implydef_element() <> IMPLYDEF_ELEMENT_ANYOTHER
+        let n dtd.n_element_types()
+        var i: size_t 0
+        while i < n
+        {
+            let p dtd.get_element_type_at(i)
+            if p <> null
+            {
+                if p.get_definition() = null
+                {
+                    let loc ps.current_location()
+                    let def ElementDefinition.make(host, loc, ELEMENT_UNDEFINED_INDEX, OMIT_END, DC_ANY, allow_recursion)
+                    p.set_element_definition(def, 0 as size_t)
+                }
+            }
+            set i: i + 1
+        }
+    }
+
+    ; implyDtd (parseDecl.cxx) — the document has no document type declaration at
+    ; all: the first thing in the prolog is the document element's start tag.
+    ;
+    ; Two errors, in this order (both hard — the parse continues but the document
+    ; does NOT conform, so onsgmls exits 1 and writes no trailing `C`):
+    ;   omittedProlog  the prolog may only be omitted with CONCUR NO, LINK EXPLICIT
+    ;                  NO and IMPLYDEF ELEMENT or DOCTYPE YES. xml.dcl and the
+    ;                  reference declaration say IMPLYDEF NO -> always reported.
+    ;   noDtd          "no document type declaration; will parse without validation"
+    ;                  — the reference reaches it when the catalog has no DTD filed
+    ;                  under the document element's name. We do not wire that
+    ;                  lookup: no corpus catalog declares a DOCTYPE entry, so the
+    ;                  lookup would always fail and this is the only branch.
+    ;
+    ; Then enableImplydef: for the rest of the parse an undeclared element is
+    ; implied (ANY content) rather than an error, and an undeclared attribute gets
+    ; an implied CDATA definition. The DTD itself is a base Dtd named after the GI,
+    ; carrying only the syntax's predefined entities.
+    function imply_dtd(this: Parser, gi: StringC)
+    {
+        let sd ps.get_sd()
+        if sd.implydef_element() = IMPLYDEF_ELEMENT_NO
+        {
+            if sd.implydef_doctype() = false
+                this.err(435)
+        }
+        this.err(187)
+        ps.enable_implydef()
+
+        let dtd Dtd.make(host, gi, true)
+        ps.set_def_dtd(dtd)
+        ps.set_current_dtd(dtd)
+        this.insert_predefined_entities(dtd)
+        this.check_dtd(dtd)
+    }
+
     ; doProlog (scoped): skip separators, dispatch the DOCTYPE declaration, and
     ; leave the input positioned at the first instance token.
     function parse_prolog(this: Parser, base_dir: String) returns bool
@@ -3754,9 +3990,41 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 ; end of the document before any content.
                 set running: false
             }
+            else if token = tokenUnrecognized
+            {
+                ; proMode has no STAGO recognizer, so the document element's start
+                ; tag arrives here as an unrecognized token. With a DTD in hand the
+                ; instance simply begins (unget, let do_content rescan it); WITHOUT
+                ; one this is a document with no DOCTYPE — peek for the start tag
+                ; and imply the DTD from its general identifier (doProlog).
+                if ps.get_current_dtd() = null
+                {
+                    let gi this.looking_at_start_tag()
+                    if gi.get_size() > (0 as size_t)
+                    {
+                        ps.current_input().unget_token()
+                        this.imply_dtd(gi)
+                    }
+                    else
+                    {
+                        ; prologCharacter — a character that can neither open a
+                        ; declaration nor start the instance. The reference retries
+                        ; (prologRecover, up to 10 tries); with no DTD to fall back
+                        ; on we stop here.
+                        this.err(46)
+                        set ok: false
+                    }
+                    set running: false
+                }
+                else
+                {
+                    ps.current_input().unget_token()
+                    set running: false
+                }
+            }
             else
             {
-                ; the instance begins (a start tag / data): unget and stop.
+                ; the instance begins (data / another instance token): unget and stop.
                 ps.current_input().unget_token()
                 set running: false
             }
