@@ -49,6 +49,7 @@ use opensp.EntityCatalog.EntityCatalog
 use opensp.SdParser.SdParser
 use opensp.SdParser.SdSyntax
 use opensp.CharsetDecl.CharsetDecl
+use opensp.CharsetDecl.CharsetDeclRange
 use opensp.CharsetDecl.UnivCharsetDesc
 use scaly.io.File
 use scaly.io.Path
@@ -523,6 +524,26 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.report_at(mt, args, loc)
     }
 
+    ; E2 with %1 Number, %2 String (quoted) — numericCharRefUnknownDesc.
+    function report_num_str_at(this: Parser, mt: MessageType, a1: u64, a2: StringC, loc: Location)
+    {
+        var args Vector[MessageArg](2 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Num(a1)
+        set *(args.get(1 as size_t)): MessageArg.Str(a2)
+        ps.report_at(mt, args, loc)
+    }
+
+    ; E3 with %1 Number, %2 Number, %3 String (quoted) —
+    ; numericCharRefUnknownBase (doc number, base number, baseset public id).
+    function report_num_num_str_at(this: Parser, mt: MessageType, a1: u64, a2: u64, a3: StringC, loc: Location)
+    {
+        var args Vector[MessageArg](3 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Num(a1)
+        set *(args.get(1 as size_t)): MessageArg.Num(a2)
+        set *(args.get(2 as size_t)): MessageArg.Str(a3)
+        ps.report_at(mt, args, loc)
+    }
+
     ; report1 at a location WITH an auxiliary "start tag was here"-style line at
     ; aux_loc (the omitted-end-tag diagnostics). %1 is the String a1 (quoted).
     ; `aux` is the companion fragment from the table (e.g. omitEndTagOmittag_aux()).
@@ -882,11 +903,38 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             else if (token = tokenCroDigit) or (token = tokenHcroHexDigit)
             {
                 var ch: u32 0
-                if this.parse_numeric_char_ref(&ch)
-                    buf.add(ch)
+                var refc_loc Location()
+                if this.parse_numeric_char_ref(&ch, &refc_loc)
+                {
+                    var is_sgml true
+                    if this.translate_numeric_char_ref(&ch, &is_sgml, refc_loc)
+                    {
+                        if is_sgml
+                            buf.add(ch)
+                        else
+                        {
+                            ; parseLiteral (parseCommon.cxx:139): a declared
+                            ; non-SGML char (UNUSED range) in a literal. CDATA
+                            ; attribute values carry the literalNonSgml flag
+                            ; (parseAttribute.cxx:398) and admit it SILENTLY
+                            ; (Text::addNonSgmlChar — the ESIS attribute writer
+                            ; drops it; verified vs onsgmls 1.5.2, exit 0);
+                            ; every other literal — tokenized attribute values,
+                            ; parameter literals — reports
+                            ; numericCharRefLiteralNonSgml (E1, at the REFC)
+                            ; and drops the char, the literal continuing.
+                            if ((lit_mode = alitMode) or (lit_mode = alitaMode)) = false
+                                this.report_num_at(ParserMessages.numericCharRefLiteralNonSgml(), ch as u64, refc_loc)
+                        }
+                    }
+                    ; translate false: already reported, char dropped, literal
+                    ; continues (the reference case's `break`)
+                }
                 else
                 {
-                    this.err(2)
+                    ; parseNumericCharRef failed (characterNumber, reported
+                    ; there) -> the WHOLE literal parse fails (the reference
+                    ; returns 0 from parseLiteral); the caller recovers.
                     set ok: false
                     set running: false
                 }
@@ -4202,33 +4250,28 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         true
     }
 
-    ; parseNumericCharRef (parseCommon.cxx, scoped): a decimal `&#NN;` reference
-    ; in content -> the referenced Char (returned via out_ch). discard_initial
-    ; drops the CRO; extend_number grows the digits; the digits fold to a value
-    ; guarded against charMax; the REFC (`;`) or record-end terminating the
-    ; reference is consumed. Returns false when the number is out of range (the
-    ; char is NOT produced — the caller emits no data). HEX refs (`&#xNN;`) and the
-    ; markup capture are deferred (the corpus's char refs are decimal into ASCII,
-    ; e.g. `&#60;`=`<`).
-    function parse_numeric_char_ref(this: Parser, out_ch: pointer[u32]) returns bool
+    ; parseNumericCharRef (parseCommon.cxx:282, scoped): a decimal `&#NN;`
+    ; reference -> the referenced document-charset Char (via out_ch). The
+    ; digits fold to a value guarded against the CONSTANT charMax = 0x10FFFF
+    ; (constant.h:12 — the internal Char range, NOT a charset-derived cap);
+    ; then the number must be DECLARED in the document character set
+    ; (sd().docCharsetDecl().charDeclared — UNUSED ranges count as declared),
+    ; else characterNumber. Both failures report at the number token's start
+    ; (verified vs real onsgmls: the first digit, not the CRO) and return
+    ; false with no char produced; the REFC is consumed either way.
+    ; out_refc_loc = the start of the reference-terminating token (the REFC
+    ; `;`) — where the translate-stage diagnostics point (verified: real
+    ; onsgmls reports numericCharRefNoInternal/UnknownBase at the `;`).
+    ; HEX refs (`&#xNN;`) and the markup capture are still deferred.
+    function parse_numeric_char_ref(this: Parser, out_ch: pointer[u32], out_refc_loc: pointer[Location]) returns bool
     {
         let ins ps.current_input()
         ins.discard_initial()
         this.extend_number(this.namelen())
-        ; the number token's start — where characterNumber points (verified vs real
-        ; onsgmls: the first digit, not the CRO).
+        ; the number token's start — where characterNumber points.
         let numloc ins.token_start_location()
         let tok ps.current_token()
         let n tok.get_size()
-        ; charMax = the highest character number in the document character set:
-        ; UCS-2 (0xFFFF) under the XML/WWW declaration, 0x10FFFF otherwise. The
-        ; reference reads this from sd().docCharsetDecl(); our Sd tracks only the
-        ; feature flags, so www() stands in for the UCS-2-capped XML charset (a
-        ; fuller charset would need docCharsetDecl + charDeclared — deferred; every
-        ; number in [0, charMax] is declared in both concrete syntaxes we support).
-        var char_max: u32 1114111
-        if ps.get_sd().www()
-            set char_max: 65535 as u32
         var c: u32 0
         var valid true
         var i: size_t 0
@@ -4238,7 +4281,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             ; fold guarded against charMax (parseCommon.cxx): the instant the next
             ; digit would exceed charMax, report characterNumber and stop, so a long
             ; digit run cannot overflow and the char is not produced.
-            if (c <= (char_max / (10 as u32))) and ((c * (10 as u32)) <= (char_max - d))
+            if (c <= (CHAR_MAX / (10 as u32))) and ((c * (10 as u32)) <= (CHAR_MAX - d))
                 set c: c * (10 as u32) + d
             else
             {
@@ -4247,13 +4290,91 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             set i: i + 1
         }
+        ; the fold stayed in range, but the number must be a DECLARED character
+        ; of the document charset (charDeclared counts UNUSED ranges — an
+        ; UNUSED number passes here and is dropped by translate, NOT an error).
+        if valid
+        {
+            if ps.get_sd().doc_charset_decl().char_declared(c) = false
+            {
+                this.report1_at(ParserMessages.characterNumber(), tok, numloc)
+                set valid: false
+            }
+        }
         ; consume the REFC (`;`) or record-end that terminates the reference (always,
         ; valid or not — the reference is recovered past either way).
         let refc ps.get_token(refMode)
+        set *out_refc_loc: ps.current_input().token_start_location()
         if valid = false
             return false
         set *out_ch: c
         true
+    }
+
+    ; translateNumericCharRef (parseCommon.cxx:360): translate a character
+    ; number in the DOCUMENT character set into the INTERNAL character set.
+    ; In the default mode the internal charset IS the doc charset — no
+    ; translation, every declared ref is an SGML char (the reference's
+    ; warnNonSgmlCharRef refinement is a non-default option, not ported).
+    ; Under SP_CHARSET_FIXED (internalCharsetIsDocCharset false):
+    ;   - docCharset().descToUniv succeeds -> internalCharset().univToDesc:
+    ;     the fixed internal charset is the system charset, identity over
+    ;     0..INTERNAL_CHAR_MAX (see CharsetDecl.scaly) — in range translates
+    ;     the char, beyond it reports numericCharRefNoInternal (E1, at the
+    ;     REFC). The reference's numericCharRefBadInternal arm (ambiguous /
+    ;     over-charMax internal mapping) is unreachable with an identity map.
+    ;   - descToUniv fails -> getCharInfo classifies the number: an UNUSED
+    ;     range is a declared NON-SGML char (return true, is_sgml_char false —
+    ;     the callers drop it silently); a string-described range reports
+    ;     numericCharRefUnknownDesc (E2); a number range whose base char the
+    ;     baseset does not cover reports numericCharRefUnknownBase (E3, args:
+    ;     doc number, base number, QUOTED baseset public id).
+    ; Returns false when the char could not be translated (already reported).
+    function translate_numeric_char_ref(this: Parser, ch: pointer[u32], is_sgml_char: pointer[bool], refc_loc: Location) returns bool
+    {
+        let sd ps.get_sd()
+        if sd.internal_charset_is_doc_charset()
+        {
+            set *is_sgml_char: true
+            return true
+        }
+        let c *ch
+        var univ: u32 0
+        if sd.doc_charset_desc().desc_to_univ(c, &univ)
+        {
+            if univ <= INTERNAL_CHAR_MAX
+            {
+                set *ch: univ
+                set *is_sgml_char: true
+                return true
+            }
+            this.report_num_at(ParserMessages.numericCharRefNoInternal(), c as u64, refc_loc)
+            return false
+        }
+        let r sd.doc_charset_decl().find_range(c)
+        if r = null
+        {
+            ; CANNOT_HAPPEN (parseCommon.cxx:381): charDeclared passed in
+            ; parse_numeric_char_ref, so a covering range exists. Defensive:
+            ; report as an unknown base char of an anonymous baseset.
+            this.report_num_num_str_at(ParserMessages.numericCharRefUnknownBase(), c as u64, c as u64, StringC(), refc_loc)
+            return false
+        }
+        if r.range_type = CHARSET_RANGE_UNUSED
+        {
+            set *is_sgml_char: false
+            return true
+        }
+        if r.range_type = CHARSET_RANGE_STRING
+        {
+            let dstr r.str
+            this.report_num_str_at(ParserMessages.numericCharRefUnknownDesc(), c as u64, dstr, refc_loc)
+            return false
+        }
+        let base_n r.base_min + (c - r.desc_min)
+        let pid ps.get_sd().doc_charset_decl().section_pubid(r.section)
+        this.report_num_num_str_at(ParserMessages.numericCharRefUnknownBase(), c as u64, base_n as u64, pid, refc_loc)
+        false
     }
 
     ; doContent — the instance token-dispatch loop (well-formed subset).
@@ -4286,13 +4407,27 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 let loc ps.current_location()
                 var ch: u32 0
-                if this.parse_numeric_char_ref(&ch)
+                var refc_loc Location()
+                if this.parse_numeric_char_ref(&ch, &refc_loc)
                 {
+                    ; doContent (parseInstance.cxx:119): pcdata is accepted and
+                    ; data noted BEFORE translation; a char the fixed internal
+                    ; charset cannot represent (translate false) or a declared
+                    ; NON-SGML char (UNUSED range — is_sgml false; the
+                    ; reference's NonSgmlCharEvent, which onsgmls's default
+                    ; output ignores) emits NO data — silently dropped.
                     this.accept_pcdata(loc)
                     ps.note_data()
-                    let scp StringC^host(&ch, 1 as size_t)
-                    let cev Event.make_data(host, *scp, loc)
-                    ps.queue_event(cev)
+                    var is_sgml true
+                    if this.translate_numeric_char_ref(&ch, &is_sgml, refc_loc)
+                    {
+                        if is_sgml
+                        {
+                            let scp StringC^host(&ch, 1 as size_t)
+                            let cev Event.make_data(host, *scp, loc)
+                            ps.queue_event(cev)
+                        }
+                    }
                 }
             }
             else if token = tokenStagoNameStart
@@ -5068,7 +5203,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; A concept STATIC so a user program resolves it across packages. `base_dir`
     ; is the document's directory — external DTD subsets (SYSTEM/PUBLIC) resolve
     ; their (relative) system ids against it.
-    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, out_conforming: pointer[bool]) returns String
+    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, charset_fixed: bool, out_conforming: pointer[bool]) returns String
     {
         ; Record normalization (ExtendEntityManager, `lf` record type — the whole
         ; Unix corpus): insert one RS (0x0A) at the entity start, and translate
@@ -5140,6 +5275,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             sd.set_doc_charset_decl(CharsetDecl.make_implied(host))
             sd.set_doc_charset_desc(UnivCharsetDesc.make_system(host))
         }
+        ; SP_CHARSET_FIXED=YES/1 (the driver's charset_fixed): the internal
+        ; charset is the FIXED system charset, no longer the document charset —
+        ; numeric char refs are then translated doc -> univ -> internal
+        ; (translate_numeric_char_ref). SP_ENCODING never affects this decision
+        ; (it only selects the coding systems — see onsgmls.scaly).
+        if charset_fixed
+            sd.set_internal_charset_is_doc_charset(false)
         ps.set_sd(sd)
         ps.set_syntax(syn)
 
