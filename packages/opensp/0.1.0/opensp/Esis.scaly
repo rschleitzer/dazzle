@@ -32,7 +32,23 @@ use opensp.ElementType.ElementType
 ; ENTITY attribute type strings (need AttributeSemantics wiring).
 ;
 ; Escaping (outputString, SgmlsEventHandler.cxx): '\' -> '\\'; RE (0x0D) -> '\n';
-; any char < 0x20 -> '\0' + two octal digits; everything else verbatim.
+; any char < 0x20 -> '\0' + two octal digits; everything else through the
+; output coding system.
+;
+; Output coding system (CmdLineApp::makeStdOut -> EncodeOutputCharStream): the
+; whole ESIS stream (names, data, attribute values) leaves through ONE encoder
+; selected by CmdLineApp::initCodingSystem from the environment (see
+; onsgmls.scaly). A char the encoder cannot represent triggers the stream's
+; escaper (SgmlsEventHandler::escaper, set once via setEscaper) which writes
+; escapePrefix numEscape <decimal> escapeEnd = `\#<N>;`. Two encoders are
+; modeled (put_char):
+;   Identity (the default, IdentityCodingSystem.cxx): c <= 0xFF -> the single
+;   byte c; c > UCHAR_MAX -> handleUnencodable -> `\#N;`.
+;   UTF-8 (SP_CHARSET_FIXED=YES + SP_ENCODING=XML/UTF-8): UTF8Encoder.output —
+;   plain UTF-8 bytes; its 5/6-byte forms (c >= 0x200000) are unreachable
+;   because parse_numeric_char_ref caps chars at charMax <= 0x10FFFF, so the
+;   UTF-8 path never escapes. Surrogates encode blindly as 3-byte sequences,
+;   exactly like the reference encoder.
 
 define Esis
 {
@@ -51,11 +67,44 @@ define Esis
         }
     }
 
+    ; decimal digits of n (the escaper prints `(unsigned long)c` — plain
+    ; decimal, no padding).
+    function put_dec(acc: pointer[Array[u8]], n: u32)
+    {
+        var digits u8[16]
+        let dp digits as pointer[u8]
+        var v n
+        var count: size_t 0
+        var go true
+        while go
+        {
+            set *(dp + count): (((0x30 as u32) + (v % (10 as u32))) as u8)
+            set count: count + (1 as size_t)
+            set v: v / (10 as u32)
+            if v = (0 as u32)
+                set go: false
+        }
+        var i count
+        while i > (0 as size_t)
+        {
+            set i: i - (1 as size_t)
+            acc.add(*(dp + i))
+        }
+    }
+
+    ; the unencodable-char escape (SgmlsEventHandler::escaper): `\#<decimal>;`.
+    function put_esc(acc: pointer[Array[u8]], c: u32)
+    {
+        acc.add(0x5C as u8)
+        acc.add(0x23 as u8)
+        Esis.put_dec(acc, c)
+        acc.add(0x3B as u8)
+    }
+
     ; Encode one Char as UTF-8. The C++ handler never narrows a Char itself: it
     ; hands every Char to an OutputCharStream (`os().put(*p)`, `os() << name`)
-    ; whose encoding under SP_ENCODING=XML is UTF-8. So names AND data leave
-    ; through the same encoder; ASCII is identity, which is why the ASCII-only
-    ; models stay byte-identical.
+    ; whose UTF-8 encoder this mirrors (UTF8CodingSystem.cxx; the 5/6-byte
+    ; forms are unreachable, chars are capped at 0x10FFFF).
     function put_utf8(acc: pointer[Array[u8]], c: u32)
     {
         if c < (0x80 as u32)
@@ -80,21 +129,41 @@ define Esis
         }
     }
 
+    ; one Char through the active output coding system (see the header note):
+    ; Identity emits the raw byte for c <= 0xFF and escapes the rest; UTF-8
+    ; always encodes (nothing valid is unencodable there).
+    function put_char(acc: pointer[Array[u8]], c: u32, utf8: bool)
+    {
+        if utf8
+        {
+            Esis.put_utf8(acc, c)
+            return
+        }
+        if c < (0x100 as u32)
+            acc.add(c as u8)
+        else
+            Esis.put_esc(acc, c)
+    }
+
     ; append a StringC as a name (no escaping; GIs/attr names are already
-    ; reference-syntax name characters) through the UTF-8 encoder.
-    function put_name(acc: pointer[Array[u8]], sc: StringC)
+    ; reference-syntax name characters) through the output encoder — the
+    ; escaper is set on the whole stream, so names take the same path as data.
+    function put_name(acc: pointer[Array[u8]], sc: StringC, utf8: bool)
     {
         let n sc.get_size()
         var i: size_t 0
         while i < n
         {
-            Esis.put_utf8(acc, sc.get(i))
+            Esis.put_char(acc, sc.get(i), utf8)
             set i: i + 1
         }
     }
 
-    ; append a StringC as ESIS data with the C++ outputString escaping.
-    function put_data(acc: pointer[Array[u8]], sc: StringC)
+    ; append a StringC as ESIS data with the C++ outputString escaping. The
+    ; control-char / '\' / RE escapes run BEFORE the coding system (they are
+    ; outputString's, upstream of the encoder); only the default arm is
+    ; encoding-dependent.
+    function put_data(acc: pointer[Array[u8]], sc: StringC, utf8: bool)
     {
         let n sc.get_size()
         var i: size_t 0
@@ -121,13 +190,13 @@ define Esis
                 acc.add(((0x30 as u32) + d2) as u8)
             }
             else
-                Esis.put_utf8(acc, c)
+                Esis.put_char(acc, c, utf8)
             set i: i + 1
         }
     }
 
     ; A<NAME> <TYPE> <VALUE> for each attribute in the list that has a value.
-    function put_attributes(acc: pointer[Array[u8]], atts: pointer[AttributeList])
+    function put_attributes(acc: pointer[Array[u8]], atts: pointer[AttributeList], utf8: bool)
     {
         if atts = null
             return
@@ -140,19 +209,19 @@ define Esis
             {
                 let ty v.value_type()
                 Esis.put(acc, 0x41 as u8)
-                Esis.put_name(acc, atts.name(i))
+                Esis.put_name(acc, atts.name(i), utf8)
                 Esis.put(acc, 0x20 as u8)
                 if ty = AVT_IMPLIED
                     Esis.put_lit(acc, String("IMPLIED"))
                 else if ty = AVT_CDATA
                 {
                     Esis.put_lit(acc, String("CDATA "))
-                    Esis.put_data(acc, v.get_string())
+                    Esis.put_data(acc, v.get_string(), utf8)
                 }
                 else
                 {
                     Esis.put_lit(acc, String("TOKEN "))
-                    Esis.put_data(acc, v.get_string())
+                    Esis.put_data(acc, v.get_string(), utf8)
                 }
                 Esis.put(acc, 0x0A as u8)
             }
@@ -164,6 +233,9 @@ define Esis
     function write(host: pointer[Page], ps: pointer[ParserState], conforming: bool) returns String
     {
         let acc Array[u8]^host()
+        ; the output coding system (identity vs UTF-8), decided once from the
+        ; environment by the driver (CmdLineApp::initCodingSystem).
+        let utf8 ps.get_output_utf8()
         let n ps.n_events()
         var have_data false
         var k: size_t 0
@@ -178,7 +250,7 @@ define Esis
                     Esis.put(acc, 0x2D as u8)
                     set have_data: true
                 }
-                Esis.put_data(acc, ev.get_data())
+                Esis.put_data(acc, ev.get_data(), utf8)
             }
             else if ty = EV_START_ELEMENT
             {
@@ -187,9 +259,9 @@ define Esis
                     Esis.put(acc, 0x0A as u8)
                     set have_data: false
                 }
-                Esis.put_attributes(acc, ev.get_attributes())
+                Esis.put_attributes(acc, ev.get_attributes(), utf8)
                 Esis.put(acc, 0x28 as u8)
-                Esis.put_name(acc, ev.get_element_type().get_name())
+                Esis.put_name(acc, ev.get_element_type().get_name(), utf8)
                 Esis.put(acc, 0x0A as u8)
             }
             else if ty = EV_END_ELEMENT
@@ -200,7 +272,7 @@ define Esis
                     set have_data: false
                 }
                 Esis.put(acc, 0x29 as u8)
-                Esis.put_name(acc, ev.get_element_type().get_name())
+                Esis.put_name(acc, ev.get_element_type().get_name(), utf8)
                 Esis.put(acc, 0x0A as u8)
             }
             else if ty = EV_PI
@@ -212,7 +284,7 @@ define Esis
                     set have_data: false
                 }
                 Esis.put(acc, 0x3F as u8)
-                Esis.put_data(acc, ev.get_data())
+                Esis.put_data(acc, ev.get_data(), utf8)
                 Esis.put(acc, 0x0A as u8)
             }
             set k: k + 1
@@ -258,7 +330,7 @@ define Esis
         set *(rp + (3 as size_t)): 0x5C as u32
         set *(rp + (4 as size_t)): 0x0D as u32
         let sc StringC(rp, 5 as size_t)
-        Esis.put_data(acc, sc)
+        Esis.put_data(acc, sc, false)
         let got String(acc.get_buffer() as pointer[const_char], acc.get_length())
         if got.equals(String("a\\011b\\\\\\n")) = false
             return -1
@@ -272,7 +344,7 @@ define Esis
         set *(rp2 + (1 as size_t)): 0xFC as u32     ; 'ü'
         set *(rp2 + (2 as size_t)): 0xFFFD as u32   ; U+FFFD
         let sc2 StringC(rp2, 3 as size_t)
-        Esis.put_data(acc2, sc2)
+        Esis.put_data(acc2, sc2, true)
         if acc2.get_length() <> (6 as size_t)
             return -2
         let b2 acc2.get_buffer()
@@ -288,6 +360,23 @@ define Esis
             return -7
         if *(b2 + (5 as size_t)) <> (0xBD as u8)
             return -8
+
+        ; identity output (the default coding system): c <= 0xFF -> the raw
+        ; byte; c >= 0x100 -> the `\#N;` escape. Same input Chars as above:
+        ; z ü U+FFFD -> 7A FC "\#65533;".
+        let acc3 Array[u8]^host()
+        Esis.put_data(acc3, sc2, false)
+        let got3 String(acc3.get_buffer() as pointer[const_char], acc3.get_length())
+        if got3.get_length() <> (10 as size_t)
+            return -9
+        if got3.get(0) <> (0x7A as u8)
+            return -10
+        if got3.get(1) <> (0xFC as u8)
+            return -11
+        let b3 acc3.get_buffer()
+        let esc3 String((b3 + (2 as size_t)) as pointer[const_char], 8 as size_t)
+        if esc3.equals(String("\\#65533;")) = false
+            return -12
         0
     }
 }
