@@ -60,6 +60,9 @@ define Id (name: StringC, def_loc: Location, pending_refs: pointer[Array[Locatio
     function n_pending_refs(this: Id) returns size_t
         pending_refs.get_length()
 
+    function pending_ref_at(this: Id, i: size_t) returns Location
+        *(pending_refs.get_buffer() + i)
+
     function first_ref_location(this: Id) returns Location
     {
         if pending_refs.get_length() > (0 as size_t)
@@ -111,6 +114,191 @@ define Id (name: StringC, def_loc: Location, pending_refs: pointer[Array[Locatio
         if id.n_pending_refs() <> (0 as size_t)
             return -9
 
+        0
+    }
+}
+
+; --- IdTable ---------------------------------------------------------------
+; ParserState's idTable_: NamedTable<Id> = OwnerTable over PointerTable
+; (PointerTable.cxx) keyed by Hash::hash (Hash.cxx: h = h*33 + char, the Chris
+; Torek fold in an unsigned long). The table SHAPE is load-bearing for the
+; drop-in: checkIdrefs iterates the raw bucket vector in ascending index order,
+; so the missingId message ORDER is the open-addressing layout — initial size
+; 8 (usedLimit 4), grow x2 when used_ >= usedLimit_ (rehash reinserting in old
+; bucket order), probe DOWNWARD (nextIndex: i == 0 ? size-1 : i-1). Verified
+; against real onsgmls: ids NOPE,Y,GONE,LOST land as [GONE,Y,NOPE,_,_,_,_,LOST]
+; and the messages print GONE,NOPE,LOST — not document order.
+define IdTable
+(
+    vec: pointer[pointer[Id]]
+    vec_size: size_t
+    used: size_t
+    used_limit: size_t
+)
+{
+    function make(host: pointer[Page]) returns pointer[IdTable]
+    {
+        let t host.allocate(sizeof IdTable, alignof IdTable) as pointer[IdTable]
+        set t.vec: null
+        set t.vec_size: 0
+        set t.used: 0
+        set t.used_limit: 0
+        t
+    }
+
+    ; Hash::hash — h*33 + char over the (folded) name, in u64.
+    function hash(name: StringC) returns u64
+    {
+        var h: u64 0
+        let n name.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            set h: (h << (5 as u64)) + h + (name.get(i) as u64)
+            set i: i + 1
+        }
+        h
+    }
+
+    function start_index(this: IdTable, name: StringC) returns size_t
+        (IdTable.hash(name) & ((vec_size - (1 as size_t)) as u64)) as size_t
+
+    function next_index(this: IdTable, i: size_t) returns size_t
+    {
+        if i = (0 as size_t)
+            return vec_size - (1 as size_t)
+        i - (1 as size_t)
+    }
+
+    function alloc_vec(host: pointer[Page], n: size_t) returns pointer[pointer[Id]]
+    {
+        let v host.allocate(n * (sizeof pointer[Id]), alignof pointer[Id]) as pointer[pointer[Id]]
+        var i: size_t 0
+        while i < n
+        {
+            set *(v + i): null
+            set i: i + 1
+        }
+        v
+    }
+
+    function lookup(this: IdTable, name: StringC) returns pointer[Id]
+    {
+        if used = (0 as size_t)
+            return null
+        var i this.start_index(name)
+        while *(vec + i) <> null
+        {
+            let id *(vec + i)
+            if id.get_name().equals(name)
+                return id
+            set i: this.next_index(i)
+        }
+        null
+    }
+
+    ; PointerTable::insert of a fresh Id (no replace arm — lookupCreateId
+    ; looks up first). Mirrors the reference exactly: first insert allocates 8
+    ; buckets; at used_ >= usedLimit_ the vector doubles and every old entry
+    ; reinserts IN OLD BUCKET ORDER, each probing down to the first free slot.
+    function insert(this: pointer[IdTable], host: pointer[Page], id: pointer[Id])
+    {
+        var h: size_t 0
+        if this.vec_size = (0 as size_t)
+        {
+            set this.vec: IdTable.alloc_vec(host, 8 as size_t)
+            set this.vec_size: 8
+            set this.used_limit: 4
+            set h: this.start_index(id.get_name())
+        }
+        else
+        {
+            set h: this.start_index(id.get_name())
+            while *(this.vec + h) <> null
+                set h: this.next_index(h)
+            if this.used >= this.used_limit
+            {
+                let old_vec this.vec
+                let old_size this.vec_size
+                set this.vec: IdTable.alloc_vec(host, old_size * (2 as size_t))
+                set this.vec_size: old_size * (2 as size_t)
+                set this.used_limit: this.vec_size / (2 as size_t)
+                var oi: size_t 0
+                while oi < old_size
+                {
+                    let e *(old_vec + oi)
+                    if e <> null
+                    {
+                        var j this.start_index(e.get_name())
+                        while *(this.vec + j) <> null
+                            set j: this.next_index(j)
+                        set *(this.vec + j): e
+                    }
+                    set oi: oi + 1
+                }
+                set h: this.start_index(id.get_name())
+                while *(this.vec + h) <> null
+                    set h: this.next_index(h)
+            }
+        }
+        set this.used: this.used + (1 as size_t)
+        set *(this.vec + h): id
+    }
+
+    ; ParserState::lookupCreateId.
+    function lookup_create(this: pointer[IdTable], host: pointer[Page], name: StringC) returns pointer[Id]
+    {
+        let found (*this).lookup(name)
+        if found <> null
+            return found
+        ; deep-copy the name onto the table's page: the caller's StringC
+        ; borrows a transient value buffer.
+        let n name.get_size()
+        let nb host.allocate(n * (4 as size_t), 4) as pointer[u32]
+        var i: size_t 0
+        while i < n
+        {
+            set *(nb + i): name.get(i)
+            set i: i + 1
+        }
+        let owned StringC^host(nb, n)
+        let id Id.make(host, *owned)
+        this.insert(host, id)
+        id
+    }
+
+    ; iteration surface for checkIdrefs: ascending bucket index, nulls skipped
+    ; by the caller (PointerTableIter::next).
+    function bucket_count(this: IdTable) returns size_t
+        vec_size
+
+    function bucket_at(this: IdTable, i: size_t) returns pointer[Id]
+        *(vec + i)
+
+    function id_test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+        let t IdTable.make(host)
+        if t.lookup(StringC("NOPE")) <> null
+            return -20
+        let a t.lookup_create(host, StringC("NOPE"))
+        let b t.lookup_create(host, StringC("Y"))
+        let c t.lookup_create(host, StringC("GONE"))
+        let d t.lookup_create(host, StringC("LOST"))
+        if t.lookup_create(host, StringC("NOPE")) <> a
+            return -21
+        if (*t).bucket_count() <> (8 as size_t)
+            return -22
+        ; the layout real onsgmls's message order proved: GONE,Y,NOPE,_,...,LOST
+        if (*t).bucket_at(0 as size_t) <> c
+            return -23
+        if (*t).bucket_at(1 as size_t) <> b
+            return -24
+        if (*t).bucket_at(2 as size_t) <> a
+            return -25
+        if (*t).bucket_at(7 as size_t) <> d
+            return -26
         0
     }
 }

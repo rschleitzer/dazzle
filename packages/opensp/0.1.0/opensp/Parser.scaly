@@ -51,6 +51,8 @@ use opensp.SdParser.SdSyntax
 use opensp.CharsetDecl.CharsetDecl
 use opensp.CharsetDecl.CharsetDeclRange
 use opensp.CharsetDecl.UnivCharsetDesc
+use opensp.Id.Id
+use opensp.Id.IdTable
 use scaly.io.File
 use scaly.io.Path
 
@@ -816,6 +818,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; and back once the entity ends and we return to startLevel.
         var cur_mode lit_mode
         let buf Array[u32]^host()
+        ; per-char source locations, parallel to buf (Text::addChar's Location
+        ; argument): the ID/IDREF token locations must survive entity expansion
+        ; and normalization, so every stored char carries where it came from.
+        let locbuf Array[Location]^host()
         let space (0x20 as u32)
         var running true
         var ok true
@@ -851,7 +857,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     ; ignore
                 }
                 else
+                {
                     buf.add(space)
+                    locbuf.add(ps.current_input().token_start_location())
+                }
             }
             else if token = tokenSpace
             {
@@ -860,7 +869,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     ; ignore
                 }
                 else
+                {
                     buf.add(ps.current_input().current_char())
+                    locbuf.add(ps.current_input().token_start_location())
+                }
             }
             else if token = tokenChar
             {
@@ -877,7 +889,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     this.report_num_at(mt, lc as u64, loc)
                 }
                 else
+                {
                     buf.add(lc)
+                    locbuf.add(ps.current_input().token_start_location())
+                }
             }
             else if (token = tokenEroNameStart) or (token = tokenEroGrpo)
             {
@@ -905,13 +920,19 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 var ch: u32 0
                 var refc_loc Location()
                 let is_hex_ref token = tokenHcroHexDigit
+                ; the CRO/HCRO token start — the reference stores the char with
+                ; parseNumericCharRef's startLocation (parseCommon.cxx:135).
+                let cro_loc ps.current_input().token_start_location()
                 if this.parse_numeric_char_ref(is_hex_ref, &ch, &refc_loc)
                 {
                     var is_sgml true
                     if this.translate_numeric_char_ref(&ch, &is_sgml, refc_loc)
                     {
                         if is_sgml
+                        {
                             buf.add(ch)
+                            locbuf.add(ps.current_input().token_start_location())
+                        }
                         else
                         {
                             ; parseLiteral (parseCommon.cxx:139): a declared
@@ -975,17 +996,21 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 this.parse_named_char_ref()
             }
             else if token = tokenUnrecognized
+            {
                 buf.add(ps.current_input().current_char())
+                locbuf.add(ps.current_input().token_start_location())
+            }
             else
             {
                 ; other tokens in literal context: treat first char as data.
                 buf.add(ps.current_input().current_char())
+                locbuf.add(ps.current_input().token_start_location())
             }
         }
         if ok = false
             return false
         let sc this.build_stringc(buf)
-        set *out_text: Text(sc)
+        set *out_text: Text(sc, locbuf.get_buffer())
         true
     }
 
@@ -3193,7 +3218,18 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             this.extend_name_token(this.namelen())
             let ins ps.current_input()
             let ts ins.current_token_string()
-            set *text: Text(StringC^host(ts.data_ptr(), ts.get_size()))
+            ; per-char locations (linear: an unquoted value is one source token).
+            let tn ts.get_size()
+            let tstart ins.current_token_start_index()
+            let tlb host.allocate(tn * sizeof Location, alignof Location) as pointer[Location]
+            let torg ins.get_origin()
+            var tli: size_t 0
+            while tli < tn
+            {
+                set *(tlb + tli): Location(torg, (tstart + tli) as u32)
+                set tli: tli + 1
+            }
+            set *text: Text(StringC^host(ts.data_ptr(), ts.get_size()), tlb)
         }
         else
         {
@@ -3204,7 +3240,64 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return false
         let tlen (*text).size()
         set *spec_length: *spec_length + tlen
-        atts.set_value(host, index, text, ctx)
+        ; set_value's bool IS parse_attribute's return value (implicit return —
+        ; anything appended after it would silently become the return).
+        let sv_ok atts.set_value(host, index, text, ctx)
+        ; the ID/IDREF half of makeValue's makeSemantics — reported from the
+        ; parser (the duplicateAttributeSpec precedent: `this` can report).
+        ; set_value left *text as the folded, normalized value WITH per-char
+        ; locations, so the value tokens and their locations read back directly.
+        this.check_id_semantics(atts, index, text)
+        sv_ok
+    }
+
+    ; IdDeclaredValue/IdrefDeclaredValue::makeSemantics (Attribute.cxx:534,556):
+    ; an ID attribute value defines its id — a repeated definition reports
+    ; duplicateId (E1, at the value token) with the "ID %1 first defined here"
+    ; auxiliary at the FIRST definition's location; each IDREF/IDREFS token
+    ; books a pending reference against the id table, resolved at document end
+    ; (check_idrefs -> missingId). define_id/note_idref gate themselves on
+    ; inInstance+validate, so DTD default/FIXED values never book anything.
+    ; Values are single-space-normalized by set_value, so tokens split on one
+    ; 0x20; token locations come from the value Text's per-char locations
+    ; (verified vs real onsgmls: each message points at its token's first
+    ; char, entity-expanded tokens resolving through the origin chain).
+    ; The reference's nIdrefs/grpcnt capacity count stays with the deferred
+    ; capacity axis.
+    function check_id_semantics(this: Parser, atts: pointer[AttributeList], index: size_t, text: pointer[Text])
+    {
+        let is_id atts.id(index)
+        let is_idref atts.idref(index)
+        if (is_id = false) and (is_idref = false)
+            return
+        let s (*text).string()
+        let n s.get_size()
+        var start: size_t 0
+        while start < n
+        {
+            var e start
+            var scanning true
+            while scanning
+            {
+                if e >= n
+                    set scanning: false
+                else if s.get(e) = (0x20 as u32)
+                    set scanning: false
+                else
+                    set e: e + 1
+            }
+            let tok StringC^host(s.data_ptr() + start, e - start)
+            let tloc (*text).loc_at(start)
+            if is_id
+            {
+                var prev_loc Location()
+                if ps.define_id(*tok, tloc, &prev_loc) = false
+                    this.report1_aux(ParserMessages.duplicateId(), *tok, tloc, ParserMessages.duplicateId_aux(), prev_loc)
+            }
+            else
+                ps.note_idref(*tok, tloc)
+            set start: e + (1 as size_t)
+        }
     }
 
     ; handleAttributeNameToken (parseAttribute.cxx) — SHORTTAG attribute-name
