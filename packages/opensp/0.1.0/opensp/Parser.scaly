@@ -515,6 +515,16 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.report_at(mt, args, loc)
     }
 
+    ; report1 at a location WITH an auxiliary "start tag was here"-style line at
+    ; aux_loc (the omitted-end-tag diagnostics). %1 is the String a1 (quoted).
+    function report1_aux(this: Parser, text: StringC, sev: Severity, a1: StringC, loc: Location, aux_text: StringC, aux_loc: Location)
+    {
+        let mt MessageType(MessageFragment(0 as u32, text), sev)
+        var args Vector[MessageArg](1 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Str(a1)
+        ps.report_aux(mt, args, loc, aux_text, aux_loc)
+    }
+
     function namelen(this: Parser) returns size_t
         ps.get_syntax().get_quantity(qNAMELEN) as size_t
 
@@ -2972,6 +2982,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     function do_parse_start_tag(this: Parser, out_net: pointer[bool]) returns pointer[Event]
     {
         let ins ps.current_input()
+        ; markupLocation() — the STAGO of the start tag. do_content's get_token
+        ; already consumed the STAGO+name-start token, so the scan cursor sits
+        ; past it; the token's START location is the STAGO. This becomes the open
+        ; element's start location (and the "start tag was here" aux); `loc` below
+        ; (after the GI name) is the TAGC position elementNotAllowed reports at.
+        let mloc ins.token_start_location()
         ins.discard_initial()
         this.extend_name_token(this.namelen())
         let name this.name_folded()
@@ -3010,6 +3026,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
         set *out_net: net
         let ev Event.make_start(host, e, loc)
+        ev.set_markup_loc(mloc)
         ev.set_attributes(atts)
         ev
     }
@@ -3153,7 +3170,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         var map e.get_map()
         if map = null
             set map: ce.get_map()
-        let oe OpenElement.make(host, e, net, event.is_included(), map, event.get_loc())
+        let oe OpenElement.make(host, e, net, event.is_included(), map, event.get_markup_loc())
         ps.push_element_mode(oe)
         ps.queue_event(event)
     }
@@ -3223,10 +3240,34 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 ps.note_end_element(included)
                 return
             }
-            let endev2 Event.make_end(host, e, start_loc)
+            ; the following end tag names a DIFFERENT element. If that element is
+            ; open, this empty element's (implied) end comes first, then the end
+            ; tag closes the enclosing element (endTagEmptyElement: implyEmptyElementEnd
+            ; then acceptEndTag). Dropping it here (the old behavior) left the
+            ; enclosing element to be closed at document end — a spurious
+            ; omitEndTag/notFinished diagnostic. `parse_end_tag` already returns null
+            ; (and reports elementNotOpen) for an UNDECLARED name.
+            if end <> null
+            {
+                let cs ps.get_content_state()
+                if cs.element_is_open(end.get_element_type())
+                {
+                    let endev2 Event.make_end(host, e, start_loc)
+                    if included
+                        endev2.set_included()
+                    ps.queue_event(endev2)
+                    ps.note_end_element(included)
+                    this.accept_end_tag(end)
+                    return
+                }
+                ; declared but not open: elementNotOpen, then imply this end.
+                let t_notopen StringC("end tag for element %1 which is not open")
+                this.report1_at(t_notopen, Severity.Error, end.get_element_type().get_name(), end.get_loc())
+            }
+            let endev4 Event.make_end(host, e, start_loc)
             if included
-                endev2.set_included()
-            ps.queue_event(endev2)
+                endev4.set_included()
+            ps.queue_event(endev4)
             ps.note_end_element(included)
             return
         }
@@ -3247,6 +3288,44 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let cs ps.get_content_state()
         let ce cs.current_element()
         let e ce.get_type()
+        ; implyCurrentElementEnd (parseInstance.cxx): an end tag is being OMITTED
+        ; for the current element. If OMITTAG NO is in force it may never be
+        ; omitted (omitEndTagOmittag); otherwise the element's declaration must
+        ; permit omission (omitEndTagDeclare when it does not). Both carry a
+        ; "start tag was here" auxiliary line at the element's start location.
+        let t_starthere StringC("start tag was here")
+        if ps.get_sd().omittag() = false
+        {
+            let t_omittag StringC("end tag for %1 omitted, but OMITTAG NO was specified")
+            this.report1_aux(t_omittag, Severity.Error, e.get_name(), loc, t_starthere, ce.get_start_location())
+        }
+        else
+        {
+            let def e.get_definition()
+            if def <> null
+                if def.can_omit_end_tag() = false
+                {
+                    let t_declare StringC("end tag for %1 omitted, but its declaration does not permit this")
+                    this.report1_aux(t_declare, Severity.Error, e.get_name(), loc, t_starthere, ce.get_start_location())
+                }
+        }
+        ps.note_end_element(ce.get_included())
+        let endev Event.make_end(host, e, loc)
+        if ce.get_included()
+            endev.set_included()
+        ps.queue_event(endev)
+        ps.pop_element_mode()
+    }
+
+    ; close the current element WITHOUT an omitted-end-tag diagnostic — used when
+    ; the end is genuinely marked (a NET null end tag closing its net-enabling
+    ; element), where onsgmls emits a real EndElementEvent via acceptEndTag rather
+    ; than implyCurrentElementEnd.
+    function close_current_element(this: Parser, loc: Location)
+    {
+        let cs ps.get_content_state()
+        let ce cs.current_element()
+        let e ce.get_type()
         ps.note_end_element(ce.get_included())
         let endev Event.make_end(host, e, loc)
         if ce.get_included()
@@ -3257,9 +3336,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
     ; parseNullEndTag — a NET delimiter (`>` under the XML/scaly syntax) closes
     ; the nearest net-enabling element on the stack, implying ends of any
-    ; intervening open elements first. For an IMMEDNET `<x .../>` empty element
-    ; the net-enabling element IS the current one, so this emits its end
-    ; immediately. (elementNotFinished / markup diagnostics deferred.)
+    ; INTERVENING open elements first (each via implyCurrentElementEnd, which
+    ; complains if it is unfinished / may not be omitted). The net-enabling
+    ; element itself is closed by a genuine (null) end tag — no omission
+    ; diagnostic — but still elementEndTagNotFinished if its model is unsatisfied.
     function parse_null_end_tag(this: Parser)
     {
         let cs ps.get_content_state()
@@ -3267,10 +3347,26 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         var running true
         while running and (cs.tag_level_of() > (0 as u32))
         {
-            let net cs.current_element().get_net_enabling()
-            this.imply_current_element_end(ps.current_location())
-            if net
+            let ce cs.current_element()
+            if ce.get_net_enabling()
+            {
+                if (ce.is_finished() = false) and ps.validate()
+                {
+                    let t_endnotfin StringC("end tag for %1 which is not finished")
+                    this.report1(t_endnotfin, Severity.Error, ce.get_type().get_name())
+                }
+                this.close_current_element(ps.current_location())
                 set running: false
+            }
+            else
+            {
+                if (ce.is_finished() = false) and ps.validate()
+                {
+                    let t_notfin StringC("%1 not finished but containing element ended")
+                    this.report1(t_notfin, Severity.Error, ce.get_type().get_name())
+                }
+                this.imply_current_element_end(ps.current_location())
+            }
             set guard: guard + 1
             if guard > 100000
                 set running: false
@@ -3305,6 +3401,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 set running: false
             else
             {
+                ; an intervening open element is being closed by omission: if its
+                ; own content model is unsatisfied, elementNotFinished.
+                if (ce.is_finished() = false) and ps.validate()
+                {
+                    let t_notfin StringC("%1 not finished but containing element ended")
+                    this.report1_at(t_notfin, Severity.Error, ce.get_type().get_name(), event.get_loc())
+                }
                 this.imply_current_element_end(event.get_loc())
                 set guard: guard + 1
                 if guard > 100000
@@ -3312,6 +3415,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
         }
         let cef cs.current_element()
+        ; the named element itself: if its content model is unsatisfied at its
+        ; explicit end tag, elementEndTagNotFinished.
+        if (cef.is_finished() = false) and ps.validate()
+        {
+            let t_endnotfin StringC("end tag for %1 which is not finished")
+            this.report1_at(t_endnotfin, Severity.Error, cef.get_type().get_name(), event.get_loc())
+        }
         if cef.get_included()
             event.set_included()
         ps.note_end_element(event.is_included())
@@ -3410,12 +3520,16 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 let ce cs.current_element()
                 if ce.is_finished() = false
-                    this.err(82)   ; elementNotFinishedDocumentEnd
-                let e ce.get_type()
-                ps.note_end_element(ce.get_included())
-                let ev Event.make_end(host, e, ps.current_location())
-                ps.queue_event(ev)
-                ps.pop_element_mode()
+                {
+                    ; elementNotFinishedDocumentEnd (no validate() guard in the
+                    ; reference) — the open element's content model is unsatisfied
+                    ; at end of document. Reported at the current scan cursor.
+                    let t_docend StringC("%1 not finished but document ended")
+                    this.report1(t_docend, Severity.Error, ce.get_type().get_name())
+                }
+                ; implyCurrentElementEnd — closes it (and complains if its end tag
+                ; may not be omitted here).
+                this.imply_current_element_end(ps.current_location())
             }
         }
         let root cs.current_element()
@@ -3696,6 +3810,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         var running true
         while running
         {
+            ; doContent (parseInstance.cxx): the error limit was reached — STOP
+            ; without closing the open elements or ending the instance. onsgmls
+            ; truncates the ESIS here (no closing tags, no conformance marker).
+            if ps.is_cancelled()
+                return
             let token ps.get_token(ps.get_current_mode())
             if token = tokenEe
             {
@@ -4504,6 +4623,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.push_input(src)
 
         let ok parser.parse_document(table, base_dir)
+        ; errorLimitExceeded (ParserApp.cxx): after the parse, if the error count
+        ; reached the limit, emit the locationless Info line (once). onsgmls prints
+        ; this last, after every queued diagnostic.
+        if (ERROR_LIMIT <> (0 as u32)) and (ps.get_n_errors() >= ERROR_LIMIT)
+            ps.report_error_limit(ERROR_LIMIT)
         let conforming ok and (ps.get_n_errors() = (0 as u32))
         set *out_conforming: conforming
         Esis.write(host, ps, conforming)

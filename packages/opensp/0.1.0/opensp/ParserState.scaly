@@ -102,6 +102,11 @@ define OS_AFTER_DATA: int 2
 define OS_PENDING_AFTER_RSRE: int 3
 define OS_PENDING_AFTER_MARKUP: int 4
 
+; DEFAULT_ERROR_LIMIT (ParserApp.cxx): onsgmls cancels the parse once this many
+; error messages have been reported (the -E option changes it; we use the fixed
+; default). 0 would disable the limit.
+define ERROR_LIMIT: u32 200
+
 ; Message (Message.cs, minimal) — a dispatched diagnostic: its type
 ; (fragment + severity) and the source location where it occurred. The full C++
 ; Message also carries the MessageArg vector + auxiliary/open-element info; the
@@ -170,6 +175,11 @@ define ParserState
     messages: Array[Message]
     n_messages: u32
     n_errors: u32
+    ; --- error-limit abort (ErrorCountEventHandler): once n_errors reaches the
+    ;     limit (DEFAULT_ERROR_LIMIT = 200) the parse is CANCELLED — the content
+    ;     loop stops immediately without closing the open elements or emitting the
+    ;     conformance marker, exactly as onsgmls does. ---
+    cancelled: bool
     ; --- Event stream (Stage 4): the content events in document order ---
     events: Array[pointer[Event]]
     ; --- OutputState (RS/RE record-boundary shaping): a per-output-level state
@@ -243,6 +253,7 @@ define ParserState
         set ps.messages: Array[Message]^host()
         set ps.n_messages: 0 as u32
         set ps.n_errors: 0 as u32
+        set ps.cancelled: false
         set ps.events: Array[pointer[Event]]^host()
         set ps.os_state: Array[int]^host()
         ps.os_state.add(OS_AFTER_START_TAG)
@@ -932,8 +943,18 @@ define ParserState
         this.messages.add(msg)
         set this.n_messages: this.n_messages + (1 as u32)
         if msg.get_type().is_error()
+        {
             set this.n_errors: this.n_errors + (1 as u32)
+            ; ErrorCountEventHandler::noteMessage — cancel exactly when the count
+            ; reaches the limit (`++errorCount_ == maxErrors_`).
+            if (ERROR_LIMIT <> (0 as u32)) and (this.n_errors = ERROR_LIMIT)
+                set this.cancelled: true
+        }
     }
+
+    ; cancelled() — the parse hit the error limit; the content loop must stop.
+    function is_cancelled(this: ParserState) returns bool
+        cancelled
 
     ; message(type) — build a Message, init its location, dispatch it (the
     ; Messenger::message entry the parse methods call, minus the arg vector).
@@ -962,6 +983,30 @@ define ParserState
         var msg Message(type, loc)
         this.emit_message(&msg, args)
         this.dispatch_message(msg)
+    }
+
+    ; report at an explicit location WITH an auxiliary location line. onsgmls's
+    ; dispatchMessage prints a second, severity-less line for a message whose
+    ; auxLoc is non-null (`<prog>:<file>:<line>:<col>: <auxText>`). Used by the
+    ; omitted-end-tag diagnostics whose aux fragment is "start tag was here",
+    ; pointing at the open element's start location. Counts as ONE message.
+    function report_aux(this: pointer[ParserState], type: MessageType, args: Vector[MessageArg], loc: Location, aux_text: StringC, aux_loc: Location)
+    {
+        var msg Message(type, loc)
+        this.emit_message(&msg, args)
+        this.emit_aux_line(aux_text, args, aux_loc)
+        this.dispatch_message(msg)
+    }
+
+    ; errorLimitExceeded (ParserApp.cxx): emitted once, after the parse, iff the
+    ; error count reached the limit. Severity Info (does NOT raise the error
+    ; count) and LOCATIONLESS (`<prog>:I: <text>`), %1 = the limit (unquoted).
+    function report_error_limit(this: pointer[ParserState], limit: u32)
+    {
+        let txt StringC("maximum number of errors (%1) reached; change with -E option")
+        var args Vector[MessageArg](1 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Num(limit as u64)
+        this.emit_message_noloc(txt, args, 0x49 as u32)
     }
 
     ; emit_message — one diagnostic line to stderr, byte-identical to onsgmls's
@@ -1048,6 +1093,110 @@ define ParserState
 
         set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
 
+        ParserState.write_utf8(bp, p)
+    }
+
+    ; emit_aux_line — the auxiliary line onsgmls prints under a message with a
+    ; non-null auxLoc: `<prog>:<file>:<line>:<col>: <aux text>` (NO severity tag),
+    ; with the aux loc's own file/line/col and the same arg vector substituted
+    ; into the aux fragment text.
+    function emit_aux_line(this: pointer[ParserState], text: StringC, args: Vector[MessageArg], loc: Location)
+    {
+        let ins this.current_input()
+
+        var fname StringC()
+        var org loc.get_origin()
+        var walking true
+        while walking
+        {
+            if org = null
+                set walking: false
+            else
+            {
+                let f org.get_file_name()
+                if f.get_size() > (0 as size_t)
+                {
+                    set fname: f
+                    set walking: false
+                }
+                else
+                {
+                    let par org.parent()
+                    set org: par.get_origin()
+                }
+            }
+        }
+
+        var line: u32 0
+        var col: u32 0
+        if ins <> null
+            ins.line_col(loc.get_index() as size_t, &line, &col)
+
+        var buf u32[2048]
+        let bp buf as pointer[u32]
+        let cap 2048 as size_t
+        var p: size_t 0
+
+        let pn this.prog_name
+        var pi: size_t 0
+        while pi < pn.get_length()
+        {
+            set p: ParserState.put_char(bp, cap, p, (*(pn.get_buffer() + pi)) as u32)
+            set pi: pi + 1
+        }
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+
+        var fi: size_t 0
+        while fi < fname.get_size()
+        {
+            set p: ParserState.put_char(bp, cap, p, fname.get(fi))
+            set fi: fi + 1
+        }
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+
+        set p: ParserState.put_dec(bp, cap, p, line as u64)
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+        set p: ParserState.put_dec(bp, cap, p, col as u64)
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x20 as u32)
+
+        let fmt MessageFormatter()
+        let added fmt.format(text, args, bp + p, cap - p, false)
+        set p: p + added
+
+        set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
+        ParserState.write_utf8(bp, p)
+    }
+
+    ; emit_message_noloc — a diagnostic with NO source location (a Messenger
+    ; message issued by the driver, e.g. errorLimitExceeded): `<prog>:<sev>: <text>`.
+    ; onsgmls's dispatchMessage omits the file:line:col entirely when the location
+    ; has a null origin.
+    function emit_message_noloc(this: pointer[ParserState], text: StringC, args: Vector[MessageArg], sev_char: u32)
+    {
+        var buf u32[2048]
+        let bp buf as pointer[u32]
+        let cap 2048 as size_t
+        var p: size_t 0
+
+        let pn this.prog_name
+        var pi: size_t 0
+        while pi < pn.get_length()
+        {
+            set p: ParserState.put_char(bp, cap, p, (*(pn.get_buffer() + pi)) as u32)
+            set pi: pi + 1
+        }
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+
+        set p: ParserState.put_char(bp, cap, p, sev_char)
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x20 as u32)
+
+        let fmt MessageFormatter()
+        let added fmt.format(text, args, bp + p, cap - p, false)
+        set p: p + added
+
+        set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
         ParserState.write_utf8(bp, p)
     }
 
