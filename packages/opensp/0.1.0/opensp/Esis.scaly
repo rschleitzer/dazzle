@@ -1,12 +1,22 @@
 use scaly.memory.Page
 use scaly.containers.Array
 use scaly.containers.String
+use scaly.io.Path
 use opensp.StringC.StringC
 use opensp.ParserState.ParserState
 use opensp.Event.Event
 use opensp.Attribute.AttributeValue
+use opensp.Attribute.Attribute
+use opensp.Attribute.AttributeSemantics
 use opensp.AttributeList.AttributeList
 use opensp.ElementType.ElementType
+use opensp.Entity.Entity
+use opensp.Entity.InternalEntity
+use opensp.Entity.ExternalTextEntity
+use opensp.Entity.ExternalDataEntity
+use opensp.Entity.SubdocEntity
+use opensp.Notation.Notation
+use opensp.ExternalId.ExternalId
 
 ; Esis — the ESIS event-dump writer (Stage 4 Increment 3).
 ;
@@ -26,10 +36,15 @@ use opensp.ElementType.ElementType
 ;                            trailing '\n' is written when the run is flushed)
 ;   C                        conforming document (only when errorCount == 0)
 ;
-; DEFERRED (later increments / Stage 5): the markup/declaration ESIS commands
-; (L location lines, N/E/I/T entity+notation defs, ? PI, _ comment, & external
-; data entity, i/e/o included/empty/omission flags, subdoc {}). Also NOTATION/
-; ENTITY attribute type strings (need AttributeSemantics wiring).
+;   N/E/I/S/T + p/s/f      entity + notation definitions (printed inline, once
+;                          per document, before the A-line / `&` reference that
+;                          first needs them)
+;   A<NAME> NOTATION/ENTITY <v>   typed tokenized values (AttributeSemantics)
+;   &<NAME>                external data entity reference in content
+;   D<ENAME> <NAME> <TYPE...>     data attributes of an external data entity
+;
+; DEFERRED (later increments): L location lines, _ comment, i/e/o flags,
+; subdoc content parsing ({}).
 ;
 ; Escaping (outputString, SgmlsEventHandler.cxx): '\' -> '\\'; RE (0x0D) -> '\n';
 ; any char < 0x20 -> '\0' + two octal digits; everything else through the
@@ -195,8 +210,179 @@ define Esis
         }
     }
 
-    ; A<NAME> <TYPE> <VALUE> for each attribute in the list that has a value.
-    function put_attributes(acc: pointer[Array[u8]], atts: pointer[AttributeList], utf8: bool)
+    ; SgmlsEventHandler::markEntity/markNotation — StringSet::add: true when
+    ; the name was already output this document, else remember it. Names alias
+    ; run-page StringCs (stable for the writer's lifetime).
+    function mark(seen: pointer[Array[StringC]], name: StringC) returns bool
+    {
+        let n seen.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let s *(seen.get_buffer() + i)
+            if s.equals(name)
+                return true
+            set i: i + 1
+        }
+        seen.add(name)
+        false
+    }
+
+    ; outputString over an 8-bit String (system/public identifiers) — the same
+    ; escaping as put_data, byte-wise.
+    function put_data_bytes(acc: pointer[Array[u8]], s: String, utf8: bool)
+    {
+        let n s.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let c s.get(i) as u32
+            if c = (0x5C as u32)
+            {
+                acc.add(0x5C as u8)
+                acc.add(0x5C as u8)
+            }
+            else if c = (0x0D as u32)
+            {
+                acc.add(0x5C as u8)
+                acc.add(0x6E as u8)
+            }
+            else if c < (0x20 as u32)
+            {
+                acc.add(0x5C as u8)
+                acc.add(0x30 as u8)
+                let d1 (c / (8 as u32)) % (8 as u32)
+                let d2 c % (8 as u32)
+                acc.add(((0x30 as u32) + d1) as u8)
+                acc.add(((0x30 as u32) + d2) as u8)
+            }
+            else
+                Esis.put_char(acc, c, utf8)
+            set i: i + 1
+        }
+    }
+
+    ; SgmlsEventHandler::externalId (:585): p<pubid> / s<sysid> and, for
+    ; entities (outputFile), f<effective system id>. The effective id is the
+    ; storage manager's resolution: `<OSFILE>` + the declaring-directory join
+    ; (PosixStorage resolveRelative) — printed only when a system id was
+    ; declared (a public-only id already warned cannotGenerateSystemId at
+    ; define time and has no effective id).
+    function put_external_id(acc: pointer[Array[u8]], id: ExternalId, base_dir: String, output_file: bool, utf8: bool)
+    {
+        if id.has_public_id()
+        {
+            Esis.put(acc, 0x70 as u8)
+            Esis.put_data_bytes(acc, id.get_public_id(), utf8)
+            Esis.put(acc, 0x0A as u8)
+        }
+        if id.has_system_id()
+        {
+            Esis.put(acc, 0x73 as u8)
+            Esis.put_data_bytes(acc, id.get_system_id(), utf8)
+            Esis.put(acc, 0x0A as u8)
+            if output_file
+            {
+                Esis.put(acc, 0x66 as u8)
+                Esis.put_lit(acc, String("<OSFILE>"))
+                let eff Path.join(base_dir, id.get_system_id())
+                Esis.put_data_bytes(acc, eff, utf8)
+                Esis.put(acc, 0x0A as u8)
+            }
+        }
+    }
+
+    ; SgmlsEventHandler::defineNotation (:575) — marks itself; a repeat is
+    ; silent. No f-line: outputNotationSysid (-onotation-sysid) is off in the
+    ; drop-in.
+    function define_notation(acc: pointer[Array[u8]], nt: pointer[Notation], seen_n: pointer[Array[StringC]], utf8: bool)
+    {
+        let nm nt.get_name()
+        if Esis.mark(seen_n, nm)
+            return
+        let id nt.get_external_id()
+        Esis.put_external_id(acc, id, String(), false, utf8)
+        Esis.put(acc, 0x4E as u8)
+        Esis.put_name(acc, nm, utf8)
+        Esis.put(acc, 0x0A as u8)
+    }
+
+    ; SgmlsEventHandler::defineEntity (:488) — the CALLER checks markEntity
+    ; first (both the attribute and the `&` reference sites), exactly like the
+    ; reference.
+    ;   internal        I<name> <CDATA|SDATA|TEXT|PI> <text>
+    ;   external data   the notation's definition, p/s/f, E<name> <TYPE> <not>,
+    ;                   then the entity's data attributes as D records
+    ;   subdoc          p/s/f, S<name>
+    ;   external text   p/s/f, T<name> — only reachable with -oentity in the
+    ;                   reference (sgml-text entities never make ENTITY-
+    ;                   attribute semantics); ported blind for completeness.
+    function define_entity(acc: pointer[Array[u8]], ent: pointer[Entity], seen_e: pointer[Array[StringC]], seen_n: pointer[Array[StringC]], utf8: bool)
+    {
+        choose *ent
+            when i: Internal
+            {
+                Esis.put(acc, 0x49 as u8)
+                Esis.put_name(acc, i.get_name(), utf8)
+                Esis.put(acc, 0x20 as u8)
+                let dt i.get_data_type()
+                if dt = DT_CDATA
+                    Esis.put_lit(acc, String("CDATA "))
+                else if dt = DT_SDATA
+                    Esis.put_lit(acc, String("SDATA "))
+                else if dt = DT_PI
+                    Esis.put_lit(acc, String("PI "))
+                else
+                    Esis.put_lit(acc, String("TEXT "))
+                Esis.put_data(acc, i.get_text(), utf8)
+                Esis.put(acc, 0x0A as u8)
+            }
+            when e: ExternalText
+            {
+                Esis.put_external_id(acc, e.get_external_id(), e.get_base_dir(), true, utf8)
+                Esis.put(acc, 0x54 as u8)
+                Esis.put_name(acc, e.get_name(), utf8)
+                Esis.put(acc, 0x0A as u8)
+            }
+            when d: ExternalData
+            {
+                let nt d.get_notation() as pointer[Notation]
+                Esis.define_notation(acc, nt, seen_n, utf8)
+                Esis.put_external_id(acc, d.get_external_id(), d.get_base_dir(), true, utf8)
+                Esis.put(acc, 0x45 as u8)
+                let dname d.get_name()
+                Esis.put_name(acc, dname, utf8)
+                Esis.put(acc, 0x20 as u8)
+                let ddt d.get_data_type()
+                if ddt = DT_CDATA
+                    Esis.put_lit(acc, String("CDATA "))
+                else if ddt = DT_SDATA
+                    Esis.put_lit(acc, String("SDATA "))
+                else
+                    Esis.put_lit(acc, String("NDATA "))
+                let ntname nt.get_name()
+                Esis.put_name(acc, ntname, utf8)
+                Esis.put(acc, 0x0A as u8)
+                let datts d.get_attributes() as pointer[AttributeList]
+                Esis.put_attributes(acc, datts, 0x44 as u8, &dname, seen_e, seen_n, utf8)
+            }
+            when sub: Subdoc
+            {
+                Esis.put_external_id(acc, sub.get_external_id(), sub.get_base_dir(), true, utf8)
+                Esis.put(acc, 0x53 as u8)
+                Esis.put_name(acc, sub.get_name(), utf8)
+                Esis.put(acc, 0x0A as u8)
+            }
+    }
+
+    ; A<NAME> <TYPE> <VALUE> for each attribute in the list that has a value
+    ; (SgmlsEventHandler::attributes, :330). `code` is 'A' for start-tag
+    ; attributes, 'D' for an entity's data attributes (`owner` then prefixes
+    ; the attribute name — startAttribute's ownerName). A tokenized value WITH
+    ; semantics first prints the definitions its value references — the
+    ; notation, or each not-yet-output entity — and types the line
+    ; NOTATION / ENTITY instead of TOKEN.
+    function put_attributes(acc: pointer[Array[u8]], atts: pointer[AttributeList], code: u8, owner: pointer[StringC], seen_e: pointer[Array[StringC]], seen_n: pointer[Array[StringC]], utf8: bool)
     {
         if atts = null
             return
@@ -208,7 +394,45 @@ define Esis
             if v <> null
             {
                 let ty v.value_type()
-                Esis.put(acc, 0x41 as u8)
+                ; 0 TOKEN, 1 NOTATION, 2 ENTITY
+                var tkind: int 0
+                if ty = AVT_TOKENIZED
+                {
+                    let a atts.attribute(i)
+                    let sem a.get_semantics()
+                    if sem <> null
+                    {
+                        let ntv sem.get_notation()
+                        if ntv <> null
+                        {
+                            Esis.define_notation(acc, ntv as pointer[Notation], seen_n, utf8)
+                            set tkind: 1
+                        }
+                        else
+                        {
+                            let ne sem.n_entities()
+                            if ne > (0 as size_t)
+                            {
+                                set tkind: 2
+                                var j: size_t 0
+                                while j < ne
+                                {
+                                    let ent sem.entity(j) as pointer[Entity]
+                                    let en ent.get_name()
+                                    if Esis.mark(seen_e, en) = false
+                                        Esis.define_entity(acc, ent, seen_e, seen_n, utf8)
+                                    set j: j + 1
+                                }
+                            }
+                        }
+                    }
+                }
+                Esis.put(acc, code)
+                if owner <> null
+                {
+                    Esis.put_name(acc, *owner, utf8)
+                    Esis.put(acc, 0x20 as u8)
+                }
                 Esis.put_name(acc, atts.name(i), utf8)
                 Esis.put(acc, 0x20 as u8)
                 if ty = AVT_IMPLIED
@@ -220,7 +444,12 @@ define Esis
                 }
                 else
                 {
-                    Esis.put_lit(acc, String("TOKEN "))
+                    if tkind = 1
+                        Esis.put_lit(acc, String("NOTATION "))
+                    else if tkind = 2
+                        Esis.put_lit(acc, String("ENTITY "))
+                    else
+                        Esis.put_lit(acc, String("TOKEN "))
                     Esis.put_data(acc, v.get_string(), utf8)
                 }
                 Esis.put(acc, 0x0A as u8)
@@ -236,6 +465,11 @@ define Esis
         ; the output coding system (identity vs UTF-8), decided once from the
         ; environment by the driver (CmdLineApp::initCodingSystem).
         let utf8 ps.get_output_utf8()
+        ; definedEntities_/definedNotations_ — each entity/notation definition
+        ; prints ONCE per document, at its first use (attribute value or `&`
+        ; reference).
+        let seen_e Array[StringC]^host()
+        let seen_n Array[StringC]^host()
         let n ps.n_events()
         var have_data false
         var k: size_t 0
@@ -259,7 +493,7 @@ define Esis
                     Esis.put(acc, 0x0A as u8)
                     set have_data: false
                 }
-                Esis.put_attributes(acc, ev.get_attributes(), utf8)
+                Esis.put_attributes(acc, ev.get_attributes(), 0x41 as u8, null, &seen_e, &seen_n, utf8)
                 Esis.put(acc, 0x28 as u8)
                 Esis.put_name(acc, ev.get_element_type().get_name(), utf8)
                 Esis.put(acc, 0x0A as u8)
@@ -285,6 +519,24 @@ define Esis
                 }
                 Esis.put(acc, 0x3F as u8)
                 Esis.put_data(acc, ev.get_data(), utf8)
+                Esis.put(acc, 0x0A as u8)
+            }
+            else if ty = EV_ENTITY_REF
+            {
+                ; SgmlsEventHandler::externalDataEntity (:448): flush the data
+                ; run, print the entity's definition on first use, then the
+                ; `&name` reference line.
+                if have_data
+                {
+                    Esis.put(acc, 0x0A as u8)
+                    set have_data: false
+                }
+                let rent ev.get_entity()
+                let rname rent.get_name()
+                if Esis.mark(&seen_e, rname) = false
+                    Esis.define_entity(acc, rent, &seen_e, &seen_n, utf8)
+                Esis.put(acc, 0x26 as u8)
+                Esis.put_name(acc, rname, utf8)
                 Esis.put(acc, 0x0A as u8)
             }
             set k: k + 1
