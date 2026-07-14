@@ -27,6 +27,8 @@ use opensp.Notation.Notation
 use opensp.Entity.Entity
 use opensp.Entity.InternalEntity
 use opensp.Entity.ExternalTextEntity
+use opensp.Entity.ExternalDataEntity
+use opensp.Entity.SubdocEntity
 use opensp.ExternalId.ExternalId
 use opensp.Storage.Storage
 use opensp.ShortReferenceMap.ShortReferenceMap
@@ -514,6 +516,15 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     {
         var args Vector[MessageArg](1 as size_t)
         set *(args.get(0 as size_t)): MessageArg.Str(a1)
+        ps.report_at(mt, args, loc)
+    }
+
+    ; E2 with two String args (%1, %2, both quoted) — entityNotationUndefined.
+    function report2_at(this: Parser, mt: MessageType, a1: StringC, a2: StringC, loc: Location)
+    {
+        var args Vector[MessageArg](2 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Str(a1)
+        set *(args.get(1 as size_t)): MessageArg.Str(a2)
         ps.report_at(mt, args, loc)
     }
 
@@ -2366,12 +2377,20 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         if this.parse_external_id(allow_sys_mdc, allow_mdc, decl_input_level, parm, &id) = false
             return false
         if nt.is_defined() = false
-            nt.set_external_id(id, ps.current_location())
+        {
+            ; pin the id strings to the run page (ExternalId.make) — `id` aliases
+            ; the transient literal buffer (cf. parse_entity_decl); the ESIS
+            ; writer reads them long after this declaration (the notation's
+            ; p/s definition lines).
+            let hid ExternalId.make(host, id)
+            nt.set_external_id(*hid, ps.current_location())
+        }
         true
     }
 
     ; ---- parseEntityDecl ---------------------------------------------------
-    function parse_entity_decl(this: Parser) returns bool
+    ; mdo_loc: the declaration's MDO (markupLocation()) — the entity's defLocation_.
+    function parse_entity_decl(this: Parser, mdo_loc: Location) returns bool
     {
         let decl_input_level ps.get_input_level()
         let parm Param.make(host)
@@ -2406,7 +2425,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return false
 
         if (parm.kind = (P_RESERVED_NAME + R_SYSTEM)) or (parm.kind = (P_RESERVED_NAME + R_PUBLIC))
-            return this.parse_external_entity(name, is_parameter, decl_input_level, parm)
+            return this.parse_external_entity(name, is_parameter, decl_input_level, parm, mdo_loc)
 
         var data_type: int DT_SGML
         if parm.kind = (P_RESERVED_NAME + R_CDATA)
@@ -2448,11 +2467,22 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         true
     }
 
-    ; parseExternalEntity(name, isParameter, declInputLevel, parm)
-    function parse_external_entity(this: Parser, name: StringC, is_parameter: bool, decl_input_level: u32, parm: pointer[Param]) returns bool
+    ; parseExternalEntity(name, isParameter, declInputLevel, parm, mdo_loc).
+    ; mdo_loc = markupLocation() — every entity built here carries it as its
+    ; defLocation_ (where entityNotationUndefined and the "entity was defined
+    ; here" auxiliary point: the declaration's MDO, verified col 0).
+    function parse_external_entity(this: Parser, name: StringC, is_parameter: bool, decl_input_level: u32, parm: pointer[Param], mdo_loc: Location) returns bool
     {
-        let allow_sys AllowedParams.a5(host, P_SYSTEMIDENTIFIER, P_RESERVED_NAME + R_CDATA, P_RESERVED_NAME + R_SDATA, P_RESERVED_NAME + R_NDATA, P_MDC)
-        let allow_end AllowedParams.a3(host, P_RESERVED_NAME + R_CDATA, P_RESERVED_NAME + R_NDATA, P_MDC)
+        var sys_codes int[6]
+        let scp sys_codes as pointer[int]
+        set *(scp + (0 as size_t)): P_SYSTEMIDENTIFIER
+        set *(scp + (1 as size_t)): P_RESERVED_NAME + R_SUBDOC
+        set *(scp + (2 as size_t)): P_RESERVED_NAME + R_CDATA
+        set *(scp + (3 as size_t)): P_RESERVED_NAME + R_SDATA
+        set *(scp + (4 as size_t)): P_RESERVED_NAME + R_NDATA
+        set *(scp + (5 as size_t)): P_MDC
+        let allow_sys AllowedParams.an(host, scp, 6)
+        let allow_end AllowedParams.a5(host, P_RESERVED_NAME + R_SUBDOC, P_RESERVED_NAME + R_CDATA, P_RESERVED_NAME + R_SDATA, P_RESERVED_NAME + R_NDATA, P_MDC)
         var id ExternalId()
         if this.parse_external_id(allow_sys, allow_end, decl_input_level, parm, &id) = false
             return false
@@ -2467,41 +2497,94 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             ; by then the declaring file is off the input stack.
             let hid ExternalId.make(host, id)
             let hbase String^host(ps.get_decl_base_dir())
-            ; EntityDecl::defLocation_ — the declaration site (the aux location a
-            ; later nonExistentEntityRef would point at for a systemless entity).
-            let dloc ps.current_location()
             let ent host.allocate(sizeof Entity, alignof Entity) as pointer[Entity]
-            set *ent: Entity.ExternalText(ExternalTextEntity(name, *hid, hbase, dloc))
+            set *ent: Entity.ExternalText(ExternalTextEntity(name, *hid, hbase, mdo_loc))
             this.maybe_define_entity(ent, is_parameter)
             return true
         }
 
-        if parm.kind = (P_RESERVED_NAME + R_NDATA)
+        let allow_mdc AllowedParams.a1(host, P_MDC)
+        let ent host.allocate(sizeof Entity, alignof Entity) as pointer[Entity]
+        if parm.kind = (P_RESERVED_NAME + R_SUBDOC)
         {
+            ; the reference reports subdocEntity when the SGML declaration says
+            ; SUBDOC NO. Our Sd does not model the SUBDOC feature; the reference
+            ; (implied) declaration says SUBDOC YES so no message fires there —
+            ; the xml.dcl (SUBDOC NO) case is owed to FEATURES parsing (full
+            ; parseSd axis), like the other constant Sd feature accessors.
+            if this.parse_param(allow_mdc, decl_input_level, parm) = false
+                return false
+            let hid ExternalId.make(host, id)
+            let hbase String^host(ps.get_decl_base_dir())
+            set *ent: Entity.Subdoc(SubdocEntity(name, *hid, hbase, mdo_loc))
+        }
+        else
+        {
+            var data_type: int DT_NDATA
+            if parm.kind = (P_RESERVED_NAME + R_CDATA)
+                set data_type: DT_CDATA
+            else if parm.kind = (P_RESERVED_NAME + R_SDATA)
+                set data_type: DT_SDATA
+            ; (warnExternalCdataEntity / warnExternalSdataEntity: option-off.)
             let allow_notname AllowedParams.a1(host, P_NAME)
             if this.parse_param(allow_notname, decl_input_level, parm) = false
                 return false
-            ; (notation reference recorded; ExternalDataEntity variant deferred)
+            let nt this.lookup_create_notation(parm.token)
             let allow_dso_mdc AllowedParams.a2(host, P_DSO, P_MDC)
             if this.parse_param(allow_dso_mdc, decl_input_level, parm) = false
                 return false
+            ; the entity's data attributes: an AttributeList over the notation's
+            ; attribute definitions — either specified in a DSO group here or
+            ; defaulted by finish() (the writer's D records read them).
+            let adl nt.get_attribute_def()
+            let atts AttributeList.make(host, adl)
+            let ctx ps.get_attribute_context()
             if parm.kind = P_DSO
             {
-                ; DEFERRED: data-attribute spec on an external data entity.
-                this.err(61)
-                return false
+                if atts.size() = (0 as size_t)
+                    if ps.get_sd().www() = false
+                    {
+                        ; notationNoAttributes — a data attribute specification
+                        ; for a notation that defined none.
+                        let nnm nt.get_name()
+                        this.report1(ParserMessages.notationNoAttributes(), nnm)
+                    }
+                var net false
+                var new_att_def: pointer[AttributeDefinitionList] null
+                if this.parse_attribute_spec(asMode, atts, &net, &new_att_def) = false
+                    return false
+                if new_att_def <> null
+                {
+                    let dtd ps.get_def_dtd()
+                    new_att_def.set_index(dtd.alloc_attribute_definition_list_index())
+                    nt.set_attribute_def(new_att_def)
+                }
+                if atts.n_spec_of() = (0 as size_t)
+                    this.report0(ParserMessages.emptyDataAttributeSpec())
+                if this.parse_param(allow_mdc, decl_input_level, parm) = false
+                    return false
             }
-            ; DEFERRED: ExternalDataEntity (NDATA) entity object.
-            this.err(62)
-            return true
+            else
+                atts.finish(ctx)
+            let hid ExternalId.make(host, id)
+            let hbase String^host(ps.get_decl_base_dir())
+            set *ent: Entity.ExternalData(ExternalDataEntity(name, *hid, hbase, mdo_loc, data_type, nt as pointer[void], atts as pointer[void]))
         }
-        ; CDATA/SDATA external entities: deferred (data-entity events).
-        this.err(63)
+        ; external CDATA/SDATA/NDATA/SUBDOC parameter entities are rejected
+        ; (reported, NOT defined) unless WWW extensions are on.
+        if is_parameter
+            if ps.get_sd().www() = false
+            {
+                this.report1(ParserMessages.externalParameterDataSubdocEntity(), name)
+                return true
+            }
+        this.maybe_define_entity(ent, is_parameter)
         true
     }
 
-    ; maybeDefineEntity (scoped): insert into the def DTD (Lpd/defaulted/events/
-    ; generateSystemId deferred).
+    ; maybeDefineEntity (scoped): insert into the def DTD (the Lpd/defaulted
+    ; arms are LINK-axis); a FRESH insert runs generateSystemId (a duplicate
+    ; keeps the old definition and generates nothing).
     function maybe_define_entity(this: Parser, entity: pointer[Entity], is_parameter: bool)
     {
         let dtd ps.get_def_dtd()
@@ -2509,7 +2592,50 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         if name.get_size() = (0 as size_t)
             dtd.set_default_entity(entity)
         else
-            dtd.insert_entity(entity, is_parameter, false)
+        {
+            let inserted dtd.insert_entity(entity, is_parameter, false)
+            if inserted = entity
+                this.generate_system_id(entity, is_parameter)
+        }
+    }
+
+    ; ExternalEntity::generateSystemId (Entity.cxx:127), run at define time.
+    ; With a system id the storage manager resolves it (our effective id is the
+    ; base-dir join computed lazily at use sites) — silent. With only a public
+    ; id there is no catalog mapping → cannotGenerateSystemIdPublic (W, arg =
+    ; the public id text). With neither → cannotGenerateSystemIdGeneral /
+    ; ...Parameter (W, arg = the entity name). All at the current token start
+    ; (the MDC — verified 3:19/4:20 vs real onsgmls). Internal entities and
+    ; notation declarations generate nothing (notations verified silent).
+    function generate_system_id(this: Parser, entity: pointer[Entity], is_parameter: bool)
+    {
+        if entity.is_external() = false
+            return
+        let id entity.get_external_id()
+        if id.has_system_id()
+            return
+        let loc ps.current_input().token_start_location()
+        if id.has_public_id()
+        {
+            ; widen the (8-bit) public id String into a StringC message arg.
+            let pub id.get_public_id()
+            let pn pub.get_length()
+            let pbuf host.allocate(pn * (4 as size_t), 4) as pointer[u32]
+            var pi: size_t 0
+            while pi < pn
+            {
+                set *(pbuf + pi): pub.get(pi) as u32
+                set pi: pi + 1
+            }
+            let parg StringC(pbuf, pn)
+            this.report1_at(ParserMessages.cannotGenerateSystemIdPublic(), parg, loc)
+            return
+        }
+        let ename entity.get_name()
+        if is_parameter
+            this.report1_at(ParserMessages.cannotGenerateSystemIdParameter(), ename, loc)
+        else
+            this.report1_at(ParserMessages.cannotGenerateSystemIdGeneral(), ename, loc)
     }
 
     ; ---- parseShortrefDecl -------------------------------------------------
@@ -2803,6 +2929,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if token = tokenMdoNameStart
             {
+                ; markupLocation() — the MDO of the declaration (the token start
+                ; BEFORE parse_declaration_name re-tokenizes the name). It becomes
+                ; an entity's defLocation_ (EntityDecl ctor takes markup.location()),
+                ; where entityNotationUndefined and the "entity was defined here"
+                ; auxiliary point.
+                let mdo_loc ps.current_input().token_start_location()
                 var decl_name: int 0
                 if this.parse_declaration_name(&decl_name)
                 {
@@ -2812,7 +2944,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     else if decl_name = R_ATTLIST
                         set result: this.parse_attlist_decl()
                     else if decl_name = R_ENTITY
-                        set result: this.parse_entity_decl()
+                        set result: this.parse_entity_decl(mdo_loc)
                     else if decl_name = R_NOTATION
                         set result: this.parse_notation_decl()
                     else if decl_name = R_SHORTREF
@@ -4320,6 +4452,25 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 ps.push_input(esrc)
             }
+            when d: ExternalData
+            {
+                ; ExternalDataEntity::contentReference — a data (CDATA/SDATA/
+                ; NDATA) entity reference emits an ExternalDataEntityEvent
+                ; instead of stacking input; the writer prints the entity's
+                ; definition records (once per document) and the `&name` line.
+                ; checkRef/checkEntlvl ran above; noteData's data-run break is
+                ; what the writer's flush-before-`&` models.
+                ps.queue_event(Event.make_entity_ref(host, ent, ref_start))
+            }
+            when sub: Subdoc
+            {
+                ; SubdocEntity::contentReference — fires a SubdocEntityEvent and
+                ; parses the subdocument with a nested parser (`{name` … `}name`).
+                ; The sub-parse is the SUBDOC feature axis (unported); the
+                ; entity itself (declaration + ENTITY-attribute semantics + the
+                ; ESIS S definition record) is modeled.
+                this.err(64)
+            }
         true
     }
 
@@ -4408,6 +4559,15 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 ps.push_input(esrc)
             }
+            when d: ExternalData
+            {
+                ; ExternalNonTextEntity::normalReference — a data PE referenced
+                ; in a declaration context is not text (only definable under
+                ; WWW, where external data parameter entities are admitted).
+                this.report0(ParserMessages.externalNonTextEntityReference())
+            }
+            when sub: Subdoc
+                this.report0(ParserMessages.externalNonTextEntityReference())
         true
     }
 
@@ -5163,6 +5323,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             ps.set_decl_base_dir(base_dir)
         }
 
+        ; ---- checkDtd's entity/notation sweeps ----
+        ; parseDoctypeDeclEnd calls checkDtd BEFORE parsing the final MDC, so a
+        ; current-location diagnostic (attlistNotationUndefined) points at the DSC.
+        this.check_dtd_notations(dtd)
+
         ; ---- the closing MDC ----
         ; In the MDC-only case (no internal subset) the MDC was already consumed
         ; by allow_ext / parse_external_id; otherwise it follows the DSC.
@@ -5249,6 +5414,115 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
             }
             set i: i + 1
+        }
+    }
+
+    ; checkDtd (parseDecl.cxx:2466-2520), the ENTITY/NOTATION halves — the
+    ; element half stays with the implied-DTD check_dtd above. Runs at DOCTYPE
+    ; end BEFORE the closing MDC is parsed (so a current-location message points
+    ; at the DSC, verified vs real onsgmls). Two sweeps:
+    ;   - every external data entity whose notation is still undefined reports
+    ;     entityNotationUndefined (notation, entity) at the entity's declaration
+    ;     MDO (its defLocation);
+    ;   - every undefined notation that carries an attribute definition list
+    ;     reports attlistNotationUndefined at the current location.
+    ; Both sweeps iterate the reference's NamedTable BUCKET order, NOT
+    ; declaration order (verified: zebra/mike/alpha) — re-derived by inserting
+    ; the names in declaration order into an IdTable (the faithful
+    ; Hash/PointerTable port) and walking its buckets. The reference's
+    ; implydefNotation branch (auto-define instead of report) is unreachable:
+    ; our Sd never sets IMPLYDEF NOTATION (constant, like implydef_doctype).
+    ; Under WWW the reference sweeps parameter entities too.
+    function check_dtd_notations(this: Parser, dtd: pointer[Dtd])
+    {
+        if ps.validate() = false
+            return
+        var passes: int 1
+        if ps.get_sd().www()
+            set passes: 2
+        var pass: int 0
+        while pass < passes
+        {
+            let is_parameter pass = 1
+            let n dtd.n_entities(is_parameter)
+            let t IdTable.make(host)
+            var i: size_t 0
+            while i < n
+            {
+                let ent dtd.entity_at(is_parameter, i)
+                if ent <> null
+                {
+                    let ename ent.get_name()
+                    t.lookup_create(host, ename)
+                }
+                set i: i + 1
+            }
+            let nb (*t).bucket_count()
+            var b: size_t 0
+            while b < nb
+            {
+                let slot (*t).bucket_at(b)
+                if slot <> null
+                {
+                    let sname slot.get_name()
+                    let ent2 dtd.lookup_entity(is_parameter, sname)
+                    if ent2 <> null
+                    {
+                        let ntv ent2.get_data_notation()
+                        if ntv <> null
+                        {
+                            let nt ntv as pointer[Notation]
+                            if nt.is_defined() = false
+                            {
+                                let nn nt.get_name()
+                                let en ent2.get_name()
+                                let dl ent2.get_def_location()
+                                this.report2_at(ParserMessages.entityNotationUndefined(), nn, en, dl)
+                            }
+                        }
+                    }
+                }
+                set b: b + 1
+            }
+            set pass: pass + 1
+        }
+        let nnot dtd.n_notations()
+        let tn IdTable.make(host)
+        var j: size_t 0
+        while j < nnot
+        {
+            let ntj dtd.notation_at(j)
+            if ntj <> null
+            {
+                let nname ntj.get_name()
+                tn.lookup_create(host, nname)
+            }
+            set j: j + 1
+        }
+        let nb2 (*tn).bucket_count()
+        var b2: size_t 0
+        while b2 < nb2
+        {
+            let slot2 (*tn).bucket_at(b2)
+            if slot2 <> null
+            {
+                let sname2 slot2.get_name()
+                let nt2 dtd.lookup_notation(sname2)
+                if nt2 <> null
+                {
+                    if nt2.is_defined() = false
+                        if nt2.get_attribute_def() <> null
+                        {
+                            ; current-location message: the current TOKEN start
+                            ; (the DSC — verified 7:0 vs real onsgmls; report1's
+                            ; cursor position is one past it).
+                            let nn2 nt2.get_name()
+                            let nloc ps.current_input().token_start_location()
+                            this.report1_at(ParserMessages.attlistNotationUndefined(), nn2, nloc)
+                        }
+                }
+            }
+            set b2: b2 + 1
         }
     }
 
