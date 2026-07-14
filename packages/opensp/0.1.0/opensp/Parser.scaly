@@ -800,9 +800,34 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     set running: false
                 }
             }
-            else if (token = tokenCroNameStart) or (token = tokenPeroNameStart)
+            else if token = tokenPeroNameStart
             {
-                ; DEFERRED: named char refs / parameter-entity refs inside literals.
+                ; parseLiteral case tokenPeroNameStart: Entity::litReference for a
+                ; parameter entity -> `%pe;` inside a parameter literal STACKS the
+                ; PE like a content reference; its chars then scan as literal
+                ; content in the `e` variant (the tokenEe arm above pops it).
+                ; Parameter literals occur only in declarations, so the reference
+                ; is always valid for the corpus's external DTDs.
+                if ps.get_current_dtd() = null
+                {
+                    this.err(2)
+                    set ok: false
+                    set running: false
+                }
+                else
+                {
+                    if this.parse_parameter_entity_reference() = false
+                    {
+                        set ok: false
+                        set running: false
+                    }
+                    else if ps.get_input_level() > start_level
+                        set cur_mode: lite_mode
+                }
+            }
+            else if token = tokenCroNameStart
+            {
+                ; DEFERRED: named char refs inside literals.
                 this.err(2)
                 set ok: false
                 set running: false
@@ -979,9 +1004,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if (token = tokenPeroNameStart) or (token = tokenPeroGrpo)
             {
-                ; DEFERRED: parameter-entity references in declarations.
-                this.err(11)
-                return false
+                ; parseParam case tokenPeroNameStart: a parameter-entity reference
+                ; where a parameter is expected -> declReference stacks it; the
+                ; loop continues, reading the replacement text as the parameter
+                ; (the tokenEe arm above pops the entity when it is exhausted).
+                if this.parse_parameter_entity_reference() = false
+                    return false
             }
             else if token = tokenPlusGrpo
             {
@@ -1245,9 +1273,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if (token = tokenPeroNameStart) or (token = tokenPeroGrpo)
             {
-                ; DEFERRED: parameter-entity references in groups.
-                this.err(31)
-                return false
+                ; parseGroupToken case tokenPeroNameStart: a parameter-entity
+                ; reference IN a model group (`(%pe;)*`) -> declReference stacks it;
+                ; the loop continues, reading the group tokens from the replacement
+                ; text (the tokenEe arm above pops the entity when exhausted).
+                if this.parse_parameter_entity_reference() = false
+                    return false
             }
             else if token = tokenUnrecognized
             {
@@ -1377,8 +1408,17 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if (token = tokenPeroNameStart) or (token = tokenPeroGrpo)
             {
-                this.err(41)
-                return false
+                ; parseGroupConnector case tokenPeroNameStart: a parameter-entity
+                ; reference in connector position. Only allowed under WWW (the XML
+                ; profile); otherwise groupEntityReference. Under WWW, declReference
+                ; stacks it and the loop reads the connector from the expansion.
+                if ps.get_sd().www() = false
+                {
+                    this.err(41)
+                    return false
+                }
+                if this.parse_parameter_entity_reference() = false
+                    return false
             }
             else if token = tokenUnrecognized
             {
@@ -2458,6 +2498,15 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 if this.parse_processing_instruction() = false
                     this.decl_subset_recover(start_level)
             }
+            else if (token = tokenPeroNameStart) or (token = tokenPeroGrpo)
+            {
+                ; doDeclSubset case tokenPeroNameStart: a parameter-entity reference
+                ; BETWEEN declarations -> dsReference stacks it; its tokens (whole
+                ; declarations) then flow into this same loop, and the tokenEe arm
+                ; above pops it when exhausted.
+                if this.parse_parameter_entity_reference() = false
+                    this.decl_subset_recover(start_level)
+            }
             else
                 this.decl_subset_recover(start_level)
         }
@@ -3423,6 +3472,76 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 if esrc = null
                 {
                     ; the entity's file could not be opened.
+                    this.err(85)
+                    return true
+                }
+                ps.push_input(esrc)
+            }
+        true
+    }
+
+    ; parseEntityReference(isParameter=1) (parseCommon.cxx:428) + the declReference/
+    ; dsReference push (entity.cxx). A `%name;` parameter-entity reference inside
+    ; a markup declaration or the declaration subset: look the PE up, then STACK
+    ; its replacement text as an InputSource so its tokens flow transparently into
+    ; the running parse. The enclosing loop's tokenEe arm pops it when exhausted —
+    ; EXACTLY the general-entity content path (parse_entity_reference above), only
+    ; with is_parameter=true. The target DTDs are EXTERNAL, where PE references
+    ; inside declarations are allowed. Only internal TEXT entities occur here (a
+    ; PE with an external / non-text body is not exercised by the corpus).
+    function parse_parameter_entity_reference(this: Parser) returns bool
+    {
+        let ins ps.current_input()
+        let start_loc ps.current_location()
+        ; discard_initial drops the PERO (`%`); the name grows over name chars.
+        ; extend_name_token's length limit is deferred (penamelen == namelen - the
+        ; PERO length, but the limit is never enforced), so namelen is exact here.
+        ins.discard_initial()
+        this.extend_name_token(this.namelen())
+        let name ps.current_token^host()
+        let dtd ps.get_current_dtd()
+        var ent dtd.lookup_entity(true, name)
+        ; consume the REFC (`;`) or record-end that terminates the reference.
+        let refc ps.get_token(refMode)
+        if ent = null
+        {
+            ; parameterEntityUndefined — reported (exit 1), reference dropped.
+            this.err(87)
+            return true
+        }
+
+        ; checkEntlvl: nesting deeper than ENTLVL is a diagnostic only.
+        let entlvl ps.get_syntax().get_quantity(qENTLVL)
+        if (ps.get_input_level() - (1 as u32)) = entlvl
+            this.err(82)
+        ; checkNotOpen: a recursive parameter-entity reference.
+        if ps.entity_is_open(ent as pointer[void])
+        {
+            this.err(83)
+            return true
+        }
+
+        let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+        set *org: Origin(start_loc, ent as pointer[void])
+        choose *ent
+            when i: Internal
+            {
+                let itext i.get_text()
+                let isrc host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
+                set *isrc: InputSource(org, itext.data_ptr(), itext.get_size())
+                ps.push_input(isrc)
+            }
+            when e: ExternalText
+            {
+                let id e.get_external_id()
+                if id.has_system_id() = false
+                {
+                    this.err(84)
+                    return true
+                }
+                let esrc this.open_external_text(id.get_system_id(), org)
+                if esrc = null
+                {
                     this.err(85)
                     return true
                 }
