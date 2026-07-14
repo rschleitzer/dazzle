@@ -19,6 +19,8 @@ use opensp.ContentToken.Ambiguity
 use opensp.Attribute.DeclaredValue
 use opensp.Attribute.AttributeDefinition
 use opensp.Attribute.AttributeValue
+use opensp.Attribute.Attribute
+use opensp.Attribute.AttributeSemantics
 use opensp.Attribute.Text
 use opensp.Attribute.AttributeContext
 use opensp.AttributeList.AttributeDefinitionList
@@ -2565,7 +2567,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     return false
             }
             else
+            {
                 atts.finish(ctx)
+                this.check_missing_semantics(atts)
+            }
             let hid ExternalId.make(host, id)
             let hbase String^host(ps.get_decl_base_dir())
             set *ent: Entity.ExternalData(ExternalDataEntity(name, *hid, hbase, mdo_loc, data_type, nt as pointer[void], atts as pointer[void]))
@@ -3375,35 +3380,88 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; set_value's bool IS parse_attribute's return value (implicit return —
         ; anything appended after it would silently become the return).
         let sv_ok atts.set_value(host, index, text, ctx)
-        ; the ID/IDREF half of makeValue's makeSemantics — reported from the
-        ; parser (the duplicateAttributeSpec precedent: `this` can report).
-        ; set_value left *text as the folded, normalized value WITH per-char
-        ; locations, so the value tokens and their locations read back directly.
-        this.check_id_semantics(atts, index, text)
+        ; the makeSemantics half of makeValue — reported from the parser (the
+        ; duplicateAttributeSpec precedent: `this` can report). set_value left
+        ; *text as the folded, normalized value WITH per-char locations, so the
+        ; value tokens and their locations read back directly.
+        this.check_value_semantics(atts, index, text)
         sv_ok
     }
 
-    ; IdDeclaredValue/IdrefDeclaredValue::makeSemantics (Attribute.cxx:534,556):
-    ; an ID attribute value defines its id — a repeated definition reports
-    ; duplicateId (E1, at the value token) with the "ID %1 first defined here"
-    ; auxiliary at the FIRST definition's location; each IDREF/IDREFS token
-    ; books a pending reference against the id table, resolved at document end
-    ; (check_idrefs -> missingId). define_id/note_idref gate themselves on
-    ; inInstance+validate, so DTD default/FIXED values never book anything.
+    ; ParserState::getAttributeEntity (ParserState.cxx:837) — lookupEntity on
+    ; the current DTD. The reference's defaulted-entity substitution (#DEFAULT
+    ; clones) and the option-off warnDefaultEntityReference warning are not
+    ; modeled — the content reference path shares the same gap.
+    function get_attribute_entity(this: Parser, name: StringC) returns pointer[Entity]
+    {
+        let dtd ps.get_current_dtd()
+        dtd.lookup_entity(false, name)
+    }
+
+    ; ParserState::getAttributeNotation (ParserState.cxx:810) — currentDtd
+    ; lookupNotation. The implydefNotation auto-create branch is unreachable
+    ; (our Sd never sets IMPLYDEF NOTATION — constant, like implydef_doctype);
+    ; the resultAttributeSpecMode arm is LINK-axis.
+    function get_attribute_notation(this: Parser, name: StringC) returns pointer[Notation]
+    {
+        let dtd ps.get_current_dtd()
+        dtd.lookup_notation(name)
+    }
+
+    ; The makeSemantics half of makeValue (Attribute.cxx) — reported from the
+    ; parser (the duplicateAttributeSpec precedent).
+    ;   ID/IDREF (IdDeclaredValue/IdrefDeclaredValue, :534/:556): an ID value
+    ;   defines its id — a repeat reports duplicateId (E1, at the value token)
+    ;   with the "ID %1 first defined here" auxiliary at the FIRST definition;
+    ;   each IDREF token books a pending reference, resolved at document end
+    ;   (check_idrefs -> missingId). define_id/note_idref gate themselves on
+    ;   inInstance+validate, so DTD default/FIXED values never book anything.
+    ;   ENTITY/ENTITIES (EntityDeclaredValue, :472): per token,
+    ;   getAttributeEntity — unknown reports invalidEntityAttribute, a non-data
+    ;   entity notDataOrSubdocEntity (both E1, validate-gated, at the token
+    ;   start); the token count accumulates into nEntityNames (GRPCNT check in
+    ;   finish); ALL tokens valid -> EntityAttributeSemantics on the Attribute,
+    ;   any invalid -> NO semantics (the ESIS A-line then says TOKEN).
+    ;   NOTATION (NotationDeclaredValue, :430): the WHOLE value is the name;
+    ;   unknown reports invalidNotationAttribute (E1, validate-gated, at the
+    ;   first token) and leaves no semantics.
     ; Values are single-space-normalized by set_value, so tokens split on one
     ; 0x20; token locations come from the value Text's per-char locations
     ; (verified vs real onsgmls: each message points at its token's first
     ; char, entity-expanded tokens resolving through the origin chain).
     ; The reference's nIdrefs/grpcnt capacity count stays with the deferred
     ; capacity axis.
-    function check_id_semantics(this: Parser, atts: pointer[AttributeList], index: size_t, text: pointer[Text])
+    function check_value_semantics(this: Parser, atts: pointer[AttributeList], index: size_t, text: pointer[Text])
     {
         let is_id atts.id(index)
         let is_idref atts.idref(index)
-        if (is_id = false) and (is_idref = false)
+        let is_ent atts.entity(index)
+        if atts.notation(index)
+        {
+            let s (*text).string()
+            let nt this.get_attribute_notation(s)
+            if nt = null
+            {
+                if ps.validate()
+                {
+                    let tloc0 (*text).loc_at(0 as size_t)
+                    let sc StringC^host(s.data_ptr(), s.get_size())
+                    this.report1_at(ParserMessages.invalidNotationAttribute(), *sc, tloc0)
+                }
+                return
+            }
+            let a atts.attribute(index)
+            let sem AttributeSemantics.make_notation(host, nt as pointer[void])
+            a.set_semantics(sem)
+            return
+        }
+        if (is_id = false) and (is_idref = false) and (is_ent = false)
             return
         let s (*text).string()
         let n s.get_size()
+        var valid true
+        var ntokens: u32 0
+        let ents Array[pointer[void]]^host()
         var start: size_t 0
         while start < n
         {
@@ -3420,15 +3478,73 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             let tok StringC^host(s.data_ptr() + start, e - start)
             let tloc (*text).loc_at(start)
+            set ntokens: ntokens + (1 as u32)
             if is_id
             {
                 var prev_loc Location()
                 if ps.define_id(*tok, tloc, &prev_loc) = false
                     this.report1_aux(ParserMessages.duplicateId(), *tok, tloc, ParserMessages.duplicateId_aux(), prev_loc)
             }
-            else
+            else if is_idref
                 ps.note_idref(*tok, tloc)
+            else
+            {
+                let ent this.get_attribute_entity(*tok)
+                if ent = null
+                {
+                    if ps.validate()
+                        this.report1_at(ParserMessages.invalidEntityAttribute(), *tok, tloc)
+                    set valid: false
+                }
+                else if ent.is_data_or_subdoc() = false
+                {
+                    if ps.validate()
+                        this.report1_at(ParserMessages.notDataOrSubdocEntity(), *tok, tloc)
+                    set valid: false
+                }
+                else
+                    ents.add(ent as pointer[void])
+            }
             set start: e + (1 as size_t)
+        }
+        if is_ent
+        {
+            atts.add_entity_names(ntokens)
+            if valid
+            {
+                let a atts.attribute(index)
+                let sem AttributeSemantics.make_entity(host, &ents)
+                a.set_semantics(sem)
+            }
+        }
+    }
+
+    ; the makeSemantics half of AttributeList::finish (Attribute.cxx:1246):
+    ; an UNSPECIFIED attribute whose missing value is a real tokenized value
+    ; gets its semantics (ID/IDREF booking, entity/notation resolution + the
+    ; validation messages) exactly like a specified one — message locations
+    ; come from the DTD default literal's Text locations. Runs right after
+    ; finish, in definition order, mirroring the reference's loop.
+    function check_missing_semantics(this: Parser, atts: pointer[AttributeList])
+    {
+        let n atts.size()
+        var i: size_t 0
+        while i < n
+        {
+            if atts.specified(i) = false
+            {
+                let v atts.value(i)
+                if v <> null
+                {
+                    if v.value_type() = AVT_TOKENIZED
+                    {
+                        let t v.get_text()
+                        if t <> null
+                            this.check_value_semantics(atts, i, t)
+                    }
+                }
+            }
+            set i: i + 1
         }
     }
 
@@ -3548,6 +3664,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return false
         let ctx ps.get_attribute_context()
         atts.finish(ctx)
+        this.check_missing_semantics(atts)
         true
     }
 
@@ -3581,7 +3698,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         var new_att_def: pointer[AttributeDefinitionList] null
         let close_token ps.get_token(tagMode)
         if close_token = tokenTagc
+        {
             atts.finish(ctx)
+            this.check_missing_semantics(atts)
+        }
         else
         {
             ins.unget_token()
@@ -3655,6 +3775,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let atts AttributeList.make(host, adl)
         let ctx ps.get_attribute_context()
         atts.finish(ctx)
+        this.check_missing_semantics(atts)
         set *start_implied: *start_implied + (1 as u32)
         let stev Event.make_start(host, e, loc)
         stev.set_attributes(atts)
