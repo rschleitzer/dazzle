@@ -1,7 +1,11 @@
 use scaly.memory.Page
+use scaly.containers.Array
 use scaly.containers.String
 use opensp.Sd.Sd
 use opensp.Syntax.Syntax
+use opensp.StringC.StringC
+use opensp.CharsetDecl.CharsetDecl
+use opensp.CharsetDecl.UnivCharsetDesc
 
 ; SdParser — a scoped reader for the SGML declaration (parseSd.cxx).
 ;
@@ -237,6 +241,292 @@ define SdParser ()
         syn.set_delim_general(delim_idx, cbuf, n)
     }
 
+    ; Widen a scanned literal into a fresh host u32 buffer, applying
+    ; minimum-literal normalization (parseMinimumLiteral: literalSingleSpace |
+    ; literalMinimumData) — runs of space/CR/LF/TAB collapse to ONE space,
+    ; leading/trailing separators drop — so a stored public id prints exactly
+    ; as onsgmls would print it in a diagnostic. Returns the normalized length;
+    ; the caller wraps the buffer in a StringC^host binding (the deep-copy-onto-
+    ; host discipline for values stored into the long-lived CharsetDecl).
+    function min_lit_buf(this: SdParser, host: pointer[Page], buf: pointer[u8], start: size_t, len: size_t, out_buf: pointer[pointer[u32]]) returns size_t
+    {
+        if len = (0 as size_t)
+        {
+            set *out_buf: null
+            return 0 as size_t
+        }
+        let cbuf host.allocate(len * (4 as size_t), 4) as pointer[u32]
+        var n: size_t 0
+        var j: size_t 0
+        while j < len
+        {
+            let c *(buf + start + j)
+            if is_ws(c)
+            {
+                if n > (0 as size_t)
+                {
+                    if *(cbuf + n - (1 as size_t)) <> (0x20 as u32)
+                    {
+                        set *(cbuf + n): 0x20 as u32
+                        set n: n + 1
+                    }
+                }
+            }
+            else
+            {
+                set *(cbuf + n): c as u32
+                set n: n + 1
+            }
+            set j: j + 1
+        }
+        if (n > (0 as size_t)) and (*(cbuf + n - (1 as size_t)) = (0x20 as u32))
+            set n: n - (1 as size_t)
+        set *out_buf: cbuf
+        n
+    }
+
+    ; CharsetRegistry::getRegistrationNumber (CharsetRegistry.cxx): the ISO
+    ; designating sequence at the END of the baseset's public id
+    ; (`...//ESC 2/5 2/15 4/6`) selects the registration; each `a/b` code is
+    ; the byte a*16+b (column/row notation), the leading ESC (0x1B) implied.
+    ; Only the IDENTITY registrations are covered (see CharsetDecl.scaly);
+    ; anything else — including the non-identity 8859-x/JIS/KSC tables and
+    ; non-ISO owners — is BASESET_UNKNOWN (the reference would look those up
+    ; in its range tables or report unknownBaseset; the corpus declarations
+    ; only use ISO 646 / ISO 10646).
+    function baseset_from_pubid(this: SdParser, buf: pointer[u8], start: size_t, len: size_t) returns int
+    {
+        ; find the last "ESC" word
+        var esc_end: size_t 0
+        var found false
+        var j: size_t 0
+        while (j + (3 as size_t)) <= len
+        {
+            if (*(buf + start + j) = (0x45 as u8)) and (*(buf + start + j + (1 as size_t)) = (0x53 as u8)) and (*(buf + start + j + (2 as size_t)) = (0x43 as u8))
+            {
+                set found: true
+                set esc_end: j + (3 as size_t)
+            }
+            set j: j + 1
+        }
+        if found = false
+            return BASESET_UNKNOWN
+        ; parse up to 4 `a/b` byte codes after the ESC
+        var bytes u32[4]
+        var nb: size_t 0
+        var k esc_end
+        while (k < len) and (nb < (4 as size_t))
+        {
+            while (k < len) and is_ws(*(buf + start + k))
+                set k: k + 1
+            if k >= len
+                break
+            if is_digit_byte(*(buf + start + k)) = false
+                break
+            var a: u32 0
+            while (k < len) and is_digit_byte(*(buf + start + k))
+            {
+                set a: (a * (10 as u32)) + ((*(buf + start + k) - (0x30 as u8)) as u32)
+                set k: k + 1
+            }
+            if (k >= len) or (*(buf + start + k) <> (0x2F as u8))
+                break
+            set k: k + 1
+            var b: u32 0
+            if (k >= len) or (is_digit_byte(*(buf + start + k)) = false)
+                break
+            while (k < len) and is_digit_byte(*(buf + start + k))
+            {
+                set b: (b * (10 as u32)) + ((*(buf + start + k) - (0x30 as u8)) as u32)
+                set k: k + 1
+            }
+            set *(bytes + nb): (a * (16 as u32)) + b
+            set nb: nb + 1
+        }
+        let b0 *(bytes + (0 as size_t))
+        let b1 *(bytes + (1 as size_t))
+        if nb = (2 as size_t)
+        {
+            ; ESC 2/5 4/0 | 2/8 4/0 | 2/8 4/2 -> ISO 646 IRV/ASCII G0;
+            ; ESC 2/1 4/0 -> ISO 646 C0
+            if (b0 = (0x25 as u32)) and (b1 = (0x40 as u32))
+                return BASESET_ASCII
+            if (b0 = (0x28 as u32)) and ((b1 = (0x40 as u32)) or (b1 = (0x42 as u32)))
+                return BASESET_ASCII
+            if (b0 = (0x21 as u32)) and (b1 = (0x40 as u32))
+                return BASESET_C0
+            return BASESET_UNKNOWN
+        }
+        if nb = (3 as size_t)
+        {
+            let b2 *(bytes + (2 as size_t))
+            if (b0 = (0x25 as u32)) and (b1 = (0x2F as u32))
+            {
+                ; ESC 2/5 2/15 4/0|4/3|4/5 -> UCS-2; 4/1|4/4|4/6 -> UCS-4
+                if (b2 = (0x40 as u32)) or (b2 = (0x43 as u32)) or (b2 = (0x45 as u32))
+                    return BASESET_UCS2
+                if (b2 = (0x41 as u32)) or (b2 = (0x44 as u32)) or (b2 = (0x46 as u32))
+                    return BASESET_UCS4
+            }
+            return BASESET_UNKNOWN
+        }
+        BASESET_UNKNOWN
+    }
+
+    ; nameToUniv (Sd.cxx:255): a minimum-literal-described character maps into
+    ; the ISO 10646 private-use group — 0x60000000 + n, one n per DISTINCT
+    ; name — never encodable in the 16-bit internal charset, so a char ref to
+    ; it under SP_CHARSET_FIXED reports numericCharRefNoInternal.
+    function name_univ(this: SdParser, names: pointer[Array[StringC]], s: StringC) returns u32
+    {
+        var i: size_t 0
+        let n names.get_length()
+        while i < n
+        {
+            let e names.get_buffer() + i
+            let ev *e
+            if ev.equals(s)
+                return (0x60000000 as u32) + (i as u32)
+            set i: i + 1
+        }
+        names.add(s)
+        (0x60000000 as u32) + (n as u32)
+    }
+
+    ; The CHARSET section (sdParseDocumentCharset / sdParseCharset,
+    ; parseSd.cxx:814/886): per BASESET a minimum-literal public id, then
+    ; DESCSET rows `<start> <count> <basenum | UNUSED | "literal">`. Builds the
+    ; CharsetDecl (charDeclared / getCharInfo) and the desc->univ mapping into
+    ; the Sd. Scoped STRICTLY to the first CHARSET keyword: rows are consumed
+    ; only while they conform, and the first non-conforming token (CAPACITY)
+    ; ends the section — the SYNTAX section's own BASESET/DESCSET (the
+    ; syntax-reference charset) is never touched. The full sdParseCharset
+    ; validation (formal-error checks, referencePublic external charsets, the
+    ; unknownBaseset/documentCharMax/tooManyCharsMinimumLiteral messages)
+    ; needs the SD report path the full parseSd port will bring; a declaration
+    ; without a parsable CHARSET section keeps the implied pair.
+    function parse_charset(this: SdParser, host: pointer[Page], buf: pointer[u8], len: size_t, sd: pointer[Sd])
+    {
+        var pos: size_t 0
+        var found_charset false
+        while found_charset = false
+        {
+            let t scan(buf, len, pos)
+            set pos: t.next_pos
+            if t.kind = SD_EOF
+                return
+            if (t.kind = SD_WORD) and word_eq(buf, t.start, t.len, "CHARSET")
+                set found_charset: true
+        }
+        let decl CharsetDecl^host()
+        let desc UnivCharsetDesc^host()
+        let names Array[StringC]^host()
+        var baseset_id BASESET_UNKNOWN
+        var running true
+        while running
+        {
+            let t scan(buf, len, pos)
+            if t.kind = SD_EOF
+                set running: false
+            else if (t.kind = SD_WORD) and word_eq(buf, t.start, t.len, "BASESET")
+            {
+                set pos: t.next_pos
+                let lit scan(buf, len, pos)
+                if lit.kind <> SD_LIT
+                    set running: false
+                else
+                {
+                    set pos: lit.next_pos
+                    ; deep-copy the public id onto host — the scan indexes a
+                    ; transient byte buffer
+                    var pid_buf: pointer[u32] null
+                    let pid_n this.min_lit_buf(host, buf, lit.start, lit.len, &pid_buf)
+                    let pid StringC^host(pid_buf, pid_n)
+                    decl.add_section(pid)
+                    set baseset_id: this.baseset_from_pubid(buf, lit.start, lit.len)
+                    let d scan(buf, len, pos)
+                    if (d.kind = SD_WORD) and word_eq(buf, d.start, d.len, "DESCSET")
+                        set pos: d.next_pos
+                    else
+                        set running: false
+                }
+            }
+            else if (t.kind = SD_WORD) and is_digit_byte(*(buf + t.start))
+            {
+                ; a DESCSET row — only valid after a BASESET opened a section
+                if decl.section_count() = (0 as size_t)
+                    set running: false
+                else
+                {
+                    set pos: t.next_pos
+                    let dmin parse_uint(buf, t.start, t.len)
+                    let t2 scan(buf, len, pos)
+                    var row_ok false
+                    if (t2.kind = SD_WORD) and is_digit_byte(*(buf + t2.start))
+                        set row_ok: true
+                    if row_ok = false
+                        set running: false
+                    else
+                    {
+                        set pos: t2.next_pos
+                        let dcount parse_uint(buf, t2.start, t2.len)
+                        let t3 scan(buf, len, pos)
+                        if t3.kind = SD_LIT
+                        {
+                            set pos: t3.next_pos
+                            var s_buf: pointer[u32] null
+                            let s_n this.min_lit_buf(host, buf, t3.start, t3.len, &s_buf)
+                            let s StringC^host(s_buf, s_n)
+                            decl.add_range_string(dmin, dcount, s)
+                            ; adjCount cap (tooManyCharsMinimumLiteral,
+                            ; parseSd.cxx:989): at most 256 chars of a
+                            ; literal-described row land in the desc
+                            var adj dcount
+                            if adj > (256 as u32)
+                                set adj: 256 as u32
+                            let univ this.name_univ(names, s)
+                            desc.add_range(dmin, adj, univ, true)
+                        }
+                        else if (t3.kind = SD_WORD) and word_eq(buf, t3.start, t3.len, "UNUSED")
+                        {
+                            set pos: t3.next_pos
+                            decl.add_range_unused(dmin, dcount)
+                        }
+                        else if (t3.kind = SD_WORD) and is_digit_byte(*(buf + t3.start))
+                        {
+                            set pos: t3.next_pos
+                            let basenum parse_uint(buf, t3.start, t3.len)
+                            decl.add_range_number(dmin, dcount, basenum)
+                            ; documentCharMax clamp (parseSd.cxx:955): only the
+                            ; part at or below charMax lands in the desc.
+                            ; (Two independent no-else ifs — an `if set else if
+                            ; set` chain here mis-emits a dead, non-dominating
+                            ; if.value phi that llc rejects.)
+                            var adj dcount
+                            if dmin > CHAR_MAX
+                                set adj: 0 as u32
+                            if (dmin <= CHAR_MAX) and (dcount > (0 as u32)) and ((dcount - (1 as u32)) > (CHAR_MAX - dmin))
+                                set adj: (CHAR_MAX - dmin) + (1 as u32)
+                            desc.add_base_range(baseset_id, dmin, adj, basenum)
+                        }
+                        else
+                            set running: false
+                    }
+                }
+            }
+            else
+                set running: false
+        }
+        ; install only a section with rows; a declaration whose CHARSET could
+        ; not be parsed keeps the implied pair (parse_to_esis installs it when
+        ; the decl slot is still null)
+        if decl.range_count() > (0 as size_t)
+        {
+            sd.set_doc_charset_decl(decl)
+            sd.set_doc_charset_desc(desc)
+        }
+    }
+
     ; build — parse an SGML declaration's byte text into an Sd + Syntax pair.
     function build(this: SdParser, host: pointer[Page], text: String) returns SdSyntax
     {
@@ -327,6 +617,12 @@ define SdParser ()
                 }
             }
         }
+
+        ; the CHARSET section — document charset declaration + desc->univ map
+        ; (independent of the keyword passes; leaves the Sd's decl slot null
+        ; when no parsable CHARSET section exists).
+        if buf <> null
+            this.parse_charset(host, buf, len, sd)
 
         let syn Syntax^host(*sd)
 
