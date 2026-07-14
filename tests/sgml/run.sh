@@ -57,6 +57,12 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# Diagnostics on stderr are compared byte-for-byte EXCEPT the leading program
+# name (MessageReporter's programName_, argv[0]) which differs between the real
+# onsgmls and the Scaly drop-in. Strip everything up to the first colon (program
+# paths carry no colon, and the filename that follows never does either).
+norm_err() { sed 's/^[^:]*://'; }
+
 total=0; ok=0; failed=""
 for entry in "$HERE"/corpus/*/ "$HERE"/corpus-private/*/; do
   [ -f "$entry/manifest" ] || continue
@@ -86,9 +92,12 @@ for entry in "$HERE"/corpus/*/ "$HERE"/corpus-private/*/; do
     >"$got_esis" 2>"$TMP/$name.err"
   echo $? >"$got_exit"
 
+  norm_err <"$TMP/$name.err" >"$TMP/$name.err.norm"
+
   if [ "$BLESS" -eq 1 ]; then
     cp "$got_esis" "$entry/expected.esis"
     cp "$got_exit" "$entry/expected.exit"
+    cp "$TMP/$name.err.norm" "$entry/expected.err"
     echo "  blessed $name"
     total=$((total+1)); ok=$((ok+1))
     continue
@@ -98,12 +107,21 @@ for entry in "$HERE"/corpus/*/ "$HERE"/corpus-private/*/; do
   if [ ! -f "$entry/expected.esis" ]; then
     echo "  $name: NO GOLDEN (run --bless)"; failed="$failed $name"; continue
   fi
+  # stderr is compared (normalized) only where a golden exists — an entry without
+  # expected.err stays backward-compatible (ESIS + exit only).
+  err_ok=1
+  if [ -f "$entry/expected.err" ]; then
+    diff -q "$entry/expected.err" "$TMP/$name.err.norm" >/dev/null 2>&1 || err_ok=0
+  fi
   if diff -q "$entry/expected.esis" "$got_esis" >/dev/null 2>&1 \
-     && [ "$(cat "$entry/expected.exit" 2>/dev/null)" = "$(cat "$got_exit")" ]; then
+     && [ "$(cat "$entry/expected.exit" 2>/dev/null)" = "$(cat "$got_exit")" ] \
+     && [ "$err_ok" -eq 1 ]; then
     ok=$((ok+1))
   else
     failed="$failed $name"
-    echo "  MISMATCH $name (exit want=$(cat "$entry/expected.exit" 2>/dev/null) got=$(cat "$got_exit"))"
+    reason="exit want=$(cat "$entry/expected.exit" 2>/dev/null) got=$(cat "$got_exit")"
+    [ "$err_ok" -eq 0 ] && reason="$reason; stderr differs"
+    echo "  MISMATCH $name ($reason)"
   fi
 done
 

@@ -24,6 +24,8 @@ use opensp.EntityCatalog.EntityCatalog
 use opensp.Message.MessageType
 use opensp.Message.MessageFragment
 use opensp.Message.Severity
+use opensp.Message.MessageArg
+use opensp.Message.MessageFormatter
 use opensp.Event.Event
 
 ; ParserState — a slice of ParserState.cs (the 1627-LOC parser god-object). This
@@ -190,6 +192,10 @@ define ParserState
     ;     external entity captures it at declaration time (its content is opened
     ;     LATER, after that file has been popped). ---
     decl_base_dir: String
+    ; --- diagnostic prefix: the program name onsgmls prints before every
+    ;     message (MessageReporter::programName_). Set from argv[0]; the harness
+    ;     normalizes it away, so its exact value is not load-bearing. ---
+    prog_name: String
 )
 {
     function make(host: pointer[Page], entity_manager: pointer[EntityManager], subdoc_level: u32, final_phase: int) returns pointer[ParserState]
@@ -245,8 +251,17 @@ define ParserState
         set ps.implydef_attlist: false
         set ps.base_dir: String()
         set ps.decl_base_dir: String()
+        set ps.prog_name: String()
         ps
     }
+
+    ; ---- diagnostic program name -----------------------------------------
+    ; The caller's String outlives the parse (argv[0] in the onsgmls program).
+    function set_prog_name(this: pointer[ParserState], name: String)
+        set this.prog_name: name
+
+    function get_prog_name(this: ParserState) returns String
+        prog_name
 
     ; ---- document base directory ------------------------------------------
     ; The caller's String outlives the parse (it is the onsgmls program's own
@@ -927,6 +942,186 @@ define ParserState
         var msg Message(type, Location())
         this.init_message(&msg)
         this.dispatch_message(msg)
+    }
+
+    ; report(type, args) — the MessageReporter path for a message with real
+    ; text: stamp its location, WRITE it to stderr now (onsgmls emits each
+    ; message immediately, independent of the ESIS stream), then queue+count it.
+    function report(this: pointer[ParserState], type: MessageType, args: Vector[MessageArg])
+    {
+        var msg Message(type, Location())
+        this.init_message(&msg)
+        this.emit_message(&msg, args)
+        this.dispatch_message(msg)
+    }
+
+    ; emit_message — one diagnostic line to stderr, byte-identical to onsgmls's
+    ; plain MessageReporter::dispatchMessage:
+    ;   <prog>:<file>:<line>:<col>:<sev>: <formatted text>\n
+    ; line 1-based, col 0-based (printLocation prints its 1-based columnNumber
+    ; minus 1). The location is the current top input's scan cursor (initMessage
+    ; stamped msg.loc there): its buffer gives line/col, its origin chain the file.
+    function emit_message(this: pointer[ParserState], msg: pointer[Message], args: Vector[MessageArg])
+    {
+        let ins this.current_input()
+        let loc msg.get_loc()
+
+        ; file name: the nearest origin up the reference chain that names a
+        ; storage id (the top document source, or an external subset/entity).
+        var fname StringC()
+        var org loc.get_origin()
+        var walking true
+        while walking
+        {
+            if org = null
+                set walking: false
+            else
+            {
+                let f org.get_file_name()
+                if f.get_size() > (0 as size_t)
+                {
+                    set fname: f
+                    set walking: false
+                }
+                else
+                {
+                    let par org.parent()
+                    set org: par.get_origin()
+                }
+            }
+        }
+
+        var line: u32 0
+        var col: u32 0
+        if ins <> null
+            ins.line_col(loc.get_index() as size_t, &line, &col)
+
+        var buf u32[2048]
+        let bp buf as pointer[u32]
+        let cap 2048 as size_t
+        var p: size_t 0
+
+        ; program name (raw ASCII bytes) + ':'
+        let pn this.prog_name
+        var pi: size_t 0
+        while pi < pn.get_length()
+        {
+            set p: ParserState.put_char(bp, cap, p, (*(pn.get_buffer() + pi)) as u32)
+            set pi: pi + 1
+        }
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+
+        ; file name + ':'
+        var fi: size_t 0
+        while fi < fname.get_size()
+        {
+            set p: ParserState.put_char(bp, cap, p, fname.get(fi))
+            set fi: fi + 1
+        }
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+
+        ; line ':' col ':'
+        set p: ParserState.put_dec(bp, cap, p, line as u64)
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+        set p: ParserState.put_dec(bp, cap, p, col as u64)
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+
+        ; severity ':' ' '
+        set p: ParserState.put_char(bp, cap, p, msg.get_type().severity_char())
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x20 as u32)
+
+        ; formatted message text (%1.. args substituted, String args quoted)
+        let fmt MessageFormatter()
+        let txt msg.get_type().get_text()
+        let added fmt.format(txt, args, bp + p, cap - p, false)
+        set p: p + added
+
+        set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
+
+        ParserState.write_utf8(bp, p)
+    }
+
+    ; append one Char to a u32 buffer (bounds-checked).
+    function put_char(out: pointer[u32], cap: size_t, pos: size_t, c: u32) returns size_t
+    {
+        if pos < cap
+        {
+            set *(out + pos): c
+            return pos + (1 as size_t)
+        }
+        pos
+    }
+
+    ; append a decimal u64.
+    function put_dec(out: pointer[u32], cap: size_t, pos: size_t, v: u64) returns size_t
+    {
+        var tmp u32[24]
+        let t tmp as pointer[u32]
+        var count: size_t 0
+        var n v
+        if n = (0 as u64)
+        {
+            set *t: (0x30 as u32)
+            set count: 1
+        }
+        else
+            while n > (0 as u64)
+            {
+                set *(t + count): (((0x30 as u64) + (n % (10 as u64))) as u32)
+                set n: n / (10 as u64)
+                set count: count + 1
+            }
+        var p pos
+        var i count
+        while i > (0 as size_t)
+        {
+            set i: i - 1
+            set p: ParserState.put_char(out, cap, p, *(t + i))
+        }
+        p
+    }
+
+    ; UTF-8 encode n Chars and write them to stderr (fd 2) in one blocking
+    ; write, exactly as onsgmls flushes each formatted message.
+    function write_utf8(out: pointer[u32], n: size_t)
+    {
+        var bytes u8[8192]
+        let b bytes as pointer[u8]
+        var w: size_t 0
+        var i: size_t 0
+        while i < n
+        {
+            let c *(out + i)
+            if c < (0x80 as u32)
+            {
+                set *(b + w): (c as u8)
+                set w: w + (1 as size_t)
+            }
+            else if c < (0x800 as u32)
+            {
+                set *(b + w): (((0xC0 as u32) | (c >> (6 as u32))) as u8)
+                set *(b + (w + (1 as size_t))): (((0x80 as u32) | (c & (0x3F as u32))) as u8)
+                set w: w + (2 as size_t)
+            }
+            else if c < (0x10000 as u32)
+            {
+                set *(b + w): (((0xE0 as u32) | (c >> (12 as u32))) as u8)
+                set *(b + (w + (1 as size_t))): (((0x80 as u32) | ((c >> (6 as u32)) & (0x3F as u32))) as u8)
+                set *(b + (w + (2 as size_t))): (((0x80 as u32) | (c & (0x3F as u32))) as u8)
+                set w: w + (3 as size_t)
+            }
+            else
+            {
+                set *(b + w): (((0xF0 as u32) | (c >> (18 as u32))) as u8)
+                set *(b + (w + (1 as size_t))): (((0x80 as u32) | ((c >> (12 as u32)) & (0x3F as u32))) as u8)
+                set *(b + (w + (2 as size_t))): (((0x80 as u32) | ((c >> (6 as u32)) & (0x3F as u32))) as u8)
+                set *(b + (w + (3 as size_t))): (((0x80 as u32) | (c & (0x3F as u32))) as u8)
+                set w: w + (4 as size_t)
+            }
+            set i: i + (1 as size_t)
+        }
+        write(2 as int, b as pointer[void], w)
     }
 
     function get_n_messages(this: ParserState) returns u32
