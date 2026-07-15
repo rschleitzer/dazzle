@@ -48,6 +48,7 @@ use opensp.Message.MessageArg
 use opensp.Message.Severity
 use opensp.ParserMessages.ParserMessages
 use opensp.ParserAppMessages.ParserAppMessages
+use opensp.PosixStorageMessages.PosixStorageMessages
 use opensp.EntityCatalog.CatalogParser
 use opensp.EntityCatalog.EntityCatalog
 use opensp.SdParser.SdParser
@@ -586,6 +587,18 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         set *(args.get(0 as size_t)): MessageArg.Str(a1)
         set *(args.get(1 as size_t)): MessageArg.Str(a2)
         ps.report_at(mt, args, loc)
+    }
+
+    ; PosixStorageManager's open-failure report, openSystemCall "cannot open %1
+    ; (%2)": %1 the effective system id (quoted StringMessageArg), %2 the
+    ; strerror text (unquoted — ErrnoMessageArg). Reported at the location of
+    ; the reference that opened the entity (ParentLocationMessenger).
+    function report_open_failure(this: Parser, sysid: StringC, emsg: pointer[const_char], loc: Location)
+    {
+        var args Vector[MessageArg](2 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Str(sysid)
+        set *(args.get(1 as size_t)): MessageArg.Raw(StringC(emsg))
+        ps.report_at(PosixStorageMessages.openSystemCall(), args, loc)
     }
 
     ; report a message whose %1 is a NUMBER (decimal, unquoted — NumberMessageArg)
@@ -3272,6 +3285,35 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 ; empty comment declaration: skip
             }
+            else if token = tokenMdoDso
+            {
+                ; doDeclSubset case tokenMdoDso: a marked section declaration
+                ; (`<![ status [`). The ParserState marked-section machine already
+                ; handles the dsMode<->dsiMode switching (startMarkedSection).
+                if this.parse_marked_section_decl_start() = false
+                    this.decl_subset_recover(start_level)
+            }
+            else if token = tokenMscMdc
+            {
+                ; doDeclSubset case tokenMscMdc: a `]]>` closing the innermost
+                ; open marked section (endMarkedSection restores dsMode).
+                this.handle_marked_section_end()
+            }
+            else if token = tokenIgnoredChar
+            {
+                ; a char inside an IGNORE marked section (imsMode) — no event
+                ; wanted for ESIS; skip.
+            }
+            else if (token = tokenRe) or (token = tokenRs) or (token = tokenCroNameStart) or (token = tokenCroDigit) or (token = tokenHcroHexDigit) or (token = tokenEroNameStart) or (token = tokenEroGrpo) or (token = tokenChar)
+            {
+                ; doDeclSubset: these occur only inside a CDATA or RCDATA marked
+                ; section (cmsMode/rcmsMode) — data is not allowed in a
+                ; declaration subset. One message at the first data token, then
+                ; recover to the section's `]]>`.
+                let dloc ps.current_input().token_start_location()
+                this.report0_at(ParserMessages.dataMarkedSectionDeclSubset(), dloc)
+                this.decl_subset_recover(start_level)
+            }
             else if token = tokenPio
             {
                 ; a processing instruction in the declaration subset (doDeclSubset
@@ -3388,7 +3430,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     {
         let sdv *ps.get_sd()
         let synv *ps.get_syntax()
-        var modes int[24]
+        var modes int[27]
         let mp modes as pointer[int]
         set *(mp + (0 as size_t)): dsMode
         set *(mp + (1 as size_t)): dsiMode
@@ -3423,8 +3465,16 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; pliteMode: the `e` variant of the parameter-literal mode — parse_literal
         ; switches to it while an entity reference is open inside a param literal.
         set *(mp + (23 as size_t)): pliteMode
+        ; Marked-section content modes: a marked section can open inside a
+        ; declaration subset (doDeclSubset tokenMdoDso), so the IGNORE/CDATA/
+        ; RCDATA scan modes must be installed for the prolog too, not only for
+        ; the instance (same null-recognizer trap as piMode above: without them
+        ; get_token yields tokenEe and the subset is silently abandoned).
+        set *(mp + (24 as size_t)): imsMode
+        set *(mp + (25 as size_t)): cmsMode
+        set *(mp + (26 as size_t)): rcmsMode
         var i: int 0
-        while i < 24
+        while i < 27
         {
             let m *(mp + (i as size_t))
             let r Recognizer.build_recognizer(host, m, sdv, synv, table)
@@ -5154,8 +5204,17 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 let esrc this.open_external_text(ebase, esys, org)
                 if esrc = null
                 {
-                    ; the entity's file could not be opened.
-                    this.err(85)
+                    ; EntityManager.open failed: openSystemCall ("cannot open
+                    ; ...") at the reference site (ParentLocationMessenger's
+                    ; parent = the origin's refLocation, the ERO), with the
+                    ; effective system id + strerror text; the reference is
+                    ; dropped and the parse continues.
+                    let disp Path.join(ebase, esys)
+                    let dispc StringC^host(disp.to_c_string())
+                    let stor Storage.OsFile(ebase)
+                    let emsg stor.open_error(esys)
+                    if emsg <> null
+                        this.report_open_failure(dispc, emsg, ref_start)
                     return true
                 }
                 ps.push_input(esrc)
@@ -5262,7 +5321,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 let esrc this.open_external_text(ebase, esys, org)
                 if esrc = null
                 {
-                    this.err(85)
+                    ; EntityManager.open failed: openSystemCall at the PERO
+                    ; reference site (see the general-entity arm above).
+                    let disp Path.join(ebase, esys)
+                    let dispc StringC^host(disp.to_c_string())
+                    let stor Storage.OsFile(ebase)
+                    let emsg stor.open_error(esys)
+                    if emsg <> null
+                        this.report_open_failure(dispc, emsg, ref_start)
                     return true
                 }
                 ps.push_input(esrc)
@@ -5884,13 +5950,19 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
     ; Load an external DTD subset named by a system id, resolved relative to the
     ; document's base directory (Storage.OsFile), into an InputSource (not yet
-    ; pushed). Returns null if the file is missing / empty.
+    ; pushed). Returns null ONLY if the file cannot be opened (the caller
+    ; reports openSystemCall and parses on with the internal subset alone); an
+    ; existing-but-EMPTY file is a valid zero-char subset, as in real onsgmls.
     function load_external_subset(this: Parser, base_dir: String, system_id: String) returns pointer[InputSource]
     {
         let storage Storage.OsFile(base_dir)
         let bytes storage.read(system_id)
         if bytes.get_length() = (0 as size_t)
-            return null
+        {
+            let emsg storage.open_error(system_id)
+            if emsg <> null
+                return null
+        }
         let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
         set *org: Origin()
         ; the storage id onsgmls displays for a location in this external subset:
@@ -5909,13 +5981,19 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; DECLARED in — see ExternalTextEntity.base_dir) and decode the file into an
     ; InputSource carrying `org` (whose entity_decl arms the recursion guard). The
     ; SAME record normalization as the document entity applies — an included text
-    ; entity is an external input source like any other. Null if not readable.
+    ; entity is an external input source like any other. Null ONLY if the file
+    ; cannot be opened (the caller reports openSystemCall at the reference site);
+    ; an existing-but-empty entity file is valid, zero-char content.
     function open_external_text(this: Parser, base_dir: String, system_id: String, org: pointer[Origin]) returns pointer[InputSource]
     {
         let storage Storage.OsFile(base_dir)
         let bytes storage.read(system_id)
         if bytes.get_length() = (0 as size_t)
-            return null
+        {
+            let emsg storage.open_error(system_id)
+            if emsg <> null
+                return null
+        }
         ; the storage id onsgmls displays for a location in this external text
         ; entity: its effective system id = the entity's SYSTEM literal resolved
         ; against the DECLARING file's directory (base_dir = ExternalTextEntity's
@@ -5974,11 +6052,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return false
 
         ; ---- external identifier (PUBLIC/SYSTEM), if present ----
-        var ext_src: pointer[InputSource] null
-        ; the external subset's own directory — the base that relative SYSTEM ids
-        ; in ITS declarations resolve against (extractDir of the DTD's system id,
-        ; combined with the document base). Defaults to the document base.
-        var ext_base base_dir
+        ; the file itself is NOT opened here: the reference stashes the doctype
+        ; entity (setDsEntity) and references it only when the internal subset
+        ; ends — at the DSC (referenceDsEntity in the tokenDsc arm) or, with no
+        ; internal subset, at the MDC. Only the system id is captured now.
+        var has_ext false
+        var dtd_sys String()
         if (parm.kind = (P_RESERVED_NAME + R_SYSTEM)) or (parm.kind = (P_RESERVED_NAME + R_PUBLIC))
         {
             var id ExternalId()
@@ -5988,19 +6067,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 return false
             if id.has_system_id()
             {
-                ; pin the DTD's system id onto host before load_external_subset —
-                ; id.get_system_id() aliases the transient literal buffer, which the
-                ; file read reuses (it read as garbage by the time we take its dir).
-                let dtd_sys String^host(id.get_system_id())
-                set ext_src: this.load_external_subset(base_dir, dtd_sys)
-                if ext_src = null
-                {
-                    ; the external subset file could not be opened.
-                    this.err(80)
-                    return false
-                }
-                let dtd_dir Path.get_directory_name(dtd_sys)
-                set ext_base: Path.join(base_dir, dtd_dir)
+                ; pin the DTD's system id onto host before any further parsing —
+                ; id.get_system_id() aliases the transient literal buffer.
+                set dtd_sys: String^host(id.get_system_id())
+                set has_ext: true
             }
             ; parm.kind is now P_DSO or P_MDC (the end token).
         }
@@ -6019,16 +6089,40 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
 
         ; ---- external subset, parsed AFTER the internal subset (SGML order) ----
-        if ext_src <> null
+        if has_ext
         {
-            ; relative SYSTEM ids in the external subset's declarations resolve
-            ; against the DTD's own directory while it is parsed; restore the
-            ; document base afterwards (content-level refs use it again).
-            ps.set_decl_base_dir(ext_base)
-            ps.push_input(ext_src)
-            let ext_level ps.get_input_level()
-            this.parse_decl_subset(ext_level, true)
-            ps.set_decl_base_dir(base_dir)
+            let ext_src this.load_external_subset(base_dir, dtd_sys)
+            if ext_src = null
+            {
+                ; the external subset file could not be opened: real onsgmls
+                ; reports openSystemCall ("cannot open ...") through the entity
+                ; manager at the point the doctype entity is referenced — the
+                ; DSC's (or, without an internal subset, the MDC's) token start,
+                ; which IS the current token here — and parses on with the
+                ; internal subset alone (referenceDsEntity returns 0).
+                let disp Path.join(base_dir, dtd_sys)
+                let dispc StringC^host(disp.to_c_string())
+                let storage Storage.OsFile(base_dir)
+                let emsg storage.open_error(dtd_sys)
+                let ins ps.current_input()
+                let floc ins.token_start_location()
+                if emsg <> null
+                    this.report_open_failure(dispc, emsg, floc)
+            }
+            else
+            {
+                ; relative SYSTEM ids in the external subset's declarations
+                ; resolve against the DTD's own directory while it is parsed
+                ; (extractDir of the DTD's system id, combined with the document
+                ; base); restore the document base afterwards.
+                let dtd_dir Path.get_directory_name(dtd_sys)
+                let ext_base Path.join(base_dir, dtd_dir)
+                ps.set_decl_base_dir(ext_base)
+                ps.push_input(ext_src)
+                let ext_level ps.get_input_level()
+                this.parse_decl_subset(ext_level, true)
+                ps.set_decl_base_dir(base_dir)
+            }
         }
 
         ; ---- checkDtd's entity/notation sweeps ----
@@ -6145,6 +6239,27 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     {
         if ps.validate() = false
             return
+        ; checkDtd's element sweep runs FIRST (parseDecl.cxx:2384): an element
+        ; type whose declaration never arrived. Only the DOCUMENT element (the
+        ; type named like the DTD, created by Dtd.make) is an error —
+        ; documentElementUndefined, validating + IMPLYDEF ELEMENT NO — at the
+        ; current location (the DSC/MDC token start, where checkDtd is called);
+        ; other undefined elements are warn-gated (warnUndefinedElement, off).
+        if ps.get_implydef_element() = IMPLYDEF_ELEMENT_NO
+        {
+            let det dtd.get_document_element_type()
+            if det <> null
+            {
+                if det.get_definition() = null
+                {
+                    ; currentLocation() = the START of the current token (the
+                    ; DSC / MDC that ended the subset), not the scan cursor.
+                    let ins ps.current_input()
+                    let cloc ins.token_start_location()
+                    this.report0_at(ParserMessages.documentElementUndefined(), cloc)
+                }
+            }
+        }
         var passes: int 1
         if ps.get_sd().www()
             set passes: 2
