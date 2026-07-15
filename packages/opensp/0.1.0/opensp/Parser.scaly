@@ -479,6 +479,64 @@ define RT_CRLF: int 1
 define RT_CR: int 2
 define RT_ASIS: int 3
 
+; Text-item tracking for AttributeValue::handleAsUnterminated (Attribute.cxx:
+; 1377) inside parse_literal. The reference iterates the Text's ITEM list and
+; remembers the last data item that is not a single space (lastStr/lastLen);
+; our Text is a flat buffer, so parse_literal reconstructs the item boundaries
+; while it accumulates: contiguous same-origin chars merge into one data item
+; (Text::addChar's merge rule), separator-replacement spaces stand alone and
+; never become the candidate, and entity boundaries / non-SGML chars RESET the
+; candidate (they are non-data items — the reference's `default:` arm).
+define HuState (item_start: size_t(0), item_open: bool(false), last_start: size_t(0), last_len: size_t(0), have_last: bool(false), prev_org: pointer[Origin](null), prev_idx: u32(0))
+{
+    ; close the open data item; a closed item that is not a single space
+    ; becomes the candidate last data item.
+    function close(this: pointer[HuState], buf: pointer[Array[u32]])
+    {
+        if this.item_open = false
+            return
+        set this.item_open: false
+        let n buf.get_length() - this.item_start
+        if (n = (1 as size_t)) and (*(buf.get_buffer() + this.item_start) = (0x20 as u32))
+            return
+        set this.last_start: this.item_start
+        set this.last_len: n
+        set this.have_last: true
+    }
+
+    ; a data char is about to be appended at buf's end: merge into the open
+    ; item when its location follows contiguously, else start a new item.
+    function note_data(this: pointer[HuState], buf: pointer[Array[u32]], loc: Location)
+    {
+        var merge false
+        if this.item_open
+        {
+            if (loc.get_origin() = this.prev_org) and (loc.get_index() = (this.prev_idx + (1 as u32)))
+                set merge: true
+        }
+        if merge = false
+        {
+            this.close(buf)
+            set this.item_start: buf.get_length()
+            set this.item_open: true
+        }
+        set this.prev_org: loc.get_origin()
+        set this.prev_idx: loc.get_index()
+    }
+
+    ; a separator-replacement space is about to be appended: it is its own
+    ; single-space item — close the open item, leave the candidate untouched.
+    function note_space(this: pointer[HuState], buf: pointer[Array[u32]])
+        this.close(buf)
+
+    ; a non-data item (entity start/end, non-SGML char): close and RESET.
+    function note_reset(this: pointer[HuState], buf: pointer[Array[u32]])
+    {
+        this.close(buf)
+        set this.have_last: false
+    }
+}
+
 define Parser (host: pointer[Page], ps: pointer[ParserState])
 {
     function make(host: pointer[Page], ps: pointer[ParserState]) returns Parser
@@ -611,9 +669,19 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     function namelen(this: Parser) returns size_t
         ps.get_syntax().get_quantity(qNAMELEN) as size_t
 
+    ; Syntax::penamelen — NAMELEN less the length of the PERO delimiter.
+    function penamelen(this: Parser) returns size_t
+    {
+        let n this.namelen()
+        let pn ps.get_syntax().delim_general_len(dPERO)
+        n - pn
+    }
+
     ; void extendNameToken(maxLength, tooLong): grow the current token over
-    ; name characters (the quantity-limit "too long" message is deferred).
-    function extend_name_token(this: Parser, maxlen: size_t)
+    ; name characters; past maxLength report the site's quantity message
+    ; (nameLength / nameTokenLength / parameterEntityNameLength /
+    ; attributeValueLength) at the token start.
+    function extend_name_token(this: Parser, maxlen: size_t, too_long: MessageType)
     {
         let ins ps.current_input()
         if ins = null
@@ -629,6 +697,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             else
                 set length: length + (1 as size_t)
         }
+        if length > maxlen
+            this.report_num_at(too_long, maxlen as u64, ins.token_start_location())
         ins.end_token(length)
     }
 
@@ -843,7 +913,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         lit_mode
     }
 
-    function parse_literal(this: Parser, lit_mode: int, single_space: bool, out_text: pointer[Text]) returns bool
+    function parse_literal(this: Parser, lit_mode: int, single_space: bool, max_length: size_t, too_long: MessageType, out_text: pointer[Text]) returns bool
     {
         let start_level ps.get_input_level()
         let lite_mode this.lite_mode_for(lit_mode)
@@ -857,6 +927,17 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; and normalization, so every stored char carries where it came from.
         let locbuf Array[Location]^host()
         let space (0x20 as u32)
+        ; startLoc (parseCommon.cxx:78) — the opening LIT/LITA delimiter, the
+        ; token the caller consumed just before calling: the location of the
+        ; guessed-unterminated-literal recovery message.
+        let start_loc ps.current_input().token_start_location()
+        ; reallyMaxLength (parseCommon.cxx:74): past twice the limit, a record
+        ; end at the base input level is taken as a missing closing delimiter.
+        var really_max (0 as size_t) - (1 as size_t)
+        if max_length <= (really_max / (2 as size_t))
+            set really_max: max_length * (2 as size_t)
+        let hu host.allocate(sizeof HuState, alignof HuState) as pointer[HuState]
+        set *hu: HuState()
         var running true
         var ok true
         while running
@@ -875,6 +956,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 else
                 {
                     ps.pop_input_stack()
+                    ; entity-end item (Text::addEntityEnd) — resets the
+                    ; unterminated-guess candidate.
+                    hu.note_reset(buf)
                     ; back at the base input level → LIT/LITA are delimiters again.
                     if ps.get_input_level() = start_level
                         set cur_mode: lit_mode
@@ -886,12 +970,25 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if (token = tokenRe) or (token = tokenSepchar)
             {
+                ; a record end past twice the limit at the base input level:
+                ; guess that the closing delimiter has been omitted
+                ; (parseCommon.cxx:130) — report at the opening delimiter and
+                ; fail the literal; the caller recovers.
+                if token = tokenRe
+                {
+                    if (buf.get_length() > really_max) and (ps.get_input_level() = start_level)
+                    {
+                        this.report0_at(ParserMessages.literalClosingDelimiter(), start_loc)
+                        return false
+                    }
+                }
                 if single_space and ((buf.get_length() = (0 as size_t)) or (this.last_char(buf) = space))
                 {
                     ; ignore
                 }
                 else
                 {
+                    hu.note_space(buf)
                     buf.add(space)
                     locbuf.add(ps.current_input().token_start_location())
                 }
@@ -904,12 +1001,22 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else
                 {
+                    hu.note_space(buf)
                     buf.add(ps.current_input().current_char())
                     locbuf.add(ps.current_input().token_start_location())
                 }
             }
             else if token = tokenChar
             {
+                ; a data RE char past twice the limit at the base input level
+                ; (parseCommon.cxx:204): same missing-closing-delimiter guess
+                ; as the tokenRe arm.
+                let lc0 ps.current_input().current_char()
+                if (buf.get_length() > really_max) and (ps.get_input_level() = start_level) and (lc0 = (0x0D as u32))
+                {
+                    this.report0_at(ParserMessages.literalClosingDelimiter(), start_loc)
+                    return false
+                }
                 ; a non-SGML character in a literal (attribute value / parameter
                 ; literal). Our scanner admits C0/DEL as sgmlChar (they stay data
                 ; in content), so they arrive as tokenChar rather than the
@@ -924,8 +1031,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else
                 {
+                    let dloc ps.current_input().token_start_location()
+                    hu.note_data(buf, dloc)
                     buf.add(lc)
-                    locbuf.add(ps.current_input().token_start_location())
+                    locbuf.add(dloc)
                 }
             }
             else if (token = tokenEroNameStart) or (token = tokenEroGrpo)
@@ -943,6 +1052,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 else
                 {
                     this.parse_entity_reference()
+                    ; entity-start item (Entity::litReference) — resets the
+                    ; unterminated-guess candidate.
+                    hu.note_reset(buf)
                     ; entity pushed → scan its chars in the `e` variant, where a
                     ; `"`/`'` (e.g. from `&quot;`) is data, not a literal close.
                     if ps.get_input_level() > start_level
@@ -964,6 +1076,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     {
                         if is_sgml
                         {
+                            hu.note_data(buf, cro_loc)
                             buf.add(ch)
                             ; the char's location is the CRO start (the
                             ; reference stores parseNumericCharRef's
@@ -972,6 +1085,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                         }
                         else
                         {
+                            ; non-SGML-char item (Text::addNonSgmlChar) —
+                            ; resets the unterminated-guess candidate.
+                            hu.note_reset(buf)
                             ; parseLiteral (parseCommon.cxx:139): a declared
                             ; non-SGML char (UNUSED range) in a literal. CDATA
                             ; attribute values carry the literalNonSgml flag
@@ -1019,8 +1135,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                         set ok: false
                         set running: false
                     }
-                    else if ps.get_input_level() > start_level
-                        set cur_mode: lite_mode
+                    else
+                    {
+                        ; entity-start item — resets the unterminated-guess
+                        ; candidate (as in the general-entity arm).
+                        hu.note_reset(buf)
+                        if ps.get_input_level() > start_level
+                            set cur_mode: lite_mode
+                    }
                 }
             }
             else if token = tokenCroNameStart
@@ -1034,14 +1156,18 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if token = tokenUnrecognized
             {
+                let uloc ps.current_input().token_start_location()
+                hu.note_data(buf, uloc)
                 buf.add(ps.current_input().current_char())
-                locbuf.add(ps.current_input().token_start_location())
+                locbuf.add(uloc)
             }
             else
             {
                 ; other tokens in literal context: treat first char as data.
+                let oloc ps.current_input().token_start_location()
+                hu.note_data(buf, oloc)
                 buf.add(ps.current_input().current_char())
-                locbuf.add(ps.current_input().token_start_location())
+                locbuf.add(oloc)
             }
         }
         if ok = false
@@ -1059,6 +1185,46 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 if this.last_char(buf) = (0x20 as u32)
                     set out_n: out_n - (1 as size_t)
             }
+        }
+        ; the maxLength check (parseCommon.cxx:223), on the size AFTER the
+        ; trailing-space drop. For attribute-value literals the reference
+        ; first tries the unterminated-literal guess
+        ; (AttributeValue::handleAsUnterminated): if the last data item, its
+        ; trailing spaces stripped, ends with the VI delimiter, report
+        ; literalClosingDelimiter at the literal's FIRST item location and
+        ; fail the literal; otherwise the too-long quantity message.
+        if out_n > max_length
+        {
+            if (lit_mode = alitMode) or (lit_mode = alitaMode) or (lit_mode = talitMode) or (lit_mode = talitaMode)
+            {
+                hu.close(buf)
+                if hu.have_last
+                {
+                    var ll hu.last_len
+                    while (ll > (0 as size_t)) and (*(buf.get_buffer() + hu.last_start + ll - (1 as size_t)) = space)
+                        set ll: ll - (1 as size_t)
+                    let syn ps.get_syntax()
+                    let vn syn.delim_general_len(dVI)
+                    if (vn > (0 as size_t)) and (ll >= vn)
+                    {
+                        var vi_match true
+                        var vj: size_t 0
+                        while vj < vn
+                        {
+                            if *(buf.get_buffer() + hu.last_start + ll - vn + vj) <> syn.delim_general_char(dVI, vj)
+                                set vi_match: false
+                            set vj: vj + 1
+                        }
+                        if vi_match
+                        {
+                            let first_loc *(locbuf.get_buffer())
+                            this.report0_at(ParserMessages.literalClosingDelimiter(), first_loc)
+                            return false
+                        }
+                    }
+                }
+            }
+            this.report_num_at(too_long, max_length as u64, ps.current_input().token_start_location())
         }
         var sc StringC()
         if out_n > (0 as size_t)
@@ -1157,41 +1323,39 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     return false
                 }
                 let txt host.allocate(sizeof Text, alignof Text) as pointer[Text]
-                var lmode: int mlitMode
-                var single false
+                ; each literal kind carries its own maxLength + quantity
+                ; message (parseParam.cxx:954-991 / parseAttribute.cxx:389):
+                ; minimum literal = the REFERENCE LITLEN (240), system id /
+                ; param literal = LITLEN, attribute values = LITLEN - NORMSEP
+                ; (via the shared wrappers, including the negative-limit edge).
+                var lit_ok true
                 if allow.literal_type = P_MINIMUMLITERAL
                 {
-                    set lmode: mlitMode
+                    var lmode: int mlitMode
                     if parm.lita
                         set lmode: mlitaMode
-                    set single: true
+                    let syn ps.get_syntax()
+                    set lit_ok: this.parse_literal(lmode, true, syn.reference_quantity(qLITLEN) as size_t, ParserMessages.minimumLiteralLength(), txt)
                 }
                 else if allow.literal_type = P_SYSTEMIDENTIFIER
                 {
-                    set lmode: slitMode
+                    var lmode: int slitMode
                     if parm.lita
                         set lmode: slitaMode
-                }
-                else if allow.literal_type = P_PARAMLITERAL
-                {
-                    set lmode: plitMode
-                    if parm.lita
-                        set lmode: plitaMode
+                    set lit_ok: this.parse_literal(lmode, false, ps.get_syntax().get_quantity(qLITLEN) as size_t, ParserMessages.systemIdentifierLength(), txt)
                 }
                 else if allow.literal_type = P_ATTRIBUTEVALUELITERAL
-                {
-                    set lmode: alitMode
-                    if parm.lita
-                        set lmode: alitaMode
-                }
+                    set lit_ok: this.parse_attribute_value_literal(parm.lita, txt)
                 else if allow.literal_type = P_TOKENIZEDATTRIBUTEVALUELITERAL
+                    set lit_ok: this.parse_tokenized_attribute_value_literal(parm.lita, txt)
+                else
                 {
-                    set lmode: talitMode
+                    var lmode: int plitMode
                     if parm.lita
-                        set lmode: talitaMode
-                    set single: true
+                        set lmode: plitaMode
+                    set lit_ok: this.parse_literal(lmode, false, ps.get_syntax().get_quantity(qLITLEN) as size_t, ParserMessages.parameterLiteralLength(), txt)
                 }
-                if this.parse_literal(lmode, single, txt) = false
+                if lit_ok = false
                     return false
                 set parm.literal_text: txt
                 return true
@@ -1269,7 +1433,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     return this.parse_reserved_name(allow, parm)
                 else if allow.name_start_type = P_NAME
                 {
-                    this.extend_name_token(this.namelen())
+                    this.extend_name_token(this.namelen(), ParserMessages.nameLength())
                     set parm.kind: P_NAME
                     set parm.orig_token: ps.current_token^host()
                     set parm.token: this.name_folded^host()
@@ -1277,7 +1441,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else if allow.name_start_type = P_ENTITYNAME
                 {
-                    this.extend_name_token(this.namelen())
+                    this.extend_name_token(this.namelen(), ParserMessages.nameLength())
                     set parm.kind: P_ENTITYNAME
                     ; NAMECASE ENTITY NO: entity names stay case-exact (unlike
                     ; P_NAME above, which folds under NAMECASE GENERAL YES).
@@ -1286,7 +1450,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else if allow.name_start_type = P_PARAMENTITYNAME
                 {
-                    this.extend_name_token(this.namelen())
+                    this.extend_name_token(this.penamelen(), ParserMessages.parameterEntityNameLength())
                     set parm.kind: P_PARAMENTITYNAME
                     ; NAMECASE ENTITY NO: parameter-entity names stay case-exact.
                     set parm.token: ps.current_token^host()
@@ -1352,14 +1516,15 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             else
                 set length: length + (1 as size_t)
         }
+        ; parseCommon.cxx:580 — a number longer than NAMELEN.
+        if length > maxlen
+            this.report_num_at(ParserMessages.numberLength(), maxlen as u64, ins.token_start_location())
         ins.end_token(length)
     }
 
     ; extendHexNumber (parseCommon.cxx:584): grow the current token over hex
-    ; digits (0-9 a-f A-F per Syntax::isHexDigit). Like extend_number, the
-    ; reference's over-NAMELEN length report (hexNumberLength) is not ported —
-    ; both corpus declarations say QUANTITY NONE, and the decimal path's
-    ; numberLength is equally unwired (the quantity-enforcement axis).
+    ; digits (0-9 a-f A-F per Syntax::isHexDigit), reporting hexNumberLength
+    ; past NAMELEN.
     function extend_hex_number(this: Parser, maxlen: size_t)
     {
         let ins ps.current_input()
@@ -1376,6 +1541,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             else
                 set length: length + (1 as size_t)
         }
+        if length > maxlen
+            this.report_num_at(ParserMessages.hexNumberLength(), maxlen as u64, ins.token_start_location())
         ins.end_token(length)
     }
 
@@ -1393,7 +1560,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; parseAttributeValueParam — an unquoted attribute value (name/number/nmchar).
     function parse_attribute_value_param(this: Parser, parm: pointer[Param]) returns bool
     {
-        this.extend_name_token(this.namelen())
+        this.extend_name_token(this.attribute_value_max_length(), ParserMessages.attributeValueLength())
         set parm.kind: P_ATTRIBUTEVALUE
         ; Copy the token onto the stable run region (^host), not the transient
         ; caller page: a default attribute value parsed here is stored in the DTD
@@ -1436,7 +1603,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
     function get_reserved_name(this: Parser, out_rn: pointer[int]) returns bool
     {
-        this.extend_name_token(this.namelen())
+        this.extend_name_token(this.namelen(), ParserMessages.nameLength())
         let buffer this.name_folded()
         let rn this.lookup_reserved_name(buffer)
         if rn < 0
@@ -1476,7 +1643,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             this.err(22)
             return false
         }
-        this.extend_name_token(this.namelen())
+        this.extend_name_token(this.namelen(), ParserMessages.nameLength())
         let buffer this.name_folded()
         let rn this.lookup_reserved_name(buffer)
         if rn < 0
@@ -1618,7 +1785,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 let ns this.gt_name_start(allow)
                 if ns = GT_ELEMENTTOKEN
                 {
-                    this.extend_name_token(this.namelen())
+                    this.extend_name_token(this.namelen(), ParserMessages.nameLength())
                     let buffer this.name_folded()
                     let e this.lookup_create_element(buffer)
                     let oi this.get_occurrence_indicator(grpMode)
@@ -1628,7 +1795,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else if (ns = GT_NAME) or (ns = GT_NAMETOKEN)
                 {
-                    this.extend_name_token(this.namelen())
+                    this.extend_name_token(this.namelen(), ParserMessages.nameLength())
                     set gt.token: this.name_folded^host()
                     set gt.kind: ns
                     return true
@@ -1646,7 +1813,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     this.err(38)
                     return false
                 }
-                this.extend_name_token(this.namelen())
+                this.extend_name_token(this.namelen(), ParserMessages.nameTokenLength())
                 set gt.token: this.name_folded^host()
                 set gt.kind: GT_NAMETOKEN
                 return true
@@ -2832,7 +2999,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     function parse_declaration_name(this: Parser, out_rn: pointer[int]) returns bool
     {
         ps.current_input().discard_initial()
-        this.extend_name_token(this.namelen())
+        this.extend_name_token(this.namelen(), ParserMessages.nameLength())
         let name this.name_folded()
         let rn this.lookup_reserved_name(name)
         if rn < 0
@@ -3259,12 +3426,41 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; capture, and the full makeValue validation (folding/category/id/idref/
     ; entity/notation — see AttributeList.set_value).
 
+    ; maxLength of an attribute value literal (parseAttribute.cxx:391):
+    ; LITLEN less NORMSEP, clamped at zero.
+    function attribute_value_max_length(this: Parser) returns size_t
+    {
+        let syn ps.get_syntax()
+        let litlen syn.get_quantity(qLITLEN) as size_t
+        let normsep syn.get_quantity(qNORMSEP) as size_t
+        if litlen > normsep
+            return litlen - normsep
+        0 as size_t
+    }
+
+    ; the NORMSEP > LITLEN edge (parseAttribute.cxx:402): an EMPTY value still
+    ; exceeds the (negative) limit — report with the shortfall as argument.
+    function report_attribute_value_length_neg(this: Parser, text: pointer[Text], neg_mt: MessageType)
+    {
+        if (*text).size() <> (0 as size_t)
+            return
+        let syn ps.get_syntax()
+        let litlen syn.get_quantity(qLITLEN) as size_t
+        let normsep syn.get_quantity(qNORMSEP) as size_t
+        if normsep > litlen
+            this.report_num_at(neg_mt, (normsep - litlen) as u64, ps.current_input().token_start_location())
+    }
+
     function parse_attribute_value_literal(this: Parser, lita: bool, out_text: pointer[Text]) returns bool
     {
         var m alitMode
         if lita
             set m: alitaMode
-        this.parse_literal(m, false, out_text)
+        let maxlen this.attribute_value_max_length()
+        if this.parse_literal(m, false, maxlen, ParserMessages.attributeValueLength(), out_text) = false
+            return false
+        this.report_attribute_value_length_neg(out_text, ParserMessages.attributeValueLengthNeg())
+        true
     }
 
     function parse_tokenized_attribute_value_literal(this: Parser, lita: bool, out_text: pointer[Text]) returns bool
@@ -3272,7 +3468,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         var m talitMode
         if lita
             set m: talitaMode
-        this.parse_literal(m, true, out_text)
+        let maxlen this.attribute_value_max_length()
+        if this.parse_literal(m, true, maxlen, ParserMessages.tokenizedAttributeValueLength(), out_text) = false
+            return false
+        this.report_attribute_value_length_neg(out_text, ParserMessages.tokenizedAttributeValueLengthNeg())
+        true
     }
 
     ; parseAttributeParameter — read the next attribute-spec token, classify it,
@@ -3321,12 +3521,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             set *result: APT_END
         else if token = tokenNameStart
         {
-            this.extend_name_token(this.namelen())
+            this.extend_name_token(this.namelen(), ParserMessages.nameTokenLength())
             set *result: APT_NAME
         }
         else if (token = tokenDigit) or (token = tokenLcUcNmchar)
         {
-            this.extend_name_token(this.namelen())
+            this.extend_name_token(this.namelen(), ParserMessages.nameTokenLength())
             set *result: APT_NAMETOKEN
         }
         else if (token = tokenLit) or (token = tokenLita)
@@ -3425,7 +3625,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             ; Copy the token onto the run page: current_token_string's buffer is
             ; transient, and a CDATA value is stored verbatim (no fold-copy in
             ; set_value), so it would dangle and read as later token bytes.
-            this.extend_name_token(this.namelen())
+            this.extend_name_token(this.attribute_value_max_length(), ParserMessages.attributeValueLength())
             let ins ps.current_input()
             let ts ins.current_token_string()
             ; per-char locations (linear: an unquoted value is one source token).
@@ -3983,7 +4183,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; (after the GI name) is the TAGC position elementNotAllowed reports at.
         let mloc ins.token_start_location()
         ins.discard_initial()
-        this.extend_name_token(this.namelen())
+        this.extend_name_token(this.namelen(), ParserMessages.nameLength())
         let name this.name_folded()
         let dtd ps.get_current_dtd()
         var e dtd.lookup_element_type(name)
@@ -4136,16 +4336,18 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 return
         }
         ; Not admissible even after minimization: elementNotAllowed
-        ; (parseInstance.cxx). Reported at the start tag's location, then recover
-        ; by forcing the transition and pushing so parsing continues (onsgmls
-        ; likewise emits the start-element event and reads on).
+        ; (parseInstance.cxx:676) — a plain message(), i.e. at the CURRENT scan
+        ; token (normally the start tag's TAGC; after an attribute-spec failure
+        ; wherever the failing literal stopped). Then recover by forcing the
+        ; transition and pushing so parsing continues (onsgmls likewise emits
+        ; the start-element event and reads on).
         let ce3 cs.current_element()
         ; elementNotAllowed only for a DEFINED element — an undefined one already
         ; got undefinedElement above (onsgmls does not also report not-allowed).
         if e.get_definition() <> null
         {
             let gi e.get_name()
-            let eloc event.get_loc()
+            let eloc ps.current_input().token_start_location()
             let mt_notallowed ParserMessages.elementNotAllowed()
             this.report1_at(mt_notallowed, gi, eloc)
         }
@@ -4193,7 +4395,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     {
         let ins ps.current_input()
         ins.discard_initial()
-        this.extend_name_token(this.namelen())
+        this.extend_name_token(this.namelen(), ParserMessages.nameLength())
         let name this.name_folded()
         let dtd ps.get_current_dtd()
         let e dtd.lookup_element_type(name)
@@ -4787,7 +4989,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; BEFORE discard_initial peels the delimiter — EntityOrigin's refLocation.
         let ref_start ins.token_start_location()
         ins.discard_initial()
-        this.extend_name_token(this.namelen())
+        this.extend_name_token(this.namelen(), ParserMessages.nameLength())
         let name ps.current_token^host()
         ; the entity-name start (cannotGenerateSystemId + entityUndefined point here).
         let name_loc ins.token_start_location()
@@ -4919,7 +5121,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; extend_name_token's length limit is deferred (penamelen == namelen - the
         ; PERO length, but the limit is never enforced), so namelen is exact here.
         ins.discard_initial()
-        this.extend_name_token(this.namelen())
+        this.extend_name_token(this.penamelen(), ParserMessages.parameterEntityNameLength())
         let name ps.current_token^host()
         let name_loc ins.token_start_location()
         let dtd ps.get_current_dtd()
@@ -5013,7 +5215,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     {
         let ins ps.current_input()
         ins.discard_initial()
-        this.extend_name_token(this.namelen())
+        this.extend_name_token(this.namelen(), ParserMessages.nameLength())
         let name_loc ins.token_start_location()
         let name this.name_folded()
         var c: u32 0
