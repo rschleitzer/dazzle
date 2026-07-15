@@ -42,6 +42,15 @@ use opensp.Event.Event
 use opensp.Esis.Esis
 use opensp.Recognizer.Recognizer
 use opensp.ModeInfo.ModeInfo
+use opensp.SdParser.SdParam
+use opensp.SdParser.AllowedSdParams
+use opensp.SdParser.CharSwitcher
+use opensp.SdParser.SdBuilder
+use opensp.CharsetDecl.CharsetDecl
+use opensp.CharsetDecl.CharsetDeclRange
+use opensp.CharsetDecl.UnivCharsetDesc
+use opensp.CharsetRegistry.CharsetRegistry
+use opensp.CharsetRegistry.CharsetRegistryIter
 use opensp.ModeInfo.PackedTokenInfo
 use opensp.ModeInfo.TokenInfo
 use opensp.Message.MessageType
@@ -54,7 +63,6 @@ use opensp.PosixStorageMessages.PosixStorageMessages
 use opensp.EntityCatalog.CatalogParser
 use opensp.EntityCatalog.EntityCatalog
 use opensp.SdParser.SdParser
-use opensp.SdParser.SdSyntax
 use opensp.CharsetDecl.CharsetDecl
 use opensp.CharsetDecl.CharsetDeclRange
 use opensp.CharsetDecl.UnivCharsetDesc
@@ -4021,6 +4029,22 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 set ok: false
                 set running: false
             }
+            else if token = tokenUnrecognized
+            {
+                ; parseComment's tokenUnrecognized arm (parseCommon.cxx:546):
+                ; a non-SGML char reports nonSgmlCharacter; a valid SGML char
+                ; that is not significant in the SD comment mode reports
+                ; sdCommentSignificant. report_non_sgml_param CONSUMES the
+                ; char either way (a zero-length unrecognized token would
+                ; loop forever otherwise — only reachable in sdcomMode, whose
+                ; tokenChar set is significant, not sgmlChar).
+                if this.report_non_sgml_param() = false
+                {
+                    let ins ps.current_input()
+                    let ts ins.current_token_string()
+                    this.report1_at(ParserMessages.sdCommentSignificant(), ts, ins.token_start_location())
+                }
+            }
             ; else: a comment character (already consumed by get_token) — continue
         }
         ok
@@ -6701,75 +6725,6 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
     }
 
-    ; reportNonSgmlCharacter over the SGML DECLARATION (parseSd.cxx). onsgmls
-    ; reads the declaration through the same record machinery as the document
-    ; and reports every non-SGML char it tokenizes up to the declaration-closing
-    ; MDC (`>`) — INCLUDING chars inside `--…--` comments and quoted literals
-    ; (verified against onsgmls 1.5.2); a trailing comment AFTER the MDC is never
-    ; reached. Our SdParser is a scoped byte tokenizer with no report path, so
-    ; this is a dedicated pass over the declaration's normalized buffer (pushed
-    ; as the current input, so emit_message reads line/col + file from it). The
-    ; comment/literal state is used ONLY to find the MDC: a `>` inside a literal
-    ; (e.g. `NET ">"`) or a comment does not end the declaration.
-    function scan_sd_non_sgml(this: Parser)
-    {
-        let ins ps.current_input()
-        if ins = null
-            return
-        let origin ins.get_origin()
-        let n ins.get_length()
-        let mt ParserMessages.nonSgmlCharacter()
-        var state: int 0
-        var quote: u32 0
-        var i: size_t 0
-        while i < n
-        {
-            let c ins.char_at(i)
-            if this.is_non_sgml_char(c)
-                this.report_num_at(mt, c as u64, Location(origin, i as u32))
-            if state = (0 as int)
-            {
-                if c = (0x3E as u32)
-                    return
-                else if (c = (0x22 as u32)) or (c = (0x27 as u32))
-                {
-                    set state: 1 as int
-                    set quote: c
-                }
-                else if c = (0x2D as u32)
-                {
-                    if (i + (1 as size_t)) < n
-                    {
-                        if ins.char_at(i + (1 as size_t)) = (0x2D as u32)
-                        {
-                            set state: 2 as int
-                            set i: i + (1 as size_t)
-                        }
-                    }
-                }
-            }
-            else if state = (1 as int)
-            {
-                if c = quote
-                    set state: 0 as int
-            }
-            else
-            {
-                if c = (0x2D as u32)
-                {
-                    if (i + (1 as size_t)) < n
-                    {
-                        if ins.char_at(i + (1 as size_t)) = (0x2D as u32)
-                        {
-                            set state: 0 as int
-                            set i: i + (1 as size_t)
-                        }
-                    }
-                }
-            }
-            set i: i + (1 as size_t)
-        }
-    }
 
     ; endAllElements (parseInstance.cxx:1118). Closes every still-open element,
     ; complaining about each one whose content model is unsatisfied, and then —
@@ -8591,10 +8546,3852 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let dtd ps.get_current_dtd()
         if dtd = null
             return false
+        ; SCOPE INSTANCE: the instance parses with the DECLARED syntax; the
+        ; content-mode recognizers compile from it.
+        let inst ps.get_instance_syntax()
+        let cur_syn ps.get_syntax()
+        if (inst <> null) and (inst <> cur_syn)
+            ps.switch_to_instance_syntax()
         this.install_content_recognizers(table)
         ps.start_instance(host, dtd)
         this.do_instance_start()
         this.do_content()
+        true
+    }
+
+    ; ======================================================================
+    ; The SGML-declaration parser (parseSd.cxx) — parseSdParam tokenizer
+    ; level. Sections and the parseSgmlDecl driver follow below.
+
+    ; every plain message() in the SD context anchors at the current token's
+    ; start (the S27 location convention).
+    function sd_loc(this: Parser) returns Location
+    {
+        let ins ps.current_input()
+        ins.token_start_location()
+    }
+
+    ; StringMessageArg + NumberMessageArg pair (delimiterLength).
+    function report_str_num_at(this: Parser, mt: MessageType, a1: StringC, a2: u64, loc: Location)
+    {
+        var args Vector[MessageArg](2 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Str(a1)
+        set *(args.get(1 as size_t)): MessageArg.Num(a2)
+        ps.report_at(mt, args, loc)
+    }
+
+    function arg_append_dec(this: Parser, buf: pointer[Array[u32]], v: u64)
+    {
+        var digits u32[24]
+        let dp digits as pointer[u32]
+        var n: size_t 0
+        var x v
+        if x = (0 as u64)
+        {
+            buf.add(0x30 as u32)
+            return
+        }
+        while x > (0 as u64)
+        {
+            set *(dp + n): ((0x30 as u64) + (x % (10 as u64))) as u32
+            set x: x / (10 as u64)
+            set n: n + 1
+        }
+        while n > (0 as size_t)
+        {
+            set n: n - (1 as size_t)
+            buf.add(*(dp + n))
+        }
+    }
+
+    ; CharsetMessageArg (parseSd.cxx:3456): number list, "a" / "a, b" for an
+    ; adjacent pair / "a-b" for a longer range; ", " between entries. Rendered
+    ; via appendNumber/appendFragment — UNQUOTED.
+    function charset_message_arg(this: Parser, cset: pointer[ISet]) returns StringC
+    {
+        let buf Array[u32]^host()
+        var first true
+        var i: size_t 0
+        let n cset.get_count()
+        while i < n
+        {
+            let mn cset.range_min(i)
+            let mx cset.range_max(i)
+            this.arg_append_sep(buf, &first)
+            this.arg_append_dec(buf, mn as u64)
+            if mx <> mn
+            {
+                if mx = (mn + (1 as u32))
+                    this.arg_append(buf, StringC(", "))
+                else
+                    this.arg_append(buf, StringC("-"))
+                this.arg_append_dec(buf, mx as u64)
+            }
+            set i: i + 1
+        }
+        this.arg_to_string(buf)
+    }
+
+    ; AllowedSdParamsMessageArg (parseSd.cxx:3313): fragments unquoted,
+    ; appendChars pieces quoted, listSep between entries.
+    function sd_allow_arg(this: Parser, allow: AllowedSdParams) returns StringC
+    {
+        let buf Array[u32]^host()
+        var first true
+        var i: int 0
+        while i < 6
+        {
+            let t allow.get(i)
+            if t = SDP_INVALID
+                break
+            this.arg_append_sep(buf, &first)
+            if t = SDP_EE
+                this.arg_append(buf, StringC("entity end"))
+            else if t = SDP_MINIMUM_LITERAL
+                this.arg_append(buf, StringC("minimum literal"))
+            else if t = SDP_MDC
+            {
+                this.arg_append(buf, StringC("delimiter "))
+                this.arg_append_quoted(buf, StringC(">"))
+            }
+            else if t = SDP_NUMBER
+                this.arg_append(buf, StringC("number"))
+            else if t = SDP_NAME
+                this.arg_append(buf, StringC("name"))
+            else if t = SDP_PARAM_LITERAL
+                this.arg_append(buf, StringC("parameter literal"))
+            else if t = SDP_SYSTEM_IDENTIFIER
+                this.arg_append(buf, StringC("system identifier"))
+            else if t = SDP_CAPACITY_NAME
+                this.arg_append(buf, StringC("name of capacity"))
+            else if t = SDP_GENERAL_DELIMITER_NAME
+                this.arg_append(buf, StringC("name of general delimiter role"))
+            else if t = SDP_REFERENCE_RESERVED_NAME
+                this.arg_append(buf, StringC("reference reserved name"))
+            else if t = SDP_QUANTITY_NAME
+                this.arg_append(buf, StringC("name of quantity"))
+            else if t = SDP_MINUS
+                this.arg_append_quoted(buf, StringC("..."))
+            else
+            {
+                let sdv ps.get_sd()
+                let spell sdv.sd_reserved_name(t - SDP_RESERVED_NAME)
+                this.arg_append_quoted(buf, spell)
+            }
+            set i: i + 1
+        }
+        this.arg_to_string(buf)
+    }
+
+    ; Parser::sdParamInvalidToken (parseSd.cxx:3251).
+    function sd_param_invalid_token(this: Parser, token: u32, allow: AllowedSdParams)
+    {
+        let tok_arg this.token_message_arg(token, sdMode)
+        let allow_arg this.sd_allow_arg(allow)
+        this.report_raw_raw_at(ParserMessages.sdParamInvalidToken(), tok_arg, allow_arg, this.sd_loc())
+    }
+
+    ; Parser::stringToNumber over the current token (u64 accumulation with the
+    ; reference's overflow guard).
+    function sd_token_number(this: Parser, out_n: pointer[u64]) returns bool
+    {
+        let ins ps.current_input()
+        let start ins.current_token_start_index()
+        let len ins.current_token_length()
+        var n: u64 0
+        var i: size_t 0
+        while i < len
+        {
+            let c ins.char_at(start + i)
+            let d (c - (0x30 as u32)) as u64
+            if n > (0x1999999999999999 as u64)
+                return false
+            set n: n * (10 as u64)
+            if n > ((0xFFFFFFFFFFFFFFFF as u64) - d)
+                return false
+            set n: n + d
+            set i: i + 1
+        }
+        set *out_n: n
+        true
+    }
+
+    ; Parser::parseSdParam (parseSd.cxx:2882) — the SD tokenizer/dispatcher.
+    function parse_sd_param(this: Parser, allow: AllowedSdParams, parm: pointer[SdParam]) returns bool
+    {
+        while true
+        {
+            let token ps.get_token(sdMode)
+            if token = tokenUnrecognized
+            {
+                if this.report_non_sgml_param()
+                {
+                    ; reported + consumed; keep scanning.
+                }
+                else
+                {
+                    let ins ps.current_input()
+                    let ts ins.current_token_string()
+                    let allow_arg this.sd_allow_arg(allow)
+                    this.report_str_raw_at(ParserMessages.markupDeclarationCharacter(), ts, allow_arg, this.sd_loc())
+                    return false
+                }
+            }
+            else if token = tokenEe
+            {
+                if allow.param(SDP_EE)
+                {
+                    set parm.kind: SDP_EE
+                    ps.pop_input_stack()
+                    return true
+                }
+                let allow_arg this.sd_allow_arg(allow)
+                this.report_raw_at(ParserMessages.sdEntityEnd(), allow_arg, this.sd_loc())
+                return false
+            }
+            else if token = tokenS
+            {
+                ; separator — keep scanning.
+            }
+            else if token = tokenCom
+            {
+                if this.parse_comment(sdcomMode) = false
+                    return false
+            }
+            else if (token = tokenDso) or (token = tokenGrpo) or (token = tokenMinusGrpo) or (token = tokenPlusGrpo) or (token = tokenRni) or (token = tokenPeroNameStart) or (token = tokenPeroGrpo)
+            {
+                this.sd_param_invalid_token(token, allow)
+                return false
+            }
+            else if token = tokenMinus
+            {
+                if allow.param(SDP_MINUS)
+                {
+                    set parm.kind: SDP_MINUS
+                    return true
+                }
+                this.sd_param_invalid_token(tokenMinus, allow)
+                return false
+            }
+            else if (token = tokenLit) or (token = tokenLita)
+            {
+                let lita token = tokenLita
+                if allow.param(SDP_MINIMUM_LITERAL)
+                {
+                    var lmode: int mlitMode
+                    if lita
+                        set lmode: mlitaMode
+                    let txt host.allocate(sizeof Text, alignof Text) as pointer[Text]
+                    let syn ps.get_syntax()
+                    if this.parse_literal(lmode, true, syn.reference_quantity(qLITLEN) as size_t, ParserMessages.minimumLiteralLength(), txt) = false
+                        return false
+                    set parm.kind: SDP_MINIMUM_LITERAL
+                    set parm.literal_text: txt
+                }
+                else if allow.param(SDP_PARAM_LITERAL)
+                {
+                    if this.parse_sd_param_literal(lita, parm) = false
+                        return false
+                    set parm.kind: SDP_PARAM_LITERAL
+                }
+                else if allow.param(SDP_SYSTEM_IDENTIFIER)
+                {
+                    let txt host.allocate(sizeof Text, alignof Text) as pointer[Text]
+                    if this.parse_sd_system_identifier(lita, txt) = false
+                        return false
+                    set parm.kind: SDP_SYSTEM_IDENTIFIER
+                    set parm.literal_text: txt
+                }
+                else
+                {
+                    this.sd_param_invalid_token(token, allow)
+                    return false
+                }
+                return true
+            }
+            else if token = tokenMdc
+            {
+                if allow.param(SDP_MDC)
+                {
+                    set parm.kind: SDP_MDC
+                    return true
+                }
+                this.sd_param_invalid_token(tokenMdc, allow)
+                return false
+            }
+            else if token = tokenNameStart
+            {
+                let syn ps.get_syntax()
+                let namelen syn.get_quantity(qNAMELEN) as size_t
+                this.extend_name_token(namelen, ParserMessages.nameLength())
+                ; pin the folded token onto host — parm outlives this frame.
+                let tok ps.current_token_subst#(syn)
+                set parm.token: StringC^host(tok.data_ptr(), tok.get_size())
+                let sdv ps.get_sd()
+                if allow.param(SDP_CAPACITY_NAME)
+                {
+                    let ci sdv.lookup_capacity_name(parm.token)
+                    if ci >= 0
+                    {
+                        set parm.kind: SDP_CAPACITY_NAME
+                        set parm.idx: ci
+                        return true
+                    }
+                }
+                if allow.param(SDP_REFERENCE_RESERVED_NAME)
+                {
+                    let rr syn.lookup_reserved_name(parm.token)
+                    if rr >= 0
+                    {
+                        set parm.kind: SDP_REFERENCE_RESERVED_NAME
+                        set parm.idx: rr
+                        return true
+                    }
+                }
+                if allow.param(SDP_GENERAL_DELIMITER_NAME)
+                {
+                    let di sdv.lookup_general_delimiter_name(parm.token)
+                    if di >= 0
+                    {
+                        set parm.kind: SDP_GENERAL_DELIMITER_NAME
+                        set parm.idx: di
+                        return true
+                    }
+                }
+                if allow.param(SDP_QUANTITY_NAME)
+                {
+                    let qi sdv.lookup_quantity_name(parm.token)
+                    if qi >= 0
+                    {
+                        set parm.kind: SDP_QUANTITY_NAME
+                        set parm.idx: qi
+                        return true
+                    }
+                }
+                var ai: int 0
+                while ai < 6
+                {
+                    let t allow.get(ai)
+                    if t = SDP_INVALID
+                        break
+                    if t >= SDP_RESERVED_NAME
+                    {
+                        let spell sdv.sd_reserved_name(t - SDP_RESERVED_NAME)
+                        if parm.token.equals(spell)
+                        {
+                            set parm.kind: t
+                            return true
+                        }
+                    }
+                    set ai: ai + 1
+                }
+                if allow.param(SDP_NAME)
+                {
+                    set parm.kind: SDP_NAME
+                    return true
+                }
+                let allow_arg this.sd_allow_arg(allow)
+                this.report_str_raw_at(ParserMessages.sdInvalidNameToken(), parm.token, allow_arg, this.sd_loc())
+                return false
+            }
+            else if token = tokenDigit
+            {
+                if allow.param(SDP_NUMBER)
+                {
+                    let syn ps.get_syntax()
+                    let nlen syn.get_quantity(qNAMELEN) as size_t
+                    this.extend_number(nlen)
+                    set parm.kind: SDP_NUMBER
+                    var n64: u64 0
+                    var num_ok this.sd_token_number(&n64)
+                    if num_ok
+                    {
+                        if n64 > (4294967295 as u64)
+                            set num_ok: false
+                    }
+                    if num_ok = false
+                    {
+                        let ins ps.current_input()
+                        let ts ins.current_token_string()
+                        this.report1_at(ParserMessages.numberTooBig(), ts, this.sd_loc())
+                        set parm.n: 4294967295 as u32
+                    }
+                    else
+                        set parm.n: n64 as u32
+                    ; a name start directly after a number needs a separator
+                    ; (parseSd.cxx:3053).
+                    let peek ps.get_token(sdMode)
+                    if peek = tokenNameStart
+                        this.report0_at(ParserMessages.psRequired(), this.sd_loc())
+                    let ins2 ps.current_input()
+                    ins2.unget_token()
+                    return true
+                }
+                this.sd_param_invalid_token(tokenDigit, allow)
+                return false
+            }
+            else
+            {
+                ; CANNOT_HAPPEN in the reference; treat as invalid.
+                this.sd_param_invalid_token(token, allow)
+                return false
+            }
+        }
+        false
+    }
+
+    ; Parser::parseSdParamLiteral (parseSd.cxx:3070) — a parameter literal in
+    ; the SGML declaration; chars are SYNTAX chars (numeric refs bounded by
+    ; syntaxCharMax, not the document charset).
+    function parse_sd_param_literal(this: Parser, lita: bool, parm: pointer[SdParam]) returns bool
+    {
+        var lmode: int sdplitMode
+        if lita
+            set lmode: sdplitaMode
+        let syn ps.get_syntax()
+        let ref_litlen syn.reference_quantity(qLITLEN) as size_t
+        let buf Array[u32]^host()
+        var running true
+        while running
+        {
+            let token ps.get_token(lmode)
+            if token = tokenEe
+            {
+                this.report0_at(ParserMessages.literalLevel(), this.sd_loc())
+                return false
+            }
+            else if token = tokenUnrecognized
+            {
+                if this.report_non_sgml_param()
+                {
+                    ; non-SGML char reported + consumed (dropped).
+                }
+                else
+                {
+                    ; options().errorSignificant (sdLiteralSignificant) is a
+                    ; -w flag, default off; the char joins the literal.
+                    let ins ps.current_input()
+                    let pc ins.current_char()
+                    buf.add(pc)
+                }
+            }
+            else if token = tokenCroDigit
+            {
+                let ins ps.current_input()
+                ins.discard_initial()
+                let nlen2 syn.get_quantity(qNAMELEN) as size_t
+                this.extend_number(nlen2)
+                var n64: u64 0
+                var valid this.sd_token_number(&n64)
+                if valid
+                {
+                    if n64 > (4294967295 as u64)
+                        set valid: false
+                }
+                if valid = false
+                {
+                    let ts ins.current_token_string()
+                    this.report1_at(ParserMessages.syntaxCharacterNumber(), ts, this.sd_loc())
+                }
+                ; consume the reference end (REFC / RE / neither); warnRefc is
+                ; a -w flag, default off.
+                let rt ps.get_token(refMode)
+                if valid
+                    buf.add(n64 as u32)
+            }
+            else if token = tokenCroNameStart
+            {
+                if this.parse_named_char_ref() = false
+                    return false
+            }
+            else if (token = tokenLit) or (token = tokenLita)
+                set running: false
+            else if (token = tokenPeroNameStart) or (token = tokenPeroGrpo)
+            {
+                this.report0_at(ParserMessages.sdParameterEntity(), this.sd_loc())
+                let ins ps.current_input()
+                let start ins.current_token_start_index()
+                let len ins.current_token_length()
+                var i: size_t 0
+                while i < len
+                {
+                    let c ins.char_at(start + i)
+                    buf.add(c)
+                    set i: i + 1
+                }
+            }
+            else if token = tokenChar
+            {
+                let ins ps.current_input()
+                let pc ins.current_char()
+                if buf.get_length() > ref_litlen
+                {
+                    let re_char syn.standard_function(fRE)
+                    if pc = re_char
+                    {
+                        this.report_num_at(ParserMessages.parameterLiteralLength(), ref_litlen as u64, this.sd_loc())
+                        ; guess that the closing delimiter has been omitted
+                        this.report0_at(ParserMessages.literalClosingDelimiter(), this.sd_loc())
+                        return false
+                    }
+                }
+                buf.add(pc)
+            }
+            else
+            {
+                ; no other token is recognized in the sdplit modes.
+                set running: false
+            }
+        }
+        if buf.get_length() > ref_litlen
+            this.report_num_at(ParserMessages.parameterLiteralLength(), ref_litlen as u64, this.sd_loc())
+        set parm.param_literal: StringC^host(buf.get_buffer(), buf.get_length())
+        true
+    }
+
+    ; Parser::parseSdSystemIdentifier (parseSd.cxx:3191).
+    function parse_sd_system_identifier(this: Parser, lita: bool, txt: pointer[Text]) returns bool
+    {
+        var lmode: int sdslitMode
+        if lita
+            set lmode: sdslitaMode
+        let syn ps.get_syntax()
+        let ref_litlen syn.reference_quantity(qLITLEN) as size_t
+        let buf Array[u32]^host()
+        var running true
+        while running
+        {
+            let token ps.get_token(lmode)
+            if token = tokenEe
+            {
+                this.report0_at(ParserMessages.literalLevel(), this.sd_loc())
+                return false
+            }
+            else if token = tokenUnrecognized
+            {
+                if this.report_non_sgml_param()
+                {
+                    ; reported + consumed (dropped).
+                }
+                else
+                {
+                    let ins ps.current_input()
+                    let pc ins.current_char()
+                    buf.add(pc)
+                }
+            }
+            else if (token = tokenLit) or (token = tokenLita)
+                set running: false
+            else if token = tokenChar
+            {
+                let ins ps.current_input()
+                let pc ins.current_char()
+                buf.add(pc)
+            }
+            else
+                set running: false
+        }
+        if buf.get_length() > ref_litlen
+            this.report_num_at(ParserMessages.systemIdentifierLength(), ref_litlen as u64, this.sd_loc())
+        let s StringC^host(buf.get_buffer(), buf.get_length())
+        set *txt: Text(s)
+        true
+    }
+
+    ; the modes the SGML-declaration parse drives, compiled from the
+    ; PROVISIONAL (reference) syntax before the declaration is parsed
+    ; (compileSdModes).
+    function install_sd_recognizers(this: Parser, table: pointer[Array[PackedTokenInfo]])
+    {
+        let sdv *ps.get_sd()
+        let synv *ps.get_syntax()
+        var modes int[9]
+        let mp modes as pointer[int]
+        set *(mp + (0 as size_t)): sdMode
+        set *(mp + (1 as size_t)): sdcomMode
+        set *(mp + (2 as size_t)): sdplitMode
+        set *(mp + (3 as size_t)): sdplitaMode
+        set *(mp + (4 as size_t)): sdslitMode
+        set *(mp + (5 as size_t)): sdslitaMode
+        set *(mp + (6 as size_t)): mlitMode
+        set *(mp + (7 as size_t)): mlitaMode
+        set *(mp + (8 as size_t)): refMode
+        var i: int 0
+        while i < 9
+        {
+            let m *(mp + (i as size_t))
+            let r Recognizer.build_recognizer(host, m, sdv, synv, table)
+            ps.set_recognizer(m, r)
+            set i: i + 1
+        }
+    }
+
+    ; Parser::scanForSgmlDecl (parseSd.cxx:593) — does the current input open
+    ; with `<!SGML` + non-name-char? Consumes the prefix on success (pushing
+    ; the last peeked char back); the CALLER ungets the token on failure.
+    function scan_for_sgml_decl(this: Parser) returns bool
+    {
+        let ins ps.current_input()
+        ins.start_token_no_multicode()
+        var c ins.token_char()
+        while (c = 10) or (c = 13) or (c = 32) or (c = 9)
+            set c: ins.token_char()
+        if c <> 60
+            return false
+        if ins.token_char() <> 33
+            return false
+        set c: ins.token_char()
+        if (c <> 83) and (c <> 115)
+            return false
+        set c: ins.token_char()
+        if (c <> 71) and (c <> 103)
+            return false
+        set c: ins.token_char()
+        if (c <> 77) and (c <> 109)
+            return false
+        set c: ins.token_char()
+        if (c <> 76) and (c <> 108)
+            return false
+        set c: ins.token_char()
+        if c < 0
+            return true
+        let tl ins.current_token_length()
+        ins.end_token(tl - (1 as size_t))
+        if c = 45
+            return false
+        if c = 46
+            return false
+        if (c >= 97) and (c < 123)
+            return false
+        if (c >= 65) and (c < 91)
+            return false
+        if (c >= 48) and (c < 58)
+            return false
+        true
+    }
+
+    ; Parser::findMissingMinimum (parseSd.cxx:652): the minimum-data chars a
+    ; charset must map — letters, digits and the special minimum-data chars.
+    function find_missing_minimum(this: Parser, charset: pointer[UnivCharsetDesc], missing: pointer[ISet])
+    {
+        var to: u32 0
+        var cnt: u32 0
+        var i: u32 0
+        while i < (26 as u32)
+        {
+            let uc (65 as u32) + i
+            let m1 charset.univ_to_desc(uc, &to, &cnt, null)
+            if m1 = (0 as u32)
+                missing.add(uc)
+            let lc (97 as u32) + i
+            let m2 charset.univ_to_desc(lc, &to, &cnt, null)
+            if m2 = (0 as u32)
+                missing.add(lc)
+            set i: i + (1 as u32)
+        }
+        set i: 0 as u32
+        while i < (10 as u32)
+        {
+            let dc (48 as u32) + i
+            let m3 charset.univ_to_desc(dc, &to, &cnt, null)
+            if m3 = (0 as u32)
+                missing.add(dc)
+            set i: i + (1 as u32)
+        }
+        var special u32[11]
+        let sp special as pointer[u32]
+        set *(sp + (0 as size_t)): 39 as u32
+        set *(sp + (1 as size_t)): 40 as u32
+        set *(sp + (2 as size_t)): 41 as u32
+        set *(sp + (3 as size_t)): 43 as u32
+        set *(sp + (4 as size_t)): 44 as u32
+        set *(sp + (5 as size_t)): 45 as u32
+        set *(sp + (6 as size_t)): 46 as u32
+        set *(sp + (7 as size_t)): 47 as u32
+        set *(sp + (8 as size_t)): 58 as u32
+        set *(sp + (9 as size_t)): 61 as u32
+        set *(sp + (10 as size_t)): 63 as u32
+        var j: size_t 0
+        while j < (11 as size_t)
+        {
+            let sc *(sp + j)
+            let m4 charset.univ_to_desc(sc, &to, &cnt, null)
+            if m4 = (0 as u32)
+                missing.add(sc)
+            set j: j + 1
+        }
+    }
+
+    ; Parser::intersectCharSets (parseSd.cxx:1899).
+    function intersect_char_sets(this: Parser, s1: pointer[ISet], s2: pointer[ISet], inter: pointer[ISet])
+    {
+        var i: size_t 0
+        let n1 s1.get_count()
+        while i < n1
+        {
+            let a_min s1.range_min(i)
+            let a_max s1.range_max(i)
+            var j: size_t 0
+            let n2 s2.get_count()
+            while j < n2
+            {
+                let b_min s2.range_min(j)
+                let b_max s2.range_max(j)
+                var lo a_min
+                if b_min > lo
+                    set lo: b_min
+                var hi a_max
+                if b_max < hi
+                    set hi: b_max
+                if lo <= hi
+                    inter.add_range(lo, hi)
+                set j: j + 1
+            }
+            set i: i + 1
+        }
+    }
+
+    ; ---- SD charset translation (parseSd.cxx:2505-2701) -------------------
+
+    ; the internal charset of an Sd as a desc->univ mapping: the document
+    ; charset in the default mode, the fixed system charset otherwise.
+    function sd_internal_of(this: Parser, sdp: pointer[Sd], sys: pointer[UnivCharsetDesc]) returns pointer[UnivCharsetDesc]
+    {
+        if sdp.internal_charset_is_doc_charset()
+        {
+            let d sdp.doc_charset_desc()
+            if d <> null
+                return d
+        }
+        sys
+    }
+
+    ; univToDescCheck (parseSd.cxx:2844): >1 matches would warn
+    ; ambiguousDocCharacter under -wsgmldecl (off); success needs a match at
+    ; or below charMax.
+    function univ_to_desc_check(this: Parser, charset: pointer[UnivCharsetDesc], from: u32, out_to: pointer[u32]) returns bool
+    {
+        var c: u32 0
+        var cnt: u32 0
+        let m charset.univ_to_desc(from, &c, &cnt, null)
+        if (m > (0 as u32)) and (c <= CHAR_MAX)
+        {
+            set *out_to: c
+            return true
+        }
+        false
+    }
+
+    function univ_to_desc_check_count(this: Parser, charset: pointer[UnivCharsetDesc], from: u32, out_to: pointer[u32], out_count: pointer[u32]) returns bool
+    {
+        var c: u32 0
+        var cnt: u32 0
+        let m charset.univ_to_desc(from, &c, &cnt, null)
+        if (m > (0 as u32)) and (c <= CHAR_MAX)
+        {
+            set *out_to: c
+            set *out_count: cnt
+            return true
+        }
+        false
+    }
+
+    ; the translateSyntaxCharDoc/translateSyntaxCharInternal pair — selected
+    ; by the CURRENT parser sd's internal-charset mode (the reference's sd()).
+    function report_translate_syntax_char(this: Parser, c: u32)
+    {
+        let sdp ps.get_sd()
+        if sdp.internal_charset_is_doc_charset()
+            this.report_num_at(ParserMessages.translateSyntaxCharDoc(), c as u64, this.sd_loc())
+        else
+            this.report_num_at(ParserMessages.translateSyntaxCharInternal(), c as u64, this.sd_loc())
+    }
+
+    ; Parser::translateUniv (parseSd.cxx:2683).
+    function translate_univ(this: Parser, univ: u32, switcher: pointer[CharSwitcher], syn_charset: pointer[UnivCharsetDesc]) returns u32
+    {
+        var sc: u32 0
+        var cnt: u32 0
+        let m syn_charset.univ_to_desc(univ, &sc, &cnt, null)
+        if m <> (1 as u32)
+        {
+            this.report_num_at(ParserMessages.missingSyntaxChar(), univ as u64, this.sd_loc())
+            return univ
+        }
+        let tem switcher.subst(sc)
+        if tem <> sc
+        {
+            var univ2: u32 0
+            if syn_charset.desc_to_univ(tem, &univ2)
+                return univ2
+            this.report_translate_syntax_char(tem)
+        }
+        univ
+    }
+
+    ; Parser::translateSyntaxNoSwitch (parseSd.cxx:2582).
+    function translate_syntax_no_switch(this: Parser, b: pointer[SdBuilder], syntax_char: u32, out_doc: pointer[u32], out_count: pointer[u32]) returns bool
+    {
+        if b.sd.internal_charset_is_doc_charset()
+        {
+            let r b.syntax_charset_decl.find_range(syntax_char)
+            if r <> null
+            {
+                let doc_chars ISet^host()
+                var count r.count - (syntax_char - r.desc_min)
+                if r.range_type = CHARSET_RANGE_STRING
+                {
+                    let ddecl b.sd.doc_charset_decl()
+                    ddecl.string_to_char(r.str, doc_chars)
+                }
+                else if r.range_type = CHARSET_RANGE_NUMBER
+                {
+                    let n r.base_min + (syntax_char - r.desc_min)
+                    var count2: u32 0
+                    let sid b.syntax_charset_decl.section_pubid(r.section)
+                    let sdg b.syntax_charset_decl.section_desig(r.section)
+                    let ddecl b.sd.doc_charset_decl()
+                    ddecl.number_to_char(sid, sdg, n, doc_chars, &count2)
+                    if doc_chars.is_empty() = false
+                    {
+                        if count2 < count
+                            set count: count2
+                    }
+                }
+                if doc_chars.is_empty() = false
+                {
+                    ; >1 doc chars would warn ambiguousDocCharacter (-wsgmldecl).
+                    let mn doc_chars.range_min(0 as size_t)
+                    if mn <= CHAR_MAX
+                    {
+                        set *out_doc: mn
+                        set *out_count: count
+                        return true
+                    }
+                }
+            }
+        }
+        var univ: u32 0
+        var also_max: u32 0
+        if b.syntax_charset.desc_to_univ_also_max(syntax_char, &univ, &also_max)
+        {
+            let internal this.sd_internal_of(b.sd, b.sys_desc)
+            var doc: u32 0
+            var count2: u32 0
+            if this.univ_to_desc_check_count(internal, univ, &doc, &count2)
+            {
+                var count (also_max - syntax_char) + (1 as u32)
+                if count2 < count
+                    set count: count2
+                set *out_doc: doc
+                set *out_count: count
+                return true
+            }
+        }
+        set b.valid: false
+        this.report_translate_syntax_char(syntax_char)
+        false
+    }
+
+    ; Parser::translateSyntax(SdBuilder&, WideChar, Char&) (parseSd.cxx:2572).
+    function translate_syntax(this: Parser, b: pointer[SdBuilder], syntax_char: u32, out_doc: pointer[u32]) returns bool
+    {
+        var count: u32 0
+        let subst b.switcher.subst(syntax_char)
+        this.translate_syntax_no_switch(b, subst, out_doc, &count)
+    }
+
+    ; Parser::translateSyntax over a syntax string (parseSd.cxx:2646).
+    function translate_syntax_string(this: Parser, b: pointer[SdBuilder], s: StringC, out_str: pointer[StringC]) returns bool
+    {
+        let buf Array[u32]^host()
+        var ret true
+        var i: size_t 0
+        let n s.get_size()
+        while i < n
+        {
+            var c: u32 0
+            let sc s.get(i)
+            if this.translate_syntax(b, sc, &c)
+                buf.add(c)
+            else
+                set ret: false
+            set i: i + 1
+        }
+        set *out_str: StringC^host(buf.get_buffer(), buf.get_length())
+        ret
+    }
+
+    ; Parser::translateName (parseSd.cxx:2662) — a name spelled in the
+    ; CURRENT internal charset carried into the new syntax.
+    function translate_name(this: Parser, b: pointer[SdBuilder], name: StringC, out_str: pointer[StringC]) returns bool
+    {
+        let cur_sd ps.get_sd()
+        let cur_internal this.sd_internal_of(cur_sd, b.sys_desc)
+        let new_internal this.sd_internal_of(b.sd, b.sys_desc)
+        let buf Array[u32]^host()
+        var i: size_t 0
+        let n name.get_size()
+        while i < n
+        {
+            var univ: u32 0
+            let nc name.get(i)
+            let got cur_internal.desc_to_univ(nc, &univ)
+            let univ2 this.translate_univ(univ, b.switcher, b.syntax_charset)
+            var c: u32 0
+            if this.univ_to_desc_check(new_internal, univ2, &c) = false
+            {
+                this.report_num_at(ParserMessages.translateDocChar(), univ2 as u64, this.sd_loc())
+                set b.valid: false
+                set *out_str: StringC()
+                return false
+            }
+            buf.add(c)
+            set i: i + 1
+        }
+        set *out_str: StringC^host(buf.get_buffer(), buf.get_length())
+        true
+    }
+
+    ; Parser::translateRange (parseSd.cxx:2523) — switch-aware bulk range
+    ; translation.
+    function translate_range(this: Parser, b: pointer[SdBuilder], start_in: u32, end: u32, chars: pointer[ISet])
+    {
+        var start start_in
+        var running true
+        while running
+        {
+            var done_up_to end
+            var got_switch false
+            var first_switch: u32 0
+            var i: size_t 0
+            let nsw b.switcher.n_switches()
+            while i < nsw
+            {
+                let c b.switcher.switch_from(i)
+                if (start <= c) and (c <= end)
+                {
+                    if got_switch = false
+                    {
+                        set got_switch: true
+                        set first_switch: c
+                    }
+                    else if c < first_switch
+                        set first_switch: c
+                }
+                set i: i + 1
+            }
+            if got_switch and (first_switch = start)
+            {
+                set done_up_to: start
+                var doc_char: u32 0
+                if this.translate_syntax(b, start, &doc_char)
+                    chars.add(doc_char)
+            }
+            else
+            {
+                if got_switch
+                    set done_up_to: first_switch - (1 as u32)
+                var doc_char: u32 0
+                var count: u32 0
+                if this.translate_syntax_no_switch(b, start, &doc_char, &count)
+                {
+                    if (count - (1 as u32)) < (done_up_to - start)
+                        set done_up_to: start + (count - (1 as u32))
+                    chars.add_range(doc_char, doc_char + (done_up_to - start))
+                }
+            }
+            if done_up_to = end
+                set running: false
+            else
+                set start: done_up_to + (1 as u32)
+        }
+    }
+
+    ; ---- SD syntax checks (parseSd.cxx:2703-2842) --------------------------
+
+    function check_not_function(this: Parser, syn: pointer[Syntax], c: u32) returns bool
+    {
+        let fset syn.char_set(setFunctionChar)
+        if fset.contains(c)
+        {
+            this.report_num_at(ParserMessages.oneFunction(), c as u64, this.sd_loc())
+            return false
+        }
+        true
+    }
+
+    ; checkShortrefDelim: at most one B sequence, not adjacent to blanks.
+    function check_shortref_delim(this: Parser, syn: pointer[Syntax], delim: StringC) returns bool
+    {
+        var had_b false
+        let bset syn.char_set(setBlank)
+        let n delim.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            if delim.get(i) = (66 as u32)
+            {
+                if had_b
+                {
+                    this.report1_at(ParserMessages.multipleBSequence(), delim, this.sd_loc())
+                    return false
+                }
+                set had_b: true
+                if i > (0 as size_t)
+                {
+                    let prev delim.get(i - (1 as size_t))
+                    if bset.contains(prev)
+                    {
+                        this.report1_at(ParserMessages.blankAdjacentBSequence(), delim, this.sd_loc())
+                        return false
+                    }
+                }
+                while ((i + (1 as size_t)) < n) and (delim.get(i + (1 as size_t)) = (66 as u32))
+                    set i: i + 1
+                if (i + (1 as size_t)) < n
+                {
+                    let nxt delim.get(i + (1 as size_t))
+                    if bset.contains(nxt)
+                    {
+                        this.report1_at(ParserMessages.blankAdjacentBSequence(), delim, this.sd_loc())
+                        return false
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        true
+    }
+
+    function check_general_delim(this: Parser, syn: pointer[Syntax], delim: StringC) returns bool
+    {
+        let fset syn.char_set(setFunctionChar)
+        let n delim.get_size()
+        if n > (0 as size_t)
+        {
+            var all_function true
+            var i: size_t 0
+            while i < n
+            {
+                if fset.contains(delim.get(i)) = false
+                    set all_function: false
+                set i: i + 1
+            }
+            if all_function
+            {
+                this.report1_at(ParserMessages.generalDelimAllFunction(), delim, this.sd_loc())
+                return false
+            }
+        }
+        true
+    }
+
+    ; checkSwitches: neither side of a switch may be a letter or digit.
+    function check_switches(this: Parser, switcher: pointer[CharSwitcher], syn_charset: pointer[UnivCharsetDesc]) returns bool
+    {
+        var valid true
+        var i: size_t 0
+        let n switcher.n_switches()
+        while i < n
+        {
+            var j: int 0
+            while j < 2
+            {
+                var c switcher.switch_from(i)
+                if j = 1
+                    set c: switcher.switch_to(i)
+                var univ: u32 0
+                if syn_charset.desc_to_univ(c, &univ)
+                {
+                    var bad false
+                    if (univ >= (97 as u32)) and (univ < (123 as u32))
+                        set bad: true
+                    if (univ >= (65 as u32)) and (univ < (91 as u32))
+                        set bad: true
+                    if (univ >= (48 as u32)) and (univ < (58 as u32))
+                        set bad: true
+                    if bad
+                    {
+                        this.report_num_at(ParserMessages.switchLetterDigit(), univ as u64, this.sd_loc())
+                        set valid: false
+                    }
+                }
+                set j: j + 1
+            }
+            set i: i + 1
+        }
+        valid
+    }
+
+    function check_switches_markup(this: Parser, switcher: pointer[CharSwitcher]) returns bool
+    {
+        var valid true
+        var i: size_t 0
+        let n switcher.n_switches()
+        while i < n
+        {
+            if switcher.switch_used(i) = false
+            {
+                let c switcher.switch_from(i)
+                this.report_num_at(ParserMessages.switchNotMarkup(), c as u64, this.sd_loc())
+                set valid: false
+            }
+            set i: i + 1
+        }
+        valid
+    }
+
+    ; checkSyntaxNames: every function name must be a valid name in the
+    ; declared syntax.
+    function check_syntax_names(this: Parser, syn: pointer[Syntax])
+    {
+        var i: size_t 0
+        let n syn.n_funcs()
+        while i < n
+        {
+            let fname syn.func_name(i)
+            var k: size_t 1
+            let fn fname.get_size()
+            while k < fn
+            {
+                if syn.is_name_character(fname.get(k)) = false
+                {
+                    this.report1_at(ParserMessages.reservedNameSyntax(), fname, this.sd_loc())
+                    set k: fn
+                }
+                else
+                    set k: k + 1
+            }
+            set i: i + 1
+        }
+    }
+
+    ; checkSyntaxNamelen: delimiters (general + complex shortref) longer than
+    ; NAMELEN; over-long reserved names are -wsgmldecl only.
+    function check_syntax_namelen(this: Parser, syn: pointer[Syntax])
+    {
+        let namelen syn.get_quantity(qNAMELEN)
+        var i: int 0
+        while i < N_DELIM_GENERAL
+        {
+            let dl syn.delim_general_len(i)
+            if dl > (namelen as size_t)
+            {
+                let ds syn.delim_string(i)
+                this.report_str_num_at(ParserMessages.delimiterLength(), ds, namelen as u64, this.sd_loc())
+            }
+            set i: i + 1
+        }
+        var j: size_t 0
+        let nc syn.n_delim_shortref_complex()
+        while j < nc
+        {
+            let sc syn.delim_shortref_complex(j)
+            if sc.get_size() > (namelen as size_t)
+                this.report_str_num_at(ParserMessages.delimiterLength(), sc, namelen as u64, this.sd_loc())
+            set j: j + 1
+        }
+    }
+
+    ; checkNmchars (parseSd.cxx:1857): declared naming chars must not collide
+    ; with letters, digits, RE/RS/SPACE or SEPCHARs.
+    function check_nmchars(this: Parser, cset: pointer[ISet], syn: pointer[Syntax]) returns bool
+    {
+        var valid true
+        let bad ISet^host()
+        this.intersect_char_sets(cset, syn.char_set(setNameStart), bad)
+        if bad.is_empty() = false
+        {
+            let arg this.charset_message_arg(bad)
+            this.report_raw_at(ParserMessages.nmcharLetter(), arg, this.sd_loc())
+            set valid: false
+            bad.clear()
+        }
+        this.intersect_char_sets(cset, syn.char_set(setDigit), bad)
+        if bad.is_empty() = false
+        {
+            let arg2 this.charset_message_arg(bad)
+            this.report_raw_at(ParserMessages.nmcharDigit(), arg2, this.sd_loc())
+            set valid: false
+            bad.clear()
+        }
+        var fc: u32 0
+        if syn.get_standard_function(fRE, &fc)
+        {
+            if cset.contains(fc)
+            {
+                this.report_num_at(ParserMessages.nmcharRe(), fc as u64, this.sd_loc())
+                set valid: false
+            }
+        }
+        if syn.get_standard_function(fRS, &fc)
+        {
+            if cset.contains(fc)
+            {
+                this.report_num_at(ParserMessages.nmcharRs(), fc as u64, this.sd_loc())
+                set valid: false
+            }
+        }
+        if syn.get_standard_function(fSPACE, &fc)
+        {
+            if cset.contains(fc)
+            {
+                this.report_num_at(ParserMessages.nmcharSpace(), fc as u64, this.sd_loc())
+                set valid: false
+            }
+        }
+        this.intersect_char_sets(cset, syn.char_set(setSepchar), bad)
+        if bad.is_empty() = false
+        {
+            let arg3 this.charset_message_arg(bad)
+            this.report_raw_at(ParserMessages.nmcharSepchar(), arg3, this.sd_loc())
+            set valid: false
+        }
+        valid
+    }
+
+    ; setRefNames (parseSd.cxx:433): enter the reference reserved-name
+    ; spellings into empty slots; rDATA/rIMPLICIT are WWW-only (rALL would be
+    ; gated by --errorAfdr, which the drop-in does not model).
+    function set_ref_names(this: Parser, syn: pointer[Syntax], www: bool)
+    {
+        var i: int 0
+        while i < N_SYNTAX_NAMES
+        {
+            var skip false
+            if (i = R_DATA) or (i = R_IMPLICIT)
+            {
+                if www = false
+                    set skip: true
+            }
+            if skip = false
+            {
+                let doc_name syn.ref_reserved_name(i)
+                let existing syn.lookup_reserved_name(doc_name)
+                if existing >= 0
+                    this.report1_at(ParserMessages.nameReferenceReservedName(), doc_name, this.sd_loc())
+                let cur syn.reserved_name(i)
+                if cur.get_size() = (0 as size_t)
+                    syn.set_name(i, doc_name)
+            }
+            set i: i + 1
+        }
+    }
+
+    ; setRefDelimGeneral (parseSd.cxx:363): fill every UNSPECIFIED slot from
+    ; Figure 3 column 3 (the Syntax module's DELIM_LEN/DELIM_CHARS seed),
+    ; translated through the switcher; delims whose chars the internal charset
+    ; lacks collect into missingSignificant646.
+    function set_ref_delim_general(this: Parser, b: pointer[SdBuilder], syn: pointer[Syntax], syn_charset: pointer[UnivCharsetDesc], specified: pointer[u8]) returns bool
+    {
+        var valid true
+        let missing ISet^host()
+        let internal this.sd_internal_of(b.sd, b.sys_desc)
+        var i: int 0
+        while i < N_DELIM_GENERAL
+        {
+            var is_spec false
+            if specified <> null
+            {
+                if (*(specified + (i as size_t))) <> (0 as u8)
+                    set is_spec: true
+            }
+            if is_spec = false
+            {
+                let dp host.allocate(12 as size_t, 4) as pointer[u32]
+                let want *(DELIM_LEN + (i as size_t)) as size_t
+                var got: size_t 0
+                var j: size_t 0
+                while j < want
+                {
+                    let fig_char *(DELIM_CHARS + ((i as size_t) * MAX_DELIM_LEN + j))
+                    let univ this.translate_univ(fig_char, b.switcher, syn_charset)
+                    var c: u32 0
+                    if this.univ_to_desc_check(internal, univ, &c)
+                    {
+                        set *(dp + got): c
+                        set got: got + 1
+                    }
+                    else
+                    {
+                        missing.add(univ)
+                        set valid: false
+                    }
+                    set j: j + 1
+                }
+                if got = want
+                {
+                    let ds StringC^host(dp, got)
+                    if this.check_general_delim(syn, ds)
+                        syn.set_delim_general(i, dp, got)
+                    else
+                        set valid: false
+                }
+            }
+            set i: i + 1
+        }
+        if missing.is_empty() = false
+        {
+            let arg this.charset_message_arg(missing)
+            this.report_raw_at(ParserMessages.missingSignificant646(), arg, this.sd_loc())
+        }
+        valid
+    }
+
+    ; addRefDelimShortref (parseSd.cxx:522): the 31 Figure-4 short reference
+    ; delimiters ('B' = a blank sequence position).
+    function add_ref_delim_shortref(this: Parser, b: pointer[SdBuilder], syn: pointer[Syntax], syn_charset: pointer[UnivCharsetDesc]) returns bool
+    {
+        let missing ISet^host()
+        let internal this.sd_internal_of(b.sd, b.sys_desc)
+        var row: int 0
+        while row < 32
+        {
+            let dp host.allocate(12 as size_t, 4) as pointer[u32]
+            let want *(SHORTREF_DELIM_LEN + (row as size_t)) as size_t
+            var got: size_t 0
+            var j: size_t 0
+            while j < want
+            {
+                let fig_char *(SHORTREF_DELIM_CHARS + ((row as size_t) * (3 as size_t) + j))
+                let univ this.translate_univ(fig_char, b.switcher, syn_charset)
+                var c: u32 0
+                if this.univ_to_desc_check(internal, univ, &c)
+                {
+                    set *(dp + got): c
+                    set got: got + 1
+                }
+                else
+                    missing.add(univ)
+                set j: j + 1
+            }
+            if got = want
+            {
+                let ds StringC^host(dp, got)
+                var dup false
+                let nsw b.switcher.n_switches()
+                if nsw > (0 as size_t)
+                {
+                    if syn.is_valid_shortref(ds)
+                        set dup: true
+                }
+                if dup
+                    this.report1_at(ParserMessages.duplicateDelimShortref(), ds, this.sd_loc())
+                else
+                    syn.add_delim_shortref(ds)
+            }
+            set row: row + 1
+        }
+        if missing.is_empty() = false
+        {
+            let arg this.charset_message_arg(missing)
+            this.report_raw_at(ParserMessages.missingSignificant646(), arg, this.sd_loc())
+        }
+        true
+    }
+
+    ; setStandardSyntax (parseSd.cxx:273) over a bare syntax: shunned
+    ; controls, standard + TAB functions, '-'/'.' name chars, namecase, the
+    ; reference delimiters/names, and (refSyntax only) the Figure-4 shortrefs.
+    function set_standard_syntax(this: Parser, b: pointer[SdBuilder], syn: pointer[Syntax], shortref: bool, www: bool) returns bool
+    {
+        let id128 UnivCharsetDesc.make_identity128(host)
+        var valid true
+        if this.check_switches(b.switcher, id128) = false
+            set valid: false
+        var si: size_t 0
+        let nsw b.switcher.n_switches()
+        while si < nsw
+        {
+            let sto b.switcher.switch_to(si)
+            if sto >= (128 as u32)
+                this.report_num_at(ParserMessages.switchNotInCharset(), sto as u64, this.sd_loc())
+            set si: si + 1
+        }
+        var shc: u32 0
+        while shc < (32 as u32)
+        {
+            syn.add_shunchar(shc)
+            set shc: shc + (1 as u32)
+        }
+        syn.add_shunchar(127 as u32)
+        syn.add_shunchar(255 as u32)
+        syn.set_shunchar_controls()
+        var fi: int 0
+        while fi < 3
+        {
+            var fig: u32 13
+            if fi = 1
+                set fig: 10 as u32
+            else if fi = 2
+                set fig: 32 as u32
+            var doc_char: u32 0
+            if this.translate_syntax_switcher(b, fig, id128, &doc_char)
+            {
+                if this.check_not_function(syn, doc_char)
+                    syn.set_standard_function(fi, doc_char)
+                else
+                    set valid: false
+            }
+            else
+                set valid: false
+            set fi: fi + 1
+        }
+        ; added function TAB SEPCHAR 9 (coreFunctions).
+        var tab_char: u32 0
+        if this.translate_syntax_switcher(b, 9 as u32, id128, &tab_char)
+        {
+            if this.check_not_function(syn, tab_char)
+                syn.add_function_char(StringC("TAB"), cSEPCHAR, tab_char)
+            else
+                set valid: false
+        }
+        else
+            set valid: false
+        ; name characters '-' '.'
+        let name_char_set ISet^host()
+        var nci: int 0
+        while nci < 2
+        {
+            var fig2: u32 45
+            if nci = 1
+                set fig2: 46 as u32
+            var doc2: u32 0
+            if this.translate_syntax_switcher(b, fig2, id128, &doc2)
+                name_char_set.add(doc2)
+            else
+                set valid: false
+            set nci: nci + 1
+        }
+        if this.check_nmchars(name_char_set, syn) = false
+            set valid: false
+        else
+            this.apply_name_chars(syn, name_char_set)
+        syn.set_namecase_general(true)
+        syn.set_namecase_entity(false)
+        if this.set_ref_delim_general(b, syn, id128, null) = false
+            set valid: false
+        this.set_ref_names(syn, www)
+        syn.enter_standard_function_names()
+        if shortref
+        {
+            if this.add_ref_delim_shortref(b, syn, id128) = false
+                set valid: false
+        }
+        valid
+    }
+
+    ; translateSyntax(CharSwitcher&, syntaxCharset, internalCharset, ...)
+    ; (parseSd.cxx:2505) — the standard-syntax flavor: switch, map through
+    ; the syntax charset to univ, then into the internal charset.
+    function translate_syntax_switcher(this: Parser, b: pointer[SdBuilder], syntax_char: u32, syn_charset: pointer[UnivCharsetDesc], out_doc: pointer[u32]) returns bool
+    {
+        let sc b.switcher.subst(syntax_char)
+        var univ: u32 0
+        if syn_charset.desc_to_univ(sc, &univ)
+        {
+            let internal this.sd_internal_of(b.sd, b.sys_desc)
+            if this.univ_to_desc_check(internal, univ, out_doc)
+                return true
+        }
+        this.report_translate_syntax_char(sc)
+        false
+    }
+
+    ; apply an ISet of name characters to the syntax (nmchar set + category).
+    function apply_name_chars(this: Parser, syn: pointer[Syntax], cset: pointer[ISet])
+    {
+        let nm syn.char_set(setNmchar)
+        var i: size_t 0
+        let n cset.get_count()
+        while i < n
+        {
+            let lo cset.range_min(i)
+            let hi cset.range_max(i)
+            nm.add_range(lo, hi)
+            syn.add_name_characters(lo, hi)
+            set i: i + 1
+        }
+    }
+
+    function apply_name_start_chars(this: Parser, syn: pointer[Syntax], cset: pointer[ISet])
+    {
+        let ns syn.char_set(setNameStart)
+        var i: size_t 0
+        let n cset.get_count()
+        while i < n
+        {
+            let lo cset.range_min(i)
+            let hi cset.range_max(i)
+            ns.add_range(lo, hi)
+            syn.add_name_start_characters(lo, hi)
+            set i: i + 1
+        }
+    }
+
+    ; Syntax::checkSgmlChar (Syntax.cxx:343): a shunned char that is not
+    ; significant (in either syntax) yet declared an SGML char is invalid.
+    function check_sgml_char(this: Parser, syn: pointer[Syntax], sdp: pointer[Sd], other: pointer[Syntax], sys: pointer[UnivCharsetDesc], invalid: pointer[ISet])
+    {
+        let shun syn.shunchar_set()
+        let sig syn.char_set(setSignificant)
+        let sgml syn.char_set(setSgmlChar)
+        var i: size_t 0
+        let n shun.get_count()
+        while i < n
+        {
+            var c shun.range_min(i)
+            let mx shun.range_max(i)
+            var scanning true
+            while scanning
+            {
+                ; internal != doc translation is skipped: with the identity
+                ; system charset a shunned doc char IS the internal char when
+                ; it is mapped at all.
+                var sig_ok sig.contains(c)
+                if (sig_ok = false) and (other <> null)
+                {
+                    let osig other.char_set(setSignificant)
+                    set sig_ok: osig.contains(c)
+                }
+                if (sig_ok = false) and sgml.contains(c)
+                    invalid.add(c)
+                if c = mx
+                    set scanning: false
+                else
+                    set c: c + (1 as u32)
+            }
+            set i: i + 1
+        }
+        if syn.shunchar_controls()
+        {
+            var u: u32 0
+            while u < (32 as u32)
+            {
+                this.check_univ_control_char(u, syn, other, sdp, sys, invalid)
+                set u: u + (1 as u32)
+            }
+            set u: 127 as u32
+            while u < (160 as u32)
+            {
+                this.check_univ_control_char(u, syn, other, sdp, sys, invalid)
+                set u: u + (1 as u32)
+            }
+        }
+    }
+
+    function check_univ_control_char(this: Parser, univ: u32, syn: pointer[Syntax], other: pointer[Syntax], sdp: pointer[Sd], sys: pointer[UnivCharsetDesc], invalid: pointer[ISet])
+    {
+        let charset this.sd_internal_of(sdp, sys)
+        var c: u32 0
+        if this.univ_to_desc_check(charset, univ, &c) = false
+            return
+        let sig syn.char_set(setSignificant)
+        var sig_ok sig.contains(c)
+        if (sig_ok = false) and (other <> null)
+        {
+            let osig other.char_set(setSignificant)
+            set sig_ok: osig.contains(c)
+        }
+        let sgml syn.char_set(setSgmlChar)
+        if (sig_ok = false) and sgml.contains(c)
+            invalid.add(c)
+    }
+
+    ; ---- SD section parsers (parseSd.cxx:781-2503) --------------------------
+
+    ; widen a byte substring of an ExternalId's public id into a StringC.
+    function bytes_to_stringc(this: Parser, s: String, start: size_t, len: size_t) returns StringC
+    {
+        if len = (0 as size_t)
+            return StringC^host(null as pointer[u32], 0 as size_t)
+        let cb host.allocate(len * (4 as size_t), 4) as pointer[u32]
+        var i: size_t 0
+        while i < len
+        {
+            set *(cb + i): s.get(start + i) as u32
+            set i: i + 1
+        }
+        StringC^host(cb, len)
+    }
+
+    ; PublicId::init over a minimum literal + the SD formal-error queueing:
+    ; a non-FPI id queues its FPI decomposition error; a valid FPI whose text
+    ; class differs from the section's required one queues the class message.
+    function sd_classify_public(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam], tc_required: int, class_kind: int, out_id: pointer[ExternalId])
+    {
+        let pub_sc parm.literal_text.string()
+        ; pin the byte copy on host: the classified id is read again LATER
+        ; (lookupSyntax, referencePublic) — a frame-transient String buffer
+        ; would be reused by then (the ExternalId.make discipline).
+        let pb0 this.stringc_to_bytes(pub_sc)
+        let pub_bytes String^host(pb0)
+        set *out_id: ExternalId(true, pub_bytes, false, String())
+        out_id.classify_public()
+        if out_id.get_public_type() <> PUBLIC_FPI
+        {
+            let fe out_id.get_fpi_error()
+            b.add_formal_error(SDFE_FPI, fe, pub_sc, this.sd_loc())
+        }
+        else if out_id.get_text_class() <> tc_required
+            b.add_formal_error(class_kind, 0, pub_sc, this.sd_loc())
+    }
+
+    ; the ISO designating sequence of a CHARSET-class FPI (empty otherwise).
+    function sd_designating_sequence(this: Parser, id: pointer[ExternalId]) returns StringC
+    {
+        var ds_start: size_t 0
+        var ds_len: size_t 0
+        if id.get_owner_type() <> OWNER_ISO
+            return StringC^host(null as pointer[u32], 0 as size_t)
+        if id.get_designating_sequence_bytes(&ds_start, &ds_len)
+        {
+            let pub id.get_public_id()
+            return this.bytes_to_stringc(pub, ds_start, ds_len)
+        }
+        StringC^host(null as pointer[u32], 0 as size_t)
+    }
+
+    ; Parser::referencePublic (parseSd.cxx:1185): resolve the public id
+    ; through the entity catalog and push the file as the current input.
+    ; given_error = an open failure was already reported.
+    function sd_reference_public(this: Parser, id: pointer[ExternalId], out_given: pointer[bool]) returns bool
+    {
+        set *out_given: false
+        let cat ps.get_entity_catalog()
+        if cat = null
+            return false
+        let pub id.get_public_id()
+        let sysid cat.lookup_public(pub)
+        if sysid.get_length() = (0 as size_t)
+            return false
+        let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+        set *org: Origin()
+        let empty_base String()
+        let src this.open_external_text(empty_base, sysid, org)
+        if src = null
+        {
+            let storage Storage.OsFile(empty_base)
+            let emsg storage.open_error(sysid)
+            this.report_open_failure(StringC^host(sysid.to_c_string()), emsg, this.sd_loc())
+            set *out_given: true
+            return false
+        }
+        ps.push_input(src)
+        true
+    }
+
+    ; Parser::sdParseSgmlDeclRef (parseSd.cxx:781) — `<!SGML name SYSTEM/PUBLIC ...>`.
+    function sd_parse_sgml_decl_ref(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam], out_id: pointer[ExternalId]) returns bool
+    {
+        let allow1 AllowedSdParams(SDP_RESERVED_NAME + SDR_SYSTEM, SDP_RESERVED_NAME + SDR_PUBLIC, SDP_MDC)
+        if this.parse_sd_param(allow1, parm) = false
+            return false
+        if parm.kind = SDP_MDC
+            return true
+        if parm.kind = (SDP_RESERVED_NAME + SDR_PUBLIC)
+        {
+            let allow2 AllowedSdParams(SDP_MINIMUM_LITERAL)
+            if this.parse_sd_param(allow2, parm) = false
+                return false
+            this.sd_classify_public(b, parm, TC_SD, SDFE_TEXTCLASS_SD, out_id)
+        }
+        let allow3 AllowedSdParams(SDP_SYSTEM_IDENTIFIER, SDP_MDC)
+        if this.parse_sd_param(allow3, parm) = false
+            return false
+        if parm.kind = SDP_MDC
+            return true
+        let sb0 this.stringc_to_bytes(parm.literal_text.string())
+        let sys_bytes String^host(sb0)
+        out_id.set_system(sys_bytes)
+        let allow4 AllowedSdParams(SDP_MDC)
+        this.parse_sd_param(allow4, parm)
+    }
+
+    ; Parser::sdParseDocumentCharset (parseSd.cxx:814).
+    function sd_parse_document_charset(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        let allow1 AllowedSdParams(SDP_RESERVED_NAME + SDR_CHARSET)
+        if this.parse_sd_param(allow1, parm) = false
+            return false
+        let allow2 AllowedSdParams(SDP_RESERVED_NAME + SDR_BASESET)
+        if this.parse_sd_param(allow2, parm) = false
+            return false
+        let decl CharsetDecl^host()
+        let desc UnivCharsetDesc^host()
+        if this.sd_parse_charset(b, parm, true, decl, desc) = false
+            return false
+        let missing ISet^host()
+        this.find_missing_minimum(desc, missing)
+        if missing.is_empty() = false
+        {
+            let arg this.charset_message_arg(missing)
+            this.report_raw_at(ParserMessages.missingMinimumChars(), arg, this.sd_loc())
+            return false
+        }
+        let sgml_char ISet^host()
+        decl.used_set(sgml_char)
+        b.sd.set_doc_charset_desc(desc)
+        b.sd.set_doc_charset_decl(decl)
+        let syn Syntax^host(*(b.sd))
+        syn.reset_to_bare(*(b.sd))
+        set b.syntax: syn
+        let cur_sd ps.get_sd()
+        if cur_sd.internal_charset_is_doc_charset()
+            syn.set_sgml_char_set(sgml_char)
+        else
+        {
+            ; translateDocSet (parseSd.cxx:849): doc charset -> internal.
+            let internal_sgml ISet^host()
+            this.translate_doc_set(desc, b.sys_desc, sgml_char, internal_sgml)
+            syn.set_sgml_char_set(internal_sgml)
+        }
+        true
+    }
+
+    ; Parser::translateDocSet (parseSd.cxx:849).
+    function translate_doc_set(this: Parser, from_charset: pointer[UnivCharsetDesc], to_charset: pointer[UnivCharsetDesc], from_set: pointer[ISet], to_set: pointer[ISet])
+    {
+        var i: size_t 0
+        let n from_set.get_count()
+        while i < n
+        {
+            var min from_set.range_min(i)
+            let max from_set.range_max(i)
+            var scanning true
+            while scanning
+            {
+                var univ: u32 0
+                var also_max: u32 0
+                if from_charset.desc_to_univ_also_max(min, &univ, &also_max) = false
+                {
+                    if also_max >= max
+                        set scanning: false
+                    else
+                        set min: also_max + (1 as u32)
+                }
+                else
+                {
+                    var internal_char: u32 0
+                    var count2: u32 0
+                    let n_map this.univ_to_desc_check_count(to_charset, univ, &internal_char, &count2)
+                    var upto also_max
+                    if upto > max
+                        set upto: max
+                    if (upto - min) > (count2 - (1 as u32))
+                        set upto: min + (count2 - (1 as u32))
+                    if n_map
+                        to_set.add_range(internal_char, internal_char + (upto - min))
+                    if upto >= max
+                        set scanning: false
+                    else
+                        set min: upto + (1 as u32)
+                }
+            }
+            set i: i + 1
+        }
+    }
+
+    ; Parser::sdParseCharset (parseSd.cxx:882) — BASESET/DESCSET section list.
+    function sd_parse_charset(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam], is_document: bool, decl: pointer[CharsetDecl], desc: pointer[UnivCharsetDesc]) returns bool
+    {
+        let multiply_declared ISet^host()
+        var maybe_iso646 true
+        var outer true
+        while outer
+        {
+            let allow_lit AllowedSdParams(SDP_MINIMUM_LITERAL)
+            if this.parse_sd_param(allow_lit, parm) = false
+                return false
+            let base_desc UnivCharsetDesc^host()
+            let id host.allocate(sizeof ExternalId, alignof ExternalId) as pointer[ExternalId]
+            this.sd_classify_public(b, parm, TC_CHARSET, SDFE_TEXTCLASS_BASESET, id)
+            let id_sc parm.literal_text.string()
+            var found false
+            var given_error false
+            if this.sd_reference_public(id, &given_error)
+            {
+                if this.sd_parse_external_charset(b, base_desc) = false
+                    return false
+                set found: true
+            }
+            else if given_error = false
+            {
+                if id.get_owner_type() = OWNER_ISO
+                {
+                    let desig this.sd_designating_sequence(id)
+                    if desig.get_size() > (0 as size_t)
+                    {
+                        let reg CharsetRegistry.get_registration_number(host, desig)
+                        if reg <> CR_UNREGISTERED
+                        {
+                            var iter CharsetRegistryIter()
+                            if CharsetRegistry.make_iter(reg, &iter)
+                            {
+                                set found: true
+                                var mn: u32 0
+                                var mx: u32 0
+                                var uv: u32 0
+                                while iter.next(&mn, &mx, &uv)
+                                    base_desc.add_range(mn, (mx - mn) + (1 as u32), uv, false)
+                            }
+                        }
+                    }
+                }
+                if found = false
+                    this.report1_at(ParserMessages.unknownBaseset(), id_sc, this.sd_loc())
+            }
+            if found = false
+                set maybe_iso646: false
+            let desig2 this.sd_designating_sequence(id)
+            ; pin both onto host — the literal buffer is transient and the
+            ; escape checker treats call results as frame-local.
+            let id_pin StringC^host(id_sc.data_ptr(), id_sc.get_size())
+            let desig_pin StringC^host(desig2.data_ptr(), desig2.get_size())
+            decl.add_section(id_pin, desig_pin)
+            let allow_descset AllowedSdParams(SDP_RESERVED_NAME + SDR_DESCSET)
+            if this.parse_sd_param(allow_descset, parm) = false
+                return false
+            let allow_num AllowedSdParams(SDP_NUMBER)
+            if this.parse_sd_param(allow_num, parm) = false
+                return false
+            var inner true
+            while inner
+            {
+                let min parm.n
+                if this.parse_sd_param(allow_num, parm) = false
+                    return false
+                let count parm.n
+                var adj_count count
+                ; zeroNumberOfCharacters is -wsgmldecl only.
+                decl.range_declared(min, count, multiply_declared)
+                if is_document and (count > (0 as u32))
+                {
+                    var over false
+                    if min > CHAR_MAX
+                        set over: true
+                    else if (count - (1 as u32)) > (CHAR_MAX - min)
+                        set over: true
+                    if over
+                    {
+                        this.report_num_at(ParserMessages.documentCharMax(), CHAR_MAX as u64, this.sd_loc())
+                        if min > CHAR_MAX
+                            set adj_count: 0 as u32
+                        else
+                            set adj_count: (CHAR_MAX - min) + (1 as u32)
+                        set maybe_iso646: false
+                    }
+                }
+                let allow_val AllowedSdParams(SDP_NUMBER, SDP_MINIMUM_LITERAL, SDP_RESERVED_NAME + SDR_UNUSED)
+                if this.parse_sd_param(allow_val, parm) = false
+                    return false
+                if parm.kind = SDP_NUMBER
+                {
+                    decl.add_range_number(min, count, parm.n)
+                    if found and (adj_count > (0 as u32))
+                    {
+                        let base_missing ISet^host()
+                        desc.add_base_desc_range(base_desc, min, adj_count, parm.n, base_missing)
+                        ; basesetCharsMissing is -wsgmldecl only.
+                    }
+                }
+                else if parm.kind = (SDP_RESERVED_NAME + SDR_UNUSED)
+                    decl.add_range_unused(min, count)
+                else
+                {
+                    let name_sc parm.literal_text.string()
+                    let c b.sd.name_to_univ(name_sc)
+                    var adj2 adj_count
+                    if adj2 > (256 as u32)
+                    {
+                        this.report0_at(ParserMessages.tooManyCharsMinimumLiteral(), this.sd_loc())
+                        set adj2: 256 as u32
+                    }
+                    if adj2 > (0 as u32)
+                        desc.add_range(min, adj2, c, true)
+                    set maybe_iso646: false
+                    let name_pin StringC^host(name_sc.data_ptr(), name_sc.get_size())
+                    decl.add_range_string(min, count, name_pin)
+                }
+                var follow SDP_RESERVED_NAME + SDR_CAPACITY
+                if is_document = false
+                    set follow: SDP_RESERVED_NAME + SDR_FUNCTION
+                let allow_next AllowedSdParams(SDP_NUMBER, SDP_RESERVED_NAME + SDR_BASESET, follow)
+                if this.parse_sd_param(allow_next, parm) = false
+                    return false
+                if parm.kind <> SDP_NUMBER
+                    set inner: false
+            }
+            if parm.kind <> (SDP_RESERVED_NAME + SDR_BASESET)
+                set outer: false
+        }
+        if multiply_declared.is_empty() = false
+        {
+            let arg this.charset_message_arg(multiply_declared)
+            this.report_raw_at(ParserMessages.duplicateCharNumbers(), arg, this.sd_loc())
+        }
+        let declared decl.declared_set()
+        let holes ISet^host()
+        var hi: size_t 0
+        let hn declared.get_count()
+        while hi < hn
+        {
+            if hi > (0 as size_t)
+            {
+                let prev_max declared.range_max(hi - (1 as size_t))
+                let cur_min declared.range_min(hi)
+                if (cur_min - prev_max) > (1 as u32)
+                    holes.add_range(prev_max + (1 as u32), cur_min - (1 as u32))
+            }
+            set hi: hi + 1
+        }
+        if holes.is_empty() = false
+        {
+            let harg this.charset_message_arg(holes)
+            this.report_raw_at(ParserMessages.codeSetHoles(), harg, this.sd_loc())
+        }
+        if (is_document = false) and b.sd.scope_instance()
+        {
+            ; SCOPE INSTANCE requires the syntax reference charset to be
+            ; ISO 646 (parseSd.cxx:1031) — an ordered identity walk to 128.
+            var next_min: u32 0
+            var ri: size_t 0
+            let rn desc.range_count()
+            while maybe_iso646 and (ri <= rn)
+            {
+                if ri = rn
+                {
+                    if next_min <> (128 as u32)
+                        set maybe_iso646: false
+                    set ri: ri + 1
+                }
+                else
+                {
+                    var dmin: u32 0
+                    var dcount: u32 0
+                    var duniv: u32 0
+                    desc.range_at2(ri, &dmin, &dcount, &duniv)
+                    if (dmin <> next_min) or (duniv <> dmin)
+                        set maybe_iso646: false
+                    set next_min: dmin + dcount
+                    set ri: ri + 1
+                }
+            }
+            if maybe_iso646 = false
+                this.report0_at(ParserMessages.scopeInstanceSyntaxCharset(), this.sd_loc())
+        }
+        true
+    }
+
+    ; Parser::sdParseExternalCharset (parseSd.cxx:1054) — rows from a catalog-
+    ; resolved external charset entity.
+    function sd_parse_external_charset(this: Parser, b: pointer[SdBuilder], desc: pointer[UnivCharsetDesc]) returns bool
+    {
+        let parm2 host.allocate(sizeof SdParam, alignof SdParam) as pointer[SdParam]
+        set *parm2: SdParam()
+        var running true
+        while running
+        {
+            let allow1 AllowedSdParams(SDP_NUMBER, SDP_EE)
+            if this.parse_sd_param(allow1, parm2) = false
+            {
+                ps.pop_input_stack()
+                return false
+            }
+            if parm2.kind = SDP_EE
+                return true
+            let min parm2.n
+            let allow_num AllowedSdParams(SDP_NUMBER)
+            if this.parse_sd_param(allow_num, parm2) = false
+            {
+                ps.pop_input_stack()
+                return false
+            }
+            var count parm2.n
+            let allow_val AllowedSdParams(SDP_NUMBER, SDP_MINIMUM_LITERAL, SDP_RESERVED_NAME + SDR_UNUSED)
+            if this.parse_sd_param(allow_val, parm2) = false
+            {
+                ps.pop_input_stack()
+                return false
+            }
+            if parm2.kind = SDP_NUMBER
+            {
+                if count > (0 as u32)
+                    desc.add_range(min, count, parm2.n, false)
+            }
+            else if parm2.kind = SDP_MINIMUM_LITERAL
+            {
+                let name_sc parm2.literal_text.string()
+                let c b.sd.name_to_univ(name_sc)
+                if count > (256 as u32)
+                {
+                    this.report0_at(ParserMessages.tooManyCharsMinimumLiteral(), this.sd_loc())
+                    set count: 256 as u32
+                }
+                if count > (0 as u32)
+                    desc.add_range(min, count, c, true)
+            }
+        }
+        true
+    }
+
+    ; Parser::sdParseCapacity (parseSd.cxx:1099).
+    function sd_parse_capacity(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        if b.www
+        {
+            let allow_www AllowedSdParams(SDP_RESERVED_NAME + SDR_NONE, SDP_RESERVED_NAME + SDR_PUBLIC, SDP_RESERVED_NAME + SDR_SGMLREF)
+            if this.parse_sd_param(allow_www, parm) = false
+                return false
+        }
+        else
+        {
+            let allow_std AllowedSdParams(SDP_RESERVED_NAME + SDR_PUBLIC, SDP_RESERVED_NAME + SDR_SGMLREF)
+            if this.parse_sd_param(allow_std, parm) = false
+                return false
+        }
+        var pushed false
+        if parm.kind = (SDP_RESERVED_NAME + SDR_NONE)
+        {
+            let allow_scope AllowedSdParams(SDP_RESERVED_NAME + SDR_SCOPE)
+            return this.parse_sd_param(allow_scope, parm)
+        }
+        if parm.kind = (SDP_RESERVED_NAME + SDR_PUBLIC)
+        {
+            let allow_lit AllowedSdParams(SDP_MINIMUM_LITERAL)
+            if this.parse_sd_param(allow_lit, parm) = false
+                return false
+            let id host.allocate(sizeof ExternalId, alignof ExternalId) as pointer[ExternalId]
+            this.sd_classify_public(b, parm, TC_CAPACITY, SDFE_TEXTCLASS_CAPACITY, id)
+            let id_sc parm.literal_text.string()
+            var is_ref false
+            if id_sc.equals(StringC("ISO 8879-1986//CAPACITY Reference//EN"))
+                set is_ref: true
+            if id_sc.equals(StringC("ISO 8879:1986//CAPACITY Reference//EN"))
+                set is_ref: true
+            if is_ref = false
+            {
+                var given_error false
+                if this.sd_reference_public(id, &given_error)
+                    set pushed: true
+                else if given_error = false
+                    this.report1_at(ParserMessages.unknownCapacitySet(), id_sc, this.sd_loc())
+            }
+            if pushed = false
+            {
+                let allow_scope2 AllowedSdParams(SDP_RESERVED_NAME + SDR_SCOPE)
+                return this.parse_sd_param(allow_scope2, parm)
+            }
+        }
+        let specified host.allocate(N_CAPACITY as size_t, 1) as pointer[u8]
+        var ci: int 0
+        while ci < N_CAPACITY
+        {
+            set *(specified + (ci as size_t)): 0 as u8
+            set ci: ci + 1
+        }
+        var final SDP_RESERVED_NAME + SDR_SCOPE
+        if pushed
+            set final: SDP_EE
+        if b.www
+        {
+            let allow_first AllowedSdParams(SDP_CAPACITY_NAME, final)
+            if this.parse_sd_param(allow_first, parm) = false
+                return false
+        }
+        else
+        {
+            let allow_first2 AllowedSdParams(SDP_CAPACITY_NAME)
+            if this.parse_sd_param(allow_first2, parm) = false
+                return false
+        }
+        while parm.kind = SDP_CAPACITY_NAME
+        {
+            let cap_idx parm.idx
+            let allow_num AllowedSdParams(SDP_NUMBER)
+            if this.parse_sd_param(allow_num, parm) = false
+                return false
+            if (*(specified + (cap_idx as size_t))) = (0 as u8)
+            {
+                b.sd.set_capacity(cap_idx, parm.n)
+                set *(specified + (cap_idx as size_t)): 1 as u8
+            }
+            ; duplicateCapacity is -wsgmldecl only.
+            let allow_more AllowedSdParams(SDP_CAPACITY_NAME, final)
+            if this.parse_sd_param(allow_more, parm) = false
+                return false
+        }
+        let sdv b.sd
+        let totalcap sdv.capacity(0)
+        var k: int 1
+        while k < N_CAPACITY
+        {
+            let cv sdv.capacity(k)
+            if cv > totalcap
+            {
+                let cn sdv.capacity_name(k)
+                this.report1_at(ParserMessages.capacityExceedsTotalcap(), cn, this.sd_loc())
+            }
+            set k: k + 1
+        }
+        if pushed
+        {
+            let allow_scope3 AllowedSdParams(SDP_RESERVED_NAME + SDR_SCOPE)
+            return this.parse_sd_param(allow_scope3, parm)
+        }
+        true
+    }
+
+    ; Parser::sdParseScope (parseSd.cxx:1221).
+    function sd_parse_scope(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        let allow AllowedSdParams(SDP_RESERVED_NAME + SDR_INSTANCE, SDP_RESERVED_NAME + SDR_DOCUMENT)
+        if this.parse_sd_param(allow, parm) = false
+            return false
+        if parm.kind = (SDP_RESERVED_NAME + SDR_INSTANCE)
+            b.sd.set_scope_instance()
+        true
+    }
+
+    ; Parser::lookupSyntax (parseSd.cxx:1348) — the two standard public
+    ; syntaxes; out_shortref selects refSyntax vs coreSyntax.
+    function sd_lookup_syntax(this: Parser, id: pointer[ExternalId], out_shortref: pointer[bool]) returns bool
+    {
+        if id.get_public_type() <> PUBLIC_FPI
+            return false
+        if id.get_owner_type() <> OWNER_ISO
+            return false
+        var o_start: size_t 0
+        var o_len: size_t 0
+        if id.get_owner_bytes(&o_start, &o_len) = false
+            return false
+        let pub id.get_public_id()
+        let owner this.bytes_to_stringc(pub, o_start, o_len)
+        var owner_ok false
+        if owner.equals(StringC("ISO 8879:1986"))
+            set owner_ok: true
+        if owner.equals(StringC("ISO 8879-1986"))
+            set owner_ok: true
+        if owner_ok = false
+            return false
+        if id.get_text_class() <> TC_SYNTAX
+            return false
+        var d_start: size_t 0
+        var d_len: size_t 0
+        if id.get_description_bytes(&d_start, &d_len) = false
+            return false
+        let descr this.bytes_to_stringc(pub, d_start, d_len)
+        if descr.equals(StringC("Reference"))
+        {
+            set *out_shortref: true
+            return true
+        }
+        if descr.equals(StringC("Core"))
+        {
+            set *out_shortref: false
+            return true
+        }
+        false
+    }
+
+    ; Parser::sdParseSyntax (parseSd.cxx:1232).
+    function sd_parse_syntax(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        let allow1 AllowedSdParams(SDP_RESERVED_NAME + SDR_SYNTAX)
+        if this.parse_sd_param(allow1, parm) = false
+            return false
+        let allow2 AllowedSdParams(SDP_RESERVED_NAME + SDR_SHUNCHAR, SDP_RESERVED_NAME + SDR_PUBLIC)
+        if this.parse_sd_param(allow2, parm) = false
+            return false
+        if parm.kind = (SDP_RESERVED_NAME + SDR_PUBLIC)
+        {
+            let allow_lit AllowedSdParams(SDP_MINIMUM_LITERAL)
+            if this.parse_sd_param(allow_lit, parm) = false
+                return false
+            let id host.allocate(sizeof ExternalId, alignof ExternalId) as pointer[ExternalId]
+            this.sd_classify_public(b, parm, TC_SYNTAX, SDFE_TEXTCLASS_SYNTAX, id)
+            let id_sc parm.literal_text.string()
+            let allow3 AllowedSdParams(SDP_RESERVED_NAME + SDR_FEATURES, SDP_RESERVED_NAME + SDR_SWITCHES)
+            if this.parse_sd_param(allow3, parm) = false
+                return false
+            if parm.kind = (SDP_RESERVED_NAME + SDR_SWITCHES)
+            {
+                let allow_num AllowedSdParams(SDP_NUMBER)
+                if this.parse_sd_param(allow_num, parm) = false
+                    return false
+                var switching true
+                while switching
+                {
+                    let c parm.n
+                    if this.parse_sd_param(allow_num, parm) = false
+                        return false
+                    b.switcher.add_switch(c, parm.n)
+                    let allow_more AllowedSdParams(SDP_NUMBER, SDP_RESERVED_NAME + SDR_FEATURES)
+                    if this.parse_sd_param(allow_more, parm) = false
+                        return false
+                    if parm.kind <> SDP_NUMBER
+                        set switching: false
+                }
+            }
+            var spec_shortref false
+            if this.sd_lookup_syntax(id, &spec_shortref)
+            {
+                if this.set_standard_syntax(b, b.syntax, spec_shortref, b.www) = false
+                    set b.valid: false
+            }
+            else
+            {
+                var given_error false
+                if this.sd_reference_public(id, &given_error)
+                {
+                    set b.external_syntax: true
+                    let parm2 host.allocate(sizeof SdParam, alignof SdParam) as pointer[SdParam]
+                    set *parm2: SdParam()
+                    let allow_shun AllowedSdParams(SDP_RESERVED_NAME + SDR_SHUNCHAR)
+                    if this.parse_sd_param(allow_shun, parm2) = false
+                        return false
+                    if this.sd_parse_explicit_syntax(b, parm2) = false
+                        return false
+                }
+                else
+                {
+                    if given_error = false
+                        this.report1_at(ParserMessages.unknownPublicSyntax(), id_sc, this.sd_loc())
+                    set b.valid: false
+                }
+            }
+        }
+        else
+        {
+            if this.sd_parse_explicit_syntax(b, parm) = false
+                return false
+        }
+        if b.sd.scope_instance() = false
+        {
+            let invalid ISet^host()
+            this.check_sgml_char(b.syntax, b.sd, null, b.sys_desc, invalid)
+            if invalid.is_empty() = false
+            {
+                let arg this.charset_message_arg(invalid)
+                this.report_raw_at(ParserMessages.invalidSgmlChar(), arg, this.sd_loc())
+            }
+        }
+        this.check_syntax_names(b.syntax)
+        this.check_syntax_namelen(b.syntax)
+        this.check_switches_markup(b.switcher)
+        true
+    }
+
+    ; Parser::sdParseExplicitSyntax (parseSd.cxx:1329).
+    function sd_parse_explicit_syntax(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        if this.sd_parse_shunchar(b, parm) = false
+            return false
+        if this.sd_parse_syntax_charset(b, parm) = false
+            return false
+        if this.sd_parse_function(b, parm) = false
+            return false
+        if this.sd_parse_naming(b, parm) = false
+            return false
+        if this.sd_parse_delim(b, parm) = false
+            return false
+        if this.sd_parse_names(b, parm) = false
+            return false
+        if this.sd_parse_quantity(b, parm) = false
+            return false
+        true
+    }
+
+    ; Parser::sdParseSyntaxCharset (parseSd.cxx:1371).
+    function sd_parse_syntax_charset(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        if this.sd_parse_charset(b, parm, false, b.syntax_charset_decl, b.syntax_charset) = false
+            return false
+        this.check_switches(b.switcher, b.syntax_charset)
+        var i: size_t 0
+        let n b.switcher.n_switches()
+        while i < n
+        {
+            let sto b.switcher.switch_to(i)
+            if b.syntax_charset_decl.char_declared(sto) = false
+                this.report_num_at(ParserMessages.switchNotInCharset(), sto as u64, this.sd_loc())
+            set i: i + 1
+        }
+        let missing ISet^host()
+        this.find_missing_minimum(b.syntax_charset, missing)
+        if missing.is_empty() = false
+        {
+            let arg this.charset_message_arg(missing)
+            this.report_raw_at(ParserMessages.missingMinimumChars(), arg, this.sd_loc())
+        }
+        true
+    }
+
+    ; Parser::sdParseShunchar (parseSd.cxx:1390).
+    function sd_parse_shunchar(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        let allow1 AllowedSdParams(SDP_RESERVED_NAME + SDR_NONE, SDP_RESERVED_NAME + SDR_CONTROLS, SDP_NUMBER)
+        if this.parse_sd_param(allow1, parm) = false
+            return false
+        if parm.kind = (SDP_RESERVED_NAME + SDR_NONE)
+        {
+            let allow_bs AllowedSdParams(SDP_RESERVED_NAME + SDR_BASESET)
+            return this.parse_sd_param(allow_bs, parm)
+        }
+        if parm.kind = (SDP_RESERVED_NAME + SDR_CONTROLS)
+            b.syntax.set_shunchar_controls()
+        else
+        {
+            if parm.n <= CHAR_MAX
+                b.syntax.add_shunchar(parm.n)
+        }
+        var running true
+        while running
+        {
+            let allow_more AllowedSdParams(SDP_RESERVED_NAME + SDR_BASESET, SDP_NUMBER)
+            if this.parse_sd_param(allow_more, parm) = false
+                return false
+            if parm.kind <> SDP_NUMBER
+                set running: false
+            else
+            {
+                if parm.n <= CHAR_MAX
+                    b.syntax.add_shunchar(parm.n)
+            }
+        }
+        true
+    }
+
+    ; Parser::sdParseFunction (parseSd.cxx:1420).
+    function sd_parse_function(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        var fi: int 0
+        while fi < 3
+        {
+            var std_name SDR_RE
+            if fi = 1
+                set std_name: SDR_RS
+            else if fi = 2
+                set std_name: SDR_SPACE
+            let allow_std AllowedSdParams(SDP_RESERVED_NAME + std_name)
+            if this.parse_sd_param(allow_std, parm) = false
+                return false
+            let allow_num AllowedSdParams(SDP_NUMBER)
+            if this.parse_sd_param(allow_num, parm) = false
+                return false
+            var c: u32 0
+            if this.translate_syntax(b, parm.n, &c)
+            {
+                if this.check_not_function(b.syntax, c)
+                    b.syntax.set_standard_function(fi, c)
+                else
+                    set b.valid: false
+            }
+            set fi: fi + 1
+        }
+        var have_msichar false
+        var have_msochar false
+        var running true
+        while running
+        {
+            if b.external_syntax
+            {
+                let allow_name AllowedSdParams(SDP_NAME, SDP_PARAM_LITERAL)
+                if this.parse_sd_param(allow_name, parm) = false
+                    return false
+            }
+            else
+            {
+                let allow_name2 AllowedSdParams(SDP_NAME)
+                if this.parse_sd_param(allow_name2, parm) = false
+                    return false
+            }
+            var name_was_literal false
+            var invalid_name false
+            var name StringC()
+            if parm.kind = SDP_PARAM_LITERAL
+            {
+                set name_was_literal: true
+                if this.translate_syntax_string(b, parm.param_literal, &name) = false
+                    set invalid_name: true
+            }
+            else
+            {
+                ; NB a plain struct assignment from the pointer field
+                ; mis-copied here (size garbage) — copy via the accessors.
+                let tdp parm.token.data_ptr()
+                let tdn parm.token.get_size()
+                set name: StringC^host(tdp, tdn)
+            }
+            if name_was_literal
+            {
+                let allow_cls AllowedSdParams(SDP_RESERVED_NAME + SDR_FUNCHAR, SDP_RESERVED_NAME + SDR_MSICHAR, SDP_RESERVED_NAME + SDR_MSOCHAR, SDP_RESERVED_NAME + SDR_MSSCHAR, SDP_RESERVED_NAME + SDR_SEPCHAR)
+                if this.parse_sd_param(allow_cls, parm) = false
+                    return false
+            }
+            else
+            {
+                let allow_cls2 AllowedSdParams(SDP_RESERVED_NAME + SDR_FUNCHAR, SDP_RESERVED_NAME + SDR_MSICHAR, SDP_RESERVED_NAME + SDR_MSOCHAR, SDP_RESERVED_NAME + SDR_MSSCHAR, SDP_RESERVED_NAME + SDR_SEPCHAR, SDP_RESERVED_NAME + SDR_LCNMSTRT)
+                if this.parse_sd_param(allow_cls2, parm) = false
+                    return false
+            }
+            if parm.kind = (SDP_RESERVED_NAME + SDR_LCNMSTRT)
+            {
+                let sdv ps.get_sd()
+                let naming_spell sdv.sd_reserved_name(SDR_NAMING)
+                if name.equals(naming_spell) = false
+                    this.report1_at(ParserMessages.namingBeforeLcnmstrt(), name, this.sd_loc())
+                set running: false
+            }
+            else
+            {
+                if name_was_literal = false
+                {
+                    var trans StringC()
+                    if this.translate_name(b, name, &trans) = false
+                        set invalid_name: true
+                    else
+                        set name: trans
+                }
+                var fcls cFUNCHAR
+                if parm.kind = (SDP_RESERVED_NAME + SDR_MSICHAR)
+                {
+                    set have_msichar: true
+                    set fcls: cMSICHAR
+                }
+                else if parm.kind = (SDP_RESERVED_NAME + SDR_MSOCHAR)
+                {
+                    set have_msochar: true
+                    set fcls: cMSOCHAR
+                }
+                else if parm.kind = (SDP_RESERVED_NAME + SDR_MSSCHAR)
+                    set fcls: cMSSCHAR
+                else if parm.kind = (SDP_RESERVED_NAME + SDR_SEPCHAR)
+                    set fcls: cSEPCHAR
+                let allow_num2 AllowedSdParams(SDP_NUMBER)
+                if this.parse_sd_param(allow_num2, parm) = false
+                    return false
+                var c2: u32 0
+                var ok this.translate_syntax(b, parm.n, &c2)
+                if ok
+                    set ok: this.check_not_function(b.syntax, c2)
+                if ok and (invalid_name = false)
+                {
+                    var tem: u32 0
+                    if b.syntax.lookup_declared_function_char(name, &tem)
+                        this.report1_at(ParserMessages.duplicateFunctionName(), name, this.sd_loc())
+                    else
+                        b.syntax.add_function_char(name, fcls, c2)
+                }
+            }
+        }
+        if have_msochar and (have_msichar = false)
+            this.report0_at(ParserMessages.msocharRequiresMsichar(), this.sd_loc())
+        true
+    }
+
+    ; Parser::sdParamConvertToLiteral (parseSd.cxx:3259).
+    function sd_param_convert_to_literal(this: Parser, parm: pointer[SdParam])
+    {
+        if parm.kind = SDP_NUMBER
+        {
+            set parm.kind: SDP_PARAM_LITERAL
+            let cb host.allocate(4 as size_t, 4) as pointer[u32]
+            set *cb: parm.n
+            set parm.param_literal: StringC^host(cb, 1 as size_t)
+        }
+    }
+
+    ; Parser::requireWWW (parseSd.cxx:3268).
+    function sd_require_www(this: Parser, b: pointer[SdBuilder])
+    {
+        if b.www = false
+        {
+            this.report0_at(ParserMessages.wwwRequired(), this.sd_loc())
+            set b.www: true
+        }
+    }
+
+    ; Parser::sdParseNaming (parseSd.cxx:1531) — LCNMSTRT/UCNMSTRT (+WWW
+    ; NAMESTRT) then LCNMCHAR/UCNMCHAR (+NAMECHAR), with the LC/UC pairing and
+    ; range machinery, terminated by NAMECASE GENERAL/ENTITY.
+    function sd_parse_naming(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        let name_start_char ISet^host()
+        let name_char ISet^host()
+        var is_namechar: int 0
+        var iterating true
+        while iterating
+        {
+            ; keys[isNamechar*3 + k]: 0 -> UCNMSTRT/UCNMCHAR, 1 -> NAMESTRT/
+            ; NAMECHAR, 2 -> LCNMCHAR/NAMECASE.
+            var key0 SDR_UCNMSTRT
+            var key1 SDR_NAMESTRT
+            var key2 SDR_LCNMCHAR
+            if is_namechar = 1
+            {
+                set key0: SDR_UCNMCHAR
+                set key1: SDR_NAMECHAR
+                set key2: SDR_NAMECASE
+            }
+            let lc Array[u32]^host()
+            let range_index Array[u32]^host()
+            ; --- LC side ---
+            var prev_param: int 0
+            var lc_running true
+            while lc_running
+            {
+                if prev_param = 0
+                {
+                    let allow_a AllowedSdParams(SDP_PARAM_LITERAL, SDP_NUMBER)
+                    if this.parse_sd_param(allow_a, parm) = false
+                        return false
+                }
+                else if prev_param = 1
+                {
+                    let allow_b AllowedSdParams(SDP_RESERVED_NAME + key0, SDP_PARAM_LITERAL, SDP_NUMBER, SDP_MINUS)
+                    if this.parse_sd_param(allow_b, parm) = false
+                        return false
+                }
+                else
+                {
+                    let allow_c AllowedSdParams(SDP_RESERVED_NAME + key0, SDP_PARAM_LITERAL, SDP_NUMBER)
+                    if this.parse_sd_param(allow_c, parm) = false
+                        return false
+                }
+                ; numbers (and non-leading literals) are ENR extensions.
+                var enr_hit false
+                if parm.kind = SDP_NUMBER
+                    set enr_hit: true
+                else if (parm.kind = SDP_PARAM_LITERAL) and (prev_param <> 0)
+                    set enr_hit: true
+                if enr_hit and (b.external_syntax = false) and (b.enr = false)
+                {
+                    this.report0_at(ParserMessages.enrRequired(), this.sd_loc())
+                    set b.enr: true
+                }
+                if parm.kind = SDP_NUMBER
+                    set prev_param: 1
+                else
+                    set prev_param: 2
+                if parm.kind = SDP_MINUS
+                {
+                    let allow_num AllowedSdParams(SDP_NUMBER)
+                    if this.parse_sd_param(allow_num, parm) = false
+                        return false
+                    let lc_len lc.get_length()
+                    let last *(lc.get_buffer() + lc_len - (1 as size_t))
+                    if parm.n < last
+                        this.report0_at(ParserMessages.sdInvalidRange(), this.sd_loc())
+                    else
+                    {
+                        if parm.n > (last + (1 as u32))
+                            range_index.add((lc_len - (1 as size_t)) as u32)
+                        lc.add(parm.n)
+                    }
+                }
+                else
+                {
+                    this.sd_param_convert_to_literal(parm)
+                    if parm.kind <> SDP_PARAM_LITERAL
+                        set lc_running: false
+                    else
+                    {
+                        var pi: size_t 0
+                        let pn parm.param_literal.get_size()
+                        while pi < pn
+                        {
+                            lc.add(parm.param_literal.get(pi))
+                            set pi: pi + 1
+                        }
+                    }
+                }
+            }
+            ; --- UC side ---
+            var lc_pos: size_t 0
+            var range_index_pos: size_t 0
+            var range_left: u32 0
+            var next_range_char: u32 0
+            ; explicit pointer type: an untyped var here COPIES the ISet
+            ; value (the parm.token footgun class) and the adds vanish.
+            var target: pointer[ISet] name_start_char
+            if is_namechar = 1
+                set target: name_char
+            var chars Array[u32]^host()
+            var run_out false
+            set prev_param: 0
+            var uc_running true
+            while uc_running
+            {
+                if prev_param = 0
+                {
+                    let allow_d AllowedSdParams(SDP_PARAM_LITERAL, SDP_NUMBER)
+                    if this.parse_sd_param(allow_d, parm) = false
+                        return false
+                }
+                else if prev_param = 1
+                {
+                    let allow_e AllowedSdParams(SDP_RESERVED_NAME + key1, SDP_RESERVED_NAME + key2, SDP_PARAM_LITERAL, SDP_NUMBER, SDP_MINUS)
+                    if this.parse_sd_param(allow_e, parm) = false
+                        return false
+                }
+                else
+                {
+                    let allow_f AllowedSdParams(SDP_RESERVED_NAME + key1, SDP_RESERVED_NAME + key2, SDP_PARAM_LITERAL, SDP_NUMBER)
+                    if this.parse_sd_param(allow_f, parm) = false
+                        return false
+                }
+                var enr_hit2 false
+                if parm.kind = SDP_NUMBER
+                    set enr_hit2: true
+                else if (parm.kind = SDP_PARAM_LITERAL) and (prev_param <> 0)
+                    set enr_hit2: true
+                if enr_hit2 and (b.external_syntax = false) and (b.enr = false)
+                {
+                    this.report0_at(ParserMessages.enrRequired(), this.sd_loc())
+                    set b.enr: true
+                }
+                if parm.kind = SDP_NUMBER
+                    set prev_param: 1
+                else
+                    set prev_param: 2
+                if parm.kind = SDP_MINUS
+                {
+                    let allow_num2 AllowedSdParams(SDP_NUMBER)
+                    if this.parse_sd_param(allow_num2, parm) = false
+                        return false
+                    let start0 *(chars.get_buffer() + (0 as size_t))
+                    var start start0
+                    let end parm.n
+                    if start > end
+                        this.report0_at(ParserMessages.sdInvalidRange(), this.sd_loc())
+                    else
+                    {
+                        var count (end + (1 as u32)) - start
+                        while count > (0 as u32)
+                        {
+                            if range_left = (0 as u32)
+                            {
+                                if range_index_pos < range_index.get_length()
+                                {
+                                    let ri_val *(range_index.get_buffer() + range_index_pos)
+                                    if (ri_val as size_t) = lc_pos
+                                    {
+                                        let lo *(lc.get_buffer() + lc_pos)
+                                        let hi *(lc.get_buffer() + lc_pos + (1 as size_t))
+                                        set range_left: (hi - lo) + (1 as u32)
+                                        set next_range_char: lo
+                                        set lc_pos: lc_pos + (2 as size_t)
+                                        set range_index_pos: range_index_pos + (1 as size_t)
+                                    }
+                                }
+                            }
+                            var c: u32 0
+                            if range_left > (0 as u32)
+                            {
+                                set range_left: range_left - (1 as u32)
+                                set c: next_range_char
+                                set next_range_char: next_range_char + (1 as u32)
+                            }
+                            else if lc_pos < lc.get_length()
+                            {
+                                set c: *(lc.get_buffer() + lc_pos)
+                                set lc_pos: lc_pos + (1 as size_t)
+                            }
+                            else
+                            {
+                                set c: start
+                                set run_out: true
+                            }
+                            var bulk false
+                            if (c = start) and (count > (1 as u32))
+                            {
+                                if run_out or (range_left > (0 as u32))
+                                    set bulk: true
+                            }
+                            if bulk
+                            {
+                                var n: u32 0
+                                if run_out
+                                    set n: count
+                                else if range_left < count
+                                {
+                                    set n: range_left + (1 as u32)
+                                    set range_left: 0 as u32
+                                }
+                                else
+                                {
+                                    set n: count
+                                    set range_left: range_left - (n - (1 as u32))
+                                    set next_range_char: next_range_char + (n - (1 as u32))
+                                }
+                                this.translate_range(b, start, start + (n - (1 as u32)), target)
+                                set count: count - n
+                                set start: start + n
+                            }
+                            else
+                            {
+                                var trans_lc: u32 0
+                                var trans_uc: u32 0
+                                var ok1 this.translate_syntax(b, c, &trans_lc)
+                                if ok1
+                                {
+                                    if this.translate_syntax(b, start, &trans_uc)
+                                    {
+                                        target.add(trans_lc)
+                                        if trans_lc <> trans_uc
+                                        {
+                                            target.add(trans_uc)
+                                            b.syntax.add_subst(trans_lc, trans_uc)
+                                        }
+                                    }
+                                }
+                                set count: count - (1 as u32)
+                                set start: start + (1 as u32)
+                            }
+                        }
+                    }
+                    set chars: Array[u32]^host()
+                }
+                else
+                {
+                    var ci: size_t 0
+                    let cn chars.get_length()
+                    while ci < cn
+                    {
+                        if range_left = (0 as u32)
+                        {
+                            if range_index_pos < range_index.get_length()
+                            {
+                                let ri_val2 *(range_index.get_buffer() + range_index_pos)
+                                if (ri_val2 as size_t) = lc_pos
+                                {
+                                    let lo2 *(lc.get_buffer() + lc_pos)
+                                    let hi2 *(lc.get_buffer() + lc_pos + (1 as size_t))
+                                    set range_left: (hi2 - lo2) + (1 as u32)
+                                    set next_range_char: lo2
+                                    set lc_pos: lc_pos + (2 as size_t)
+                                    set range_index_pos: range_index_pos + (1 as size_t)
+                                }
+                            }
+                        }
+                        var c2: u32 0
+                        if range_left > (0 as u32)
+                        {
+                            set range_left: range_left - (1 as u32)
+                            set c2: next_range_char
+                            set next_range_char: next_range_char + (1 as u32)
+                        }
+                        else if lc_pos < lc.get_length()
+                        {
+                            set c2: *(lc.get_buffer() + lc_pos)
+                            set lc_pos: lc_pos + (1 as size_t)
+                        }
+                        else
+                        {
+                            set run_out: true
+                            set c2: *(chars.get_buffer() + ci)
+                        }
+                        var trans_lc2: u32 0
+                        var trans_uc2: u32 0
+                        var ok2 this.translate_syntax(b, c2, &trans_lc2)
+                        if ok2
+                        {
+                            let uc_char *(chars.get_buffer() + ci)
+                            if this.translate_syntax(b, uc_char, &trans_uc2)
+                            {
+                                target.add(trans_lc2)
+                                if trans_lc2 <> trans_uc2
+                                {
+                                    target.add(trans_uc2)
+                                    b.syntax.add_subst(trans_lc2, trans_uc2)
+                                }
+                            }
+                        }
+                        set ci: ci + 1
+                    }
+                    this.sd_param_convert_to_literal(parm)
+                    if parm.kind <> SDP_PARAM_LITERAL
+                        set uc_running: false
+                    else
+                    {
+                        set chars: Array[u32]^host()
+                        var pi2: size_t 0
+                        let pn2 parm.param_literal.get_size()
+                        while pi2 < pn2
+                        {
+                            chars.add(parm.param_literal.get(pi2))
+                            set pi2: pi2 + 1
+                        }
+                    }
+                }
+            }
+            var length_err false
+            if run_out and (b.external_syntax = false)
+                set length_err: true
+            if range_left > (0 as u32)
+                set length_err: true
+            if lc_pos < lc.get_length()
+                set length_err: true
+            if length_err
+            {
+                if is_namechar = 1
+                    this.report0_at(ParserMessages.nmcharLength(), this.sd_loc())
+                else
+                    this.report0_at(ParserMessages.nmstrtLength(), this.sd_loc())
+            }
+            ; the WWW NAMESTRT/NAMECHAR extension list.
+            if parm.kind = (SDP_RESERVED_NAME + key1)
+            {
+                if (b.external_syntax = false) and (b.enr = false)
+                {
+                    this.report0_at(ParserMessages.enrRequired(), this.sd_loc())
+                    set b.enr: true
+                }
+                set prev_param: 0
+                var ext_running true
+                while ext_running
+                {
+                    if prev_param = 0
+                    {
+                        let allow_g AllowedSdParams(SDP_PARAM_LITERAL, SDP_NUMBER)
+                        if this.parse_sd_param(allow_g, parm) = false
+                            return false
+                    }
+                    else if prev_param = 1
+                    {
+                        let allow_h AllowedSdParams(SDP_RESERVED_NAME + key2, SDP_PARAM_LITERAL, SDP_NUMBER, SDP_MINUS)
+                        if this.parse_sd_param(allow_h, parm) = false
+                            return false
+                    }
+                    else
+                    {
+                        let allow_i AllowedSdParams(SDP_RESERVED_NAME + key2, SDP_PARAM_LITERAL, SDP_NUMBER)
+                        if this.parse_sd_param(allow_i, parm) = false
+                            return false
+                    }
+                    let was_number parm.kind = SDP_NUMBER
+                    if parm.kind = SDP_MINUS
+                    {
+                        let prev_number parm.n
+                        let allow_num3 AllowedSdParams(SDP_NUMBER)
+                        if this.parse_sd_param(allow_num3, parm) = false
+                            return false
+                        if parm.n < prev_number
+                            this.report0_at(ParserMessages.sdInvalidRange(), this.sd_loc())
+                        else if parm.n > prev_number
+                            this.translate_range(b, prev_number + (1 as u32), parm.n, target)
+                    }
+                    else
+                    {
+                        this.sd_param_convert_to_literal(parm)
+                        if parm.kind <> SDP_PARAM_LITERAL
+                            set ext_running: false
+                        else
+                        {
+                            var pi3: size_t 0
+                            let pn3 parm.param_literal.get_size()
+                            while pi3 < pn3
+                            {
+                                var trans3: u32 0
+                                let plc parm.param_literal.get(pi3)
+                                if this.translate_syntax(b, plc, &trans3)
+                                    target.add(trans3)
+                                set pi3: pi3 + 1
+                            }
+                            if was_number
+                                set prev_param: 1
+                            else
+                                set prev_param: 2
+                        }
+                    }
+                }
+            }
+            if this.check_nmchars(target, b.syntax) = false
+                set b.valid: false
+            if is_namechar = 1
+                set iterating: false
+            set is_namechar: is_namechar + 1
+        }
+        let bad ISet^host()
+        this.intersect_char_sets(name_start_char, name_char, bad)
+        if bad.is_empty() = false
+        {
+            set b.valid: false
+            let arg this.charset_message_arg(bad)
+            this.report_raw_at(ParserMessages.nmcharNmstrt(), arg, this.sd_loc())
+        }
+        this.apply_name_start_chars(b.syntax, name_start_char)
+        this.apply_name_chars(b.syntax, name_char)
+        let allow_gen AllowedSdParams(SDP_RESERVED_NAME + SDR_GENERAL)
+        if this.parse_sd_param(allow_gen, parm) = false
+            return false
+        let allow_yn AllowedSdParams(SDP_RESERVED_NAME + SDR_NO, SDP_RESERVED_NAME + SDR_YES)
+        if this.parse_sd_param(allow_yn, parm) = false
+            return false
+        b.syntax.set_namecase_general(parm.kind = (SDP_RESERVED_NAME + SDR_YES))
+        let allow_ent AllowedSdParams(SDP_RESERVED_NAME + SDR_ENTITY)
+        if this.parse_sd_param(allow_ent, parm) = false
+            return false
+        if this.parse_sd_param(allow_yn, parm) = false
+            return false
+        b.syntax.set_namecase_entity(parm.kind = (SDP_RESERVED_NAME + SDR_YES))
+        true
+    }
+
+    ; fold a string through the builder syntax's general substitution table.
+    function sd_general_subst(this: Parser, b: pointer[SdBuilder], s: StringC) returns StringC
+    {
+        let n s.get_size()
+        if n = (0 as size_t)
+            return StringC^host(null as pointer[u32], 0 as size_t)
+        let cb host.allocate(n * (4 as size_t), 4) as pointer[u32]
+        var i: size_t 0
+        while i < n
+        {
+            set *(cb + i): b.syntax.fold(s.get(i))
+            set i: i + 1
+        }
+        StringC^host(cb, n)
+    }
+
+    ; Parser::sdParseDelim (parseSd.cxx:1936).
+    function sd_parse_delim(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        let allow_delim AllowedSdParams(SDP_RESERVED_NAME + SDR_DELIM)
+        if this.parse_sd_param(allow_delim, parm) = false
+            return false
+        let allow_general AllowedSdParams(SDP_RESERVED_NAME + SDR_GENERAL)
+        if this.parse_sd_param(allow_general, parm) = false
+            return false
+        let allow_sgmlref AllowedSdParams(SDP_RESERVED_NAME + SDR_SGMLREF)
+        if this.parse_sd_param(allow_sgmlref, parm) = false
+            return false
+        let specified host.allocate(N_DELIM_GENERAL as size_t, 1) as pointer[u8]
+        var di: int 0
+        while di < N_DELIM_GENERAL
+        {
+            set *(specified + (di as size_t)): 0 as u8
+            set di: di + 1
+        }
+        var general_running true
+        while general_running
+        {
+            let allow_role AllowedSdParams(SDP_GENERAL_DELIMITER_NAME, SDP_RESERVED_NAME + SDR_SHORTREF)
+            if this.parse_sd_param(allow_role, parm) = false
+                return false
+            if parm.kind = (SDP_RESERVED_NAME + SDR_SHORTREF)
+                set general_running: false
+            else
+            {
+                let dg parm.idx
+                if (*(specified + (dg as size_t))) <> (0 as u8)
+                {
+                    let sdv ps.get_sd()
+                    let dn sdv.general_delimiter_name(dg)
+                    this.report1_at(ParserMessages.duplicateDelimGeneral(), dn, this.sd_loc())
+                }
+                if (dg = dHCRO) or (dg = dNESTC)
+                    this.sd_require_www(b)
+                if b.external_syntax
+                {
+                    let allow_val AllowedSdParams(SDP_PARAM_LITERAL, SDP_NUMBER)
+                    if this.parse_sd_param(allow_val, parm) = false
+                        return false
+                }
+                else
+                {
+                    let allow_val2 AllowedSdParams(SDP_PARAM_LITERAL)
+                    if this.parse_sd_param(allow_val2, parm) = false
+                        return false
+                }
+                this.sd_param_convert_to_literal(parm)
+                if parm.param_literal.get_size() = (0 as size_t)
+                    this.report0_at(ParserMessages.sdEmptyDelimiter(), this.sd_loc())
+                else
+                {
+                    var str StringC()
+                    if this.translate_syntax_string(b, parm.param_literal, &str)
+                    {
+                        let folded this.sd_general_subst(b, str)
+                        var ok this.check_general_delim(b.syntax, folded)
+                        if ok
+                        {
+                            if (*(specified + (dg as size_t))) = (0 as u8)
+                            {
+                                let fdp folded.data_ptr()
+                                let fdn folded.get_size()
+                                b.syntax.set_delim_general(dg, fdp, fdn)
+                            }
+                            else
+                            {
+                                ; a re-specified role invalidates the declaration
+                                ; (parseSd.cxx:1981's && arm).
+                                set b.valid: false
+                            }
+                        }
+                        else
+                            set b.valid: false
+                    }
+                }
+                set *(specified + (dg as size_t)): 1 as u8
+            }
+        }
+        ; NET declared without NESTC: NESTC defaults to NET (parseSd.cxx:1989).
+        if (b.syntax.delim_general_len(dNET) > (0 as size_t)) and (b.syntax.delim_general_len(dNESTC) = (0 as size_t))
+        {
+            ; specified[] gates the reference fill below; NET's chars stand in.
+            let net_len b.syntax.delim_general_len(dNET)
+            let net_buf host.allocate(net_len * (4 as size_t), 4) as pointer[u32]
+            var ni: size_t 0
+            while ni < net_len
+            {
+                set *(net_buf + ni): b.syntax.delim_general_char(dNET, ni)
+                set ni: ni + 1
+            }
+            b.syntax.set_delim_general(dNESTC, net_buf, net_len)
+            set *(specified + (dNESTC as size_t)): 1 as u8
+        }
+        ; HCRO stays empty unless declared: mark every still-empty slot whose
+        ; Figure-3 row is empty as specified so the fill skips it faithfully.
+        if this.set_ref_delim_general(b, b.syntax, b.syntax_charset, specified) = false
+            set b.valid: false
+        let allow_sr AllowedSdParams(SDP_RESERVED_NAME + SDR_SGMLREF, SDP_RESERVED_NAME + SDR_NONE)
+        if this.parse_sd_param(allow_sr, parm) = false
+            return false
+        if parm.kind = (SDP_RESERVED_NAME + SDR_SGMLREF)
+        {
+            if this.add_ref_delim_shortref(b, b.syntax, b.syntax_charset) = false
+                set b.valid: false
+        }
+        var last_literal StringC()
+        var have_last false
+        var sr_running true
+        while sr_running
+        {
+            if b.external_syntax
+            {
+                let allow_sr2 AllowedSdParams(SDP_PARAM_LITERAL, SDP_NUMBER, SDP_MINUS, SDP_RESERVED_NAME + SDR_NAMES)
+                if this.parse_sd_param(allow_sr2, parm) = false
+                    return false
+            }
+            else
+            {
+                let allow_sr3 AllowedSdParams(SDP_PARAM_LITERAL, SDP_RESERVED_NAME + SDR_NAMES)
+                if this.parse_sd_param(allow_sr3, parm) = false
+                    return false
+            }
+            this.sd_param_convert_to_literal(parm)
+            if parm.kind = SDP_MINUS
+            {
+                let allow_hi AllowedSdParams(SDP_PARAM_LITERAL, SDP_NUMBER)
+                if this.parse_sd_param(allow_hi, parm) = false
+                    return false
+                this.sd_param_convert_to_literal(parm)
+                if parm.param_literal.get_size() = (0 as size_t)
+                    this.report0_at(ParserMessages.sdEmptyDelimiter(), this.sd_loc())
+                else
+                {
+                    var not_single false
+                    if have_last = false
+                        set not_single: true
+                    else if last_literal.get_size() <> (1 as size_t)
+                        set not_single: true
+                    if parm.param_literal.get_size() <> (1 as size_t)
+                        set not_single: true
+                    if not_single
+                        this.report0_at(ParserMessages.sdRangeNotSingleChar(), this.sd_loc())
+                    else
+                    {
+                        let lo_c last_literal.get(0 as size_t)
+                        let hi_c parm.param_literal.get(0 as size_t)
+                        if hi_c < lo_c
+                            this.report0_at(ParserMessages.sdInvalidRange(), this.sd_loc())
+                        else if hi_c <> lo_c
+                        {
+                            let shortref_chars ISet^host()
+                            this.translate_range(b, lo_c + (1 as u32), hi_c, shortref_chars)
+                            let duplicates ISet^host()
+                            this.intersect_char_sets(shortref_chars, b.syntax.delim_shortref_simple(), duplicates)
+                            var ki: size_t 0
+                            let kn b.syntax.n_delim_shortref_complex()
+                            while ki < kn
+                            {
+                                let cd b.syntax.delim_shortref_complex(ki)
+                                if cd.get_size() = (1 as size_t)
+                                {
+                                    let cc cd.get(0 as size_t)
+                                    if shortref_chars.contains(cc)
+                                        duplicates.add(cc)
+                                }
+                                set ki: ki + 1
+                            }
+                            if duplicates.is_empty() = false
+                            {
+                                let arg this.charset_message_arg(duplicates)
+                                this.report_raw_at(ParserMessages.duplicateDelimShortrefSet(), arg, this.sd_loc())
+                            }
+                            b.syntax.add_delim_shortrefs_set(shortref_chars)
+                        }
+                    }
+                }
+                set have_last: false
+            }
+            else if parm.kind = SDP_PARAM_LITERAL
+            {
+                ; same struct-assignment footgun as parm.token — copy via
+                ; the accessors.
+                let lldp parm.param_literal.data_ptr()
+                let lldn parm.param_literal.get_size()
+                set last_literal: StringC^host(lldp, lldn)
+                set have_last: true
+                if last_literal.get_size() = (0 as size_t)
+                    this.report0_at(ParserMessages.sdEmptyDelimiter(), this.sd_loc())
+                else
+                {
+                    var str2 StringC()
+                    if this.translate_syntax_string(b, last_literal, &str2)
+                    {
+                        let folded2 this.sd_general_subst(b, str2)
+                        var sr_ok folded2.get_size() = (1 as size_t)
+                        if sr_ok = false
+                            set sr_ok: this.check_shortref_delim(b.syntax, folded2)
+                        if sr_ok
+                        {
+                            if b.syntax.is_valid_shortref(folded2)
+                                this.report1_at(ParserMessages.duplicateDelimShortref(), folded2, this.sd_loc())
+                            else
+                                b.syntax.add_delim_shortref(folded2)
+                        }
+                    }
+                }
+            }
+            else
+                set sr_running: false
+        }
+        true
+    }
+
+    ; Parser::sdParseNames (parseSd.cxx:2084).
+    function sd_parse_names(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        let allow_sgmlref AllowedSdParams(SDP_RESERVED_NAME + SDR_SGMLREF)
+        if this.parse_sd_param(allow_sgmlref, parm) = false
+            return false
+        var running true
+        while running
+        {
+            let allow_rn AllowedSdParams(SDP_RESERVED_NAME + SDR_QUANTITY, SDP_REFERENCE_RESERVED_NAME)
+            if this.parse_sd_param(allow_rn, parm) = false
+                return false
+            if parm.kind = (SDP_RESERVED_NAME + SDR_QUANTITY)
+                set running: false
+            else
+            {
+                let rn parm.idx
+                if (rn = R_ALL) or (rn = R_DATA) or (rn = R_IMPLICIT)
+                    this.sd_require_www(b)
+                if b.external_syntax
+                {
+                    let allow_nm AllowedSdParams(SDP_NAME, SDP_PARAM_LITERAL)
+                    if this.parse_sd_param(allow_nm, parm) = false
+                        return false
+                }
+                else
+                {
+                    let allow_nm2 AllowedSdParams(SDP_NAME)
+                    if this.parse_sd_param(allow_nm2, parm) = false
+                        return false
+                }
+                var trans_name StringC()
+                var trans_ok false
+                if parm.kind = SDP_NAME
+                    set trans_ok: this.translate_name(b, parm.token, &trans_name)
+                else
+                    set trans_ok: this.translate_syntax_string(b, parm.param_literal, &trans_name)
+                if trans_ok
+                {
+                    let existing b.syntax.lookup_reserved_name(trans_name)
+                    if existing >= 0
+                        this.report1_at(ParserMessages.ambiguousReservedName(), trans_name, this.sd_loc())
+                    else
+                    {
+                        var bad_name false
+                        if trans_name.get_size() = (0 as size_t)
+                            set bad_name: true
+                        else if b.syntax.is_name_start_character(trans_name.get(0 as size_t)) = false
+                            set bad_name: true
+                        if bad_name
+                        {
+                            this.report1_at(ParserMessages.reservedNameSyntax(), trans_name, this.sd_loc())
+                            set trans_name: StringC^host(null as pointer[u32], 0 as size_t)
+                        }
+                        var ni: size_t 1
+                        let nn trans_name.get_size()
+                        while ni < nn
+                        {
+                            if b.syntax.is_name_character(trans_name.get(ni)) = false
+                            {
+                                this.report1_at(ParserMessages.reservedNameSyntax(), trans_name, this.sd_loc())
+                                set trans_name: StringC^host(null as pointer[u32], 0 as size_t)
+                                set ni: nn
+                            }
+                            else
+                                set ni: ni + 1
+                        }
+                        let folded this.sd_general_subst(b, trans_name)
+                        let cur b.syntax.reserved_name(rn)
+                        if cur.get_size() > (0 as size_t)
+                        {
+                            let syn ps.get_syntax()
+                            let spell syn.reserved_name(rn)
+                            this.report1_at(ParserMessages.duplicateReservedName(), spell, this.sd_loc())
+                        }
+                        else if folded.get_size() > (0 as size_t)
+                            b.syntax.set_name(rn, folded)
+                        else
+                            set b.valid: false
+                    }
+                }
+            }
+        }
+        this.set_ref_names(b.syntax, b.www)
+        var fi: int 0
+        while fi < 3
+        {
+            var rn_idx R_RE
+            if fi = 1
+                set rn_idx: R_RS
+            else if fi = 2
+                set rn_idx: R_SPACE
+            let fname b.syntax.reserved_name(rn_idx)
+            var tem: u32 0
+            if b.syntax.lookup_declared_function_char(fname, &tem)
+                this.report1_at(ParserMessages.duplicateFunctionName(), fname, this.sd_loc())
+            set fi: fi + 1
+        }
+        b.syntax.enter_standard_function_names()
+        true
+    }
+
+    ; Parser::sdParseQuantity (parseSd.cxx:2162).
+    function sd_parse_quantity(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        if b.www
+        {
+            let allow_a AllowedSdParams(SDP_RESERVED_NAME + SDR_NONE, SDP_RESERVED_NAME + SDR_SGMLREF)
+            if this.parse_sd_param(allow_a, parm) = false
+                return false
+        }
+        else
+        {
+            let allow_b AllowedSdParams(SDP_RESERVED_NAME + SDR_SGMLREF)
+            if this.parse_sd_param(allow_b, parm) = false
+                return false
+        }
+        var final SDP_RESERVED_NAME + SDR_FEATURES
+        if b.external_syntax
+            set final: SDP_EE
+        if parm.kind = (SDP_RESERVED_NAME + SDR_NONE)
+        {
+            var qi: int 0
+            while (qi as size_t) < N_QUANTITY
+            {
+                if qi <> qNORMSEP
+                    b.syntax.set_quantity(qi, SYNTAX_UNLIMITED)
+                set qi: qi + 1
+            }
+            let allow_end AllowedSdParams(final, SDP_RESERVED_NAME + SDR_ENTITIES)
+            if this.parse_sd_param(allow_end, parm) = false
+                return false
+        }
+        else
+        {
+            var q_running true
+            while q_running
+            {
+                if b.www
+                {
+                    let allow_q AllowedSdParams(SDP_QUANTITY_NAME, final, SDP_RESERVED_NAME + SDR_ENTITIES)
+                    if this.parse_sd_param(allow_q, parm) = false
+                        return false
+                }
+                else
+                {
+                    let allow_q2 AllowedSdParams(SDP_QUANTITY_NAME, final)
+                    if this.parse_sd_param(allow_q2, parm) = false
+                        return false
+                }
+                if parm.kind <> SDP_QUANTITY_NAME
+                    set q_running: false
+                else
+                {
+                    let quantity parm.idx
+                    let allow_num AllowedSdParams(SDP_NUMBER)
+                    if this.parse_sd_param(allow_num, parm) = false
+                        return false
+                    b.syntax.set_quantity(quantity, parm.n)
+                }
+            }
+            if b.sd.scope_instance()
+            {
+                let syn ps.get_syntax()
+                let sdv ps.get_sd()
+                var qi2: int 0
+                while (qi2 as size_t) < N_QUANTITY
+                {
+                    let nv b.syntax.get_quantity(qi2)
+                    let pv syn.get_quantity(qi2)
+                    if nv < pv
+                    {
+                        let qn sdv.quantity_name(qi2)
+                        this.report1_at(ParserMessages.scopeInstanceQuantity(), qn, this.sd_loc())
+                    }
+                    set qi2: qi2 + 1
+                }
+            }
+        }
+        if parm.kind = (SDP_RESERVED_NAME + SDR_ENTITIES)
+            return this.sd_parse_entities(b, parm)
+        true
+    }
+
+    ; Parser::sdParseEntities (parseSd.cxx:2211).
+    function sd_parse_entities(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        var final SDP_RESERVED_NAME + SDR_FEATURES
+        if b.external_syntax
+            set final: SDP_EE
+        var running true
+        while running
+        {
+            let allow_e AllowedSdParams(final, SDP_PARAM_LITERAL)
+            if this.parse_sd_param(allow_e, parm) = false
+                return false
+            if parm.kind <> SDP_PARAM_LITERAL
+                set running: false
+            else
+            {
+                var name StringC()
+                var name_ok this.translate_syntax_string(b, parm.param_literal, &name)
+                if name_ok
+                {
+                    var bad false
+                    if name.get_size() = (0 as size_t)
+                        set bad: true
+                    else if b.syntax.is_name_start_character(name.get(0 as size_t)) = false
+                        set bad: true
+                    if bad
+                    {
+                        this.report1_at(ParserMessages.entityNameSyntax(), name, this.sd_loc())
+                        set name_ok: false
+                    }
+                    else
+                    {
+                        var ni: size_t 1
+                        let nn name.get_size()
+                        while ni < nn
+                        {
+                            if b.syntax.is_name_character(name.get(ni)) = false
+                            {
+                                this.report1_at(ParserMessages.entityNameSyntax(), name, this.sd_loc())
+                                set name_ok: false
+                                set ni: nn
+                            }
+                            else
+                                set ni: ni + 1
+                        }
+                    }
+                }
+                let allow_num AllowedSdParams(SDP_NUMBER)
+                if this.parse_sd_param(allow_num, parm) = false
+                    return false
+                var c: u32 0
+                if this.translate_syntax(b, parm.n, &c)
+                {
+                    if name_ok
+                    {
+                        if name.get_size() > (0 as size_t)
+                            b.syntax.add_entity_str(name, c)
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    ; Parser::sdParseFeatures (parseSd.cxx:2247) — the ordered FEATURES table.
+    function sd_parse_features(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        ; the FeatureInfo table: SD reserved name + argument kind
+        ; (0 none, 1 boolean, 2 number, 3 netenabl, 4 implyelt).
+        var feat_names int[34]
+        var feat_args int[34]
+        let fn feat_names as pointer[int]
+        let fa feat_args as pointer[int]
+        this.sd_fill_features(fn, fa)
+        var boolean_feature: int 0
+        var number_feature: int 0
+        var i: int 0
+        while i < 34
+        {
+            let name_i *(fn + (i as size_t))
+            var arg_i *(fa + (i as size_t))
+            var handled false
+            if name_i = SDR_STARTTAG
+            {
+                ; SHORTTAG YES/NO or the Annex-K sub-form.
+                let allow_st AllowedSdParams(SDP_RESERVED_NAME + SDR_STARTTAG, SDP_RESERVED_NAME + SDR_NO, SDP_RESERVED_NAME + SDR_YES)
+                if this.parse_sd_param(allow_st, parm) = false
+                    return false
+                ; STARTTAG itself was consumed here (the reference's switch
+                ; break) — don't parse the keyword again below.
+                if parm.kind = (SDP_RESERVED_NAME + SDR_STARTTAG)
+                    set handled: true
+                if parm.kind <> (SDP_RESERVED_NAME + SDR_STARTTAG)
+                {
+                    b.sd.set_shorttag(parm.kind = (SDP_RESERVED_NAME + SDR_YES))
+                    ; skip the sub-features up to EMPTYNRM, counting booleans.
+                    set i: i + 1
+                    while (*(fn + (i as size_t))) <> SDR_EMPTYNRM
+                    {
+                        if (*(fa + (i as size_t))) = 1
+                            set boolean_feature: boolean_feature + 1
+                        set i: i + 1
+                    }
+                    ; fall into the EMPTYNRM|LINK choice below.
+                    let allow_el AllowedSdParams(SDP_RESERVED_NAME + SDR_EMPTYNRM, SDP_RESERVED_NAME + SDR_LINK)
+                    if this.parse_sd_param(allow_el, parm) = false
+                        return false
+                    if parm.kind = (SDP_RESERVED_NAME + SDR_EMPTYNRM)
+                        this.sd_require_www(b)
+                    else
+                    {
+                        set boolean_feature: boolean_feature + 5
+                        set i: i + 7
+                    }
+                    set arg_i: *(fa + (i as size_t))
+                    set handled: true
+                }
+            }
+            else if name_i = SDR_EMPTYNRM
+            {
+                let allow_el2 AllowedSdParams(SDP_RESERVED_NAME + SDR_EMPTYNRM, SDP_RESERVED_NAME + SDR_LINK)
+                if this.parse_sd_param(allow_el2, parm) = false
+                    return false
+                if parm.kind = (SDP_RESERVED_NAME + SDR_EMPTYNRM)
+                    this.sd_require_www(b)
+                else
+                {
+                    set boolean_feature: boolean_feature + 5
+                    set i: i + 7
+                }
+                set arg_i: *(fa + (i as size_t))
+                set handled: true
+            }
+            else if name_i = SDR_URN
+            {
+                let allow_urn AllowedSdParams(SDP_RESERVED_NAME + SDR_URN, SDP_RESERVED_NAME + SDR_APPINFO)
+                if this.parse_sd_param(allow_urn, parm) = false
+                    return false
+                if parm.kind = (SDP_RESERVED_NAME + SDR_APPINFO)
+                    return true
+                this.sd_require_www(b)
+                set handled: true
+            }
+            if handled = false
+            {
+                let allow_kw AllowedSdParams(SDP_RESERVED_NAME + name_i)
+                if this.parse_sd_param(allow_kw, parm) = false
+                    return false
+            }
+            if arg_i = 2
+            {
+                ; number feature: NO or YES n.
+                let allow_yn AllowedSdParams(SDP_RESERVED_NAME + SDR_NO, SDP_RESERVED_NAME + SDR_YES)
+                if this.parse_sd_param(allow_yn, parm) = false
+                    return false
+                if parm.kind = (SDP_RESERVED_NAME + SDR_YES)
+                {
+                    let allow_num AllowedSdParams(SDP_NUMBER)
+                    if this.parse_sd_param(allow_num, parm) = false
+                        return false
+                    b.sd.set_number_feature(number_feature, parm.n)
+                }
+                else
+                    b.sd.set_number_feature(number_feature, 0 as u32)
+                set number_feature: number_feature + 1
+            }
+            else if arg_i = 3
+            {
+                let allow_ne AllowedSdParams(SDP_RESERVED_NAME + SDR_NO, SDP_RESERVED_NAME + SDR_IMMEDNET, SDP_RESERVED_NAME + SDR_ALL)
+                if this.parse_sd_param(allow_ne, parm) = false
+                    return false
+                if parm.kind = (SDP_RESERVED_NAME + SDR_NO)
+                    b.sd.set_start_tag_net_enable(NET_ENABLE_NO)
+                else if parm.kind = (SDP_RESERVED_NAME + SDR_IMMEDNET)
+                    b.sd.set_start_tag_net_enable(NET_ENABLE_IMMEDNET)
+                else
+                    b.sd.set_start_tag_net_enable(NET_ENABLE_ALL)
+            }
+            else if arg_i = 4
+            {
+                let allow_ie AllowedSdParams(SDP_RESERVED_NAME + SDR_NO, SDP_RESERVED_NAME + SDR_YES, SDP_RESERVED_NAME + SDR_ANYOTHER)
+                if this.parse_sd_param(allow_ie, parm) = false
+                    return false
+                if parm.kind = (SDP_RESERVED_NAME + SDR_NO)
+                    b.sd.set_implydef_element(IMPLYDEF_ELEMENT_NO)
+                else if parm.kind = (SDP_RESERVED_NAME + SDR_YES)
+                    b.sd.set_implydef_element(IMPLYDEF_ELEMENT_YES)
+                else
+                    b.sd.set_implydef_element(IMPLYDEF_ELEMENT_ANYOTHER)
+            }
+            else if arg_i = 1
+            {
+                let allow_yn2 AllowedSdParams(SDP_RESERVED_NAME + SDR_NO, SDP_RESERVED_NAME + SDR_YES)
+                if this.parse_sd_param(allow_yn2, parm) = false
+                    return false
+                let cur_name *(fn + (i as size_t))
+                if cur_name = SDR_EMPTYNRM
+                {
+                    if (parm.kind = (SDP_RESERVED_NAME + SDR_NO)) and (b.sd.start_tag_net_enable() = NET_ENABLE_IMMEDNET)
+                    {
+                        this.report0_at(ParserMessages.immednetRequiresEmptynrm(), this.sd_loc())
+                        set b.valid: false
+                    }
+                }
+                b.sd.set_boolean_feature(boolean_feature, parm.kind = (SDP_RESERVED_NAME + SDR_YES))
+                set boolean_feature: boolean_feature + 1
+            }
+            set i: i + 1
+        }
+        let allow_val AllowedSdParams(SDP_RESERVED_NAME + SDR_NOASSERT, SDP_RESERVED_NAME + SDR_TYPE)
+        if this.parse_sd_param(allow_val, parm) = false
+            return false
+        b.sd.set_type_valid(parm.kind = (SDP_RESERVED_NAME + SDR_TYPE))
+        let allow_ent AllowedSdParams(SDP_RESERVED_NAME + SDR_ENTITIES)
+        if this.parse_sd_param(allow_ent, parm) = false
+            return false
+        let allow_ref AllowedSdParams(SDP_RESERVED_NAME + SDR_NOASSERT, SDP_RESERVED_NAME + SDR_REF)
+        if this.parse_sd_param(allow_ref, parm) = false
+            return false
+        if parm.kind = (SDP_RESERVED_NAME + SDR_NOASSERT)
+        {
+            b.sd.set_integrally_stored(false)
+            b.sd.set_entity_ref(ENTITY_REF_ANY)
+        }
+        else
+        {
+            let allow_refv AllowedSdParams(SDP_RESERVED_NAME + SDR_NONE, SDP_RESERVED_NAME + SDR_INTERNAL, SDP_RESERVED_NAME + SDR_ANY)
+            if this.parse_sd_param(allow_refv, parm) = false
+                return false
+            if parm.kind = (SDP_RESERVED_NAME + SDR_NONE)
+                b.sd.set_entity_ref(ENTITY_REF_NONE)
+            else if parm.kind = (SDP_RESERVED_NAME + SDR_INTERNAL)
+                b.sd.set_entity_ref(ENTITY_REF_INTERNAL)
+            else
+                b.sd.set_entity_ref(ENTITY_REF_ANY)
+            let allow_int AllowedSdParams(SDP_RESERVED_NAME + SDR_INTEGRAL)
+            if this.parse_sd_param(allow_int, parm) = false
+                return false
+            let allow_yn3 AllowedSdParams(SDP_RESERVED_NAME + SDR_NO, SDP_RESERVED_NAME + SDR_YES)
+            if this.parse_sd_param(allow_yn3, parm) = false
+                return false
+            b.sd.set_integrally_stored(parm.kind = (SDP_RESERVED_NAME + SDR_YES))
+        }
+        let allow_app AllowedSdParams(SDP_RESERVED_NAME + SDR_APPINFO)
+        this.parse_sd_param(allow_app, parm)
+    }
+
+    ; the FeatureInfo table (parseSd.cxx:2259) — names + argument kinds.
+    function sd_fill_features(this: Parser, fn: pointer[int], fa: pointer[int])
+    {
+        set *(fn + (0 as size_t)): SDR_MINIMIZE
+        set *(fa + (0 as size_t)): 0
+        set *(fn + (1 as size_t)): SDR_DATATAG
+        set *(fa + (1 as size_t)): 1
+        set *(fn + (2 as size_t)): SDR_OMITTAG
+        set *(fa + (2 as size_t)): 1
+        set *(fn + (3 as size_t)): SDR_RANK
+        set *(fa + (3 as size_t)): 1
+        set *(fn + (4 as size_t)): SDR_SHORTTAG
+        set *(fa + (4 as size_t)): 0
+        set *(fn + (5 as size_t)): SDR_STARTTAG
+        set *(fa + (5 as size_t)): 0
+        set *(fn + (6 as size_t)): SDR_EMPTY
+        set *(fa + (6 as size_t)): 1
+        set *(fn + (7 as size_t)): SDR_UNCLOSED
+        set *(fa + (7 as size_t)): 1
+        set *(fn + (8 as size_t)): SDR_NETENABL
+        set *(fa + (8 as size_t)): 3
+        set *(fn + (9 as size_t)): SDR_ENDTAG
+        set *(fa + (9 as size_t)): 0
+        set *(fn + (10 as size_t)): SDR_EMPTY
+        set *(fa + (10 as size_t)): 1
+        set *(fn + (11 as size_t)): SDR_UNCLOSED
+        set *(fa + (11 as size_t)): 1
+        set *(fn + (12 as size_t)): SDR_ATTRIB
+        set *(fa + (12 as size_t)): 0
+        set *(fn + (13 as size_t)): SDR_DEFAULT
+        set *(fa + (13 as size_t)): 1
+        set *(fn + (14 as size_t)): SDR_OMITNAME
+        set *(fa + (14 as size_t)): 1
+        set *(fn + (15 as size_t)): SDR_VALUE
+        set *(fa + (15 as size_t)): 1
+        set *(fn + (16 as size_t)): SDR_EMPTYNRM
+        set *(fa + (16 as size_t)): 1
+        set *(fn + (17 as size_t)): SDR_IMPLYDEF
+        set *(fa + (17 as size_t)): 0
+        set *(fn + (18 as size_t)): SDR_ATTLIST
+        set *(fa + (18 as size_t)): 1
+        set *(fn + (19 as size_t)): SDR_DOCTYPE
+        set *(fa + (19 as size_t)): 1
+        set *(fn + (20 as size_t)): SDR_ELEMENT
+        set *(fa + (20 as size_t)): 4
+        set *(fn + (21 as size_t)): SDR_ENTITY
+        set *(fa + (21 as size_t)): 1
+        set *(fn + (22 as size_t)): SDR_NOTATION
+        set *(fa + (22 as size_t)): 1
+        set *(fn + (23 as size_t)): SDR_LINK
+        set *(fa + (23 as size_t)): 0
+        set *(fn + (24 as size_t)): SDR_SIMPLE
+        set *(fa + (24 as size_t)): 2
+        set *(fn + (25 as size_t)): SDR_IMPLICIT
+        set *(fa + (25 as size_t)): 1
+        set *(fn + (26 as size_t)): SDR_EXPLICIT
+        set *(fa + (26 as size_t)): 2
+        set *(fn + (27 as size_t)): SDR_OTHER
+        set *(fa + (27 as size_t)): 0
+        set *(fn + (28 as size_t)): SDR_CONCUR
+        set *(fa + (28 as size_t)): 2
+        set *(fn + (29 as size_t)): SDR_SUBDOC
+        set *(fa + (29 as size_t)): 2
+        set *(fn + (30 as size_t)): SDR_FORMAL
+        set *(fa + (30 as size_t)): 1
+        set *(fn + (31 as size_t)): SDR_URN
+        set *(fa + (31 as size_t)): 1
+        set *(fn + (32 as size_t)): SDR_KEEPRSRE
+        set *(fa + (32 as size_t)): 1
+        set *(fn + (33 as size_t)): SDR_VALIDITY
+        set *(fa + (33 as size_t)): 0
+    }
+
+    ; Parser::sdParseAppinfo (parseSd.cxx:2469).
+    function sd_parse_appinfo(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        let loc this.sd_loc()
+        let allow AllowedSdParams(SDP_RESERVED_NAME + SDR_NONE, SDP_MINIMUM_LITERAL)
+        if this.parse_sd_param(allow, parm) = false
+            return false
+        if parm.kind = SDP_MINIMUM_LITERAL
+        {
+            let text parm.literal_text.string()
+            let ev Event.make_appinfo(host, text, loc)
+            ps.queue_event(ev)
+        }
+        true
+    }
+
+    ; Parser::sdParseSeealso (parseSd.cxx:2485).
+    function sd_parse_seealso(this: Parser, b: pointer[SdBuilder], parm: pointer[SdParam]) returns bool
+    {
+        var final SDP_MDC
+        if b.external
+            set final: SDP_EE
+        let allow AllowedSdParams(SDP_RESERVED_NAME + SDR_SEEALSO, final)
+        if this.parse_sd_param(allow, parm) = false
+            return false
+        if parm.kind = final
+            return true
+        this.sd_require_www(b)
+        let allow2 AllowedSdParams(SDP_MINIMUM_LITERAL, SDP_RESERVED_NAME + SDR_NONE)
+        if this.parse_sd_param(allow2, parm) = false
+            return false
+        if parm.kind = (SDP_RESERVED_NAME + SDR_NONE)
+        {
+            let allow_end AllowedSdParams(final)
+            return this.parse_sd_param(allow_end, parm)
+        }
+        var running true
+        while running
+        {
+            let allow3 AllowedSdParams(SDP_MINIMUM_LITERAL, final)
+            if this.parse_sd_param(allow3, parm) = false
+                return false
+            if parm.kind = final
+                set running: false
+        }
+        true
+    }
+
+    ; Parser::parseSgmlDecl (parseSd.cxx:678) — the driver. On success the
+    ; built Sd + the prolog/instance syntaxes are returned (they differ only
+    ; under SCOPE INSTANCE).
+    function parse_sgml_decl(this: Parser, out_sd: pointer[pointer[Sd]], out_pro: pointer[pointer[Syntax]], out_inst: pointer[pointer[Syntax]]) returns bool
+    {
+        let parm host.allocate(sizeof SdParam, alignof SdParam) as pointer[SdParam]
+        set *parm: SdParam()
+        let b host.allocate(sizeof SdBuilder, alignof SdBuilder) as pointer[SdBuilder]
+        set *b: SdBuilder(host)
+        let allow_ver AllowedSdParams(SDP_MINIMUM_LITERAL, SDP_NAME)
+        if this.parse_sd_param(allow_ver, parm) = false
+            return false
+        if parm.kind = SDP_NAME
+        {
+            ; `<!SGML name ...>` — a WWW SGML-declaration reference.
+            set b.external: true
+            let id host.allocate(sizeof ExternalId, alignof ExternalId) as pointer[ExternalId]
+            set *id: ExternalId()
+            if this.sd_parse_sgml_decl_ref(b, parm, id) = false
+                return false
+            var sysid String()
+            var sys_base String()
+            if id.has_system_id()
+            {
+                ; copy-construct — a plain struct assignment into a var from
+                ; a call result mis-copies (the parm.token footgun class).
+                let s0 id.get_system_id()
+                set sysid: String^host(s0)
+                let b0 ps.get_decl_base_dir()
+                set sys_base: String^host(b0)
+            }
+            else
+            {
+                let cat ps.get_entity_catalog()
+                if cat <> null
+                {
+                    if id.has_public_id()
+                    {
+                        let p0 id.get_public_id()
+                        let s1 cat.lookup_public(p0)
+                        set sysid: String^host(s1)
+                    }
+                }
+            }
+            if sysid.get_length() = (0 as size_t)
+            {
+                this.report0_at(ParserMessages.cannotGenerateSystemIdSgml(), this.sd_loc())
+                return false
+            }
+            let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+            set *org: Origin()
+            let src this.open_external_text(sys_base, sysid, org)
+            if src = null
+            {
+                let storage Storage.OsFile(sys_base)
+                let emsg storage.open_error(sysid)
+                let disp Path.join(sys_base, sysid)
+                this.report_open_failure(StringC^host(disp.to_c_string()), emsg, this.sd_loc())
+                return false
+            }
+            ps.push_input(src)
+            let allow_ver2 AllowedSdParams(SDP_MINIMUM_LITERAL)
+            if this.parse_sd_param(allow_ver2, parm) = false
+                return false
+        }
+        let version parm.literal_text.string()
+        if version.equals(StringC("ISO 8879:1986 (ENR)"))
+            set b.enr: true
+        else if version.equals(StringC("ISO 8879:1986 (WWW)"))
+        {
+            set b.enr: true
+            set b.www: true
+        }
+        else
+        {
+            if version.equals(StringC("ISO 8879:1986")) = false
+                this.report1_at(ParserMessages.standardVersion(), version, this.sd_loc())
+        }
+        if b.external and (b.www = false)
+            this.report0_at(ParserMessages.sgmlDeclRefRequiresWww(), this.sd_loc())
+        ; the raw Sd under construction (features all off until FEATURES).
+        let bsd host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
+        set *bsd: Sd()
+        bsd.set_raw_defaults()
+        let cur_sd ps.get_sd()
+        if cur_sd.internal_charset_is_doc_charset() = false
+            bsd.set_internal_charset_is_doc_charset(false)
+        set b.sd: bsd
+        if b.www
+            bsd.set_www(true)
+        if this.sd_parse_document_charset(b, parm) = false
+            return false
+        if b.valid = false
+            return false
+        if this.sd_parse_capacity(b, parm) = false
+            return false
+        if b.valid = false
+            return false
+        if this.sd_parse_scope(b, parm) = false
+            return false
+        if b.valid = false
+            return false
+        if this.sd_parse_syntax(b, parm) = false
+            return false
+        if b.valid = false
+            return false
+        if this.sd_parse_features(b, parm) = false
+            return false
+        if b.valid = false
+            return false
+        if this.sd_parse_appinfo(b, parm) = false
+            return false
+        if b.valid = false
+            return false
+        if this.sd_parse_seealso(b, parm) = false
+            return false
+        if b.valid = false
+            return false
+        ; setSdOverrides: -w CLI overrides — none in the drop-in.
+        if b.sd.formal()
+        {
+            var fe: size_t 0
+            while fe < b.n_ferr
+            {
+                let kind *(b.ferr_kind + fe)
+                let code *(b.ferr_code + fe)
+                let fid *(b.ferr_id + fe)
+                let floc *(b.ferr_loc + fe)
+                if kind = SDFE_FPI
+                    this.report_fpi_error(code, fid, floc)
+                else if kind = SDFE_TEXTCLASS_SD
+                    this.report1_at(ParserMessages.sdTextClass(), fid, floc)
+                else if kind = SDFE_TEXTCLASS_BASESET
+                    this.report1_at(ParserMessages.basesetTextClass(), fid, floc)
+                else if kind = SDFE_TEXTCLASS_CAPACITY
+                    this.report1_at(ParserMessages.capacityTextClass(), fid, floc)
+                else
+                    this.report1_at(ParserMessages.syntaxTextClass(), fid, floc)
+                set fe: fe + 1
+            }
+        }
+        set *out_sd: b.sd
+        if b.sd.scope_instance()
+        {
+            ; SCOPE INSTANCE: the prolog parses with the reference syntax
+            ; (setStandardSyntax over a fresh syntax), the instance with the
+            ; declared one; each must accept the other's SGML chars.
+            let prosyn Syntax^host(*(b.sd))
+            let inst_sgml b.syntax.char_set(setSgmlChar)
+            prosyn.set_sgml_char_set(inst_sgml)
+            let invalid ISet^host()
+            this.check_sgml_char(prosyn, b.sd, b.syntax, b.sys_desc, invalid)
+            this.check_sgml_char(b.syntax, b.sd, prosyn, b.sys_desc, invalid)
+            if invalid.is_empty() = false
+            {
+                let arg this.charset_message_arg(invalid)
+                this.report_raw_at(ParserMessages.invalidSgmlChar(), arg, this.sd_loc())
+            }
+            set *out_pro: prosyn
+            set *out_inst: b.syntax
+        }
+        else
+        {
+            set *out_pro: b.syntax
+            set *out_inst: b.syntax
+        }
+        ; a multicode syntax's markup scan table belongs to the CONCUR axis.
         true
     }
 
@@ -8626,17 +12423,33 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.set_base_dir(base_dir)
         ps.set_decl_base_dir(base_dir)
 
-        ; SGML declaration binding (onsgmls behavior): look for a `catalog` file
-        ; in the document's directory; if it names an SGMLDECL, parse that
-        ; declaration into the Sd + Syntax (e.g. scaly.sgm's catalog -> scaly.dcl,
-        ; NAMECASE GENERAL NO + SHORTTAG OMITNAME). No catalog / no SGMLDECL ->
-        ; the reference implied declaration (Sd() + reference Syntax), byte-
-        ; identical to the previous behavior for every catalog-less corpus model.
+        ; ---- the SGML declaration (Parser::doInit, parseSd.cxx:144) --------
+        ; A PROVISIONAL Sd + reference Syntax parse the declaration itself
+        ; (ParserOptions defaults: SHORTTAG YES, OMITTAG YES, FORMAL YES; the
+        ; SD-parsing syntax keeps the Syntax-ctor REFERENCE quantities).
         var sd: pointer[Sd] null
+        set sd: host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
+        set *sd: Sd()
+        sd.set_formal(true)
+        ; the document charset machinery (Parser.cxx:46-52): the implied
+        ; declaration — one section with an EMPTY public id declaring
+        ; 0..charMax — and the system-charset identity mapping. An explicit
+        ; CHARSET section replaces both on the BUILT sd.
+        sd.set_doc_charset_decl(CharsetDecl.make_implied(host))
+        sd.set_doc_charset_desc(UnivCharsetDesc.make_system(host))
+        ; SP_CHARSET_FIXED=YES/1 (the driver's charset_fixed): the internal
+        ; charset is the FIXED system charset, no longer the document charset.
+        if charset_fixed
+            sd.set_internal_charset_is_doc_charset(false)
         var syn: pointer[Syntax] null
-        ; the declaration file (if any) is scanned for non-SGML characters after
-        ; the parser is built (reportNonSgmlCharacter over the SD — see
-        ; scan_sd_non_sgml); keep its bytes and display name for that pass.
+        set syn: Syntax^host(*sd)
+        ps.set_sd(sd)
+        ps.set_syntax(syn)
+
+        let parser Parser.make(host, ps)
+        let table ModeInfo.build_table(host)
+
+        ; catalog: SGMLDECL binding + PUBLIC resolution for the SD parse.
         var have_decl false
         var decl_text String()
         var decl_name StringC()
@@ -8649,71 +12462,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         {
             let cat_text File.read_to_string(cat_path)
             let catalog CatalogParser().parse(cat_text, base_dir)
+            ps.set_entity_catalog(catalog)
             let decl_path catalog.lookup_sgmldecl()
             if (decl_path.get_length() <> (0 as size_t)) and File.exists(decl_path)
             {
-                let dtext File.read_to_string(decl_path)
-                let pair SdParser().build(host, dtext)
-                set sd: pair.sd
-                set syn: pair.syn
-                set have_decl: true
-                set decl_text: dtext
+                set decl_text: File.read_to_string(decl_path)
                 set decl_name: StringC(decl_path.to_c_string())
+                set have_decl: true
             }
-        }
-        if sd = null
-        {
-            set sd: host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
-            set *sd: Sd()
-            set syn: Syntax^host(*sd)
-            ; implySgmlDecl: the implied declaration parses with the OPTIONS
-            ; quantities (NAMELEN 99999999, LITLEN 24000, ...), not the
-            ; reference set the Syntax ctor installs.
-            syn.set_options_quantities()
-            ; Parser.cxx:47: the implied declaration's features come from
-            ; ParserOptions — FORMAL defaults to YES (formal(1),
-            ; ParserOptions.cxx:26), so a catalog-less document validates
-            ; formal public identifiers. fURN is NOT set there (stays NO).
-            sd.set_formal(true)
-        }
-        ; the document charset machinery (Parser.cxx:46-52): when the SGML
-        ; declaration provided no CHARSET section (or there is no declaration),
-        ; install the IMPLIED declaration — one section with an EMPTY public id
-        ; declaring 0..charMax as base numbers (why the no-declaration
-        ; fixed-mode diagnostic reads `baseset ""`) — and the system-charset
-        ; identity mapping (Sd.cxx ctor: docCharset_(entityManager->charset())).
-        if sd.doc_charset_decl() = null
-        {
-            sd.set_doc_charset_decl(CharsetDecl.make_implied(host))
-            sd.set_doc_charset_desc(UnivCharsetDesc.make_system(host))
-        }
-        ; SP_CHARSET_FIXED=YES/1 (the driver's charset_fixed): the internal
-        ; charset is the FIXED system charset, no longer the document charset —
-        ; numeric char refs are then translated doc -> univ -> internal
-        ; (translate_numeric_char_ref). SP_ENCODING never affects this decision
-        ; (it only selects the coding systems — see onsgmls.scaly).
-        if charset_fixed
-            sd.set_internal_charset_is_doc_charset(false)
-        ps.set_sd(sd)
-        ps.set_syntax(syn)
-
-        let parser Parser.make(host, ps)
-        let table ModeInfo.build_table(host)
-        parser.install_recognizers(table)
-
-        ; reportNonSgmlCharacter over the SGML declaration (parseSd.cxx): push the
-        ; declaration's normalized buffer as the current input so emit_message
-        ; resolves line/col + file name from it, scan it, then pop. current_mode
-        ; is proMode here (input_level 0), which push/pop leave untouched.
-        if have_decl
-        {
-            let dorg host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
-            set *dorg: Origin()
-            dorg.set_file_name(decl_name)
-            let dsrc Parser.make_char_source(host, decl_text, dorg)
-            ps.push_input(dsrc)
-            parser.scan_sd_non_sgml()
-            ps.pop_input_stack()
         }
 
         let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
@@ -8723,7 +12479,84 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let src Parser.make_char_source(host, doc_bytes, org)
         ps.push_input(src)
 
-        let ok parser.parse_document(table, base_dir)
+        ; doInit's findMissingMinimum over the initial internal charset
+        ; (parseSd.cxx:160): fatal when minimum-data chars are unmappable.
+        ; The port's initial charset is the identity system charset, so the
+        ; set is always empty — kept for fidelity of the check's shape.
+        let init_missing ISet^host()
+        let init_internal UnivCharsetDesc.make_system(host)
+        parser.find_missing_minimum(init_internal, init_missing)
+        if init_missing.is_empty() = false
+        {
+            let init_arg parser.charset_message_arg(init_missing)
+            parser.report_raw_at(ParserMessages.sdMissingCharacters(), init_arg, ps.current_location())
+            parser.report0_at(ParserMessages.giveUp(), ps.current_location())
+            set *out_conforming: false
+            return Esis.write(host, ps, false)
+        }
+
+        ; scanForSgmlDecl: the document itself first, then the catalog's
+        ; SGMLDECL (badDefaultSgmlDecl when that file is no SGML declaration).
+        var sd_found parser.scan_for_sgml_decl()
+        if sd_found = false
+        {
+            let dins ps.current_input()
+            dins.unget_token()
+            if have_decl
+            {
+                let dorg host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+                set *dorg: Origin()
+                dorg.set_file_name(decl_name)
+                let dsrc Parser.make_char_source(host, decl_text, dorg)
+                ps.push_input(dsrc)
+                if parser.scan_for_sgml_decl()
+                    set sd_found: true
+                else
+                {
+                    let dins2 ps.current_input()
+                    dins2.unget_token()
+                    parser.report0_at(ParserMessages.badDefaultSgmlDecl(), parser.sd_loc())
+                    ps.pop_input_stack()
+                }
+            }
+        }
+        var sd_failed false
+        if sd_found
+        {
+            parser.install_sd_recognizers(table)
+            var new_sd: pointer[Sd] null
+            var new_pro: pointer[Syntax] null
+            var new_inst: pointer[Syntax] null
+            if parser.parse_sgml_decl(&new_sd, &new_pro, &new_inst)
+            {
+                ps.set_sd(new_sd)
+                if new_inst <> new_pro
+                    ps.set_syntaxes(new_pro, new_inst)
+                else
+                    ps.set_syntax(new_pro)
+                if ps.get_input_level() = (2 as u32)
+                    ps.pop_input_stack()
+            }
+            else
+            {
+                set sd_failed: true
+                ; Parser::giveUp (Parser.cxx:183) — the SD parse is fatal.
+                parser.report0_at(ParserMessages.giveUp(), parser.sd_loc())
+            }
+        }
+        else
+        {
+            ; implySgmlDecl: the implied declaration parses with the OPTIONS
+            ; quantities (NAMELEN 99999999, LITLEN 24000, ...), not the
+            ; reference set the Syntax ctor installs.
+            syn.set_options_quantities()
+        }
+
+        parser.install_recognizers(table)
+
+        var ok false
+        if sd_failed = false
+            set ok: parser.parse_document(table, base_dir)
         ; errorLimitExceeded (ParserApp.cxx): after the parse, if the error count
         ; reached the limit, emit the locationless Info line (once). onsgmls prints
         ; this last, after every queued diagnostic.

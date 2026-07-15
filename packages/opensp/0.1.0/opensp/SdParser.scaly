@@ -6,897 +6,285 @@ use opensp.Syntax.Syntax
 use opensp.StringC.StringC
 use opensp.CharsetDecl.CharsetDecl
 use opensp.CharsetDecl.UnivCharsetDesc
+use opensp.Location.Location
+use opensp.Attribute.Text
 
-; SdParser — a scoped reader for the SGML declaration (parseSd.cxx).
-;
-; The full SD parser (charset/capacity/quantity/delim/entities, the ordered
-; FEATURES table) is a later increment; this reader extracts exactly the parts
-; the corpus's declarations vary from the reference implied declaration:
-;
-;   - NAMECASE GENERAL / ENTITY  (fold on/off — Syntax's general subst table)
-;   - NAMESTRT / NAMECHAR ranges (naming extensions — e.g. XML's `_`, `:`)
-;   - SHORTTAG ATTRIB OMITNAME    (attribute-name minimization legality)
-;   - the WWW version flag         (from the `<!SGML "… (WWW)"` version literal)
-;
-; It scans the declaration as whitespace-separated words / quoted literals
-; (skipping `--…--` comments, like the catalog parser) and acts only on the
-; keywords above; every other section token is ignored. Two passes: pass A
-; settles NAMECASE/OMITNAME/WWW into the Sd BEFORE the Syntax is built (the fold
-; table is fixed at construction), pass B applies the naming ranges to it.
-; Sd()'s defaults (GENERAL YES, OMITNAME YES) match the reference syntax, so a
-; catalog-less document is parsed exactly as before.
+; SdParser — the SGML-declaration parser's builder structures (parseSd.cxx).
+; The parse itself (Parser::parse_sgml_decl + the sdParse* sections) lives in
+; Parser.scaly and drives these through parseSdParam; the former scoped
+; keyword reader was retired when the full parser landed.
 
-define SD_EOF: int 0
-define SD_WORD: int 1
-define SD_LIT: int 2
+; ======================================================================
+; Full parseSd machinery (parseSd.cxx) — the structs the Parser's
+; parse_sgml_decl drives. The scoped keyword reader above is retired once
+; parse_to_esis switches over.
 
-define SdToken (kind: int, start: size_t, len: size_t, next_pos: size_t)
+; SdParam::Type (parseSd.cxx:64). SDP_RESERVED_NAME is a BASE: an allowed
+; entry SDP_RESERVED_NAME + SDR_x means "the SD reserved name x".
+define SDP_INVALID: int 0
+define SDP_EE: int 1
+define SDP_MINIMUM_LITERAL: int 2
+define SDP_MDC: int 3
+define SDP_MINUS: int 4
+define SDP_NUMBER: int 5
+define SDP_CAPACITY_NAME: int 6
+define SDP_NAME: int 7
+define SDP_PARAM_LITERAL: int 8
+define SDP_SYSTEM_IDENTIFIER: int 9
+define SDP_GENERAL_DELIMITER_NAME: int 10
+define SDP_REFERENCE_RESERVED_NAME: int 11
+define SDP_QUANTITY_NAME: int 12
+define SDP_RESERVED_NAME: int 13
+
+; The parsed SD parameter (SdParam). The reference's union is decomposed:
+; `n` carries the number, `idx` the capacity/quantity/general-delimiter/
+; reference-reserved-name ordinal (the reserved-name ordinal rides in `kind`
+; itself as SDP_RESERVED_NAME + SDR_x).
+define SdParam
+(
+    kind: int
+    token: StringC
+    literal_text: pointer[Text]
+    param_literal: StringC
+    n: u32
+    idx: int
+)
 {
-    init(kind: int, start: size_t, len: size_t, next_pos: size_t)
+    init()
     {
-        set this.kind: kind
-        set this.start: start
-        set this.len: len
-        set this.next_pos: next_pos
+        set kind: SDP_INVALID
+        set token: StringC()
+        set literal_text: null
+        set param_literal: StringC()
+        set n: 0 as u32
+        set idx: 0
     }
 }
 
-define SdSyntax (sd: pointer[Sd], syn: pointer[Syntax])
+; AllowedSdParams — up to six allowed parameter types (parseSd.cxx:95).
+define AllowedSdParams (a0: int, a1: int, a2: int, a3: int, a4: int, a5: int)
 {
-    init(sd: pointer[Sd], syn: pointer[Syntax])
+    init(t0: int)
     {
-        set this.sd: sd
-        set this.syn: syn
-    }
-}
-
-define SdParser ()
-{
-    function is_ws(this: SdParser, c: u8) returns bool
-        (c = (0x20 as u8)) or (c = (0x09 as u8)) or (c = (0x0A as u8)) or (c = (0x0D as u8))
-
-    function is_digit_byte(this: SdParser, c: u8) returns bool
-        (c >= (0x30 as u8)) and (c <= (0x39 as u8))
-
-    ; scan one token from buf[pos..len): a "quoted"/'quoted' literal or an
-    ; unquoted word, skipping whitespace and `--…--` comments. start/len index
-    ; the byte buffer (no copy — the caller reads numbers/keywords in place).
-    function scan(this: SdParser, buf: pointer[u8], len: size_t, pos: size_t) returns SdToken
-    {
-        var i pos
-        while i < len
-        {
-            let c *(buf + i)
-            if is_ws(c)
-                set i: i + 1
-            else if (c = (0x2D as u8)) and (i + (1 as size_t) < len) and (*(buf + i + (1 as size_t)) = (0x2D as u8))
-            {
-                set i: i + (2 as size_t)
-                while (i + (1 as size_t) < len) and ((*(buf + i) <> (0x2D as u8)) or (*(buf + i + (1 as size_t)) <> (0x2D as u8)))
-                    set i: i + 1
-                set i: i + (2 as size_t)
-            }
-            else
-                break
-        }
-
-        if i >= len
-            return SdToken(SD_EOF, i, 0 as size_t, i)
-
-        let c *(buf + i)
-        if (c = (0x22 as u8)) or (c = (0x27 as u8))
-        {
-            let quote c
-            set i: i + 1
-            let start i
-            while (i < len) and (*(buf + i) <> quote)
-                set i: i + 1
-            let tlen i - start
-            if i < len
-                set i: i + 1
-            return SdToken(SD_LIT, start, tlen, i)
-        }
-
-        let start i
-        while (i < len) and (is_ws(*(buf + i)) = false)
-            set i: i + 1
-        SdToken(SD_WORD, start, i - start, i)
+        set a0: t0
+        set a1: SDP_INVALID
+        set a2: SDP_INVALID
+        set a3: SDP_INVALID
+        set a4: SDP_INVALID
+        set a5: SDP_INVALID
     }
 
-    ; case-sensitive equality of the word buf[start..start+len) with an ASCII
-    ; keyword (SD reserved names are always uppercase in the declaration).
-    function word_eq(this: SdParser, buf: pointer[u8], start: size_t, len: size_t, s: pointer[const_char]) returns bool
+    init(t0: int, t1: int)
     {
-        let sn strlen s
-        if sn <> len
-            return false
-        var j: size_t 0
-        while j < len
+        set a0: t0
+        set a1: t1
+        set a2: SDP_INVALID
+        set a3: SDP_INVALID
+        set a4: SDP_INVALID
+        set a5: SDP_INVALID
+    }
+
+    init(t0: int, t1: int, t2: int)
+    {
+        set a0: t0
+        set a1: t1
+        set a2: t2
+        set a3: SDP_INVALID
+        set a4: SDP_INVALID
+        set a5: SDP_INVALID
+    }
+
+    init(t0: int, t1: int, t2: int, t3: int)
+    {
+        set a0: t0
+        set a1: t1
+        set a2: t2
+        set a3: t3
+        set a4: SDP_INVALID
+        set a5: SDP_INVALID
+    }
+
+    init(t0: int, t1: int, t2: int, t3: int, t4: int)
+    {
+        set a0: t0
+        set a1: t1
+        set a2: t2
+        set a3: t3
+        set a4: t4
+        set a5: SDP_INVALID
+    }
+
+    init(t0: int, t1: int, t2: int, t3: int, t4: int, t5: int)
+    {
+        set a0: t0
+        set a1: t1
+        set a2: t2
+        set a3: t3
+        set a4: t4
+        set a5: t5
+    }
+
+    function param(this: AllowedSdParams, t: int) returns bool
+    {
+        var i: int 0
+        while i < 6
         {
-            if *(buf + start + j) <> (*((s as pointer[u8]) + j))
+            let v get(i)
+            if v = SDP_INVALID
                 return false
-            set j: j + 1
-        }
-        true
-    }
-
-    ; SdParam::quantityName (Sd::lookupQuantityName) — map an SD quantity
-    ; keyword to its Syntax::Quantity ordinal, -1 if the word is not one.
-    function lookup_quantity_name(this: SdParser, buf: pointer[u8], start: size_t, len: size_t) returns int
-    {
-        if word_eq(buf, start, len, "ATTCNT")
-            return qATTCNT
-        if word_eq(buf, start, len, "ATTSPLEN")
-            return qATTSPLEN
-        if word_eq(buf, start, len, "BSEQLEN")
-            return qBSEQLEN
-        if word_eq(buf, start, len, "DTAGLEN")
-            return qDTAGLEN
-        if word_eq(buf, start, len, "DTEMPLEN")
-            return qDTEMPLEN
-        if word_eq(buf, start, len, "ENTLVL")
-            return qENTLVL
-        if word_eq(buf, start, len, "GRPCNT")
-            return qGRPCNT
-        if word_eq(buf, start, len, "GRPGTCNT")
-            return qGRPGTCNT
-        if word_eq(buf, start, len, "GRPLVL")
-            return qGRPLVL
-        if word_eq(buf, start, len, "LITLEN")
-            return qLITLEN
-        if word_eq(buf, start, len, "NAMELEN")
-            return qNAMELEN
-        if word_eq(buf, start, len, "NORMSEP")
-            return qNORMSEP
-        if word_eq(buf, start, len, "PILEN")
-            return qPILEN
-        if word_eq(buf, start, len, "TAGLEN")
-            return qTAGLEN
-        if word_eq(buf, start, len, "TAGLVL")
-            return qTAGLVL
-        0 - 1
-    }
-
-    ; does the version literal contain "WWW" (Web SGML adaptations)?
-    function lit_has_www(this: SdParser, buf: pointer[u8], start: size_t, len: size_t) returns bool
-    {
-        if len < (3 as size_t)
-            return false
-        var j: size_t 0
-        while (j + (3 as size_t)) <= len
-        {
-            if (*(buf + start + j) = (0x57 as u8)) and (*(buf + start + j + (1 as size_t)) = (0x57 as u8)) and (*(buf + start + j + (2 as size_t)) = (0x57 as u8))
+            if v = t
                 return true
-            set j: j + 1
+            set i: i + 1
         }
         false
     }
 
-    function parse_uint(this: SdParser, buf: pointer[u8], start: size_t, len: size_t) returns u32
+    function get(this: AllowedSdParams, i: int) returns int
     {
-        var v: u32 0
-        var j: size_t 0
-        while j < len
-        {
-            let c *(buf + start + j)
-            if is_digit_byte(c) = false
-                break
-            set v: (v * (10 as u32)) + ((c - (0x30 as u8)) as u32)
-            set j: j + 1
-        }
-        v
+        if i = 0
+            return a0
+        if i = 1
+            return a1
+        if i = 2
+            return a2
+        if i = 3
+            return a3
+        if i = 4
+            return a4
+        if i = 5
+            return a5
+        SDP_INVALID
+    }
+}
+
+; CharSwitcher (parseSd.cxx:23) — the SWITCHES substitutions with per-switch
+; use tracking (checkSwitchesMarkup reports unused ones).
+define CharSwitcher (from_v: pointer[u32], to_v: pointer[u32], used_v: pointer[u8], n_v: size_t)
+{
+    init(host: pointer[Page])
+    {
+        set from_v: host.allocate((64 as size_t) * 4, 4) as pointer[u32]
+        set to_v: host.allocate((64 as size_t) * 4, 4) as pointer[u32]
+        set used_v: host.allocate(64 as size_t, 1) as pointer[u8]
+        set n_v: 0
     }
 
-    ; consume a run of `number` / `number-number` range tokens, adding each to
-    ; the syntax as name-start (is_start) or name characters, until a non-numeric
-    ; token — which is left unconsumed for the main loop (the next SD keyword).
-    function consume_ranges(this: SdParser, buf: pointer[u8], len: size_t, pos: pointer[size_t], syn: pointer[Syntax], is_start: bool)
+    function add_switch(this: pointer[CharSwitcher], from: u32, to: u32)
     {
-        while true
-        {
-            let save *pos
-            let t scan(buf, len, save)
-            if t.kind <> SD_WORD
-                return
-            if is_digit_byte(*(buf + t.start)) = false
-                return
-            set *pos: t.next_pos
-
-            var dash: size_t t.len
-            var k: size_t 0
-            while k < t.len
-            {
-                if *(buf + t.start + k) = (0x2D as u8)
-                {
-                    set dash: k
-                    break
-                }
-                set k: k + 1
-            }
-
-            var lo: u32 0
-            var hi: u32 0
-            if dash < t.len
-            {
-                set lo: parse_uint(buf, t.start, dash)
-                set hi: parse_uint(buf, t.start + dash + (1 as size_t), t.len - dash - (1 as size_t))
-            }
-            else
-            {
-                set lo: parse_uint(buf, t.start, t.len)
-                set hi: lo
-            }
-
-            if is_start
-                syn.add_name_start_characters(lo, hi)
-            else
-                syn.add_name_characters(lo, hi)
-        }
-    }
-
-    ; SYNTAX ENTITIES: consume `"name" number` pairs (e.g. `"lt" 60`) until the
-    ; next token is not a quoted literal, adding each to the syntax. The keyword
-    ; ENTITIES also opens FEATURES OTHER's `ENTITIES REF ANY / INTEGRAL YES` — that
-    ; one is followed by a WORD, so the leading-literal test tells them apart and
-    ; leaves the FEATURES tokens for the main loop.
-    function consume_sd_entities(this: SdParser, buf: pointer[u8], len: size_t, pos: pointer[size_t], syn: pointer[Syntax])
-    {
-        while true
-        {
-            let t scan(buf, len, *pos)
-            if t.kind <> SD_LIT
-                return
-            let v scan(buf, len, t.next_pos)
-            if v.kind <> SD_WORD
-                return
-            if is_digit_byte(*(buf + v.start)) = false
-                return
-            set *pos: v.next_pos
-            syn.add_entity(buf + t.start, t.len, parse_uint(buf, v.start, v.len))
-        }
-    }
-
-    ; SYNTAX FUNCTION section (sdParseFunction, parseSd.cxx): rows are either
-    ; the standard `RE 13` / `RS 10` / `SPACE 32` (name number) or an added
-    ; function `TAB SEPCHAR 9` (name class number, class one of FUNCHAR/
-    ; MSICHAR/MSOCHAR/MSSCHAR/SEPCHAR). Every conforming row registers its
-    ; name so `&#NAME;` resolves (the standard three are also answered
-    ; directly by lookup_function_char, so re-adding them is harmless); the
-    ; first non-conforming row (e.g. the NAMING keyword opening the next
-    ; section) is left unconsumed for the main keyword loop. The class's
-    ; character-class side effects (e.g. SEPCHAR admitting TAB as a
-    ; separator) are the pre-existing hardcoded behavior, untouched here.
-    function consume_function_names(this: SdParser, buf: pointer[u8], len: size_t, pos: pointer[size_t], syn: pointer[Syntax])
-    {
-        while true
-        {
-            let t scan(buf, len, *pos)
-            if t.kind <> SD_WORD
-                return
-            if is_digit_byte(*(buf + t.start))
-                return
-            let v scan(buf, len, t.next_pos)
-            if v.kind <> SD_WORD
-                return
-            if is_digit_byte(*(buf + v.start))
-            {
-                set *pos: v.next_pos
-                syn.add_function(buf + t.start, t.len, parse_uint(buf, v.start, v.len))
-            }
-            else
-            {
-                let w scan(buf, len, v.next_pos)
-                if w.kind <> SD_WORD
-                    return
-                if is_digit_byte(*(buf + w.start)) = false
-                    return
-                set *pos: w.next_pos
-                syn.add_function(buf + t.start, t.len, parse_uint(buf, w.start, w.len))
-            }
-        }
-    }
-
-    ; Override one general delimiter from the DELIM section: the next token must
-    ; be a quoted literal (e.g. `NET ">"`); its bytes widen to codepoints and set
-    ; the syntax's delimiter. A non-literal (e.g. `SGMLREF`) is left unconsumed.
-    ; Decimal character references inside the literal decode (the reference
-    ; parses these as parameter literals with full char-ref recognition):
-    ; xml.dcl's `HCRO "&#38;#x"` means the three chars `&#x`.
-    function set_delim_from_lit(this: SdParser, host: pointer[Page], syn: pointer[Syntax], delim_idx: int, buf: pointer[u8], len: size_t, pos: pointer[size_t])
-    {
-        let t scan(buf, len, *pos)
-        if t.kind <> SD_LIT
+        if this.n_v >= (64 as size_t)
             return
-        set *pos: t.next_pos
-        let n t.len
-        if n = (0 as size_t)
-            return
-        let cbuf host.allocate(n * (4 as size_t), 4) as pointer[u32]
-        var m: size_t 0
-        var j: size_t 0
-        while j < n
-        {
-            let b *(buf + t.start + j)
-            var decoded false
-            if (b = (0x26 as u8)) and ((j + (2 as size_t)) < n)
-            {
-                if (*(buf + t.start + j + (1 as size_t)) = (0x23 as u8)) and is_digit_byte(*(buf + t.start + j + (2 as size_t)))
-                {
-                    ; `&#NN;` — fold the digits, consume the terminating `;`.
-                    var k j + (2 as size_t)
-                    var c: u32 0
-                    while (k < n) and is_digit_byte(*(buf + t.start + k))
-                    {
-                        set c: c * (10 as u32) + ((*(buf + t.start + k) - (0x30 as u8)) as u32)
-                        set k: k + 1
-                    }
-                    if (k < n) and (*(buf + t.start + k) = (0x3B as u8))
-                        set k: k + 1
-                    set *(cbuf + m): c
-                    set m: m + (1 as size_t)
-                    set j: k
-                    set decoded: true
-                }
-            }
-            if decoded = false
-            {
-                set *(cbuf + m): b as u32
-                set m: m + (1 as size_t)
-                set j: j + 1
-            }
-        }
-        syn.set_delim_general(delim_idx, cbuf, m)
+        set *(this.from_v + this.n_v): from
+        set *(this.to_v + this.n_v): to
+        set *(this.used_v + this.n_v): 0 as u8
+        set this.n_v: this.n_v + (1 as size_t)
     }
 
-    ; Widen a scanned literal into a fresh host u32 buffer, applying
-    ; minimum-literal normalization (parseMinimumLiteral: literalSingleSpace |
-    ; literalMinimumData) — runs of space/CR/LF/TAB collapse to ONE space,
-    ; leading/trailing separators drop — so a stored public id prints exactly
-    ; as onsgmls would print it in a diagnostic. Returns the normalized length;
-    ; the caller wraps the buffer in a StringC^host binding (the deep-copy-onto-
-    ; host discipline for values stored into the long-lived CharsetDecl).
-    function min_lit_buf(this: SdParser, host: pointer[Page], buf: pointer[u8], start: size_t, len: size_t, out_buf: pointer[pointer[u32]]) returns size_t
-    {
-        if len = (0 as size_t)
-        {
-            set *out_buf: null
-            return 0 as size_t
-        }
-        let cbuf host.allocate(len * (4 as size_t), 4) as pointer[u32]
-        var n: size_t 0
-        var j: size_t 0
-        while j < len
-        {
-            let c *(buf + start + j)
-            if is_ws(c)
-            {
-                if n > (0 as size_t)
-                {
-                    if *(cbuf + n - (1 as size_t)) <> (0x20 as u32)
-                    {
-                        set *(cbuf + n): 0x20 as u32
-                        set n: n + 1
-                    }
-                }
-            }
-            else
-            {
-                set *(cbuf + n): c as u32
-                set n: n + 1
-            }
-            set j: j + 1
-        }
-        if (n > (0 as size_t)) and (*(cbuf + n - (1 as size_t)) = (0x20 as u32))
-            set n: n - (1 as size_t)
-        set *out_buf: cbuf
-        n
-    }
-
-    ; CharsetRegistry::getRegistrationNumber (CharsetRegistry.cxx): the ISO
-    ; designating sequence at the END of the baseset's public id
-    ; (`...//ESC 2/5 2/15 4/6`) selects the registration; each `a/b` code is
-    ; the byte a*16+b (column/row notation), the leading ESC (0x1B) implied.
-    ; Only the IDENTITY registrations are covered (see CharsetDecl.scaly);
-    ; anything else — including the non-identity 8859-x/JIS/KSC tables and
-    ; non-ISO owners — is BASESET_UNKNOWN (the reference would look those up
-    ; in its range tables or report unknownBaseset; the corpus declarations
-    ; only use ISO 646 / ISO 10646).
-    function baseset_from_pubid(this: SdParser, buf: pointer[u8], start: size_t, len: size_t) returns int
-    {
-        ; find the last "ESC" word
-        var esc_end: size_t 0
-        var found false
-        var j: size_t 0
-        while (j + (3 as size_t)) <= len
-        {
-            if (*(buf + start + j) = (0x45 as u8)) and (*(buf + start + j + (1 as size_t)) = (0x53 as u8)) and (*(buf + start + j + (2 as size_t)) = (0x43 as u8))
-            {
-                set found: true
-                set esc_end: j + (3 as size_t)
-            }
-            set j: j + 1
-        }
-        if found = false
-            return BASESET_UNKNOWN
-        ; parse up to 4 `a/b` byte codes after the ESC
-        var bytes u32[4]
-        var nb: size_t 0
-        var k esc_end
-        while (k < len) and (nb < (4 as size_t))
-        {
-            while (k < len) and is_ws(*(buf + start + k))
-                set k: k + 1
-            if k >= len
-                break
-            if is_digit_byte(*(buf + start + k)) = false
-                break
-            var a: u32 0
-            while (k < len) and is_digit_byte(*(buf + start + k))
-            {
-                set a: (a * (10 as u32)) + ((*(buf + start + k) - (0x30 as u8)) as u32)
-                set k: k + 1
-            }
-            if (k >= len) or (*(buf + start + k) <> (0x2F as u8))
-                break
-            set k: k + 1
-            var b: u32 0
-            if (k >= len) or (is_digit_byte(*(buf + start + k)) = false)
-                break
-            while (k < len) and is_digit_byte(*(buf + start + k))
-            {
-                set b: (b * (10 as u32)) + ((*(buf + start + k) - (0x30 as u8)) as u32)
-                set k: k + 1
-            }
-            set *(bytes + nb): (a * (16 as u32)) + b
-            set nb: nb + 1
-        }
-        let b0 *(bytes + (0 as size_t))
-        let b1 *(bytes + (1 as size_t))
-        if nb = (2 as size_t)
-        {
-            ; ESC 2/5 4/0 | 2/8 4/0 | 2/8 4/2 -> ISO 646 IRV/ASCII G0;
-            ; ESC 2/1 4/0 -> ISO 646 C0
-            if (b0 = (0x25 as u32)) and (b1 = (0x40 as u32))
-                return BASESET_ASCII
-            if (b0 = (0x28 as u32)) and ((b1 = (0x40 as u32)) or (b1 = (0x42 as u32)))
-                return BASESET_ASCII
-            if (b0 = (0x21 as u32)) and (b1 = (0x40 as u32))
-                return BASESET_C0
-            return BASESET_UNKNOWN
-        }
-        if nb = (3 as size_t)
-        {
-            let b2 *(bytes + (2 as size_t))
-            if (b0 = (0x25 as u32)) and (b1 = (0x2F as u32))
-            {
-                ; ESC 2/5 2/15 4/0|4/3|4/5 -> UCS-2; 4/1|4/4|4/6 -> UCS-4
-                if (b2 = (0x40 as u32)) or (b2 = (0x43 as u32)) or (b2 = (0x45 as u32))
-                    return BASESET_UCS2
-                if (b2 = (0x41 as u32)) or (b2 = (0x44 as u32)) or (b2 = (0x46 as u32))
-                    return BASESET_UCS4
-            }
-            return BASESET_UNKNOWN
-        }
-        BASESET_UNKNOWN
-    }
-
-    ; nameToUniv (Sd.cxx:255): a minimum-literal-described character maps into
-    ; the ISO 10646 private-use group — 0x60000000 + n, one n per DISTINCT
-    ; name — never encodable in the 16-bit internal charset, so a char ref to
-    ; it under SP_CHARSET_FIXED reports numericCharRefNoInternal.
-    function name_univ(this: SdParser, names: pointer[Array[StringC]], s: StringC) returns u32
+    function subst(this: pointer[CharSwitcher], c: u32) returns u32
     {
         var i: size_t 0
-        let n names.get_length()
-        while i < n
+        while i < this.n_v
         {
-            let e names.get_buffer() + i
-            let ev *e
-            if ev.equals(s)
-                return (0x60000000 as u32) + (i as u32)
+            if (*(this.from_v + i)) = c
+            {
+                set *(this.used_v + i): 1 as u8
+                return *(this.to_v + i)
+            }
             set i: i + 1
         }
-        names.add(s)
-        (0x60000000 as u32) + (n as u32)
+        c
     }
 
-    ; The CHARSET section (sdParseDocumentCharset / sdParseCharset,
-    ; parseSd.cxx:814/886): per BASESET a minimum-literal public id, then
-    ; DESCSET rows `<start> <count> <basenum | UNUSED | "literal">`. Builds the
-    ; CharsetDecl (charDeclared / getCharInfo) and the desc->univ mapping into
-    ; the Sd. Scoped STRICTLY to the first CHARSET keyword: rows are consumed
-    ; only while they conform, and the first non-conforming token (CAPACITY)
-    ; ends the section — the SYNTAX section's own BASESET/DESCSET (the
-    ; syntax-reference charset) is never touched. The full sdParseCharset
-    ; validation (formal-error checks, referencePublic external charsets, the
-    ; unknownBaseset/documentCharMax/tooManyCharsMinimumLiteral messages)
-    ; needs the SD report path the full parseSd port will bring; a declaration
-    ; without a parsable CHARSET section keeps the implied pair.
-    function parse_charset(this: SdParser, host: pointer[Page], buf: pointer[u8], len: size_t, sd: pointer[Sd])
+    function n_switches(this: CharSwitcher) returns size_t
+        n_v
+
+    function switch_used(this: CharSwitcher, i: size_t) returns bool
+        (*(used_v + i)) <> (0 as u8)
+
+    function switch_from(this: CharSwitcher, i: size_t) returns u32
+        *(from_v + i)
+
+    function switch_to(this: CharSwitcher, i: size_t) returns u32
+        *(to_v + i)
+}
+
+; SdFormalError kinds — the deferred formal-error list entries (SdFormalError).
+; FPI classification errors carry the S28 fpi-error code; the text-class
+; mismatches map to their fixed messages.
+define SDFE_FPI: int 0
+define SDFE_TEXTCLASS_SD: int 1
+define SDFE_TEXTCLASS_BASESET: int 2
+define SDFE_TEXTCLASS_CAPACITY: int 3
+define SDFE_TEXTCLASS_SYNTAX: int 4
+
+; SdBuilder (parseSd.cxx:39) — the SGML declaration under construction.
+define SdBuilder
+(
+    sd: pointer[Sd]
+    syntax: pointer[Syntax]
+    syntax_charset_decl: pointer[CharsetDecl]
+    syntax_charset: pointer[UnivCharsetDesc]
+    switcher: pointer[CharSwitcher]
+    external_syntax: bool
+    enr: bool
+    www: bool
+    valid: bool
+    external: bool
+    sys_desc: pointer[UnivCharsetDesc]
+    ferr_kind: pointer[int]
+    ferr_code: pointer[int]
+    ferr_id: pointer[StringC]
+    ferr_loc: pointer[Location]
+    n_ferr: size_t
+)
+{
+    init(host: pointer[Page])
     {
-        var pos: size_t 0
-        var found_charset false
-        while found_charset = false
-        {
-            let t scan(buf, len, pos)
-            set pos: t.next_pos
-            if t.kind = SD_EOF
-                return
-            if (t.kind = SD_WORD) and word_eq(buf, t.start, t.len, "CHARSET")
-                set found_charset: true
-        }
-        let decl CharsetDecl^host()
-        let desc UnivCharsetDesc^host()
-        let names Array[StringC]^host()
-        var baseset_id BASESET_UNKNOWN
-        var running true
-        while running
-        {
-            let t scan(buf, len, pos)
-            if t.kind = SD_EOF
-                set running: false
-            else if (t.kind = SD_WORD) and word_eq(buf, t.start, t.len, "BASESET")
-            {
-                set pos: t.next_pos
-                let lit scan(buf, len, pos)
-                if lit.kind <> SD_LIT
-                    set running: false
-                else
-                {
-                    set pos: lit.next_pos
-                    ; deep-copy the public id onto host — the scan indexes a
-                    ; transient byte buffer
-                    var pid_buf: pointer[u32] null
-                    let pid_n this.min_lit_buf(host, buf, lit.start, lit.len, &pid_buf)
-                    let pid StringC^host(pid_buf, pid_n)
-                    decl.add_section(pid)
-                    set baseset_id: this.baseset_from_pubid(buf, lit.start, lit.len)
-                    let d scan(buf, len, pos)
-                    if (d.kind = SD_WORD) and word_eq(buf, d.start, d.len, "DESCSET")
-                        set pos: d.next_pos
-                    else
-                        set running: false
-                }
-            }
-            else if (t.kind = SD_WORD) and is_digit_byte(*(buf + t.start))
-            {
-                ; a DESCSET row — only valid after a BASESET opened a section
-                if decl.section_count() = (0 as size_t)
-                    set running: false
-                else
-                {
-                    set pos: t.next_pos
-                    let dmin parse_uint(buf, t.start, t.len)
-                    let t2 scan(buf, len, pos)
-                    var row_ok false
-                    if (t2.kind = SD_WORD) and is_digit_byte(*(buf + t2.start))
-                        set row_ok: true
-                    if row_ok = false
-                        set running: false
-                    else
-                    {
-                        set pos: t2.next_pos
-                        let dcount parse_uint(buf, t2.start, t2.len)
-                        let t3 scan(buf, len, pos)
-                        if t3.kind = SD_LIT
-                        {
-                            set pos: t3.next_pos
-                            var s_buf: pointer[u32] null
-                            let s_n this.min_lit_buf(host, buf, t3.start, t3.len, &s_buf)
-                            let s StringC^host(s_buf, s_n)
-                            decl.add_range_string(dmin, dcount, s)
-                            ; adjCount cap (tooManyCharsMinimumLiteral,
-                            ; parseSd.cxx:989): at most 256 chars of a
-                            ; literal-described row land in the desc
-                            var adj dcount
-                            if adj > (256 as u32)
-                                set adj: 256 as u32
-                            let univ this.name_univ(names, s)
-                            desc.add_range(dmin, adj, univ, true)
-                        }
-                        else if (t3.kind = SD_WORD) and word_eq(buf, t3.start, t3.len, "UNUSED")
-                        {
-                            set pos: t3.next_pos
-                            decl.add_range_unused(dmin, dcount)
-                        }
-                        else if (t3.kind = SD_WORD) and is_digit_byte(*(buf + t3.start))
-                        {
-                            set pos: t3.next_pos
-                            let basenum parse_uint(buf, t3.start, t3.len)
-                            decl.add_range_number(dmin, dcount, basenum)
-                            ; documentCharMax clamp (parseSd.cxx:955): only the
-                            ; part at or below charMax lands in the desc.
-                            var adj dcount
-                            if dmin > CHAR_MAX
-                                set adj: 0 as u32
-                            else if (dcount > (0 as u32)) and ((dcount - (1 as u32)) > (CHAR_MAX - dmin))
-                                set adj: (CHAR_MAX - dmin) + (1 as u32)
-                            desc.add_base_range(baseset_id, dmin, adj, basenum)
-                        }
-                        else
-                            set running: false
-                    }
-                }
-            }
-            else
-                set running: false
-        }
-        ; install only a section with rows; a declaration whose CHARSET could
-        ; not be parsed keeps the implied pair (parse_to_esis installs it when
-        ; the decl slot is still null)
-        if decl.range_count() > (0 as size_t)
-        {
-            sd.set_doc_charset_decl(decl)
-            sd.set_doc_charset_desc(desc)
-        }
+        set sd: null
+        set syntax: null
+        set syntax_charset_decl: CharsetDecl^host()
+        set syntax_charset: UnivCharsetDesc^host()
+        let sw host.allocate(sizeof CharSwitcher, alignof CharSwitcher) as pointer[CharSwitcher]
+        set *sw: CharSwitcher(host)
+        set switcher: sw
+        set external_syntax: false
+        set enr: false
+        set www: false
+        set valid: true
+        set external: false
+        set sys_desc: UnivCharsetDesc.make_system(host)
+        set ferr_kind: host.allocate((64 as size_t) * sizeof int, alignof int) as pointer[int]
+        set ferr_code: host.allocate((64 as size_t) * sizeof int, alignof int) as pointer[int]
+        set ferr_id: host.allocate((64 as size_t) * sizeof StringC, alignof StringC) as pointer[StringC]
+        set ferr_loc: host.allocate((64 as size_t) * sizeof Location, alignof Location) as pointer[Location]
+        set n_ferr: 0
     }
 
-    ; build — parse an SGML declaration's byte text into an Sd + Syntax pair.
-    function build(this: SdParser, host: pointer[Page], text: String) returns SdSyntax
+    ; SdBuilder::addFormalError — queued; parse_sgml_decl sends them at the
+    ; end iff the parsed declaration says FORMAL YES. The id is deep-copied
+    ; onto the builder's page (literal buffers are transient).
+    function add_formal_error(this: pointer[SdBuilder], kind: int, code: int, id: StringC, loc: Location)
     {
-        let sd host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
-        set *sd: Sd()
-        let buf text.get_buffer()
-        let len text.get_length()
-
-        ; pass A — NAMECASE / OMITNAME / WWW (before Syntax build: the general
-        ; fold table is chosen from namecase_general at construction).
-        if buf <> null
+        if this.n_ferr >= (64 as size_t)
+            return
+        let host Page.get(this.ferr_kind as pointer[void])
+        set *(this.ferr_kind + this.n_ferr): kind
+        set *(this.ferr_code + this.n_ferr): code
+        let n id.get_size()
+        var cb: pointer[u32] null
+        if n > (0 as size_t)
         {
-            var pos: size_t 0
-            var first_lit true
-            ; SHORTTAG sub-form context: EMPTY/UNCLOSED occur once under
-            ; STARTTAG and once under ENDTAG — the last group keyword seen
-            ; decides which flag they set (parseSd.cxx:2265-2271).
-            var in_endtag false
-            while true
+            set cb: host.allocate(n * (4 as size_t), 4) as pointer[u32]
+            var i: size_t 0
+            while i < n
             {
-                let t scan(buf, len, pos)
-                set pos: t.next_pos
-                if t.kind = SD_EOF
-                    break
-                if t.kind = SD_LIT
-                {
-                    if first_lit
-                    {
-                        set first_lit: false
-                        if lit_has_www(buf, t.start, t.len)
-                            sd.set_www(true)
-                    }
-                }
-                else if word_eq(buf, t.start, t.len, "NAMECASE")
-                {
-                    let g1 scan(buf, len, pos)
-                    set pos: g1.next_pos
-                    let gv scan(buf, len, pos)
-                    set pos: gv.next_pos
-                    sd.set_namecase_general(word_eq(buf, gv.start, gv.len, "YES"))
-                    let e1 scan(buf, len, pos)
-                    set pos: e1.next_pos
-                    let ev scan(buf, len, pos)
-                    set pos: ev.next_pos
-                }
-                else if word_eq(buf, t.start, t.len, "OMITNAME")
-                {
-                    let v scan(buf, len, pos)
-                    set pos: v.next_pos
-                    sd.set_attribute_omit_name(word_eq(buf, v.start, v.len, "YES"))
-                }
-                else if word_eq(buf, t.start, t.len, "NETENABL")
-                {
-                    let v scan(buf, len, pos)
-                    set pos: v.next_pos
-                    if word_eq(buf, v.start, v.len, "IMMEDNET")
-                        sd.set_start_tag_net_enable(NET_ENABLE_IMMEDNET)
-                    else if word_eq(buf, v.start, v.len, "NO")
-                        sd.set_start_tag_net_enable(NET_ENABLE_NO)
-                    else
-                        sd.set_start_tag_net_enable(NET_ENABLE_ALL)
-                }
-                else if word_eq(buf, t.start, t.len, "EMPTYNRM")
-                {
-                    let v scan(buf, len, pos)
-                    set pos: v.next_pos
-                    sd.set_empty_element_normal(word_eq(buf, v.start, v.len, "YES"))
-                }
-                ; FEATURES MINIMIZE OMITTAG — xml.dcl says NO, scaly.dcl YES.
-                else if word_eq(buf, t.start, t.len, "OMITTAG")
-                {
-                    let v scan(buf, len, pos)
-                    set pos: v.next_pos
-                    sd.set_omittag(word_eq(buf, v.start, v.len, "YES"))
-                }
-                ; FEATURES MINIMIZE SHORTTAG — the PLAIN form (`SHORTTAG YES|NO`)
-                ; sets every sub-flag via Sd::setShorttag; the Annex-K sub-form
-                ; (`SHORTTAG STARTTAG ...`) leaves the group keywords for the
-                ; handlers below (the lookahead is not consumed then).
-                else if word_eq(buf, t.start, t.len, "SHORTTAG")
-                {
-                    let v scan(buf, len, pos)
-                    if word_eq(buf, v.start, v.len, "YES")
-                    {
-                        set pos: v.next_pos
-                        sd.set_shorttag(true)
-                    }
-                    else if word_eq(buf, v.start, v.len, "NO")
-                    {
-                        set pos: v.next_pos
-                        sd.set_shorttag(false)
-                    }
-                }
-                else if word_eq(buf, t.start, t.len, "STARTTAG")
-                    set in_endtag: false
-                else if word_eq(buf, t.start, t.len, "ENDTAG")
-                    set in_endtag: true
-                ; SHORTTAG STARTTAG|ENDTAG EMPTY — the empty-tag minimization
-                ; flags (ModeInfo drops the EMPTY-tag recognizers when NO).
-                else if word_eq(buf, t.start, t.len, "EMPTY")
-                {
-                    let v scan(buf, len, pos)
-                    set pos: v.next_pos
-                    if in_endtag
-                        sd.set_end_tag_empty(word_eq(buf, v.start, v.len, "YES"))
-                    else
-                        sd.set_start_tag_empty(word_eq(buf, v.start, v.len, "YES"))
-                }
-                ; SHORTTAG STARTTAG|ENDTAG UNCLOSED — `<a<b>` / `</a<b>`.
-                else if word_eq(buf, t.start, t.len, "UNCLOSED")
-                {
-                    let v scan(buf, len, pos)
-                    set pos: v.next_pos
-                    if in_endtag
-                        sd.set_end_tag_unclosed(word_eq(buf, v.start, v.len, "YES"))
-                    else
-                        sd.set_start_tag_unclosed(word_eq(buf, v.start, v.len, "YES"))
-                }
-                ; SHORTTAG ATTRIB VALUE — unquoted attribute values legal when
-                ; YES (Sd::attributeValueNotLiteral returns this flag directly).
-                else if word_eq(buf, t.start, t.len, "VALUE")
-                {
-                    let v scan(buf, len, pos)
-                    set pos: v.next_pos
-                    sd.set_attribute_value_not_literal(word_eq(buf, v.start, v.len, "YES"))
-                }
-                ; SHORTTAG ATTRIB DEFAULT — the ONLY `DEFAULT` keyword in an SGML
-                ; declaration, so a bare word match is unambiguous. Independent of
-                ; OMITTAG: xml.dcl has OMITTAG NO + DEFAULT YES.
-                else if word_eq(buf, t.start, t.len, "DEFAULT")
-                {
-                    let v scan(buf, len, pos)
-                    set pos: v.next_pos
-                    sd.set_attribute_default(word_eq(buf, v.start, v.len, "YES"))
-                }
-                ; FEATURES OTHER FORMAL — formal-public-identifier validation
-                ; (parseSd.cxx:2290). The only FORMAL keyword in a declaration.
-                else if word_eq(buf, t.start, t.len, "FORMAL")
-                {
-                    let v scan(buf, len, pos)
-                    set pos: v.next_pos
-                    sd.set_formal(word_eq(buf, v.start, v.len, "YES"))
-                }
-                ; FEATURES OTHER URN — Annex-K URN public identifiers
-                ; (parseSd.cxx:2291; the reference requires a WWW declaration,
-                ; validation is the parseSd axis).
-                else if word_eq(buf, t.start, t.len, "URN")
-                {
-                    let v scan(buf, len, pos)
-                    set pos: v.next_pos
-                    sd.set_urn(word_eq(buf, v.start, v.len, "YES"))
-                }
-                ; OTHER KEEPRSRE — xml.dcl says YES: RS/RE stay DATA characters
-                ; instead of driving the record-boundary machine.
-                else if word_eq(buf, t.start, t.len, "KEEPRSRE")
-                {
-                    let v scan(buf, len, pos)
-                    set pos: v.next_pos
-                    sd.set_keeprsre(word_eq(buf, v.start, v.len, "YES"))
-                }
+                set *(cb + i): id.get(i)
+                set i: i + 1
             }
         }
-
-        ; the CHARSET section — document charset declaration + desc->univ map
-        ; (independent of the keyword passes; leaves the Sd's decl slot null
-        ; when no parsable CHARSET section exists).
-        if buf <> null
-            this.parse_charset(host, buf, len, sd)
-
-        let syn Syntax^host(*sd)
-
-        ; pass B — NAMESTRT / NAMECHAR ranges applied to the built syntax.
-        if buf <> null
-        {
-            var pos: size_t 0
-            while true
-            {
-                let t scan(buf, len, pos)
-                set pos: t.next_pos
-                if t.kind = SD_EOF
-                    break
-                if t.kind = SD_WORD
-                {
-                    if word_eq(buf, t.start, t.len, "NAMESTRT")
-                        consume_ranges(buf, len, &pos, syn, true)
-                    else if word_eq(buf, t.start, t.len, "NAMECHAR")
-                        consume_ranges(buf, len, &pos, syn, false)
-                    else if word_eq(buf, t.start, t.len, "NET")
-                        set_delim_from_lit(host, syn, dNET, buf, len, &pos)
-                    else if word_eq(buf, t.start, t.len, "NESTC")
-                        set_delim_from_lit(host, syn, dNESTC, buf, len, &pos)
-                    ; HCRO "&#38;#x" (xml.dcl) — the hex-char-ref open; the
-                    ; reference syntax leaves it EMPTY (setRefDelimGeneral),
-                    ; so only a declaration installs it (sdParseDelim, WWW
-                    ; required — the requireWWW validation is unported like
-                    ; all SD validation).
-                    else if word_eq(buf, t.start, t.len, "HCRO")
-                        set_delim_from_lit(host, syn, dHCRO, buf, len, &pos)
-                    ; PIC "?>" (xml.dcl): the XML processing-instruction close.
-                    ; With the SGMLREF default (`>`) the PI data would keep the
-                    ; trailing `?`; the override makes get_token(piMode) stop at `?>`.
-                    else if word_eq(buf, t.start, t.len, "PIC")
-                        set_delim_from_lit(host, syn, dPIC, buf, len, &pos)
-                    else if word_eq(buf, t.start, t.len, "ENTITIES")
-                        consume_sd_entities(buf, len, &pos, syn)
-                    ; SYNTAX FUNCTION — registers declared function names so
-                    ; `&#TAB;` (xml.dcl: TAB SEPCHAR 9) resolves as a named
-                    ; char ref. FEATURES has no FUNCTION keyword, so the bare
-                    ; word match is unambiguous.
-                    else if word_eq(buf, t.start, t.len, "FUNCTION")
-                        consume_function_names(buf, len, &pos, syn)
-                    ; SYNTAX QUANTITY (sdParseQuantity, parseSd.cxx:2162):
-                    ;   NONE — every quantity EXCEPT NORMSEP becomes unlimited
-                    ;   (parseSd.cxx:2174: `if (i != Syntax::qNORMSEP)` — NORMSEP
-                    ;   keeps its reference value 2, else the normalized-length
-                    ;   accounting itself would overflow every limit).
-                    ;   SGMLREF <name> <n> ... — a loop of quantityName + number
-                    ;   pairs, each overriding one quantity from its reference
-                    ;   value (the NONE form is WWW-only in the reference; the
-                    ;   SGMLREF form is the ISO 8879 one and does NOT exempt
-                    ;   NORMSEP). The first non-quantity word (FEATURES) is left
-                    ;   unconsumed for the main loop.
-                    else if word_eq(buf, t.start, t.len, "QUANTITY")
-                    {
-                        let v scan(buf, len, pos)
-                        if (v.kind = SD_WORD) and word_eq(buf, v.start, v.len, "NONE")
-                        {
-                            set pos: v.next_pos
-                            var qi: int 0
-                            while (qi as size_t) < N_QUANTITY
-                            {
-                                if qi <> qNORMSEP
-                                    syn.set_quantity(qi, SYNTAX_UNLIMITED)
-                                set qi: qi + 1
-                            }
-                        }
-                        else if (v.kind = SD_WORD) and word_eq(buf, v.start, v.len, "SGMLREF")
-                        {
-                            set pos: v.next_pos
-                            var pairing true
-                            while pairing
-                            {
-                                let qn scan(buf, len, pos)
-                                var qi: int 0 - 1
-                                if qn.kind = SD_WORD
-                                    set qi: lookup_quantity_name(buf, qn.start, qn.len)
-                                if qi < 0
-                                    set pairing: false
-                                else
-                                {
-                                    let num scan(buf, len, qn.next_pos)
-                                    if (num.kind = SD_WORD) and is_digit_byte(*(buf + num.start))
-                                    {
-                                        syn.set_quantity(qi, parse_uint(buf, num.start, num.len))
-                                        set pos: num.next_pos
-                                    }
-                                    else
-                                        set pairing: false
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        SdSyntax(sd, syn)
+        let slot this.ferr_id + this.n_ferr
+        set slot.data: cb
+        set slot.size: n
+        set *(this.ferr_loc + this.n_ferr): loc
+        set this.n_ferr: this.n_ferr + (1 as size_t)
     }
 }
