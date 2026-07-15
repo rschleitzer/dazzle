@@ -12,6 +12,7 @@ use opensp.ModeInfo.TokenInfo
 use opensp.ModeInfo.PackedTokenInfo
 use opensp.Location.InputSource
 use opensp.Location.Origin
+use opensp.Dtd.Dtd
 
 ; Recognizer — the trie-driven token scanner (Recognizer.cs) plus the
 ; compile-modes driver (Parser::compileModes, minus the shortref/DTD path).
@@ -56,12 +57,68 @@ define Recognizer (root: pointer[TrieNode], partition: pointer[Partition])
             input.end_token(0 as size_t)
             return tokenUnrecognized
         }
-        input.end_token(pos.get_token_length() as size_t)
+        if pos.get_blank() = null
+        {
+            input.end_token(pos.get_token_length() as size_t)
+            return pos.get_token()
+        }
+        ; the BlankTrie scan (Recognizer.cxx:50): a shortref delimiter with a
+        ; B sequence hangs a blank subtree off the stem's leaf — scan up to
+        ; maxBlanksToScan blank codes, then walk the tail (chars2). A full
+        ; tail match commits stem + blanks + tail; otherwise fall back to the
+        ; stem's own token (adding the blanks only if the stem token itself
+        ; is a blank-priority match).
+        let b pos.get_blank()
+        var new_pos: pointer[TrieNode] b
+        let max_blanks b.get_max_blanks_to_scan()
+        var n_blanks: size_t 0
+        var scanning true
+        while scanning and (n_blanks < max_blanks)
+        {
+            let ch2 input.token_char()
+            let code2 partition.code_of_xchar(ch2)
+            if b.code_is_blank_at(code2 as int)
+                set n_blanks: n_blanks + (1 as size_t)
+            else
+            {
+                if new_pos.has_next()
+                    set new_pos: new_pos.child(code2 as int)
+                set scanning: false
+            }
+        }
+        while new_pos.has_next()
+        {
+            let ch3 input.token_char()
+            let code3 partition.code_of_xchar(ch3)
+            set new_pos: new_pos.child(code3 as int)
+        }
+        if new_pos.get_token() <> (0 as u32)
+        {
+            let full (new_pos.get_token_length() + b.get_additional_length()) as size_t
+            input.end_token(full + n_blanks)
+            return new_pos.get_token()
+        }
+        var extra: size_t 0
+        if pos.include_blanks()
+            set extra: n_blanks
+        input.end_token((pos.get_token_length() as size_t) + extra)
         pos.get_token()
     }
 
     ; Build the recognizer for one Mode from the syntax + mode token table.
+    ; The plain form: no DTD (no shortref delimiters), ambiguities dropped.
     function build_recognizer(host: pointer[Page], mode: int, sd: Sd, syn: Syntax, table: pointer[Array[PackedTokenInfo]]) returns pointer[Recognizer]
+        Recognizer.build_recognizer_sr(host, mode, sd, syn, table, null, null)
+
+    ; compileModes for a single mode WITH the DTD's shortref delimiters
+    ; (parseMode.cxx:135, the `includesShortref && dtd` half): a shortref-
+    ; including mode (econ/mcon/econnet/mconnet) threads each interned shortref
+    ; string as tokenFirstShortref+j — a plain delimiter at Priority::delim, a
+    ; B-sequence delimiter through the BlankTrie machinery bounded by BSEQLEN.
+    ; `amb_out`, when non-null, receives the TrieBuilder's ambiguity pairs so
+    ; the caller can report lexicalAmbiguity (the reference does this for every
+    ; compiled mode).
+    function build_recognizer_sr(host: pointer[Page], mode: int, sd: Sd, syn: Syntax, table: pointer[Array[PackedTokenInfo]], dtd: pointer[Dtd], amb_out: pointer[Array[u32]]) returns pointer[Recognizer]
     {
         let used_delim host.allocate(N_DELIM_GENERAL as size_t, 1) as pointer[u8]
         let used_set host.allocate(N_SET as size_t, 1) as pointer[u8]
@@ -115,6 +172,33 @@ define Recognizer (root: pointer[TrieNode], partition: pointer[Partition])
                 }
             }
             set d: d + 1
+        }
+
+        ; --- the DTD's shortref delimiter chars (shortref-including modes) ---
+        ; a 'B' in a shortref string is the blank-sequence marker: it forces the
+        ; blank SET into the partition instead of contributing a char.
+        var n_sr: size_t 0
+        if dtd <> null
+        {
+            if mode >= MIN_SHORTREF_MODE
+                set n_sr: dtd.n_shortref()
+        }
+        var si: size_t 0
+        while si < n_sr
+        {
+            let dstr dtd.shortref(si)
+            let dl dstr.get_size()
+            var sj: size_t 0
+            while sj < dl
+            {
+                let dc dstr.get(sj)
+                if dc = (0x42 as u32)
+                    set *(used_set + (setBlank as size_t)): (1 as u8)
+                else
+                    chars.add(dc)
+                set sj: sj + 1
+            }
+            set si: si + 1
         }
 
         ; --- the used character sets, and each set's partition position ---
@@ -179,7 +263,9 @@ define Recognizer (root: pointer[TrieNode], partition: pointer[Partition])
 
         ; --- pass 2: thread each token into the trie ---
         let tb TrieBuilder^host((part.max_code() as int) + 1)
-        var amb Array[u32]^host()
+        var amb: pointer[Array[u32]] amb_out
+        if amb = null
+            set amb: Array[u32]^host()
         tb.recognize_ee(part.ee_code(), tokenEe)
 
         let mi2 ModeInfo^host(mode, sd, table)
@@ -230,6 +316,64 @@ define Recognizer (root: pointer[TrieNode], partition: pointer[Partition])
             }
             else if t2.kind = TT_FUNCTION
                 tb.recognize(func_codes + (t2.func_idx as size_t), 1 as size_t, t2.token, t2.priority, amb)
+        }
+
+        ; --- thread the shortref delimiters (parseMode.cxx:348) ---
+        ; SrInfo per delimiter: the EquivCode run before the first 'B', the
+        ; consecutive-B count, and the codes after the B run. A B-sequence
+        ; delimiter goes through recognizeB bounded by BSEQLEN; a plain one is
+        ; an ordinary token at Priority::delim (255).
+        var srj: size_t 0
+        while srj < n_sr
+        {
+            let dstr dtd.shortref(srj)
+            let dl dstr.get_size()
+            let cb1 host.allocate(dl * (2 as size_t), 2) as pointer[u16]
+            var n1: size_t 0
+            var k: size_t 0
+            var scanning1 true
+            while scanning1 and (k < dl)
+            {
+                let c1 dstr.get(k)
+                if c1 = (0x42 as u32)
+                    set scanning1: false
+                else
+                {
+                    set *(cb1 + n1): part.char_code(c1)
+                    set n1: n1 + (1 as size_t)
+                    set k: k + 1
+                }
+            }
+            var bseq: int 0
+            var scanning2 true
+            while scanning2 and (k < dl)
+            {
+                if dstr.get(k) = (0x42 as u32)
+                {
+                    set bseq: bseq + 1
+                    set k: k + 1
+                }
+                else
+                    set scanning2: false
+            }
+            let cb2 host.allocate(dl * (2 as size_t), 2) as pointer[u16]
+            var n2: size_t 0
+            while k < dl
+            {
+                set *(cb2 + n2): part.char_code(dstr.get(k))
+                set n2: n2 + (1 as size_t)
+                set k: k + 1
+            }
+            let tok tokenFirstShortref + (srj as u32)
+            if bseq > 0
+            {
+                let bpos *(set_pos + (setBlank as size_t))
+                let bseqlen syn.get_quantity(qBSEQLEN)
+                tb.recognize_b(cb1, n1, bseq, bseqlen as size_t, part.set_codes_buffer(bpos as int), part.set_code_count(bpos as int), cb2, n2, tok, amb)
+            }
+            else
+                tb.recognize(cb1, n1, tok, 255 as u8, amb)
+            set srj: srj + 1
         }
 
         Recognizer^host(tb.extract_trie(), part)
