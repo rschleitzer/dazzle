@@ -4041,11 +4041,15 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let ent host.allocate(sizeof Entity, alignof Entity) as pointer[Entity]
         if parm.kind = (P_RESERVED_NAME + R_SUBDOC)
         {
-            ; the reference reports subdocEntity when the SGML declaration says
-            ; SUBDOC NO. Our Sd does not model the SUBDOC feature; the reference
-            ; (implied) declaration says SUBDOC YES so no message fires there —
-            ; the xml.dcl (SUBDOC NO) case is owed to FEATURES parsing (full
-            ; parseSd axis), like the other constant Sd feature accessors.
+            ; parseDecl.cxx:1808 — a SUBDOC entity declared while the SGML
+            ; declaration allows no subdocuments (SUBDOC NO -> subdoc()==0) is
+            ; reported (the entity is still built). The implied declaration
+            ; carries the ParserOptions default subdoc quantity (99999999), so
+            ; a catalog-less document never trips this; xml.dcl's SUBDOC NO does.
+            ; Location = the SUBDOC reserved-name token just parsed (its token
+            ; start — current_location is one-past, at the following MDC).
+            if ps.get_sd().subdoc() = (0 as u32)
+                this.report1_at(ParserMessages.subdocEntity(), name, ps.current_input().token_start_location())
             if this.parse_param(allow_mdc, decl_input_level, parm) = false
                 return false
             set *ent: Entity.Subdoc(SubdocEntity(name, *hid, hbase, mdo_loc))
@@ -7583,14 +7587,119 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             when sub: Subdoc
             {
-                ; SubdocEntity::contentReference — fires a SubdocEntityEvent and
-                ; parses the subdocument with a nested parser (`{name` … `}name`).
-                ; The sub-parse is the SUBDOC feature axis (unported); the
-                ; entity itself (declaration + ENTITY-attribute semantics + the
-                ; ESIS S definition record) is modeled.
-                this.err(64)
+                ; SubdocEntity::contentReference (Entity.cxx:526) — a
+                ; SubdocEntityEvent. onsgmls handles it by defining the subdoc
+                ; entity, emitting `{name`, running a NESTED parser over the
+                ; referenced document (its events stream inline), then `}name`
+                ; (SgmlsEventHandler::subdocEntity). The preceding data run is
+                ; already queued as an EV_DATA event; the writer's have_data
+                ; flush breaks it before the `{` (like the `&name` data path).
+                this.parse_subdoc(ent, ref_start)
             }
         true
+    }
+
+    ; The subdocument sub-parse (SgmlsEventHandler::subdocEntity, :461 + a fresh
+    ; SgmlParser whose entityType is `subdoc`, Parser.cxx:104). onsgmls brackets
+    ; the sub-parse's ESIS with `{name` … `}name`; the events stream inline to
+    ; the same handler. The port batches events, so the bracket events wrap the
+    ; nested parse's events IN THE PARENT QUEUE: queue START (the writer defines
+    ; the entity + emits `{name`), run a CHILD ParserState to completion, splice
+    ; its events, roll up its counts, queue END (`}name`).
+    ;
+    ; A subdoc INHERITS the parent's Sd + prolog/instance syntaxes (Parser.cxx:56)
+    ; and starts in prologPhase — it does NOT re-scan an SGML declaration; it
+    ; parses its own DOCTYPE + instance. subdocLevel is parent+1; when it equals
+    ; sd.subdoc()+1 the nesting exceeds the SUBDOC quantity (subdocLevel message,
+    ; at an invalid location — it fires before the child reads any token).
+    function parse_subdoc(this: Parser, ent: pointer[Entity], ref_start: Location)
+    {
+        ; the subdoc's system id + declaring-directory base (captured at decl).
+        var sysid String()
+        var sbase String()
+        choose *ent
+            when s: Subdoc
+            {
+                let id s.get_external_id()
+                if id.has_system_id()
+                    set sysid: String^host(id.get_system_id())
+                set sbase: String^host(s.get_base_dir())
+            }
+            else
+                return
+
+        ; START bracket — the writer flushes the parent data run, defines the
+        ; subdoc entity on first use (s/f/S), then emits `{name`.
+        ps.queue_event(Event.make_start_subdoc(host, ent, ref_start))
+
+        ; open the referenced document (effective system id = sysid resolved
+        ; against the declaring file's directory). On failure the openSystemCall
+        ; diagnostic ("cannot open ...") is reported at the reference site, and
+        ; the subdoc parser then meets end-of-document in its prolog (below).
+        var src: pointer[InputSource] null
+        if sysid.get_length() <> (0 as size_t)
+        {
+            let sorg host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+            set *sorg: Origin()
+            set src: this.open_external_text(sbase, sysid, sorg)
+            if src = null
+            {
+                let disp Path.join(sbase, sysid)
+                let dispc StringC^host(disp.to_c_string())
+                let stor Storage.OsFile(sbase)
+                let emsg stor.open_error(sysid)
+                if emsg <> null
+                    this.report_open_failure(dispc, emsg, ref_start)
+            }
+        }
+
+        ; the child ParserState: fresh input/DTD/element stacks, subdocLevel + 1,
+        ; inheriting the parent's Sd + syntaxes. Same host page, prog name and
+        ; output coding so its stderr lines match the parent's.
+        let child ParserState.make(host, null, ps.get_subdoc_level() + (1 as u32), PHASE_PROLOG)
+        child.set_prog_name(ps.get_prog_name())
+        child.set_output_utf8(ps.get_output_utf8())
+        child.set_base_dir(sbase)
+        child.set_decl_base_dir(sbase)
+        child.set_sd(ps.get_sd())
+        child.set_syntaxes(ps.get_prolog_syntax(), ps.get_instance_syntax())
+        let cat ps.get_entity_catalog()
+        if cat <> null
+            child.set_entity_catalog(cat)
+        let sub_parser Parser.make(host, child)
+
+        ; Parser::init (Parser.cxx:107): the subdoc-nesting-depth check fires here
+        ; — before any token is read — so its location is invalid (Location()).
+        if child.get_subdoc_level() = (ps.get_sd().subdoc() + (1 as u32))
+            sub_parser.report_num_at(ParserMessages.subdocLevel(), ps.get_sd().subdoc() as u64, Location())
+
+        if src = null
+        {
+            ; the open failed (openSystemCall already reported at the reference
+            ; site). The subdoc parser runs on empty input and immediately meets
+            ; end-of-document in the prolog, at an invalid location.
+            sub_parser.report0_at(ParserMessages.documentEndProlog(), Location())
+        }
+        else
+        {
+            child.push_input(src)
+            let table ModeInfo.build_table(host)
+            sub_parser.install_recognizers(table)
+            sub_parser.parse_document(table, sbase)
+            ; splice the subdoc's events into the parent queue, in order.
+            let ne child.n_events()
+            var ei: size_t 0
+            while ei < ne
+            {
+                ps.queue_event(child.get_event(ei))
+                set ei: ei + (1 as size_t)
+            }
+        }
+        ; the subdoc's diagnostics count toward the whole document's conformance.
+        ps.add_subdoc_counts(child)
+
+        ; END bracket — `}name`.
+        ps.queue_event(Event.make_end_subdoc(host, ent, ref_start))
     }
 
     ; parseEntityReference(isParameter=1) (parseCommon.cxx:428) + the declReference/
@@ -9404,7 +9513,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                             if prolog_tries >= (10 as u32)
                             {
                                 this.report0_at(ParserMessages.notSgml(), ps.current_input().token_start_location())
-                                this.report0(ParserMessages.giveUp())
+                                ; Parser::giveUp (Parser.cxx:183): inside a
+                                ; subdocument this is subdocGiveUp, not giveUp.
+                                if ps.get_subdoc_level() > (0 as u32)
+                                    this.report0(ParserMessages.subdocGiveUp())
+                                else
+                                    this.report0(ParserMessages.giveUp())
                                 set ok: false
                                 set running: false
                             }
@@ -13397,6 +13511,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; RANK YES is the ParserOptions default (Parser.cxx:39, opt.rank=1), so
         ; the implied SGML declaration enables the RANK feature.
         sd.set_rank(true)
+        ; the SUBDOC quantity default (Parser.cxx:46, opt.subdoc = 99999999):
+        ; a catalog-less document admits subdocuments (so a SUBDOC entity
+        ; declaration does NOT trip subdocEntity, and subdocLevel never fires).
+        sd.set_subdoc(99999999 as u32)
         ; the document charset machinery (Parser.cxx:46-52): the implied
         ; declaration — one section with an EMPTY public id declaring
         ; 0..charMax — and the system-charset identity mapping. An explicit
