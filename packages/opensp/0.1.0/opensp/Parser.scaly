@@ -548,6 +548,27 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.report_at(mt, args, loc)
     }
 
+    ; two NUMBER args (%1, %2, unquoted) — normalizedAttributeValueLength /
+    ; attsplen (the limit, then the actual length).
+    function report_num_num_at(this: Parser, mt: MessageType, a1: u64, a2: u64, loc: Location)
+    {
+        var args Vector[MessageArg](2 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Num(a1)
+        set *(args.get(1 as size_t)): MessageArg.Num(a2)
+        ps.report_at(mt, args, loc)
+    }
+
+    ; %1 String, %2 String, %3 StringVector (each item quoted, ", "-separated)
+    ; — attributeValueNotInGroup (value, attribute name, allowed tokens).
+    function report2_vec_at(this: Parser, mt: MessageType, a1: StringC, a2: StringC, a3: pointer[Array[StringC]], loc: Location)
+    {
+        var args Vector[MessageArg](3 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Str(a1)
+        set *(args.get(1 as size_t)): MessageArg.Str(a2)
+        set *(args.get(2 as size_t)): MessageArg.Vec(a3)
+        ps.report_at(mt, args, loc)
+    }
+
     ; E3 with %1 Number, %2 Number, %3 String (quoted) —
     ; numericCharRefUnknownBase (doc number, base number, baseset public id).
     function report_num_num_str_at(this: Parser, mt: MessageType, a1: u64, a2: u64, a3: StringC, loc: Location)
@@ -944,7 +965,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                         if is_sgml
                         {
                             buf.add(ch)
-                            locbuf.add(ps.current_input().token_start_location())
+                            ; the char's location is the CRO start (the
+                            ; reference stores parseNumericCharRef's
+                            ; startLocation) — NOT the post-ref token.
+                            locbuf.add(cro_loc)
                         }
                         else
                         {
@@ -1022,7 +1046,26 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
         if ok = false
             return false
-        let sc this.build_stringc(buf)
+        ; parseLiteral's `done:` epilogue (parseCommon.cxx:219): under
+        ; literalSingleSpace a TRAILING space is dropped — ignoreLastChar
+        ; tests only the last char, so a space entered via `&#32;` is dropped
+        ; too. An all-space/empty tokenized value therefore ends up EMPTY,
+        ; which is what makes attributeValueSyntax reachable.
+        var out_n buf.get_length()
+        if single_space
+        {
+            if out_n > (0 as size_t)
+            {
+                if this.last_char(buf) = (0x20 as u32)
+                    set out_n: out_n - (1 as size_t)
+            }
+        }
+        var sc StringC()
+        if out_n > (0 as size_t)
+        {
+            let scp StringC^host(buf.get_buffer(), out_n)
+            set sc: *scp
+        }
         set *out_text: Text(sc, locbuf.get_buffer())
         true
     }
@@ -1358,7 +1401,20 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; region is reclaimed — ps.current_token() alone would dangle.
         let sc ps.current_token^host()
         let txt host.allocate(sizeof Text, alignof Text) as pointer[Text]
-        set *txt: Text(sc)
+        ; per-char locations (linear: the value is one source token) — the
+        ; makeValue category messages point INTO the default value.
+        let ins ps.current_input()
+        let tn sc.get_size()
+        let tstart ins.current_token_start_index()
+        let torg ins.get_origin()
+        let tlb host.allocate(tn * sizeof Location, alignof Location) as pointer[Location]
+        var tli: size_t 0
+        while tli < tn
+        {
+            set *(tlb + tli): Location(torg, (tstart + tli) as u32)
+            set tli: tli + 1
+        }
+        set *txt: Text(sc, tlb)
         set parm.literal_text: txt
         true
     }
@@ -2288,12 +2344,18 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             let allow_val AllowedParams.a2(host, P_ATTRIBUTEVALUE, lit_type)
             if this.parse_param(allow_val, decl_input_level, parm) = false
                 return false
-            let value this.make_attribute_value(declared_value, parm.literal_text)
+            let value this.make_attribute_value(declared_value, parm.literal_text, attribute_name)
+            ; idDeclaredValue (parseDecl.cxx:1439): an ID attribute may only
+            ; default to IMPLIED or REQUIRED.
+            if declared_value.is_id()
+                this.report0_at(ParserMessages.idDeclaredValue(), ps.current_input().token_start_location())
             set *out_def: AttributeDefinition.make_fixed(host, attribute_name, declared_value, value)
         }
         else if (parm.kind = P_ATTRIBUTEVALUE) or (parm.kind = P_ATTRIBUTEVALUELITERAL) or (parm.kind = P_TOKENIZEDATTRIBUTEVALUELITERAL)
         {
-            let value this.make_attribute_value(declared_value, parm.literal_text)
+            let value this.make_attribute_value(declared_value, parm.literal_text, attribute_name)
+            if declared_value.is_id()
+                this.report0_at(ParserMessages.idDeclaredValue(), ps.current_input().token_start_location())
             set *out_def: AttributeDefinition.make_default(host, attribute_name, declared_value, value)
         }
         else if parm.kind = ind_required
@@ -2315,13 +2377,20 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         true
     }
 
-    ; makeValue (pure part): CDATA -> cdata value; tokenized -> space-split value.
-    ; Full normalisation/validation (category/length checks, allowed-value/entity/
-    ; notation/id resolution) is deferred to instance parsing.
-    function make_attribute_value(this: Parser, dv: pointer[DeclaredValue], text: pointer[Text]) returns pointer[AttributeValue]
+    ; makeValue for a DTD default/FIXED value (parseDefaultValue calls
+    ; declaredValue->makeValue): CDATA -> cdata value; tokenized -> fold +
+    ; space-split. The validation half (category/length checks, group
+    ; membership) runs here at DECLARATION time, exactly like the reference —
+    ; entity/notation/id RESOLUTION stays instance-side (makeSemantics).
+    function make_attribute_value(this: Parser, dv: pointer[DeclaredValue], text: pointer[Text], attribute_name: StringC) returns pointer[AttributeValue]
     {
+        ; parseDefaultValue's specLength is local and discarded.
+        var dummy_spec: size_t 0
         if dv.tokenized() = false
+        {
+            this.validate_attribute_value(dv, text, attribute_name, &dummy_spec)
             return AttributeValue.make_cdata(host, text)
+        }
         ; tokenized: NAMECASE-fold the value (general subst — TokenizedDeclaredValue
         ; ::makeTokenizedValue), then record the single-space separator positions.
         ; A default/fixed value is built here (not through set_value), so its fold
@@ -2346,6 +2415,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             set *text: Text(StringC^host(fbuf, rn))
         }
+        this.validate_attribute_value(dv, text, attribute_name, &dummy_spec)
         let sc text.string()
         let n sc.get_size()
         let space_index Array[size_t]^host()
@@ -3378,15 +3448,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
         if ok = false
             return false
-        let tlen (*text).size()
-        set *spec_length: *spec_length + tlen
-        ; set_value's bool IS parse_attribute's return value (implicit return —
-        ; anything appended after it would silently become the return).
+        ; set_value folds the value in place; the makeValue validation half
+        ; (validate_attribute_value: categories / lengths / group membership)
+        ; then runs on the folded text and accumulates the NORMALIZED length
+        ; into spec_length (the reference's specLength += normalizedLength),
+        ; and the makeSemantics half follows — the reference's message order.
         let sv_ok atts.set_value(host, index, text, ctx)
-        ; the makeSemantics half of makeValue — reported from the parser (the
-        ; duplicateAttributeSpec precedent: `this` can report). set_value left
-        ; *text as the folded, normalized value WITH per-char locations, so the
-        ; value tokens and their locations read back directly.
+        this.validate_attribute_value(atts.declared_value(index), text, name, spec_length)
         this.check_value_semantics(atts, index, text)
         sv_ok
     }
@@ -3411,6 +3479,199 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         dtd.lookup_notation(name)
     }
 
+    ; Text::charLocation(i) for the makeValue message locations. i == size
+    ; resolves to one past the last char (the reference's per-item run
+    ; arithmetic yields the same for the trailing position); untracked text
+    ; yields the null Location (defensive — every validated Text carries
+    ; per-char locations).
+    function text_char_location(this: Parser, text: pointer[Text], i: size_t) returns Location
+    {
+        let locs (*text).get_locs()
+        if locs = null
+            return Location()
+        let n (*text).size()
+        if n = (0 as size_t)
+            return Location()
+        if i < n
+            return *(locs + i)
+        let last *(locs + (n - (1 as size_t)))
+        Location(last.get_origin(), last.get_index() + (1 as u32))
+    }
+
+    ; The validation half of DeclaredValue::makeValue — reported from the
+    ; parser (the check_value_semantics precedent). Runs over the FOLDED value
+    ; Text (after AttributeList.set_value / the make_attribute_value fold) for
+    ; BOTH instance values and DTD default/FIXED values (the reference calls
+    ; makeValue from parseDefaultValue too).
+    ;   CDATA/DATA (checkNormalizedLength, Attribute.cxx:90): the normalized
+    ;   length (size + NORMSEP) accumulates into spec_length, with the LITLEN
+    ;   overflow message.
+    ;   tokenized (makeTokenizedValue, :189): per token, the declared value's
+    ;   initial/subsequent character-category checks — attributeValueChar (a
+    ;   char allowed nowhere), attributeValueNumberToken / attributeValueName
+    ;   (a char that cannot START a number token / name) — validate-gated, at
+    ;   the offending char; the NAMELEN check (nameTokenLength, NOT gated, at
+    ;   the char just past the token). An empty value or one ending in a
+    ;   space (only enterable via a numeric char ref — parse_literal collapses
+    ;   plain spaces) reports attributeValueSyntax; a second token in a
+    ;   non-list value reports attributeValueMultiple at the first space. The
+    ;   normalized length (NORMSEP + size, list adjustment per token) then
+    ;   accumulates with the LITLEN check.
+    ;   group (GroupDeclaredValue::makeValue, :350): the whole folded value
+    ;   must be one of the declared tokens — attributeValueNotInGroup
+    ;   (validate-gated; %3 lists the group). NOTATION shares this (it IS a
+    ;   GroupDeclaredValue); its unknown-notation check stays in
+    ;   check_value_semantics (makeSemantics).
+    ; Messages with no per-char anchor (syntax / normalized-length / group)
+    ; report at the current parse location, like the reference's unlocated
+    ; context.message.
+    function validate_attribute_value(this: Parser, dv: pointer[DeclaredValue], text: pointer[Text], attribute_name: StringC, spec_length: pointer[size_t])
+    {
+        if dv = null
+            return
+        let syn ps.get_syntax()
+        let normsep syn.get_quantity(qNORMSEP) as size_t
+        let litlen syn.get_quantity(qLITLEN) as size_t
+        let vn (*text).size()
+        if dv.tokenized() = false
+        {
+            let cn vn + normsep
+            set *spec_length: *spec_length + cn
+            if litlen >= normsep
+            {
+                if vn <= litlen - normsep
+                {
+                    if cn > litlen
+                        this.report_num_num_at(ParserMessages.normalizedAttributeValueLength(), litlen as u64, cn as u64, ps.current_input().token_start_location())
+                }
+            }
+            return
+        }
+        let s (*text).string()
+        let initial dv.get_initial_categories()
+        let subsequent dv.get_subsequent_categories()
+        let namelen_q syn.get_quantity(qNAMELEN) as size_t
+        let space (0x20 as u32)
+        let validate ps.validate()
+        var nspaces: size_t 0
+        var i: size_t 0
+        var running true
+        while running
+        {
+            if i >= vn
+            {
+                ; empty value, or one that ends with a space.
+                if validate
+                    this.report0_at(ParserMessages.attributeValueSyntax(), ps.current_input().token_start_location())
+                set running: false
+            }
+            else
+            {
+                let start_index i
+                if validate
+                {
+                    let c0 s.get(i)
+                    if (syn.category_of(c0) & initial) = 0
+                    {
+                        let cs StringC^host(s.data_ptr() + i, 1 as size_t)
+                        let cloc this.text_char_location(text, i)
+                        if (syn.category_of(c0) & subsequent) = 0
+                            this.report2_at(ParserMessages.attributeValueChar(), *cs, attribute_name, cloc)
+                        else if initial = CAT_DIGIT
+                            this.report2_at(ParserMessages.attributeValueNumberToken(), *cs, attribute_name, cloc)
+                        else
+                            this.report2_at(ParserMessages.attributeValueName(), *cs, attribute_name, cloc)
+                    }
+                    else
+                    {
+                        set i: i + 1
+                        var in_token true
+                        while in_token
+                        {
+                            if i >= vn
+                                set in_token: false
+                            else if (syn.category_of(s.get(i)) & subsequent) = 0
+                                set in_token: false
+                            else
+                                set i: i + 1
+                        }
+                        if i < vn
+                        {
+                            if s.get(i) <> space
+                            {
+                                ; this char is not allowed anywhere in the value
+                                let cs2 StringC^host(s.data_ptr() + i, 1 as size_t)
+                                let cloc2 this.text_char_location(text, i)
+                                this.report2_at(ParserMessages.attributeValueChar(), *cs2, attribute_name, cloc2)
+                            }
+                        }
+                    }
+                }
+                var to_space true
+                while to_space
+                {
+                    if i >= vn
+                        set to_space: false
+                    else if s.get(i) = space
+                        set to_space: false
+                    else
+                        set i: i + 1
+                }
+                if i - start_index > namelen_q
+                {
+                    let nloc this.text_char_location(text, i)
+                    this.report_num_at(ParserMessages.nameTokenLength(), namelen_q as u64, nloc)
+                }
+                if i = vn
+                    set running: false
+                else
+                {
+                    if dv.get_is_list() = false
+                    {
+                        if validate
+                        {
+                            if nspaces = (0 as size_t)
+                            {
+                                let mloc this.text_char_location(text, i)
+                                this.report1_at(ParserMessages.attributeValueMultiple(), attribute_name, mloc)
+                            }
+                        }
+                    }
+                    set nspaces: nspaces + 1
+                    set i: i + 1
+                }
+            }
+        }
+        var tn normsep + vn
+        if dv.get_is_list()
+        {
+            set tn: tn + (1 as size_t)
+            if normsep > (0 as size_t)
+                set tn: tn + ((normsep - 1) * (nspaces + 1))
+            else
+                set tn: tn - (nspaces + 1)
+        }
+        set *spec_length: *spec_length + tn
+        ; a length error will already have been given if vn > litlen - normsep.
+        if litlen >= normsep
+        {
+            if vn <= litlen - normsep
+            {
+                if tn > litlen
+                    this.report_num_num_at(ParserMessages.normalizedAttributeValueLength(), litlen as u64, tn as u64, ps.current_input().token_start_location())
+            }
+        }
+        let allowed dv.get_tokens()
+        if allowed <> null
+        {
+            if validate
+            {
+                if dv.contains_token(s) = false
+                    this.report2_vec_at(ParserMessages.attributeValueNotInGroup(), s, attribute_name, allowed, ps.current_input().token_start_location())
+            }
+        }
+    }
+
     ; The makeSemantics half of makeValue (Attribute.cxx) — reported from the
     ; parser (the duplicateAttributeSpec precedent).
     ;   ID/IDREF (IdDeclaredValue/IdrefDeclaredValue, :534/:556): an ID value
@@ -3428,14 +3689,18 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ;   NOTATION (NotationDeclaredValue, :430): the WHOLE value is the name;
     ;   unknown reports invalidNotationAttribute (E1, validate-gated, at the
     ;   first token) and leaves no semantics.
-    ; Values are single-space-normalized by set_value, so tokens split on one
-    ; 0x20; token locations come from the value Text's per-char locations
+    ; Values are single-space-normalized by parse_literal, so tokens split on
+    ; one 0x20; token locations come from the value Text's per-char locations
     ; (verified vs real onsgmls: each message points at its token's first
     ; char, entity-expanded tokens resolving through the origin chain).
-    ; The reference's nIdrefs/grpcnt capacity count stays with the deferred
-    ; capacity axis.
+    ; nIdrefs/nEntityNames accumulate on the AttributeList; the GRPCNT checks
+    ; run in the finish tail (check_missing_semantics).
     function check_value_semantics(this: Parser, atts: pointer[AttributeList], index: size_t, text: pointer[Text])
     {
+        ; TokenizedAttributeValue::makeSemantics (Attribute.cxx:1077): an
+        ; empty value has no semantics — no lookups, no messages, no counts.
+        if (*text).size() = (0 as size_t)
+            return
         let is_id atts.id(index)
         let is_idref atts.idref(index)
         let is_ent atts.entity(index)
@@ -3489,7 +3754,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     this.report1_aux(ParserMessages.duplicateId(), *tok, tloc, ParserMessages.duplicateId_aux(), prev_loc)
             }
             else if is_idref
+            {
                 ps.note_idref(*tok, tloc)
+                ; IdrefDeclaredValue::makeSemantics (Attribute.cxx:564).
+                atts.add_idrefs(1 as u32)
+            }
             else
             {
                 let ent this.get_attribute_entity(*tok)
@@ -3549,6 +3818,21 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             set i: i + 1
         }
+        ; the tail of AttributeList::finish (Attribute.cxx:1259) — runs here
+        ; so the GRPCNT totals include the defaulted values' counts:
+        ; idrefGrpcnt / entityNameGrpcnt (quantity errors, not validate-gated)
+        ; and the CONREF/NOTATION exclusion (validate-gated).
+        let syn ps.get_syntax()
+        let grpcnt_q syn.get_quantity(qGRPCNT)
+        if atts.n_idrefs_of() > grpcnt_q
+            this.report_num_at(ParserMessages.idrefGrpcnt(), grpcnt_q as u64, ps.current_input().token_start_location())
+        if atts.n_entity_names_of() > grpcnt_q
+            this.report_num_at(ParserMessages.entityNameGrpcnt(), grpcnt_q as u64, ps.current_input().token_start_location())
+        if ps.validate()
+        {
+            if atts.conref_notation_specified()
+                this.report0_at(ParserMessages.conrefNotation(), ps.current_input().token_start_location())
+        }
     }
 
     ; handleAttributeNameToken (parseAttribute.cxx) — SHORTTAG attribute-name
@@ -3588,7 +3872,16 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         atts.set_spec(index, ctx)
         let text host.allocate(sizeof Text, alignof Text) as pointer[Text]
         set *text: Text(token)
-        set *spec_length: *spec_length + token.get_size()
+        ; GroupDeclaredValue::makeValueFromToken (Attribute.cxx:369): no
+        ; category/group validation (the token matched the group) — only the
+        ; LITLEN check and the normalized-length accounting (size + NORMSEP).
+        let syn ps.get_syntax()
+        let normsep syn.get_quantity(qNORMSEP) as size_t
+        let litlen syn.get_quantity(qLITLEN) as size_t
+        let tsz token.get_size()
+        if (normsep > litlen) or (tsz > litlen - normsep)
+            this.report_num_num_at(ParserMessages.normalizedAttributeValueLength(), litlen as u64, (tsz + normsep) as u64, ps.current_input().token_start_location())
+        set *spec_length: *spec_length + tsz + normsep
         atts.set_value(host, index, text, ctx)
     }
 
@@ -3616,6 +3909,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else if cur_parm = APT_VI
                 {
+                    ; the attribute NAME contributes its size + NORMSEP to the
+                    ; spec length (parseAttribute.cxx:41).
+                    let normsep_n ps.get_syntax().get_quantity(qNORMSEP) as size_t
+                    set spec_length: spec_length + nm.get_size() + normsep_n
                     if this.parse_attribute_value_spec(mode, nm, atts, &spec_length, new_att_def) = false
                     {
                         set ok: false
@@ -3668,6 +3965,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let ctx ps.get_attribute_context()
         atts.finish(ctx)
         this.check_missing_semantics(atts)
+        ; parseAttributeSpec tail (parseAttribute.cxx:89): the ATTSPLEN check
+        ; over the accumulated normalized spec length.
+        let attsplen_q ps.get_syntax().get_quantity(qATTSPLEN) as size_t
+        if spec_length > attsplen_q
+            this.report_num_num_at(ParserMessages.attsplen(), attsplen_q as u64, spec_length as u64, ps.current_input().token_start_location())
         true
     }
 
@@ -5886,6 +6188,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             set sd: host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
             set *sd: Sd()
             set syn: Syntax^host(*sd)
+            ; implySgmlDecl: the implied declaration parses with the OPTIONS
+            ; quantities (NAMELEN 99999999, LITLEN 24000, ...), not the
+            ; reference set the Syntax ctor installs.
+            syn.set_options_quantities()
         }
         ; the document charset machinery (Parser.cxx:46-52): when the SGML
         ; declaration provided no CHARSET section (or there is no declaration),
