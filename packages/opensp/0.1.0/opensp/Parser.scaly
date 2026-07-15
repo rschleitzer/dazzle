@@ -540,6 +540,23 @@ define HuState (item_start: size_t(0), item_open: bool(false), last_start: size_
     }
 }
 
+; ---- OMITTAG speculation rollback (Undo.h/Undo.cxx) ------------------------
+; While tags are implied the content state is mutated in place; each mutation
+; records its inverse. On rollback the entries run newest-first:
+;   START_TAG   an element was pushed          -> pop it
+;   END_TAG     an element was popped (saved)  -> re-push it
+;   TRANSITION  a required transition advanced -> restore the snapshot cursor
+define UNDO_START_TAG: int 0
+define UNDO_END_TAG: int 1
+define UNDO_TRANSITION: int 2
+
+define UndoEntry
+(
+    kind: int
+    element: pointer[OpenElement]
+    state: pointer[MatchState]
+)
+
 define Parser (host: pointer[Page], ps: pointer[ParserState])
 {
     function make(host: pointer[Page], ps: pointer[ParserState]) returns Parser
@@ -674,6 +691,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.report_at(mt, args, loc)
     }
 
+    ; a single RAW (pre-rendered, unquoted) %1 — endTagInvalidToken.
+    function report_raw_at(this: Parser, mt: MessageType, a1: StringC, loc: Location)
+    {
+        var args Vector[MessageArg](1 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Raw(a1)
+        ps.report_at(mt, args, loc)
+    }
+
     ; report0 WITH an auxiliary line at aux_loc — commentEntityEnd
     ; ("comment started here" at the COM that opened the comment).
     function report0_aux(this: Parser, mt: MessageType, loc: Location, aux: MessageFragment, aux_loc: Location)
@@ -681,6 +706,25 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let args Vector[MessageArg]()
         let aux_text aux.text
         ps.report_aux(mt, args, loc, aux_text, aux_loc)
+    }
+
+    ; ordinal %1 + two quoted names — requiredElementExcluded / invalidExclusion.
+    function report_ord2_at(this: Parser, mt: MessageType, n: u64, a1: StringC, a2: StringC, loc: Location)
+    {
+        var args Vector[MessageArg](3 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Ord(n)
+        set *(args.get(1 as size_t)): MessageArg.Str(a1)
+        set *(args.get(2 as size_t)): MessageArg.Str(a2)
+        ps.report_at(mt, args, loc)
+    }
+
+    ; quoted name %1 + quoted name list %2 — missingElementMultiple.
+    function report_str_vec_at(this: Parser, mt: MessageType, a1: StringC, v: pointer[Array[StringC]], loc: Location)
+    {
+        var args Vector[MessageArg](2 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Str(a1)
+        set *(args.get(1 as size_t)): MessageArg.Vec(v)
+        ps.report_at(mt, args, loc)
     }
 
     ; report1 with a RAW %1 plus an auxiliary line — commentDeclInvalidToken
@@ -5535,20 +5579,18 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         this.accept_start_tag(e, event, net)
     }
 
-    ; tryImplyTag — one OMITTAG inference step at the current position. Either
-    ; implies an END tag (current element finished + its end tag omissible: emit
-    ; end, pop) or a START tag (a uniquely-required next element with an omissible
-    ; start tag: advance the parent cursor, push the implied element). Returns
-    ; true if a tag was implied (retry the pending token), false otherwise.
-    ;
-    ; SCOPE: events are queued DIRECTLY. The reference speculatively pushes onto
-    ; Undo/eventList lists and rolls back (undo) when the implied chain fails to
-    ; admit the pending token — that rollback is DEFERRED. It is unreachable for
-    ; a conforming document: every implied tag on valid content leads to a
-    ; successful transition, so nothing needs undoing. Invalid documents (whose
-    ; expected exit is non-zero) may therefore diverge until the undo lands.
-    function try_imply_tag(this: Parser, loc: Location, start_implied: pointer[u32]) returns bool
+    ; tryImplyTag (parseInstance.cxx:748) — one OMITTAG inference step at the
+    ; current position, SPECULATIVE: events buffer into `events`, every content
+    ; mutation records its inverse in `undo`. The caller commits the chain with
+    ; queue_element_events (releasing kept messages) or rolls it back with
+    ; undo_all + discard_kept_messages. Either implies an END tag (current
+    ; element finished + its end tag omissible) or a START tag (the uniquely
+    ; required next element). Returns true if a tag was implied (retry the
+    ; pending token).
+    function try_imply_tag(this: Parser, loc: Location, start_implied: pointer[u32], undo: pointer[Array[UndoEntry]], events: pointer[Array[pointer[Event]]]) returns bool
     {
+        if ps.get_sd().omittag() = false
+            return false
         let cs ps.get_content_state()
         let ce cs.current_element()
         if ce.is_finished()
@@ -5559,67 +5601,230 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             if def <> null
                 if def.can_omit_end_tag() = false
                     return false
+            ; an end tag is implied for an element whose START tag was itself
+            ; implied in this chain: the element was implied empty.
             if *start_implied > (0 as u32)
+            {
+                let gi_empty ce.get_type().get_name()
+                this.report1_at(ParserMessages.startTagEmptyElement(), gi_empty, ps.current_input().token_start_location())
                 set *start_implied: *start_implied - (1 as u32)
+            }
             let e ce.get_type()
-            ps.note_end_element(ce.get_included())
             let endev Event.make_end(host, e, loc)
-            if ce.get_included()
-                endev.set_included()
-            ps.queue_event(endev)
-            ps.pop_element_mode()
+            events.add(endev)
+            var ue UndoEntry()
+            set ue.kind: UNDO_END_TAG
+            set ue.element: ps.pop_save_element_mode()
+            set ue.state: null
+            undo.add(ue)
             return true
         }
-        let e ce.implied_start_tag()
+        let tok ce.implied_start_token()
+        if tok = null
+            return false
+        let e ContentToken.token_element(tok)
         if e = null
             return false
+        ; the required element is excluded — contextually required elements may
+        ; not be excluded (E3); the imply proceeds regardless (reference).
+        if cs.element_is_excluded(e)
+        {
+            let ord_req (ContentToken.token_type_index(tok) as u64) + (1 as u64)
+            this.report_ord2_at(ParserMessages.requiredElementExcluded(), ord_req, e.get_name(), ce.get_type().get_name(), ps.current_input().token_start_location())
+        }
+        if cs.tag_level_of() <> (0 as u32)
+        {
+            var ut UndoEntry()
+            set ut.kind: UNDO_TRANSITION
+            set ut.element: null
+            set ut.state: ce.copy_match_state(host)
+            undo.add(ut)
+        }
         ce.do_required_transition()
-        ; (declared-content / canOmitStartTag / undefined diagnostics deferred)
+        let def2 e.get_definition()
+        ; start-tag omission diagnostics (parseInstance.cxx:799-807): declared
+        ; content other than a model group / ANY; an undefined element (the
+        ; OMITTAG-inference undefinedElement — probe g1); a declaration that
+        ; does not permit start-tag omission.
+        if def2 <> null
+        {
+            let dc def2.get_declared_content()
+            if (dc <> DC_MODEL_GROUP) and (dc <> DC_ANY)
+                this.report1_at(ParserMessages.omitStartTagDeclaredContent(), e.get_name(), ps.current_input().token_start_location())
+            if def2.undefined()
+                this.report1_at(ParserMessages.undefinedElement(), e.get_name(), ps.current_input().token_start_location())
+            else if def2.can_omit_start_tag() = false
+                this.report1_at(ParserMessages.omitStartTagDeclare(), e.get_name(), ps.current_input().token_start_location())
+        }
         let adl e.get_attribute_def()
         let atts AttributeList.make(host, adl)
         let ctx ps.get_attribute_context()
         atts.finish(ctx)
+        ; gives an error if the element has a required attribute (kept while
+        ; speculating, like the reference's finish under keepMessages).
         this.check_missing_semantics(atts)
         set *start_implied: *start_implied + (1 as u32)
         let stev Event.make_start(host, e, loc)
         stev.set_attributes(atts)
-        this.push_element_check(e, stev, false)
+        this.push_element_check_spec(e, stev, undo, events)
+        ; checkImplyLoop (parseInstance.cxx:821): break a non-advancing infinite
+        ; imply chain after a fairly arbitrary limit.
+        if *start_implied > (30 as u32)
+            if cs.check_imply_loop(*start_implied) = false
+                return false
         true
+    }
+
+    ; pushElementCheck (parseInstance.cxx:973), the SPECULATIVE variant: the
+    ; start event buffers into the event list; a mustOmitEnd (EMPTY) element
+    ; buffers its end event right behind it and is never pushed; otherwise the
+    ; element is pushed live and the undo list records the pop.
+    function push_element_check_spec(this: Parser, e: pointer[ElementType], event: pointer[Event], undo: pointer[Array[UndoEntry]], events: pointer[Array[pointer[Event]]])
+    {
+        let taglvl_q ps.get_syntax().get_quantity(qTAGLVL)
+        if ps.get_content_state().tag_level_of() = taglvl_q
+            this.report_num_at(ParserMessages.taglvlOpenElements(), taglvl_q as u64, ps.current_input().token_start_location())
+        events.add(event)
+        if this.must_omit_end(e)
+        {
+            let endev Event.make_end(host, e, event.get_loc())
+            if event.is_included()
+                endev.set_included()
+            events.add(endev)
+        }
+        else
+        {
+            var ue UndoEntry()
+            set ue.kind: UNDO_START_TAG
+            set ue.element: null
+            set ue.state: null
+            undo.add(ue)
+            let cs ps.get_content_state()
+            let ce cs.current_element()
+            var map e.get_map()
+            if map = null
+                set map: ce.get_map()
+            let oe OpenElement.make(host, e, false, event.is_included(), map, event.get_markup_loc())
+            ps.push_element_mode(oe)
+        }
+    }
+
+    ; queueElementEvents (parseInstance.cxx:693) — the speculation commits:
+    ; release the kept diagnostics, then emit the buffered events in document
+    ; order, noting each start/end.
+    function queue_element_events(this: Parser, events: pointer[Array[pointer[Event]]])
+    {
+        ps.release_kept_messages()
+        let n events.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let ev *(events.get_buffer() + i)
+            if ev.get_type() = EV_START_ELEMENT
+                ps.note_start_element(ev.is_included())
+            else
+                ps.note_end_element(ev.is_included())
+            ps.queue_event(ev)
+            set i: i + 1
+        }
+    }
+
+    ; undo (parseInstance.cxx:684) — roll the speculation back, newest first.
+    function undo_all(this: Parser, undo: pointer[Array[UndoEntry]])
+    {
+        var i undo.get_length()
+        while i > (0 as size_t)
+        {
+            set i: i - (1 as size_t)
+            let ue *(undo.get_buffer() + i)
+            if ue.kind = UNDO_START_TAG
+                ps.pop_element_mode()
+            else if ue.kind = UNDO_END_TAG
+                ps.push_element_mode(ue.element)
+            else
+            {
+                let cs ps.get_content_state()
+                let ce cs.current_element()
+                ce.set_match_state(ue.state)
+            }
+        }
+    }
+
+    ; checkExclusion (parseInstance.cxx:715) — the excluded element's transition
+    ; token exists but is neither inherently optional nor an OR-group member:
+    ; the exclusion is invalid (E3).
+    function check_exclusion(this: Parser, e: pointer[ElementType])
+    {
+        let cs ps.get_content_state()
+        let ce cs.current_element()
+        let tok ce.invalid_exclusion(e)
+        if tok <> null
+        {
+            let ord_exc (ContentToken.token_type_index(tok) as u64) + (1 as u64)
+            let tname ContentToken.token_element(tok)
+            var tgi StringC()
+            if tname <> null
+                set tgi: tname.get_name()
+            this.report_ord2_at(ParserMessages.invalidExclusion(), ord_exc, tgi, ce.get_type().get_name(), ps.current_input().token_start_location())
+        }
+    }
+
+    ; tryStartTag (parseInstance.cxx:725) — one admission attempt for the
+    ; pending start tag after an imply step: exclusion refutes it (with the
+    ; invalid-exclusion check), a clean transition or an inclusion admits it
+    ; (committing the buffered chain).
+    function try_start_tag(this: Parser, e: pointer[ElementType], event: pointer[Event], net: bool, events: pointer[Array[pointer[Event]]]) returns bool
+    {
+        let cs ps.get_content_state()
+        if cs.element_is_excluded(e)
+        {
+            this.check_exclusion(e)
+            return false
+        }
+        let ce cs.current_element()
+        if ce.try_transition(e)
+        {
+            this.queue_element_events(events)
+            this.push_element_check(e, event, net)
+            return true
+        }
+        if cs.element_is_included(e)
+        {
+            this.queue_element_events(events)
+            event.set_included()
+            this.push_element_check(e, event, net)
+            return true
+        }
+        false
     }
 
     function accept_start_tag(this: Parser, e: pointer[ElementType], event: pointer[Event], net: bool)
     {
-        ; undefinedElement (parseInstance.cxx:805): a start tag names an element
-        ; that was referenced but never declared (null definition). onsgmls always
-        ; reports it and ADMITS the element (an undefined element has undefined
-        ; content, so it pre-empts elementNotAllowed below); location = the start
-        ; tag's TAGC. Under IMPLYDEF undeclared elements get a real ANY definition
-        ; (non-null), so this never fires there.
-        if e.get_definition() = null
+        ; undefinedElement (parseInstance.cxx:643): the element's definition is
+        ; the checkDtd/lookupCreate UNDEFINED one and elements may not be
+        ; implied (IMPLYDEF ELEMENT NO). onsgmls reports it and ADMITS the
+        ; element (undefined content pre-empts elementNotAllowed below);
+        ; location = the start tag's TAGC.
+        let def e.get_definition()
+        var undefined false
+        if def <> null
+            set undefined: def.undefined()
+        if undefined and (ps.get_implydef_element() = IMPLYDEF_ELEMENT_NO)
         {
             let uname e.get_name()
             this.report1_at(ParserMessages.undefinedElement(), uname, event.get_loc())
         }
         let cs ps.get_content_state()
-        let ce cs.current_element()
-        if ce.try_transition(e)
+        if cs.element_is_excluded(e)
         {
-            this.push_element_check(e, event, net)
-            return
+            ps.keep_messages()
+            if ps.validate()
+                this.check_exclusion(e)
         }
-        if cs.element_is_included(e)
+        else
         {
-            event.set_included()
-            this.push_element_check(e, event, net)
-            return
-        }
-        ; OMITTAG: imply end/start tags until e is admissible.
-        var start_implied: u32 0
-        var guard: int 0
-        while this.try_imply_tag(event.get_loc(), &start_implied)
-        {
-            let cei cs.current_element()
-            if cei.try_transition(e)
+            let ce cs.current_element()
+            if ce.try_transition(e)
             {
                 this.push_element_check(e, event, net)
                 return
@@ -5630,28 +5835,248 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 this.push_element_check(e, event, net)
                 return
             }
-            set guard: guard + 1
-            if guard > 100
+            ps.keep_messages()
+        }
+        ; OMITTAG: imply end/start tags speculatively until e is admissible.
+        ; Implied tags carry the pending event's MARKUP location (its STAGO) —
+        ; the reference's event->location().
+        var start_implied: u32 0
+        let undo Array[UndoEntry]^host()
+        let events Array[pointer[Event]]^host()
+        while this.try_imply_tag(event.get_markup_loc(), &start_implied, undo, events)
+        {
+            if this.try_start_tag(e, event, net, events)
                 return
         }
-        ; Not admissible even after minimization: elementNotAllowed
-        ; (parseInstance.cxx:676) — a plain message(), i.e. at the CURRENT scan
-        ; token (normally the start tag's TAGC; after an attribute-spec failure
-        ; wherever the failing literal stopped). Then recover by forcing the
-        ; transition and pushing so parsing continues (onsgmls likewise emits
-        ; the start-element event and reads on).
-        let ce3 cs.current_element()
-        ; elementNotAllowed only for a DEFINED element — an undefined one already
-        ; got undefinedElement above (onsgmls does not also report not-allowed).
-        if e.get_definition() <> null
+        ; Not admissible even after minimization: roll the speculation back.
+        ps.discard_kept_messages()
+        this.undo_all(undo)
+        if ps.validate() and (undefined = false)
+            this.handle_bad_start_tag(e, event, net)
+        else
         {
-            let gi e.get_name()
-            let eloc ps.current_input().token_start_location()
-            let mt_notallowed ParserMessages.elementNotAllowed()
-            this.report1_at(mt_notallowed, gi, eloc)
+            ; elementNotAllowed (parseInstance.cxx:676) — a plain message() at
+            ; the CURRENT scan token (normally the start tag's TAGC). Gated:
+            ; validating parses report it only when elements may be implied
+            ; (IMPLYDEF), non-validating ones only after the document element.
+            var say_not_allowed false
+            if ps.validate()
+                set say_not_allowed: ps.get_implydef_element() <> IMPLYDEF_ELEMENT_NO
+            else
+                set say_not_allowed: cs.after_document_element()
+            if say_not_allowed
+            {
+                let gi e.get_name()
+                let eloc ps.current_input().token_start_location()
+                this.report1_at(ParserMessages.elementNotAllowed(), gi, eloc)
+            }
+            ; if the element could not occur because it was excluded, do the
+            ; transition here; then force-push so parsing continues.
+            let ce3 cs.current_element()
+            let discard ce3.try_transition(e)
+            this.push_element_check(e, event, net)
         }
-        let discard ce3.try_transition(e)
+    }
+
+    ; handleBadStartTag (parseInstance.cxx:1206) — the validating recovery for
+    ; a defined element the model rejects: search the possible transitions for
+    ; element(s) whose own content admits it. Exactly one candidate -> report
+    ; missingElementInferred, push the inferred element, then the pending one.
+    ; Several -> report missingElementMultiple (candidate list in DTD order)
+    ; and force-push. None -> imply an end tag (if permitted) and retry one
+    ; level up; when that runs dry, elementNotAllowed + force-push.
+    function handle_bad_start_tag(this: Parser, e: pointer[ElementType], event: pointer[Event], net: bool)
+    {
+        let cs ps.get_content_state()
+        let undo Array[UndoEntry]^host()
+        let events Array[pointer[Event]]^host()
+        ps.keep_messages()
+        var looping true
+        while looping
+        {
+            let missing Array[pointer[ElementType]]^host()
+            this.find_missing_tag(e, missing)
+            if missing.get_length() = (1 as size_t)
+            {
+                this.queue_element_events(events)
+                let m *(missing.get_buffer() + (0 as size_t))
+                this.report2_at(ParserMessages.missingElementInferred(), e.get_name(), m.get_name(), ps.current_input().token_start_location())
+                let adl m.get_attribute_def()
+                let atts AttributeList.make(host, adl)
+                let ctx ps.get_attribute_context()
+                atts.finish(ctx)
+                this.check_missing_semantics(atts)
+                let inferev Event.make_start(host, m, event.get_markup_loc())
+                inferev.set_attributes(atts)
+                let ce_i cs.current_element()
+                if ce_i.try_transition(m) = false
+                    inferev.set_included()
+                this.push_element_check(m, inferev, false)
+                let ce_e cs.current_element()
+                if ce_e.try_transition(e) = false
+                    event.set_included()
+                this.push_element_check(e, event, net)
+                return
+            }
+            if missing.get_length() > (0 as size_t)
+            {
+                this.queue_element_events(events)
+                let names Array[StringC]^host()
+                let nm missing.get_length()
+                var i: size_t 0
+                while i < nm
+                {
+                    let mi *(missing.get_buffer() + i)
+                    names.add(mi.get_name())
+                    set i: i + 1
+                }
+                this.report_str_vec_at(ParserMessages.missingElementMultiple(), e.get_name(), names, ps.current_input().token_start_location())
+                this.push_element_check(e, event, net)
+                return
+            }
+            let ce cs.current_element()
+            var can_pop false
+            if ps.get_sd().omittag() and ce.is_finished() and (cs.tag_level_of() <> (0 as u32))
+            {
+                let def ce.get_type().get_definition()
+                if def <> null
+                    set can_pop: def.can_omit_end_tag()
+            }
+            if can_pop
+            {
+                let endev Event.make_end(host, ce.get_type(), event.get_markup_loc())
+                events.add(endev)
+                var ue UndoEntry()
+                set ue.kind: UNDO_END_TAG
+                set ue.element: ps.pop_save_element_mode()
+                set ue.state: null
+                undo.add(ue)
+            }
+            else
+                set looping: false
+        }
+        ps.discard_kept_messages()
+        this.undo_all(undo)
+        let gi e.get_name()
+        this.report1_at(ParserMessages.elementNotAllowed(), gi, ps.current_input().token_start_location())
+        let ce4 cs.current_element()
+        let discard ce4.try_transition(e)
         this.push_element_check(e, event, net)
+    }
+
+    ; findMissingTag (parseInstance.cxx:1273) — the candidate elements whose
+    ; own content model (or inclusions) admit `e` (e = null searches for a
+    ; #PCDATA host), filtered by the live exclusions, sorted in DTD declaration
+    ; order (insertion sort, like the reference).
+    function find_missing_tag(this: Parser, e: pointer[ElementType], v: pointer[Array[pointer[ElementType]]])
+    {
+        let cs ps.get_content_state()
+        let ce cs.current_element()
+        if ce.current_position() = null
+        {
+            if e = null
+                v.add(null as pointer[ElementType])
+            return
+        }
+        if e <> null
+            if cs.element_is_excluded(e)
+                return
+        let cands Array[pointer[ElementType]]^host()
+        ce.possible_transitions(cands)
+        let n cands.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let cand *(cands.get_buffer() + i)
+            if cand <> null
+            {
+                if cs.element_is_excluded(cand) = false
+                {
+                    var success false
+                    let cdef cand.get_definition()
+                    if cdef <> null
+                    {
+                        let dc cdef.get_declared_content()
+                        if dc = DC_MODEL_GROUP
+                        {
+                            let grp cdef.compiled_model_group()
+                            let state ContentToken.make_match_state(host, grp)
+                            if e = null
+                                set success: ContentToken.ms_try_transition_pcdata(state)
+                            else
+                            {
+                                if ContentToken.ms_try_transition(state, e)
+                                    set success: true
+                                if success = false
+                                {
+                                    let ni cdef.n_inclusions()
+                                    var j: size_t 0
+                                    while j < ni
+                                    {
+                                        if cdef.inclusion(j) = e
+                                        {
+                                            set success: true
+                                            set j: ni
+                                        }
+                                        else
+                                            set j: j + 1
+                                    }
+                                }
+                                if success
+                                {
+                                    let ne cdef.n_exclusions()
+                                    var k: size_t 0
+                                    while k < ne
+                                    {
+                                        if cdef.exclusion(k) = e
+                                        {
+                                            set success: false
+                                            set k: ne
+                                        }
+                                        else
+                                            set k: k + 1
+                                    }
+                                }
+                            }
+                        }
+                        else if (dc = DC_CDATA) or (dc = DC_RCDATA)
+                        {
+                            if e = null
+                                set success: true
+                        }
+                    }
+                    if success
+                        v.add(cand)
+                }
+            }
+            set i: i + 1
+        }
+        ; insertion sort by DTD declaration order (ElementType::index).
+        var s: size_t 1
+        while s < v.get_length()
+        {
+            let tem *(v.get_buffer() + s)
+            var j2 s
+            var moving true
+            while moving
+            {
+                if j2 > (0 as size_t)
+                {
+                    let prev *(v.get_buffer() + (j2 - (1 as size_t)))
+                    if prev.get_index() > tem.get_index()
+                    {
+                        v.put(j2, prev)
+                        set j2: j2 - (1 as size_t)
+                    }
+                    else
+                        set moving: false
+                }
+                else
+                    set moving: false
+            }
+            v.put(j2, tem)
+            set s: s + 1
+        }
     }
 
     function push_element_check(this: Parser, e: pointer[ElementType], event: pointer[Event], net: bool)
@@ -5703,9 +6128,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let dtd ps.get_current_dtd()
         let e dtd.lookup_element_type(name)
         let loc ps.current_location()
-        let close_token ps.get_token(tagMode)
-        if close_token <> tokenTagc
-            ins.unget_token()
+        this.parse_end_tag_close()
         if e = null
         {
             ; an end tag naming an UNDECLARED element: it is nowhere open, so
@@ -5717,6 +6140,57 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return null
         }
         Event.make_end(host, e, loc)
+    }
+
+    ; parseEndTagClose (parseInstance.cxx:1036) — consume the end tag's close:
+    ; S separators up to the TAGC; an ETAGO/STAGO leaves the tag unclosed
+    ; (legal only under SHORTTAG YES / ENDTAG UNCLOSED); anything else is
+    ; diagnosed and ends the tag.
+    function parse_end_tag_close(this: Parser)
+    {
+        var looping true
+        while looping
+        {
+            let token ps.get_token(tagMode)
+            if token = tokenUnrecognized
+            {
+                ; a single character not recognized in tag mode: non-SGML chars
+                ; report as such; anything else is endTagCharacter.
+                let ins ps.current_input()
+                if ins.current_token_length() = (0 as size_t)
+                    ins.end_token(1 as size_t)
+                let ts ins.current_token_string()
+                let c ts.get(0 as size_t)
+                let cloc ins.token_start_location()
+                if this.is_non_sgml_char(c)
+                    this.report_num_at(ParserMessages.nonSgmlCharacter(), c as u64, cloc)
+                else
+                    this.report1_at(ParserMessages.endTagCharacter(), ts, cloc)
+                return
+            }
+            else if token = tokenEe
+            {
+                this.report0_at(ParserMessages.endTagEntityEnd(), ps.current_input().token_start_location())
+                return
+            }
+            else if (token = tokenEtago) or (token = tokenStago)
+            {
+                if ps.get_sd().end_tag_unclosed() = false
+                    this.report0_at(ParserMessages.unclosedEndTagShorttag(), ps.current_input().token_start_location())
+                ps.current_input().unget_token()
+                return
+            }
+            else if token = tokenTagc
+                return
+            else if token = tokenS
+                set looping: looping
+            else
+            {
+                let targ this.token_message_arg(token, tagMode)
+                this.report_raw_at(ParserMessages.endTagInvalidToken(), targ, ps.current_input().token_start_location())
+                return
+            }
+        }
     }
 
     ; endTagEmptyElement (EMPTYNRM) — an EMPTY element's start tag is immediately
@@ -5962,26 +6436,40 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let ce cs.current_element()
         if ce.try_transition_pcdata()
             return
-        ; OMITTAG: imply end/start tags until #PCDATA is admissible.
+        ; need to test here since implying tags may turn off pcdataRecovering.
+        if ps.is_pcdata_recovering()
+            return
+        ; OMITTAG: imply end/start tags speculatively until #PCDATA is admissible.
         var start_implied: u32 0
-        var guard: int 0
-        while this.try_imply_tag(loc, &start_implied)
+        let undo Array[UndoEntry]^host()
+        let events Array[pointer[Event]]^host()
+        ps.keep_messages()
+        while this.try_imply_tag(loc, &start_implied, undo, events)
         {
             let cei cs.current_element()
             if cei.try_transition_pcdata()
+            {
+                this.queue_element_events(events)
                 return
-            set guard: guard + 1
-            if guard > 100
-                return
+            }
         }
-        ; pcdataNotAllowed diagnostic + pcdataRecover deferred.
+        ps.discard_kept_messages()
+        this.undo_all(undo)
+        ; pcdataNotAllowed (parseInstance.cxx:635) — a plain message() at the
+        ; current token; then recover (switch to the mixed-content mode and
+        ; suppress repeats until an element pushes or pops).
+        if ps.validate() or cs.after_document_element()
+            this.report0_at(ParserMessages.pcdataNotAllowed(), ps.current_input().token_start_location())
+        ps.pcdata_recover()
     }
 
     function parse_pcdata(this: Parser)
     {
         let ins ps.current_input()
         let ts ins.current_token_string()
-        let loc ps.current_location()
+        ; the data token's START (the reference's currentLocation()) — an
+        ; element implied by this data carries it as its start location.
+        let loc ins.token_start_location()
         this.accept_pcdata(loc)
         ps.note_data()
         let ev Event.make_data(host, ts, loc)
@@ -6141,7 +6629,15 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     function end_instance(this: Parser)
     {
         this.end_all_elements()
-        ; unclosed-marked-section cleanup still deferred.
+        ; unclosedMarkedSection (parseInstance.cxx:60): every still-open marked
+        ; section reports "missing marked section end" at the current location
+        ; (EOF) with a "marked section started here" auxiliary at its MDO.
+        while ps.get_marked_section_level() > (0 as u32)
+        {
+            let ms_loc ps.current_marked_section_start_location()
+            this.report0_aux(ParserMessages.unclosedMarkedSection(), ps.current_location(), ParserMessages.unclosedMarkedSection_aux(), ms_loc)
+            ps.end_marked_section()
+        }
         this.check_idrefs()
         ps.pop_input_stack()
     }
@@ -6182,13 +6678,15 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; inside an already-special (ignored) section is itself ignored content.
     function parse_marked_section_decl_start(this: Parser) returns bool
     {
+        ; the section's start (its MDO-DSO) — the unclosedMarkedSection aux.
+        let ms_start ps.current_input().token_start_location()
         ; parseDecl.cxx:3404 — marked sections nest against TAGLVL.
         let mstaglvl_q ps.get_syntax().get_quantity(qTAGLVL)
         if ps.get_marked_section_level() = mstaglvl_q
             this.report_num_at(ParserMessages.markedSectionLevel(), mstaglvl_q as u64, ps.current_input().token_start_location())
         if ps.get_marked_section_special_level() > (0 as u32)
         {
-            ps.start_marked_section()
+            ps.start_marked_section(ms_start)
             return true
         }
         let decl_input_level ps.get_input_level()
@@ -6233,13 +6731,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
         }
         if status = MS_INCLUDE
-            ps.start_marked_section()
+            ps.start_marked_section(ms_start)
         else if status = MS_CDATA
-            ps.start_special_marked_section(cmsMode)
+            ps.start_special_marked_section(cmsMode, ms_start)
         else if status = MS_RCDATA
-            ps.start_special_marked_section(rcmsMode)
+            ps.start_special_marked_section(rcmsMode, ms_start)
         else
-            ps.start_special_marked_section(imsMode)
+            ps.start_special_marked_section(imsMode, ms_start)
         true
     }
 
@@ -6728,14 +7226,30 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     set running: false
                 }
                 else
+                {
+                    ; an entity ends inside CDATA/RCDATA content or an ignored
+                    ; marked section (the special parse) — parseInstance.cxx:96.
+                    if ps.get_input_level() = ps.get_special_parse_input_level()
+                        this.report0_at(ParserMessages.specialParseEntityEnd(), ps.current_input().token_start_location())
+                    if ps.get_content_state().after_document_element()
+                        this.report0_at(ParserMessages.afterDocumentElementEntityEnd(), ps.current_input().token_start_location())
+                    ; (contentAsyncEntityRef needs INTEGRAL YES — the parseSd
+                    ; axis; sd().integrallyStored() is never set here.)
                     ps.pop_input_stack()
+                }
             }
             else if (token = tokenEroNameStart) or (token = tokenEroGrpo)
+            {
+                if ps.get_content_state().after_document_element()
+                    this.report0_at(ParserMessages.entityReferenceAfterDocumentElement(), ps.current_input().token_start_location())
                 this.parse_entity_reference()
+            }
             else if token = tokenNet
                 this.parse_null_end_tag()
             else if (token = tokenCroDigit) or (token = tokenHcroHexDigit)
             {
+                if ps.get_content_state().after_document_element()
+                    this.report0_at(ParserMessages.characterReferenceAfterDocumentElement(), ps.current_input().token_start_location())
                 let loc ps.current_location()
                 var ch: u32 0
                 var refc_loc Location()
@@ -6763,17 +7277,25 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
             }
             else if token = tokenCroNameStart
+            {
                 ; doContent (parseInstance.cxx:137): a named function char ref;
                 ; the pushed char re-scans through the normal token dispatch
                 ; (an RE lands in the tokenRe arm and the record machinery).
+                if ps.get_content_state().after_document_element()
+                    this.report0_at(ParserMessages.characterReferenceAfterDocumentElement(), ps.current_input().token_start_location())
                 this.parse_named_char_ref()
+            }
             else if token = tokenStagoNameStart
                 this.parse_start_tag()
+            else if token = tokenStagoTagc
+                this.parse_empty_start_tag()
             else if token = tokenEtagoNameStart
             {
                 let ee this.parse_end_tag()
                 this.accept_end_tag(ee)
             }
+            else if token = tokenEtagoTagc
+                this.parse_empty_end_tag()
             else if token = tokenMdoCom
             {
                 ; a comment declaration in the instance (doContent): markup, no
@@ -6819,6 +7341,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if token = tokenMdoDso
             {
+                if ps.get_content_state().after_document_element()
+                    this.report0_at(ParserMessages.markedSectionAfterDocumentElement(), ps.current_input().token_start_location())
                 this.parse_marked_section_decl_start()
                 ps.note_markup()
             }
@@ -6829,12 +7353,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if token = tokenRe
             {
-                this.accept_pcdata(ps.current_location())
+                this.accept_pcdata(ps.current_input().token_start_location())
                 ps.queue_re()
             }
             else if token = tokenRs
             {
-                this.accept_pcdata(ps.current_location())
+                this.accept_pcdata(ps.current_input().token_start_location())
                 ps.note_rs()
             }
             else if token = tokenChar
@@ -6852,12 +7376,71 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if token = tokenS
                 set running: running
+            else if token = tokenUnrecognized
+            {
+                ; reportNonSgmlCharacter + parsePcdata (parseInstance.cxx:281):
+                ; the unmatched char joins the data run; parse_pcdata's
+                ; check_non_sgml reports any non-SGML chars in the run at their
+                ; own locations. A zero-length unrecognized token must consume
+                ; its character or the loop would not advance.
+                let ins_u ps.current_input()
+                if ins_u.current_token_length() = (0 as size_t)
+                    ins_u.end_token(1 as size_t)
+                this.parse_pcdata()
+            }
             else
-                ; Unhandled token in this increment (PIs, comments, shortref,
-                ; empty/net/group tags, char refs). Bail rather than risk a
-                ; non-advancing loop; later increments handle these.
+                ; Unhandled token in this increment (shortref, group tags).
+                ; Bail rather than risk a non-advancing loop; the axes handle
+                ; these.
                 set running: false
         }
+    }
+
+    ; parseEmptyStartTag (parseInstance.cxx:511) — `<>`: the empty start tag
+    ; names the most recently ended element under OMITTAG NO, the currently
+    ; open element otherwise, falling back to the document element type.
+    ; (warnEmptyTag is option-gated off; emptyStartTagBaseDtd needs a non-base
+    ; DTD = the LINK/CONCUR axes.)
+    function parse_empty_start_tag(this: Parser)
+    {
+        let cs ps.get_content_state()
+        var e: pointer[ElementType] null
+        if ps.get_sd().omittag() = false
+            set e: cs.last_ended_element_type()
+        else if cs.tag_level_of() > (0 as u32)
+            set e: cs.current_element().get_type()
+        if e = null
+        {
+            let dtd ps.get_current_dtd()
+            set e: dtd.get_document_element_type()
+        }
+        if e = null
+            return
+        let adl e.get_attribute_def()
+        let atts AttributeList.make(host, adl)
+        let ctx ps.get_attribute_context()
+        atts.finish(ctx)
+        this.check_missing_semantics(atts)
+        let loc ps.current_input().token_start_location()
+        let stev Event.make_start(host, e, loc)
+        stev.set_attributes(atts)
+        this.accept_start_tag(e, stev, false)
+    }
+
+    ; parseEmptyEndTag (parseInstance.cxx:1070) — `</>`: ends the currently
+    ; open element; with no open elements it is an error and is dropped.
+    ; (warnEmptyTag / emptyEndTagBaseDtd as above.)
+    function parse_empty_end_tag(this: Parser)
+    {
+        let cs ps.get_content_state()
+        if cs.tag_level_of() = (0 as u32)
+        {
+            this.report0_at(ParserMessages.emptyEndTagNoOpenElements(), ps.current_input().token_start_location())
+            return
+        }
+        let e cs.current_element().get_type()
+        let endev Event.make_end(host, e, ps.current_input().token_start_location())
+        this.accept_end_tag(endev)
     }
 
     ; install the content-mode recognizers doContent drives (in addition to the
@@ -7309,9 +7892,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
         }
 
-        ; ---- checkDtd's entity/notation sweeps ----
+        ; ---- checkDtd (parseDecl.cxx:2352) ----
         ; parseDoctypeDeclEnd calls checkDtd BEFORE parsing the final MDC, so a
-        ; current-location diagnostic (attlistNotationUndefined) points at the DSC.
+        ; current-location diagnostic (attlistNotationUndefined) points at the
+        ; DSC. Element sweep first (undefined definitions), then the
+        ; entity/notation sweeps.
+        this.check_dtd(dtd)
         this.check_dtd_notations(dtd)
 
         ; ---- the closing MDC ----
@@ -7376,16 +7962,22 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         this.build_stringc(buf)
     }
 
-    ; checkDtd (parseDecl.cxx), reduced to the half an implied DTD needs: every
-    ; element type that was only ever REFERENCED (no <!ELEMENT> declared it) gets
-    ; the undefined definition — ANY content, end tag omissible, undefined index —
-    ; so the content checker admits it instead of tripping over a null definition.
-    ; For an implied DTD that is exactly the document element. The shortref-map /
-    ; ID / notation checks of the full checkDtd land with their declarations.
+    ; checkDtd's ELEMENT sweep (parseDecl.cxx:2389): every element type that was
+    ; only ever REFERENCED (no <!ELEMENT> declared it) gets the shared undefined
+    ; definition — ANY content, end tag omissible, undefined index — so the
+    ; content checker admits it instead of tripping over a null definition, and
+    ; acceptStartTag / tryImplyTag report undefinedElement off the flag. The
+    ; definition-less DOCUMENT element additionally reports
+    ; documentElementUndefined (validating + IMPLYDEF ELEMENT NO); other
+    ; undefined elements are warn-gated (warnUndefinedElement, off). Runs for
+    ; every DTD (parseDoctypeDeclEnd + implyDtd), like the reference.
     function check_dtd(this: Parser, dtd: pointer[Dtd])
     {
         let allow_recursion ps.get_implydef_element() <> IMPLYDEF_ELEMENT_ANYOTHER
+        let det dtd.get_document_element_type()
         let n dtd.n_element_types()
+        var def: pointer[ElementDefinition] null
+        var di: size_t 0
         var i: size_t 0
         while i < n
         {
@@ -7394,9 +7986,24 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if p.get_definition() = null
                 {
-                    let loc ps.current_location()
-                    let def ElementDefinition.make(host, loc, ELEMENT_UNDEFINED_INDEX, OMIT_END, DC_ANY, allow_recursion)
-                    p.set_element_definition(def, 0 as size_t)
+                    if p = det
+                    {
+                        if ps.validate() and (ps.get_implydef_element() = IMPLYDEF_ELEMENT_NO)
+                        {
+                            ; currentLocation() = the START of the current token
+                            ; (the DSC / MDC that ended the subset).
+                            let ins ps.current_input()
+                            let cloc ins.token_start_location()
+                            this.report0_at(ParserMessages.documentElementUndefined(), cloc)
+                        }
+                    }
+                    if def = null
+                    {
+                        let loc ps.current_location()
+                        set def: ElementDefinition.make(host, loc, ELEMENT_UNDEFINED_INDEX, OMIT_END, DC_ANY, allow_recursion)
+                    }
+                    p.set_element_definition(def, di)
+                    set di: di + (1 as size_t)
                 }
             }
             set i: i + 1
@@ -7423,27 +8030,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     {
         if ps.validate() = false
             return
-        ; checkDtd's element sweep runs FIRST (parseDecl.cxx:2384): an element
-        ; type whose declaration never arrived. Only the DOCUMENT element (the
-        ; type named like the DTD, created by Dtd.make) is an error —
-        ; documentElementUndefined, validating + IMPLYDEF ELEMENT NO — at the
-        ; current location (the DSC/MDC token start, where checkDtd is called);
-        ; other undefined elements are warn-gated (warnUndefinedElement, off).
-        if ps.get_implydef_element() = IMPLYDEF_ELEMENT_NO
-        {
-            let det dtd.get_document_element_type()
-            if det <> null
-            {
-                if det.get_definition() = null
-                {
-                    ; currentLocation() = the START of the current token (the
-                    ; DSC / MDC that ended the subset), not the scan cursor.
-                    let ins ps.current_input()
-                    let cloc ins.token_start_location()
-                    this.report0_at(ParserMessages.documentElementUndefined(), cloc)
-                }
-            }
-        }
+        ; (the element sweep — undefined definitions + documentElementUndefined —
+        ; runs just before this in check_dtd, reference order.)
         var passes: int 1
         if ps.get_sd().www()
             set passes: 2
@@ -7619,6 +8207,24 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
     }
 
+    ; consume the prolog separators (S / record boundaries) that follow the
+    ; DOCTYPE declaration and leave the cursor on the first instance token.
+    function skim_prolog_separators(this: Parser)
+    {
+        var skimming true
+        while skimming
+        {
+            let t ps.get_token(proMode)
+            if (t = tokenS) or (t = tokenRe) or (t = tokenRs)
+                set skimming: skimming
+            else
+            {
+                ps.current_input().unget_token()
+                set skimming: false
+            }
+        }
+    }
+
     function parse_prolog(this: Parser, base_dir: String) returns bool
     {
         ps.set_current_mode(proMode)
@@ -7649,6 +8255,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 else if decl_name = R_DOCTYPE
                 {
                     set ok: this.parse_doctype_decl_start(base_dir)
+                    ; doProlog keeps scanning after the DOCTYPE: the separators
+                    ; between `]>` and the instance are PROLOG separators —
+                    ; consumed here, so the instance's first token (which
+                    ; doInstanceStart inspects) is the document element's start
+                    ; tag, never a record boundary.
+                    if ok
+                        this.skim_prolog_separators()
                     set running: false
                 }
                 else
@@ -7751,6 +8364,37 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ok
     }
 
+    ; doInstanceStart (parseInstance.cxx:16) — the instance's FIRST token: when
+    ; it is not a tag (or entity end), the document element's start tag is
+    ; implied under OMITTAG YES; under OMITTAG NO the instance must start with
+    ; the document element (instanceStartOmittag) and the data stays outside.
+    ; The token is ungotten either way and re-dispatched by do_content.
+    function do_instance_start(this: Parser)
+    {
+        let token ps.get_token(ps.get_current_mode())
+        var needs_imply true
+        if token = tokenEe
+            set needs_imply: false
+        else if (token = tokenStagoNameStart) or (token = tokenStagoTagc) or (token = tokenStagoGrpo)
+            set needs_imply: false
+        else if (token = tokenEtagoNameStart) or (token = tokenEtagoTagc) or (token = tokenEtagoGrpo)
+            set needs_imply: false
+        if needs_imply
+        {
+            if ps.get_sd().omittag()
+            {
+                var start_implied: u32 0
+                let undo Array[UndoEntry]^host()
+                let events Array[pointer[Event]]^host()
+                let discard this.try_imply_tag(ps.current_input().token_start_location(), &start_implied, undo, events)
+                this.queue_element_events(events)
+            }
+            else
+                this.report0_at(ParserMessages.instanceStartOmittag(), ps.current_input().token_start_location())
+        }
+        ps.current_input().unget_token()
+    }
+
     ; the full document drive: prolog (DOCTYPE) -> content events.
     ; The caller installs the prolog/decl recognizers (install_recognizers) and
     ; pushes the document InputSource; parse_document adds the content-mode
@@ -7764,6 +8408,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return false
         this.install_content_recognizers(table)
         ps.start_instance(host, dtd)
+        this.do_instance_start()
         this.do_content()
         true
     }
@@ -8046,6 +8691,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         set *isrc: InputSource(iorg, ibuf, ni)
         ps.push_input(isrc)
 
+        parser.do_instance_start()
         parser.do_content()
 
         if ps.get_n_errors() <> (0 as u32)

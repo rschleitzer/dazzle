@@ -129,6 +129,57 @@ define Message (type: MessageType, loc: Location)
         loc
 }
 
+; A buffered diagnostic (Messenger keepMessages / keptMessages_). While the
+; parser speculates (OMITTAG tag inference, handleBadStartTag), every message
+; is HELD here: released (emitted + counted) only when the speculation commits
+; (queueElementEvents -> releaseKeptMessages), dropped wholesale when it is
+; rolled back (discardKeptMessages) — a discarded message never counts toward
+; the error limit or the exit code. Args are stored DECOMPOSED into fixed
+; scalar slots (the widest kept message carries 3): a MessageArg UNION field
+; inside an Array-stored struct does not survive the copy round-trip (payload
+; corruption), while plain StringC/scalar fields do (the Array[Message] queue
+; is the precedent). Every arg fired during speculation names a DTD-stable
+; string (element/attribute names), so no deep copy is needed.
+define KA_NONE: int 0
+define KA_STR: int 1
+define KA_NUM: int 2
+define KA_ORD: int 3
+define KA_VEC: int 4
+define KA_RAW: int 5
+
+define KS_INFO: int 0
+define KS_WARNING: int 1
+define KS_QUANTITY: int 2
+define KS_IDREF: int 3
+define KS_ERROR: int 4
+
+define KeptMessage
+(
+    ; the MessageType, decomposed like the args (its nested fragment StringC
+    ; does not survive the struct round-trip either).
+    msg_number: u32
+    msg_text: StringC
+    msg_sev: int
+    loc: Location
+    a0_kind: int
+    a0_str: StringC
+    a0_num: u64
+    a0_vec: pointer[Array[StringC]]
+    a1_kind: int
+    a1_str: StringC
+    a1_num: u64
+    a1_vec: pointer[Array[StringC]]
+    a2_kind: int
+    a2_str: StringC
+    a2_num: u64
+    a2_vec: pointer[Array[StringC]]
+    ; message() (the count-only err path) produces no output when released.
+    silent: bool
+    has_aux: bool
+    aux_text: StringC
+    aux_loc: Location
+)
+
 define ParserState
 (
     host: pointer[Page]
@@ -182,6 +233,19 @@ define ParserState
     messages: Array[Message]
     n_messages: u32
     n_errors: u32
+    ; keepMessages/releaseKeptMessages/discardKeptMessages (Messenger): while
+    ; keeping_messages, report*/message() land in kept_messages instead of the
+    ; stderr stream + counters. n_kept tracks the live prefix (put/add reuse).
+    keeping_messages: bool
+    kept_messages: Array[KeptMessage]
+    n_kept: size_t
+    ; pcdataRecovering_ (ParserState.cxx): data was reported not-allowed once;
+    ; suppress further pcdataNotAllowed until an element is pushed or popped.
+    pcdata_recovering: bool
+    ; markedSectionStartLocation_ — one Location per open marked section (the
+    ; MDO of its `<![`), feeding unclosedMarkedSection's auxiliary line.
+    ms_start_locations: Array[Location]
+    n_ms_start_locations: size_t
     ; --- error-limit abort (ErrorCountEventHandler): once n_errors reaches the
     ;     limit (DEFAULT_ERROR_LIMIT = 200) the parse is CANCELLED — the content
     ;     loop stops immediately without closing the open elements or emitting the
@@ -269,6 +333,12 @@ define ParserState
         set ps.messages: Array[Message]^host()
         set ps.n_messages: 0 as u32
         set ps.n_errors: 0 as u32
+        set ps.keeping_messages: false
+        set ps.kept_messages: Array[KeptMessage]^host()
+        set ps.n_kept: 0
+        set ps.pcdata_recovering: false
+        set ps.ms_start_locations: Array[Location]^host()
+        set ps.n_ms_start_locations: 0
         set ps.cancelled: false
         set ps.events: Array[pointer[Event]]^host()
         set ps.os_state: Array[int]^host()
@@ -436,14 +506,57 @@ define ParserState
     function push_element_mode(this: pointer[ParserState], e: pointer[OpenElement])
     {
         this.content_state.push_element(e)
-        set this.current_mode: this.content_state.content_mode()
+        set this.pcdata_recovering: false
+        ; the start tag of this element may have been implied by data inside a
+        ; cdata or rcdata marked section (ParserState::pushElement) — the mode
+        ; stays the section's special mode then. A CDATA/RCDATA-content element
+        ; enters its own special parse: entity ends inside it are diagnosed
+        ; (specialParseEntityEnd) until the level unwinds.
+        if this.marked_section_special_level = (0 as u32)
+        {
+            set this.current_mode: this.content_state.content_mode()
+            if e.requires_special_parse()
+            {
+                set this.special_parse_mode: this.current_mode
+                set this.special_parse_input_level: this.input_level
+            }
+        }
+    }
+
+    ; popSaveElement (ParserState.cxx) — pop, restore the enclosing content
+    ; mode, leave any element-level special parse, and return the element (the
+    ; OMITTAG undo machinery re-pushes it on rollback).
+    function pop_save_element_mode(this: pointer[ParserState]) returns pointer[OpenElement]
+    {
+        let e this.content_state.pop_save_element()
+        if this.marked_section_special_level = (0 as u32)
+        {
+            set this.current_mode: this.content_state.content_mode()
+            set this.special_parse_input_level: 0 as u32
+        }
+        set this.pcdata_recovering: false
+        e
     }
 
     function pop_element_mode(this: pointer[ParserState])
     {
-        this.content_state.pop_element()
-        set this.current_mode: this.content_state.content_mode()
+        let discard this.pop_save_element_mode()
     }
+
+    ; PCDATA was encountered where it is not allowed (acceptPcdata failed):
+    ; switch to the mixed-content mode so subsequent data chars tokenize as
+    ; data, and suppress further pcdataNotAllowed until an element pushes/pops.
+    function pcdata_recover(this: pointer[ParserState])
+    {
+        if this.current_mode = econMode
+            set this.current_mode: mconMode
+        else if this.current_mode = econnetMode
+            set this.current_mode: mconnetMode
+        set this.pcdata_recovering: true
+    }
+
+    function is_pcdata_recovering(this: ParserState) returns bool
+        pcdata_recovering
 
     ; startInstance (slice): switch to the instance syntax, build the synthetic
     ; document-element container, enter econMode, mark the content phase.
@@ -629,6 +742,9 @@ define ParserState
         ins.here_location()
     }
 
+    function get_special_parse_input_level(this: ParserState) returns u32
+        special_parse_input_level
+
     function get_input_level(this: ParserState) returns u32
         input_level
 
@@ -737,27 +853,44 @@ define ParserState
         this.undefined_entities.add(ent)
 
     ; ---- marked-section state machine (ParserState.cxx) -------------------
-    ; The start-location stack (markedSectionStartLocation_) is deferred — it
-    ; only feeds the unclosed-marked-section diagnostic. contentMode() reads the
-    ; live content head.
+    ; markedSectionStartLocation_ tracks each open section's MDO for the
+    ; unclosedMarkedSection auxiliary. contentMode() reads the live content head.
     function get_marked_section_level(this: ParserState) returns u32
         marked_section_level
 
     function get_marked_section_special_level(this: ParserState) returns u32
         marked_section_special_level
 
-    function start_marked_section(this: pointer[ParserState])
+    function push_ms_start_location(this: pointer[ParserState], loc: Location)
+    {
+        if this.n_ms_start_locations < this.ms_start_locations.get_length()
+            this.ms_start_locations.put(this.n_ms_start_locations, loc)
+        else
+            this.ms_start_locations.add(loc)
+        set this.n_ms_start_locations: this.n_ms_start_locations + (1 as size_t)
+    }
+
+    function current_marked_section_start_location(this: ParserState) returns Location
+    {
+        if n_ms_start_locations = (0 as size_t)
+            return Location()
+        *(ms_start_locations.get_buffer() + (n_ms_start_locations - (1 as size_t)))
+    }
+
+    function start_marked_section(this: pointer[ParserState], loc: Location)
     {
         set this.marked_section_level: this.marked_section_level + (1 as u32)
+        this.push_ms_start_location(loc)
         if this.current_mode = dsMode
             set this.current_mode: dsiMode
         if this.marked_section_special_level > (0 as u32)
             set this.marked_section_special_level: this.marked_section_special_level + (1 as u32)
     }
 
-    function start_special_marked_section(this: pointer[ParserState], mode: int)
+    function start_special_marked_section(this: pointer[ParserState], mode: int, loc: Location)
     {
         set this.marked_section_level: this.marked_section_level + (1 as u32)
+        this.push_ms_start_location(loc)
         set this.special_parse_input_level: this.input_level
         set this.marked_section_special_level: 1 as u32
         set this.special_parse_mode: mode
@@ -767,6 +900,8 @@ define ParserState
     function end_marked_section(this: pointer[ParserState])
     {
         set this.marked_section_level: this.marked_section_level - (1 as u32)
+        if this.n_ms_start_locations > (0 as size_t)
+            set this.n_ms_start_locations: this.n_ms_start_locations - (1 as size_t)
         if this.marked_section_special_level > (0 as u32)
         {
             set this.marked_section_special_level: this.marked_section_special_level - (1 as u32)
@@ -1000,6 +1135,12 @@ define ParserState
     {
         var msg Message(type, Location())
         this.init_message(&msg)
+        if this.keeping_messages
+        {
+            let args Vector[MessageArg]()
+            this.keep_message(type, args, msg.get_loc(), true, false, StringC(), Location())
+            return
+        }
         this.dispatch_message(msg)
     }
 
@@ -1010,6 +1151,11 @@ define ParserState
     {
         var msg Message(type, Location())
         this.init_message(&msg)
+        if this.keeping_messages
+        {
+            this.keep_message(type, args, msg.get_loc(), false, false, StringC(), Location())
+            return
+        }
         this.emit_message(&msg, args)
         this.dispatch_message(msg)
     }
@@ -1018,6 +1164,11 @@ define ParserState
     ; start tag's) rather than the current scan cursor — Messenger::setNextLocation.
     function report_at(this: pointer[ParserState], type: MessageType, args: Vector[MessageArg], loc: Location)
     {
+        if this.keeping_messages
+        {
+            this.keep_message(type, args, loc, false, false, StringC(), Location())
+            return
+        }
         var msg Message(type, loc)
         this.emit_message(&msg, args)
         this.dispatch_message(msg)
@@ -1030,10 +1181,239 @@ define ParserState
     ; pointing at the open element's start location. Counts as ONE message.
     function report_aux(this: pointer[ParserState], type: MessageType, args: Vector[MessageArg], loc: Location, aux_text: StringC, aux_loc: Location)
     {
+        if this.keeping_messages
+        {
+            this.keep_message(type, args, loc, false, true, aux_text, aux_loc)
+            return
+        }
         var msg Message(type, loc)
         this.emit_message(&msg, args)
         this.emit_aux_line(aux_text, args, aux_loc)
         this.dispatch_message(msg)
+    }
+
+    ; ---- keepMessages / releaseKeptMessages / discardKeptMessages ----------
+    ; (Messenger, Message.cxx) — buffer diagnostics while the parser speculates.
+    function keep_messages(this: pointer[ParserState])
+        set this.keeping_messages: true
+
+    function keep_message(this: pointer[ParserState], type: MessageType, args: Vector[MessageArg], loc: Location, silent: bool, has_aux: bool, aux_text: StringC, aux_loc: Location)
+    {
+        var km KeptMessage()
+        set km.msg_number: type.fragment.number
+        ; the table accessor's text (and any fired arg) is REGION-TRANSIENT —
+        ; valid at fire time, reused by release time. Pin every kept StringC
+        ; on the parser's page.
+        let hp this.host
+        let ttxt type.get_text()
+        set km.msg_text: StringC^hp(ttxt.data_ptr(), ttxt.get_size())
+        var sev_code KS_ERROR
+        choose type.severity
+            when x: Severity.Info
+                set sev_code: KS_INFO
+            when x: Severity.Warning
+                set sev_code: KS_WARNING
+            when x: Severity.QuantityError
+                set sev_code: KS_QUANTITY
+            when x: Severity.IdrefError
+                set sev_code: KS_IDREF
+            else
+                set sev_code: KS_ERROR
+        set km.msg_sev: sev_code
+        set km.loc: loc
+        set km.a0_kind: KA_NONE
+        set km.a1_kind: KA_NONE
+        set km.a2_kind: KA_NONE
+        var n args.length
+        if n > (3 as size_t)
+            set n: 3 as size_t
+        if n > (0 as size_t)
+        {
+            let a *args.get(0 as size_t)
+            choose a
+                when s: MessageArg.Str
+                {
+                    set km.a0_kind: KA_STR
+                    set km.a0_str: StringC^hp(s.data_ptr(), s.get_size())
+                }
+                when nu: MessageArg.Num
+                {
+                    set km.a0_kind: KA_NUM
+                    set km.a0_num: nu
+                }
+                when o: MessageArg.Ord
+                {
+                    set km.a0_kind: KA_ORD
+                    set km.a0_num: o
+                }
+                when v: MessageArg.Vec
+                {
+                    set km.a0_kind: KA_VEC
+                    set km.a0_vec: v
+                }
+                when r: MessageArg.Raw
+                {
+                    set km.a0_kind: KA_RAW
+                    set km.a0_str: StringC^hp(r.data_ptr(), r.get_size())
+                }
+        }
+        if n > (1 as size_t)
+        {
+            let a *args.get(1 as size_t)
+            choose a
+                when s: MessageArg.Str
+                {
+                    set km.a1_kind: KA_STR
+                    set km.a1_str: StringC^hp(s.data_ptr(), s.get_size())
+                }
+                when nu: MessageArg.Num
+                {
+                    set km.a1_kind: KA_NUM
+                    set km.a1_num: nu
+                }
+                when o: MessageArg.Ord
+                {
+                    set km.a1_kind: KA_ORD
+                    set km.a1_num: o
+                }
+                when v: MessageArg.Vec
+                {
+                    set km.a1_kind: KA_VEC
+                    set km.a1_vec: v
+                }
+                when r: MessageArg.Raw
+                {
+                    set km.a1_kind: KA_RAW
+                    set km.a1_str: StringC^hp(r.data_ptr(), r.get_size())
+                }
+        }
+        if n > (2 as size_t)
+        {
+            let a *args.get(2 as size_t)
+            choose a
+                when s: MessageArg.Str
+                {
+                    set km.a2_kind: KA_STR
+                    set km.a2_str: StringC^hp(s.data_ptr(), s.get_size())
+                }
+                when nu: MessageArg.Num
+                {
+                    set km.a2_kind: KA_NUM
+                    set km.a2_num: nu
+                }
+                when o: MessageArg.Ord
+                {
+                    set km.a2_kind: KA_ORD
+                    set km.a2_num: o
+                }
+                when v: MessageArg.Vec
+                {
+                    set km.a2_kind: KA_VEC
+                    set km.a2_vec: v
+                }
+                when r: MessageArg.Raw
+                {
+                    set km.a2_kind: KA_RAW
+                    set km.a2_str: StringC^hp(r.data_ptr(), r.get_size())
+                }
+        }
+        set km.silent: silent
+        set km.has_aux: has_aux
+        set km.aux_text: StringC^hp(aux_text.data_ptr(), aux_text.get_size())
+        set km.aux_loc: aux_loc
+        if this.n_kept < this.kept_messages.get_length()
+            this.kept_messages.put(this.n_kept, km)
+        else
+            this.kept_messages.add(km)
+        set this.n_kept: this.n_kept + (1 as size_t)
+    }
+
+    function discard_kept_messages(this: pointer[ParserState])
+    {
+        set this.keeping_messages: false
+        set this.n_kept: 0
+    }
+
+    function release_kept_messages(this: pointer[ParserState])
+    {
+        set this.keeping_messages: false
+        var i: size_t 0
+        while i < this.n_kept
+        {
+            ; access the entry through a POINTER — a by-value load of the wide
+            ; struct does not round-trip (see the decomposed-args note above).
+            let km this.kept_messages.get_buffer() + i
+            var n_args: size_t 0
+            if km.a0_kind <> KA_NONE
+                set n_args: 1
+            if km.a1_kind <> KA_NONE
+                set n_args: 2
+            if km.a2_kind <> KA_NONE
+                set n_args: 3
+            var args Vector[MessageArg](n_args)
+            ; rebuild each slot with a DIRECT construction — a MessageArg
+            ; returned from a helper reads as a local-page reference to the
+            ; escape checker when stored through the vector pointer.
+            if n_args > (0 as size_t)
+            {
+                if km.a0_kind = KA_STR
+                    set *(args.get(0 as size_t)): MessageArg.Str(km.a0_str)
+                else if km.a0_kind = KA_NUM
+                    set *(args.get(0 as size_t)): MessageArg.Num(km.a0_num)
+                else if km.a0_kind = KA_ORD
+                    set *(args.get(0 as size_t)): MessageArg.Ord(km.a0_num)
+                else if km.a0_kind = KA_VEC
+                    set *(args.get(0 as size_t)): MessageArg.Vec(km.a0_vec)
+                else
+                    set *(args.get(0 as size_t)): MessageArg.Raw(km.a0_str)
+            }
+            if n_args > (1 as size_t)
+            {
+                if km.a1_kind = KA_STR
+                    set *(args.get(1 as size_t)): MessageArg.Str(km.a1_str)
+                else if km.a1_kind = KA_NUM
+                    set *(args.get(1 as size_t)): MessageArg.Num(km.a1_num)
+                else if km.a1_kind = KA_ORD
+                    set *(args.get(1 as size_t)): MessageArg.Ord(km.a1_num)
+                else if km.a1_kind = KA_VEC
+                    set *(args.get(1 as size_t)): MessageArg.Vec(km.a1_vec)
+                else
+                    set *(args.get(1 as size_t)): MessageArg.Raw(km.a1_str)
+            }
+            if n_args > (2 as size_t)
+            {
+                if km.a2_kind = KA_STR
+                    set *(args.get(2 as size_t)): MessageArg.Str(km.a2_str)
+                else if km.a2_kind = KA_NUM
+                    set *(args.get(2 as size_t)): MessageArg.Num(km.a2_num)
+                else if km.a2_kind = KA_ORD
+                    set *(args.get(2 as size_t)): MessageArg.Ord(km.a2_num)
+                else if km.a2_kind = KA_VEC
+                    set *(args.get(2 as size_t)): MessageArg.Vec(km.a2_vec)
+                else
+                    set *(args.get(2 as size_t)): MessageArg.Raw(km.a2_str)
+            }
+            var sev Severity.Error
+            if km.msg_sev = KS_INFO
+                set sev: Severity.Info
+            else if km.msg_sev = KS_WARNING
+                set sev: Severity.Warning
+            else if km.msg_sev = KS_QUANTITY
+                set sev: Severity.QuantityError
+            else if km.msg_sev = KS_IDREF
+                set sev: Severity.IdrefError
+            let mt MessageType(MessageFragment(km.msg_number, km.msg_text), sev)
+            var msg Message(mt, km.loc)
+            if km.silent = false
+            {
+                this.emit_message(&msg, args)
+                if km.has_aux
+                    this.emit_aux_line(km.aux_text, args, km.aux_loc)
+            }
+            this.dispatch_message(msg)
+            set i: i + (1 as size_t)
+        }
+        set this.n_kept: 0
     }
 
     ; errorLimitExceeded (ParserApp.cxx): emitted once, after the parse, iff the
