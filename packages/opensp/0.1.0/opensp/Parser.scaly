@@ -3,6 +3,7 @@ use scaly.containers.Array
 use scaly.containers.String
 use scaly.io.Path
 use opensp.StringC.StringC
+use opensp.ISet.ISet
 use opensp.Location.Location
 use opensp.Location.Origin
 use opensp.Location.InputSource
@@ -42,6 +43,7 @@ use opensp.Esis.Esis
 use opensp.Recognizer.Recognizer
 use opensp.ModeInfo.ModeInfo
 use opensp.ModeInfo.PackedTokenInfo
+use opensp.ModeInfo.TokenInfo
 use opensp.Message.MessageType
 use opensp.Message.MessageFragment
 use opensp.Message.MessageArg
@@ -651,6 +653,46 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.report_at(mt, args, loc)
     }
 
+    ; E2 with both args pre-rendered (unquoted) — the *InvalidToken messages,
+    ; whose args (TokenMessageArg / Allowed*MessageArg) mix quoted delimiter
+    ; text with unquoted fragment text; the quotes are already IN the strings.
+    function report_raw_raw_at(this: Parser, mt: MessageType, a1: StringC, a2: StringC, loc: Location)
+    {
+        var args Vector[MessageArg](2 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Raw(a1)
+        set *(args.get(1 as size_t)): MessageArg.Raw(a2)
+        ps.report_at(mt, args, loc)
+    }
+
+    ; E2 with %1 String (quoted), %2 pre-rendered (unquoted) —
+    ; markupDeclarationCharacter / groupCharacter (char, allowed list).
+    function report_str_raw_at(this: Parser, mt: MessageType, a1: StringC, a2: StringC, loc: Location)
+    {
+        var args Vector[MessageArg](2 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Str(a1)
+        set *(args.get(1 as size_t)): MessageArg.Raw(a2)
+        ps.report_at(mt, args, loc)
+    }
+
+    ; report0 WITH an auxiliary line at aux_loc — commentEntityEnd
+    ; ("comment started here" at the COM that opened the comment).
+    function report0_aux(this: Parser, mt: MessageType, loc: Location, aux: MessageFragment, aux_loc: Location)
+    {
+        let args Vector[MessageArg]()
+        let aux_text aux.text
+        ps.report_aux(mt, args, loc, aux_text, aux_loc)
+    }
+
+    ; report1 with a RAW %1 plus an auxiliary line — commentDeclInvalidToken
+    ; (TokenMessageArg %1, "comment declaration started here" at the MDO).
+    function report_raw_aux(this: Parser, mt: MessageType, a1: StringC, loc: Location, aux: MessageFragment, aux_loc: Location)
+    {
+        var args Vector[MessageArg](1 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Raw(a1)
+        let aux_text aux.text
+        ps.report_aux(mt, args, loc, aux_text, aux_loc)
+    }
+
     ; report1 at a location WITH an auxiliary "start tag was here"-style line at
     ; aux_loc (the omitted-end-tag diagnostics). %1 is the String a1 (quoted).
     ; `aux` is the companion fragment from the table (e.g. omitEndTagOmittag_aux()).
@@ -664,19 +706,528 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
     ; reportNonSgmlCharacter (parseCommon.cxx) in a markup-declaration context
     ; (parseParam / parseGroupToken / parseGroupConnector): if the unrecognized
-    ; token is a non-SGML character, report it. Our scanner admits C0/DEL as
-    ; sgmlChar, so such a char reaches the tokenUnrecognized arms; the reference
-    ; skips it and continues, we then fail the declaration and recover to the same
-    ; ESIS — only the diagnostic was owed.
-    function report_non_sgml_param(this: Parser)
+    ; token is a non-SGML character, report it and return true — the caller then
+    ; CONTINUES its loop (the reference `break`s); only a genuine SGML character
+    ; falls through to the context's own invalid-character message.
+    function report_non_sgml_param(this: Parser) returns bool
     {
-        let pc ps.current_input().current_char()
+        let ins ps.current_input()
+        ; the unrecognized token has length 0 — CONSUME the offending character
+        ; (the reference's getChar()), so the caller's loop moves past it and
+        ; currentToken() carries it into the invalid-character message.
+        if ins.current_token_length() = (0 as size_t)
+            ins.end_token(1 as size_t)
+        let pc ins.current_char()
         if this.is_non_sgml_char(pc)
         {
             let mt ParserMessages.nonSgmlCharacter()
-            let loc ps.current_input().token_start_location()
+            let loc ins.token_start_location()
             this.report_num_at(mt, pc as u64, loc)
+            return true
         }
+        false
+    }
+
+    ; ---- message-argument builders (TokenMessageArg.cxx / Param.cxx /
+    ; Group.cxx) -------------------------------------------------------------
+    ; The reference renders these args through MessageBuilder: appendChars
+    ; output is QUOTED, appendFragment output (catalog fragments 1000+) is not.
+    ; Here each arg is pre-rendered into a StringC with the quotes inline and
+    ; passed as MessageArg.Raw.
+
+    function arg_append(this: Parser, buf: pointer[Array[u32]], s: StringC)
+    {
+        let n s.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            let c s.get(i)
+            buf.add(c)
+            set i: i + 1
+        }
+    }
+
+    ; appendChars — quoted text.
+    function arg_append_quoted(this: Parser, buf: pointer[Array[u32]], s: StringC)
+    {
+        buf.add(0x22 as u32)
+        this.arg_append(buf, s)
+        buf.add(0x22 as u32)
+    }
+
+    ; the characters of a general delimiter, appended bare.
+    function append_delim_chars(this: Parser, buf: pointer[Array[u32]], d: int)
+    {
+        let syn ps.get_syntax()
+        let n syn.delim_general_len(d)
+        var i: size_t 0
+        while i < n
+        {
+            let c syn.delim_general_char(d, i)
+            buf.add(c)
+            set i: i + 1
+        }
+    }
+
+    ; delimStart fragment + the delimiter's text (quoted): `delimiter "X"`.
+    function arg_append_delim(this: Parser, buf: pointer[Array[u32]], d: int)
+    {
+        this.arg_append(buf, StringC("delimiter "))
+        buf.add(0x22 as u32)
+        this.append_delim_chars(buf, d)
+        buf.add(0x22 as u32)
+    }
+
+    ; listSep fragment.
+    function arg_append_sep(this: Parser, buf: pointer[Array[u32]], first: pointer[bool])
+    {
+        if *first
+        {
+            set *first: false
+            return
+        }
+        this.arg_append(buf, StringC(", "))
+    }
+
+    function arg_to_string(this: Parser, buf: pointer[Array[u32]]) returns StringC
+        StringC^host(buf.get_buffer(), buf.get_length())
+
+    ; the canonical (reference concrete syntax) spelling of a reserved name —
+    ; Syntax::reservedName(i); the inverse of lookup_reserved_name.
+    function reserved_name_spelling(this: Parser, rn: int) returns StringC
+    {
+        if rn = R_ALL
+            return StringC("ALL")
+        if rn = R_ANY
+            return StringC("ANY")
+        if rn = R_ATTLIST
+            return StringC("ATTLIST")
+        if rn = R_CDATA
+            return StringC("CDATA")
+        if rn = R_CONREF
+            return StringC("CONREF")
+        if rn = R_CURRENT
+            return StringC("CURRENT")
+        if rn = R_DATA
+            return StringC("DATA")
+        if rn = R_DEFAULT
+            return StringC("DEFAULT")
+        if rn = R_DOCTYPE
+            return StringC("DOCTYPE")
+        if rn = R_ELEMENT
+            return StringC("ELEMENT")
+        if rn = R_EMPTY
+            return StringC("EMPTY")
+        if rn = R_ENDTAG
+            return StringC("ENDTAG")
+        if rn = R_ENTITIES
+            return StringC("ENTITIES")
+        if rn = R_ENTITY
+            return StringC("ENTITY")
+        if rn = R_FIXED
+            return StringC("FIXED")
+        if rn = R_ID
+            return StringC("ID")
+        if rn = R_IDLINK
+            return StringC("IDLINK")
+        if rn = R_IDREF
+            return StringC("IDREF")
+        if rn = R_IDREFS
+            return StringC("IDREFS")
+        if rn = R_IGNORE
+            return StringC("IGNORE")
+        if rn = R_IMPLICIT
+            return StringC("IMPLICIT")
+        if rn = R_IMPLIED
+            return StringC("IMPLIED")
+        if rn = R_INCLUDE
+            return StringC("INCLUDE")
+        if rn = R_INITIAL
+            return StringC("INITIAL")
+        if rn = R_LINK
+            return StringC("LINK")
+        if rn = R_LINKTYPE
+            return StringC("LINKTYPE")
+        if rn = R_MD
+            return StringC("MD")
+        if rn = R_MS
+            return StringC("MS")
+        if rn = R_NAME
+            return StringC("NAME")
+        if rn = R_NAMES
+            return StringC("NAMES")
+        if rn = R_NDATA
+            return StringC("NDATA")
+        if rn = R_NMTOKEN
+            return StringC("NMTOKEN")
+        if rn = R_NMTOKENS
+            return StringC("NMTOKENS")
+        if rn = R_NOTATION
+            return StringC("NOTATION")
+        if rn = R_NUMBER
+            return StringC("NUMBER")
+        if rn = R_NUMBERS
+            return StringC("NUMBERS")
+        if rn = R_NUTOKEN
+            return StringC("NUTOKEN")
+        if rn = R_NUTOKENS
+            return StringC("NUTOKENS")
+        if rn = R_O
+            return StringC("O")
+        if rn = R_PCDATA
+            return StringC("PCDATA")
+        if rn = R_PI
+            return StringC("PI")
+        if rn = R_POSTLINK
+            return StringC("POSTLINK")
+        if rn = R_PUBLIC
+            return StringC("PUBLIC")
+        if rn = R_RCDATA
+            return StringC("RCDATA")
+        if rn = R_RE
+            return StringC("RE")
+        if rn = R_REQUIRED
+            return StringC("REQUIRED")
+        if rn = R_RESTORE
+            return StringC("RESTORE")
+        if rn = R_RS
+            return StringC("RS")
+        if rn = R_SDATA
+            return StringC("SDATA")
+        if rn = R_SHORTREF
+            return StringC("SHORTREF")
+        if rn = R_SIMPLE
+            return StringC("SIMPLE")
+        if rn = R_SPACE
+            return StringC("SPACE")
+        if rn = R_STARTTAG
+            return StringC("STARTTAG")
+        if rn = R_SUBDOC
+            return StringC("SUBDOC")
+        if rn = R_SYSTEM
+            return StringC("SYSTEM")
+        if rn = R_TEMP
+            return StringC("TEMP")
+        if rn = R_USELINK
+            return StringC("USELINK")
+        if rn = R_USEMAP
+            return StringC("USEMAP")
+        StringC()
+    }
+
+    ; TokenMessageArg::append (TokenMessageArg.cxx): render a token as
+    ; `delimiter "X"` / a character-class fragment / `entity end`, resolved
+    ; through the mode's token table against the live syntax.
+    function token_message_arg(this: Parser, token: u32, mode: int) returns StringC
+    {
+        if token >= tokenFirstShortref
+            return StringC("short reference delimiter")
+        if token = tokenEe
+            return StringC("entity end")
+        let buf Array[u32]^host()
+        let table ModeInfo.build_table(host)
+        let sdv *ps.get_sd()
+        var mi ModeInfo(mode, sdv, table)
+        var info TokenInfo()
+        var scanning true
+        while scanning and mi.next_token(&info)
+        {
+            if info.token = token
+            {
+                set scanning: false
+                if (info.kind = TT_DELIM) or (info.kind = TT_DELIMDELIM) or (info.kind = TT_DELIMSET)
+                    this.arg_append_delim(buf, info.delim1)
+                else if info.kind = TT_SET
+                {
+                    if info.set_idx = setDigit
+                        this.arg_append(buf, StringC("digit"))
+                    else if info.set_idx = setNameStart
+                        this.arg_append(buf, StringC("name start character"))
+                    else if info.set_idx = setSepchar
+                        this.arg_append(buf, StringC("sepchar"))
+                    else if info.set_idx = setS
+                        this.arg_append(buf, StringC("separator"))
+                    else if info.set_idx = setNmchar
+                        this.arg_append(buf, StringC("name character"))
+                    else if info.set_idx = setSgmlChar
+                        this.arg_append(buf, StringC("data character"))
+                    else if info.set_idx = setMinimumData
+                        this.arg_append(buf, StringC("minimum data character"))
+                    else if info.set_idx = setSignificant
+                        this.arg_append(buf, StringC("significant character"))
+                }
+                else if info.kind = TT_FUNCTION
+                {
+                    if info.func_idx = fRE
+                        this.arg_append(buf, StringC("record end character"))
+                    else if info.func_idx = fRS
+                        this.arg_append(buf, StringC("record start character"))
+                    else if info.func_idx = fSPACE
+                        this.arg_append(buf, StringC("space character"))
+                }
+            }
+        }
+        this.arg_to_string(buf)
+    }
+
+    ; AllowedParamsMessageArg::append (Param.cxx): the "only ..." list of
+    ; paramInvalidToken / markupDeclarationCharacter.
+    function allowed_params_message_arg(this: Parser, allow: pointer[AllowedParams]) returns StringC
+    {
+        let buf Array[u32]^host()
+        var first true
+        if allow.mdc_ok
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append_delim(buf, dMDC)
+        }
+        if allow.dso_ok
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append_delim(buf, dDSO)
+        }
+        if allow.main_mode = mdMinusMode
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append_delim(buf, dMINUS)
+        }
+        else if allow.main_mode = mdPeroMode
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append_delim(buf, dPERO)
+        }
+        if allow.inclusions_ok
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("inclusions"))
+        }
+        if allow.exclusions_ok
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("exclusions"))
+        }
+        if allow.literal_type = P_MINIMUMLITERAL
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("minimum literal"))
+        }
+        else if (allow.literal_type = P_ATTRIBUTEVALUELITERAL) or (allow.literal_type = P_TOKENIZEDATTRIBUTEVALUELITERAL)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("attribute value literal"))
+        }
+        else if allow.literal_type = P_SYSTEMIDENTIFIER
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("system identifier"))
+        }
+        else if allow.literal_type = P_PARAMLITERAL
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("parameter literal"))
+        }
+        if (allow.name_start_type = P_NAME) or (allow.name_start_type = P_ENTITYNAME) or (allow.name_start_type = P_PARAMENTITYNAME)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("name"))
+        }
+        else if allow.name_start_type = P_ATTRIBUTEVALUE
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("attribute value"))
+        }
+        if allow.digit_type = P_NUMBER
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("number"))
+        }
+        if allow.rni_ok or (allow.name_start_type = P_RESERVED_NAME)
+        {
+            var i 0
+            while i < N_NAMES
+            {
+                if (*(allow.reserved_names + (i as size_t))) <> (0 as u8)
+                {
+                    this.arg_append_sep(buf, &first)
+                    buf.add(0x22 as u32)
+                    if allow.rni_ok
+                    {
+                        let syn ps.get_syntax()
+                        let rl syn.delim_general_len(dRNI)
+                        var j: size_t 0
+                        while j < rl
+                        {
+                            let rc syn.delim_general_char(dRNI, j)
+                            buf.add(rc)
+                            set j: j + 1
+                        }
+                    }
+                    let spell this.reserved_name_spelling(i)
+                    this.arg_append(buf, spell)
+                    buf.add(0x22 as u32)
+                }
+                set i: i + 1
+            }
+        }
+        this.arg_to_string(buf)
+    }
+
+    ; AllowedGroupTokensMessageArg::append (Group.cxx). NB the reference never
+    ; clears `first` in the #PCDATA/#ALL/#IMPLICIT arms — reproduced faithfully
+    ; (only visible when no fragment precedes them, where it drops a listSep).
+    function allowed_group_tokens_message_arg(this: Parser, allow: int) returns StringC
+    {
+        let buf Array[u32]^host()
+        var first true
+        if this.has_gt(allow, GT_DATATAGLITERAL)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("parameter literal"))
+        }
+        if this.has_gt(allow, GT_DATATAGGROUP)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("data tag group"))
+        }
+        if this.has_gt(allow, GT_MODELGROUP)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("model group"))
+        }
+        else if this.has_gt(allow, GT_DATATAGTEMPLATEGROUP)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("data tag template group"))
+        }
+        if this.has_gt(allow, GT_ELEMENTTOKEN)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("element token"))
+        }
+        else if this.has_gt(allow, GT_NAMETOKEN)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("name token"))
+        }
+        else if this.has_gt(allow, GT_NAME)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append(buf, StringC("name"))
+        }
+        let syn ps.get_syntax()
+        if this.has_gt(allow, GT_PCDATA)
+        {
+            if first = false
+                this.arg_append(buf, StringC(", "))
+            buf.add(0x22 as u32)
+            let rl syn.delim_general_len(dRNI)
+            var j: size_t 0
+            while j < rl
+            {
+                let rc syn.delim_general_char(dRNI, j)
+                buf.add(rc)
+                set j: j + 1
+            }
+            let ps_spell this.reserved_name_spelling(R_PCDATA)
+            this.arg_append(buf, ps_spell)
+            buf.add(0x22 as u32)
+        }
+        if this.has_gt(allow, GT_ALL)
+        {
+            if first = false
+                this.arg_append(buf, StringC(", "))
+            buf.add(0x22 as u32)
+            let rl syn.delim_general_len(dRNI)
+            var j: size_t 0
+            while j < rl
+            {
+                let rc syn.delim_general_char(dRNI, j)
+                buf.add(rc)
+                set j: j + 1
+            }
+            let all_spell this.reserved_name_spelling(R_ALL)
+            this.arg_append(buf, all_spell)
+            buf.add(0x22 as u32)
+        }
+        if this.has_gt(allow, GT_IMPLICIT)
+        {
+            if first = false
+                this.arg_append(buf, StringC(", "))
+            buf.add(0x22 as u32)
+            let rl syn.delim_general_len(dRNI)
+            var j: size_t 0
+            while j < rl
+            {
+                let rc syn.delim_general_char(dRNI, j)
+                buf.add(rc)
+                set j: j + 1
+            }
+            let imp_spell this.reserved_name_spelling(R_IMPLICIT)
+            this.arg_append(buf, imp_spell)
+            buf.add(0x22 as u32)
+        }
+        this.arg_to_string(buf)
+    }
+
+    ; AllowedGroupConnectorsMessageArg::append (Group.cxx): AND, OR, SEQ,
+    ; GRPC, DTGC in that order, each as `delimiter "X"`.
+    function allowed_group_connectors_message_arg(this: Parser, allow: int) returns StringC
+    {
+        let buf Array[u32]^host()
+        var first true
+        if this.has_gc(allow, GC_AND)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append_delim(buf, dAND)
+        }
+        if this.has_gc(allow, GC_OR)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append_delim(buf, dOR)
+        }
+        if this.has_gc(allow, GC_SEQ)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append_delim(buf, dSEQ)
+        }
+        if this.has_gc(allow, GC_GRPC)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append_delim(buf, dGRPC)
+        }
+        if this.has_gc(allow, GC_DTGC)
+        {
+            this.arg_append_sep(buf, &first)
+            this.arg_append_delim(buf, dDTGC)
+        }
+        this.arg_to_string(buf)
+    }
+
+    ; paramInvalidToken (parseParam.cxx:271) — `%1 invalid: only %2 and
+    ; parameter separators are allowed`; suppressed for silent allow sets.
+    function param_invalid_token(this: Parser, token: u32, allow: pointer[AllowedParams])
+    {
+        if allow.silent
+            return
+        let a1 this.token_message_arg(token, allow.main_mode)
+        let a2 this.allowed_params_message_arg(allow)
+        this.report_raw_raw_at(ParserMessages.paramInvalidToken(), a1, a2, ps.current_input().token_start_location())
+    }
+
+    ; groupTokenInvalidToken (parseParam.cxx:475).
+    function group_token_invalid_token(this: Parser, token: u32, allow: int)
+    {
+        let a1 this.token_message_arg(token, grpMode)
+        let a2 this.allowed_group_tokens_message_arg(allow)
+        this.report_raw_raw_at(ParserMessages.groupTokenInvalidToken(), a1, a2, ps.current_input().token_start_location())
+    }
+
+    ; groupConnectorInvalidToken (parseParam.cxx:589).
+    function group_connector_invalid_token(this: Parser, token: u32, allow: int)
+    {
+        let a1 this.token_message_arg(token, grpMode)
+        let a2 this.allowed_group_connectors_message_arg(allow)
+        this.report_raw_raw_at(ParserMessages.connectorInvalidToken(), a1, a2, ps.current_input().token_start_location())
     }
 
     function namelen(this: Parser) returns size_t
@@ -962,7 +1513,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if ps.get_input_level() = start_level
                 {
-                    this.err(1)
+                    ; literalLevel (parseCommon.cxx:86): the entity that opened
+                    ; the literal ended inside it.
+                    this.report0_at(ParserMessages.literalLevel(), ps.current_input().token_start_location())
                     set ok: false
                     set running: false
                 }
@@ -1056,9 +1609,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 ; STACKS the entity like a content reference; its chars then scan
                 ; as literal content (the tokenEe arm above pops it). This is how
                 ; `&lt;` inside an attribute value becomes a literal `<`.
+                ; The no-DTD guard has no reference counterpart (parseEntityReference
+                ; assumes a DTD): every literal mode that recognizes an ERO runs
+                ; inside a DOCTYPE declaration or an instance, where a DTD exists —
+                ; unreachable, kept only to protect lookup_entity from a null DTD.
                 if ps.get_current_dtd() = null
                 {
-                    this.err(2)
                     set ok: false
                     set running: false
                 }
@@ -1133,11 +1689,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 ; parameter entity -> `%pe;` inside a parameter literal STACKS the
                 ; PE like a content reference; its chars then scan as literal
                 ; content in the `e` variant (the tokenEe arm above pops it).
-                ; Parameter literals occur only in declarations, so the reference
-                ; is always valid for the corpus's external DTDs.
+                ; Parameter literals occur only in declarations, so a DTD always
+                ; exists; the null guard is unreachable (see the ERO arm above).
                 if ps.get_current_dtd() = null
                 {
-                    this.err(2)
                     set ok: false
                     set running: false
                 }
@@ -1266,30 +1821,39 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             let token ps.get_token(allow.main_mode)
             if token = tokenUnrecognized
             {
-                this.report_non_sgml_param()
-                this.err(3)
-                return false
+                ; a reported non-SGML character is skipped and the loop continues
+                ; (parseParam.cxx:27); an SGML character is a hard error.
+                if this.report_non_sgml_param() = false
+                {
+                    let ct ps.current_token()
+                    let a2 this.allowed_params_message_arg(allow)
+                    this.report_str_raw_at(ParserMessages.markupDeclarationCharacter(), ct, a2, ps.current_input().token_start_location())
+                    return false
+                }
             }
             else if token = tokenEe
             {
                 if ps.get_input_level() <= decl_input_level
                 {
-                    this.err(4)
+                    ; declarationLevel: the entity that opened the declaration
+                    ; ended inside a parameter separator.
+                    this.report0_at(ParserMessages.declarationLevel(), ps.current_input().token_start_location())
                     return false
                 }
                 ps.pop_input_stack()
             }
             else if token = tokenCom
             {
-                ; DEFERRED: comments inside markup declarations.
-                this.err(5)
-                return false
+                ; a comment in a parameter separator (parseParam.cxx:44): parse it
+                ; and continue; warnPsComment is option-gated (off by default).
+                if this.parse_comment(comMode) = false
+                    return false
             }
             else if token = tokenDso
             {
                 if allow.dso_ok = false
                 {
-                    this.err(6)
+                    this.param_invalid_token(tokenDso, allow)
                     return false
                 }
                 set parm.kind: P_DSO
@@ -1322,7 +1886,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else
                 {
-                    this.err(7)
+                    this.param_invalid_token(tokenGrpo, allow)
                     return false
                 }
             }
@@ -1332,7 +1896,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 set parm.lita: token = tokenLita
                 if allow.literal_type = P_INVALID
                 {
-                    this.err(8)
+                    this.param_invalid_token(token, allow)
                     return false
                 }
                 let txt host.allocate(sizeof Text, alignof Text) as pointer[Text]
@@ -1377,9 +1941,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if allow.mdc_ok = false
                 {
-                    this.err(9)
+                    this.param_invalid_token(tokenMdc, allow)
                     return false
                 }
+                ; parameterEntityNotEnded (parseParam.cxx:126): a PE referenced
+                ; in a parameter separator must end in the same declaration.
+                if ps.get_input_level() > decl_input_level
+                    this.report0_at(ParserMessages.parameterEntityNotEnded(), ps.current_input().token_start_location())
                 set parm.kind: P_MDC
                 return true
             }
@@ -1392,7 +1960,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if allow.exclusions_ok = false
                 {
-                    this.err(10)
+                    this.param_invalid_token(tokenMinusGrpo, allow)
                     return false
                 }
                 set parm.kind: P_EXCLUSIONS
@@ -1409,6 +1977,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 ; where a parameter is expected -> declReference stacks it; the
                 ; loop continues, reading the replacement text as the parameter
                 ; (the tokenEe arm above pops the entity when it is exhausted).
+                ; A name group in the reference (`%(`) is not allowed in the
+                ; prolog, where parse_param always runs (parseParam.cxx:153).
+                if token = tokenPeroGrpo
+                    this.report0_at(ParserMessages.peroGrpoProlog(), ps.current_input().token_start_location())
                 if this.parse_parameter_entity_reference() = false
                     return false
             }
@@ -1416,7 +1988,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if allow.inclusions_ok = false
                 {
-                    this.err(12)
+                    this.param_invalid_token(tokenPlusGrpo, allow)
                     return false
                 }
                 set parm.kind: P_INCLUSIONS
@@ -1426,7 +1998,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if allow.rni_ok = false
                 {
-                    this.err(13)
+                    this.param_invalid_token(tokenRni, allow)
                     return false
                 }
                 return this.parse_indicated_reserved_name(allow, parm)
@@ -1439,7 +2011,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if allow.name_start_type = P_INVALID
                 {
-                    this.err(14)
+                    this.param_invalid_token(tokenNameStart, allow)
                     return false
                 }
                 else if allow.name_start_type = P_RESERVED_NAME
@@ -1473,7 +2045,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     return this.parse_attribute_value_param(parm)
                 else
                 {
-                    this.err(15)
+                    ; every name-start type is handled above — the reference
+                    ; switch has no further case (CANNOT_HAPPEN).
                     return false
                 }
             }
@@ -1490,7 +2063,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     return this.parse_attribute_value_param(parm)
                 else
                 {
-                    this.err(16)
+                    this.param_invalid_token(tokenDigit, allow)
                     return false
                 }
             }
@@ -1500,13 +2073,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     return this.parse_attribute_value_param(parm)
                 else
                 {
-                    this.err(17)
+                    this.param_invalid_token(tokenLcUcNmchar, allow)
                     return false
                 }
             }
             else
             {
-                this.err(18)
+                ; the modes parse_param scans with produce no other token —
+                ; the reference's CANNOT_HAPPEN.
                 return false
             }
         }
@@ -1607,7 +2181,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return false
         if allow.reserved_name_allowed(rn) = false
         {
-            this.err(19)
+            ; invalidReservedName (parseParam.cxx:1019): arg = the CANONICAL
+            ; spelling (syntax().reservedName(rn)), not the scanned token.
+            let spell this.reserved_name_spelling(rn)
+            this.report1_at(ParserMessages.invalidReservedName(), spell, ps.current_input().token_start_location())
             return false
         }
         set parm.kind: P_RESERVED_NAME + rn
@@ -1639,7 +2216,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return false
         if allow.reserved_name_allowed(rn) = false
         {
-            this.err(21)
+            ; invalidReservedName (parseParam.cxx:1004): arg = currentToken(),
+            ; the scanned name as written (the RNI is a separate token).
+            let ct ps.current_token()
+            this.report1_at(ParserMessages.invalidReservedName(), ct, ps.current_input().token_start_location())
             return false
         }
         set parm.kind: P_INDICATED_RESERVED_NAME + rn
@@ -1653,7 +2233,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let first ins.token_char()
         if ps.get_syntax().is_name_start_character(first as u32) = false
         {
-            this.err(22)
+            ; rniNameStart (parseParam.cxx:1052).
+            this.report0_at(ParserMessages.rniNameStart(), ins.token_start_location())
             return false
         }
         this.extend_name_token(this.namelen(), ParserMessages.nameLength())
@@ -1661,7 +2242,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let rn this.lookup_reserved_name(buffer)
         if rn < 0
         {
-            this.err(23)
+            ; noSuchReservedName (parseParam.cxx:1059): the folded name, quoted.
+            this.report1_at(ParserMessages.noSuchReservedName(), buffer, ps.current_input().token_start_location())
             return false
         }
         set *out_rn: rn
@@ -1720,9 +2302,17 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if ps.get_input_level() <= group_input_level
                 {
-                    this.err(30)
+                    ; groupLevel: an entity end in a token separator must
+                    ; terminate an entity referenced in the same group.
+                    this.report0_at(ParserMessages.groupLevel(), ps.current_input().token_start_location())
                     if ps.get_input_level() <= decl_input_level
                         return false
+                }
+                else if ps.get_sd().www() = false
+                {
+                    ; groupEntityEnd (parseParam.cxx:293): an entity end in a
+                    ; token separator that does not follow a token (non-WWW).
+                    this.report0_at(ParserMessages.groupEntityEnd(), ps.current_input().token_start_location())
                 }
                 ps.pop_input_stack()
             }
@@ -1732,19 +2322,36 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 ; reference IN a model group (`(%pe;)*`) -> declReference stacks it;
                 ; the loop continues, reading the group tokens from the replacement
                 ; text (the tokenEe arm above pops the entity when exhausted).
+                ; A name group (`%(`) is not allowed in the prolog, where groups
+                ; always parse (parseParam.cxx:299).
+                if token = tokenPeroGrpo
+                    this.report0_at(ParserMessages.peroGrpoProlog(), ps.current_input().token_start_location())
                 if this.parse_parameter_entity_reference() = false
                     return false
             }
             else if token = tokenUnrecognized
             {
-                this.report_non_sgml_param()
-                this.err(32)
-                return false
+                ; a reported non-SGML character is skipped (parseParam.cxx:321).
+                if this.report_non_sgml_param() = false
+                {
+                    let ct ps.current_token()
+                    let a2 this.allowed_group_tokens_message_arg(allow)
+                    this.report_str_raw_at(ParserMessages.groupCharacter(), ct, a2, ps.current_input().token_start_location())
+                    return false
+                }
             }
             else if token = tokenDtgo
             {
-                ; DEFERRED: data-tag groups (rare SGML, absent from corpus).
-                this.err(33)
+                ; data-tag group (parseParam.cxx:330). The allow check maps to
+                ; groupTokenInvalidToken; parsing the group itself
+                ; (parseDataTagGroup) is the DATATAG feature axis, unported
+                ; (FEATURES DATATAG is likewise unmodeled = NO, so the
+                ; reference's own datatagNotImplemented arm cannot fire).
+                if this.has_gt(allow, GT_DATATAGGROUP) = false
+                {
+                    this.group_token_invalid_token(tokenDtgo, allow)
+                    return false
+                }
                 return false
             }
             else if token = tokenGrpo
@@ -1760,7 +2367,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else
                 {
-                    this.err(34)
+                    ; the dataTagTemplateGroup arm is the DATATAG axis; every
+                    ; other group kind is invalid here (parseParam.cxx:358).
+                    this.group_token_invalid_token(tokenGrpo, allow)
                     return false
                 }
             }
@@ -1768,7 +2377,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if (this.has_gt(allow, GT_PCDATA) = false) and (this.has_gt(allow, GT_ALL) = false) and (this.has_gt(allow, GT_IMPLICIT) = false)
                 {
-                    this.err(35)
+                    this.group_token_invalid_token(tokenRni, allow)
                     return false
                 }
                 var rn: int 0
@@ -1783,9 +2392,31 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     set gt.content_token: ContentToken.make_leaf(host, null as pointer[ElementType], OI_REP, true, false)
                     return true
                 }
+                else if ((rn = R_ALL) and this.has_gt(allow, GT_ALL)) or ((rn = R_IMPLICIT) and this.has_gt(allow, GT_IMPLICIT))
+                {
+                    ; the reference itself does not implement these
+                    ; (parseParam.cxx:379).
+                    this.report0_at(ParserMessages.sorryAllImplicit(), ps.current_input().token_start_location())
+                    return false
+                }
                 else
                 {
-                    this.err(36)
+                    ; invalidToken (parseParam.cxx:389): arg = RNI + the
+                    ; canonical reserved-name spelling, quoted.
+                    let buf Array[u32]^host()
+                    let syn ps.get_syntax()
+                    let rl syn.delim_general_len(dRNI)
+                    var j: size_t 0
+                    while j < rl
+                    {
+                        let rc syn.delim_general_char(dRNI, j)
+                        buf.add(rc)
+                        set j: j + 1
+                    }
+                    let spell this.reserved_name_spelling(rn)
+                    this.arg_append(buf, spell)
+                    let tok this.arg_to_string(buf)
+                    this.report1_at(ParserMessages.invalidToken(), tok, ps.current_input().token_start_location())
                     return false
                 }
             }
@@ -1815,7 +2446,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else
                 {
-                    this.err(37)
+                    this.group_token_invalid_token(tokenNameStart, allow)
                     return false
                 }
             }
@@ -1823,7 +2454,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if this.has_gt(allow, GT_NAMETOKEN) = false
                 {
-                    this.err(38)
+                    this.group_token_invalid_token(token, allow)
                     return false
                 }
                 this.extend_name_token(this.namelen(), ParserMessages.nameTokenLength())
@@ -1833,8 +2464,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else
             {
-                ; connectors and occurrence indicators are not group tokens here
-                this.err(39)
+                ; connectors, occurrence indicators, literals where a group
+                ; token is expected (parseParam.cxx:458-475).
+                this.group_token_invalid_token(token, allow)
                 return false
             }
         }
@@ -1852,7 +2484,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if ps.get_input_level() <= group_input_level
                 {
-                    this.err(40)
+                    ; groupLevel (parseParam.cxx:491).
+                    this.report0_at(ParserMessages.groupLevel(), ps.current_input().token_start_location())
                     if ps.get_input_level() <= decl_input_level
                         return false
                 }
@@ -1866,27 +2499,29 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 ; parseGroupConnector case tokenPeroNameStart: a parameter-entity
                 ; reference in connector position. Only allowed under WWW (the XML
-                ; profile); otherwise groupEntityReference. Under WWW, declReference
-                ; stacks it and the loop reads the connector from the expansion.
+                ; profile); otherwise groupEntityReference — reported, the token is
+                ; dropped, and the loop continues (parseParam.cxx:513).
                 if ps.get_sd().www() = false
-                {
-                    this.err(41)
-                    return false
-                }
-                if this.parse_parameter_entity_reference() = false
+                    this.report0_at(ParserMessages.groupEntityReference(), ps.current_input().token_start_location())
+                else if this.parse_parameter_entity_reference() = false
                     return false
             }
             else if token = tokenUnrecognized
             {
-                this.report_non_sgml_param()
-                this.err(42)
-                return false
+                ; a reported non-SGML character is skipped (parseParam.cxx:523).
+                if this.report_non_sgml_param() = false
+                {
+                    let ct ps.current_token()
+                    let a2 this.allowed_group_connectors_message_arg(allow)
+                    this.report_str_raw_at(ParserMessages.groupCharacter(), ct, a2, ps.current_input().token_start_location())
+                    return false
+                }
             }
             else if token = tokenAnd
             {
                 if this.has_gc(allow, GC_AND) = false
                 {
-                    this.err(43)
+                    this.group_connector_invalid_token(tokenAnd, allow)
                     return false
                 }
                 set *out_gc: GC_AND
@@ -1896,7 +2531,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if this.has_gc(allow, GC_SEQ) = false
                 {
-                    this.err(44)
+                    this.group_connector_invalid_token(tokenSeq, allow)
                     return false
                 }
                 set *out_gc: GC_SEQ
@@ -1906,7 +2541,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if this.has_gc(allow, GC_OR) = false
                 {
-                    this.err(45)
+                    this.group_connector_invalid_token(tokenOr, allow)
                     return false
                 }
                 set *out_gc: GC_OR
@@ -1916,15 +2551,21 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 if this.has_gc(allow, GC_GRPC) = false
                 {
-                    this.err(46)
+                    this.group_connector_invalid_token(tokenGrpc, allow)
                     return false
                 }
+                ; groupParameterEntityNotEnded (parseParam.cxx:577): a PE
+                ; referenced in a token separator must end in the same group.
+                if ps.get_input_level() > group_input_level
+                    this.report0_at(ParserMessages.groupParameterEntityNotEnded(), ps.current_input().token_start_location())
                 set *out_gc: GC_GRPC
                 return true
             }
             else
             {
-                this.err(47)
+                ; any other token where a connector is expected
+                ; (parseParam.cxx:581, the switch default).
+                this.group_connector_invalid_token(token, allow)
                 return false
             }
         }
@@ -2141,7 +2782,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
         if parm.kind = P_NUMBER
         {
-            ; DEFERRED: rank stems.
+            ; RANK feature axis (parseDecl.cxx:571): a number here is a rank
+            ; suffix — the reference builds rank stems (lookupCreateRankStem,
+            ; setRank) and parses the declaration normally, with NO diagnostic.
+            ; Unported; err keeps the abort visible in the error count until
+            ; the axis lands.
             this.err(50)
             return false
         }
@@ -2232,7 +2877,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
         else
         {
-            this.err(51)
+            ; the allow set admits only CDATA/RCDATA/EMPTY/ANY/model group,
+            ; all handled above — the reference has no further case.
             return false
         }
 
@@ -2514,8 +3160,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             let group this.group_names(parm)
             return DeclaredValue.make_name_token_group(host, group)
         }
-        ; rDATA and anything else: deferred.
-        this.err(52)
+        ; Every allowed kind is handled above, so this is the reference's
+        ; CANNOT_HAPPEN. NB the WWW-only DATA declared value (data attributes,
+        ; parseDecl.cxx:127: `sd().www() ? allowDeclaredValueData : ...`) is
+        ; NOT in the allow set yet — parse_param reports paramInvalidToken for
+        ; it; porting DataDeclaredValue belongs to the data-attribute family.
         null
     }
 
@@ -2583,7 +3232,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             set *out_def: AttributeDefinition.make_implied(host, attribute_name, declared_value)
         else
         {
-            this.err(53)
+            ; every kind the allow set admits is handled above — the
+            ; reference's CANNOT_HAPPEN (parseDecl.cxx parseDefaultValue).
             return false
         }
         true
@@ -2710,26 +3360,43 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; (indDEFAULT -> empty name, the default entity)
         let name iep.get_name()
 
-        let allow_text AllowedParams.a8(host, P_PARAMLITERAL, P_RESERVED_NAME + R_CDATA, P_RESERVED_NAME + R_SDATA, P_RESERVED_NAME + R_PI, P_RESERVED_NAME + R_SYSTEM, P_RESERVED_NAME + R_PUBLIC, P_RESERVED_NAME + R_STARTTAG, P_RESERVED_NAME + R_ENDTAG)
+        var text_codes int[10]
+        let tcp text_codes as pointer[int]
+        set *(tcp + (0 as size_t)): P_PARAMLITERAL
+        set *(tcp + (1 as size_t)): P_RESERVED_NAME + R_CDATA
+        set *(tcp + (2 as size_t)): P_RESERVED_NAME + R_SDATA
+        set *(tcp + (3 as size_t)): P_RESERVED_NAME + R_PI
+        set *(tcp + (4 as size_t)): P_RESERVED_NAME + R_STARTTAG
+        set *(tcp + (5 as size_t)): P_RESERVED_NAME + R_ENDTAG
+        set *(tcp + (6 as size_t)): P_RESERVED_NAME + R_MS
+        set *(tcp + (7 as size_t)): P_RESERVED_NAME + R_MD
+        set *(tcp + (8 as size_t)): P_RESERVED_NAME + R_SYSTEM
+        set *(tcp + (9 as size_t)): P_RESERVED_NAME + R_PUBLIC
+        let allow_text AllowedParams.an(host, tcp, 10)
         if this.parse_param(allow_text, decl_input_level, parm) = false
             return false
 
         if (parm.kind = (P_RESERVED_NAME + R_SYSTEM)) or (parm.kind = (P_RESERVED_NAME + R_PUBLIC))
             return this.parse_external_entity(name, is_parameter, decl_input_level, parm, mdo_loc)
 
+        ; bracketed text (parseDecl.cxx:68-134): STARTTAG/ENDTAG/MS/MD wrap the
+        ; parameter literal in the corresponding delimiters at reference time.
         var data_type: int DT_SGML
+        var bracketed: int 0
         if parm.kind = (P_RESERVED_NAME + R_CDATA)
             set data_type: DT_CDATA
         else if parm.kind = (P_RESERVED_NAME + R_SDATA)
             set data_type: DT_SDATA
         else if parm.kind = (P_RESERVED_NAME + R_PI)
             set data_type: DT_PI
-        else if (parm.kind = (P_RESERVED_NAME + R_STARTTAG)) or (parm.kind = (P_RESERVED_NAME + R_ENDTAG))
-        {
-            ; DEFERRED: bracketed (STARTTAG/ENDTAG/MS/MD) entities.
-            this.err(60)
-            return false
-        }
+        else if parm.kind = (P_RESERVED_NAME + R_STARTTAG)
+            set bracketed: 1
+        else if parm.kind = (P_RESERVED_NAME + R_ENDTAG)
+            set bracketed: 2
+        else if parm.kind = (P_RESERVED_NAME + R_MS)
+            set bracketed: 3
+        else if parm.kind = (P_RESERVED_NAME + R_MD)
+            set bracketed: 4
 
         if parm.kind <> P_PARAMLITERAL
         {
@@ -2742,13 +3409,56 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; DEEP-COPY the replacement text onto the host page — like the name — so it
         ; does not alias the transient literal buffer (which later parsing reuses;
         ; a shallow store corrupted it to a later token by reference time).
-        set iep.text: StringC^host(text_sc.data_ptr(), text_sc.get_size())
+        if bracketed = 0
+            set iep.text: StringC^host(text_sc.data_ptr(), text_sc.get_size())
+        else
+        {
+            ; open/close delimiter strings per bracket kind (parseDecl.cxx:98).
+            let wrap Array[u32]^host()
+            if bracketed = 1
+                this.append_delim_chars(wrap, dSTAGO)
+            else if bracketed = 2
+                this.append_delim_chars(wrap, dETAGO)
+            else if bracketed = 3
+            {
+                this.append_delim_chars(wrap, dMDO)
+                this.append_delim_chars(wrap, dDSO)
+            }
+            else
+                this.append_delim_chars(wrap, dMDO)
+            this.arg_append(wrap, text_sc)
+            if bracketed = 1
+                this.append_delim_chars(wrap, dTAGC)
+            else if bracketed = 2
+                this.append_delim_chars(wrap, dTAGC)
+            else if bracketed = 3
+            {
+                this.append_delim_chars(wrap, dMSC)
+                this.append_delim_chars(wrap, dMDC)
+            }
+            else
+                this.append_delim_chars(wrap, dMDC)
+            let total wrap.get_length()
+            set iep.text: StringC^host(wrap.get_buffer(), total)
+            ; bracketedLitlen (parseDecl.cxx:134): only when the DELIMITERS
+            ; push the interpreted text past LITLEN (the literal alone fits).
+            let litlen ps.get_syntax().get_quantity(qLITLEN) as size_t
+            if (total > litlen) and (text_sc.get_size() <= litlen)
+                this.report_num_at(ParserMessages.bracketedLitlen(), litlen as u64, ps.current_input().token_start_location())
+        }
 
         let allow_mdc AllowedParams.a1(host, P_MDC)
         if this.parse_param(allow_mdc, decl_input_level, parm) = false
             return false
 
-        set iep.data_type: data_type
+        ; internalParameterDataEntity (parseDecl.cxx:141): an internal parameter
+        ; entity cannot be CDATA or SDATA — reported at the MDC, NOT defined.
+        if is_parameter and ((data_type = DT_CDATA) or (data_type = DT_SDATA))
+        {
+            this.report1_at(ParserMessages.internalParameterDataEntity(), name, ps.current_input().token_start_location())
+            return true
+        }
+
         set iep.data_type: data_type
         let ent host.allocate(sizeof Entity, alignof Entity) as pointer[Entity]
         let iev *iep
@@ -3065,6 +3775,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; tokenEe inside a comment is an error.
     function parse_comment(this: Parser, mode: int) returns bool
     {
+        ; startLoc (parseCommon.cxx:537) — where the comment opened; the
+        ; auxiliary "comment started here" line points at it.
+        let start_loc ps.current_location()
         var running true
         var ok true
         while running
@@ -3074,7 +3787,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 set running: false
             else if token = tokenEe
             {
-                this.err(0)
+                ; commentEntityEnd (parseCommon.cxx:550): unterminated comment.
+                this.report0_aux(ParserMessages.commentEntityEnd(), ps.current_input().token_start_location(), ParserMessages.commentEntityEnd_aux(), start_loc)
                 set ok: false
                 set running: false
             }
@@ -3101,8 +3815,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 set running: false
             else if token = tokenEe
             {
-                ; processingInstructionEntityEnd
-                this.err(0)
+                ; processingInstructionEntityEnd (parseCommon.cxx:28).
+                this.report0_at(ParserMessages.processingInstructionEntityEnd(), ps.current_input().token_start_location())
                 set ok: false
                 set running: false
             }
@@ -3163,6 +3877,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; closing MDC (`>`).
     function parse_comment_decl(this: Parser) returns bool
     {
+        ; markupLocation() — the MDO that opened the declaration (the tokenMdoCom
+        ; the caller just consumed); the "comment declaration started here"
+        ; auxiliaries point at it.
+        let mdo_loc ps.current_input().token_start_location()
         if this.parse_comment(comMode) = false
             return false
         var running true
@@ -3184,10 +3902,31 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if token = tokenMdc
                 set running: false
+            else if token = tokenEe
+            {
+                ; declarationLevel (parseDecl.cxx parseCommentDecl tokenEe).
+                this.report0_at(ParserMessages.declarationLevel(), ps.current_input().token_start_location())
+                set ok: false
+                set running: false
+            }
+            else if token = tokenUnrecognized
+            {
+                ; commentDeclarationCharacter + "comment declaration started
+                ; here" at the MDO; a non-SGML character reports separately
+                ; and continues (parseDecl.cxx parseCommentDecl).
+                if this.report_non_sgml_param() = false
+                {
+                    let ct ps.current_token()
+                    this.report1_aux(ParserMessages.commentDeclarationCharacter(), ct, ps.current_input().token_start_location(), ParserMessages.commentDeclarationCharacter_aux(), mdo_loc)
+                    set ok: false
+                    set running: false
+                }
+            }
             else
             {
-                ; tokenEe or an invalid token in a comment declaration.
-                this.err(0)
+                ; commentDeclInvalidToken: any other markup-declaration token.
+                let a1 this.token_message_arg(token, mdMode)
+                this.report_raw_aux(ParserMessages.commentDeclInvalidToken(), a1, ps.current_input().token_start_location(), ParserMessages.commentDeclInvalidToken_aux(), mdo_loc)
                 set ok: false
                 set running: false
             }
@@ -3213,12 +3952,27 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             let start_level ps.get_input_level()
             if token = tokenEe
             {
-                ; end of an entity: pop it. When we drop below the subset's own
-                ; level the subset is finished (an external subset ends here; a
-                ; nested parameter entity just returns to the subset).
-                ps.pop_input_stack()
-                if ps.get_input_level() < subset_level
+                if (external = false) and (ps.get_input_level() = subset_level)
+                {
+                    ; documentEndDtdSubset (doDeclSubset tokenEe, inputLevel 1):
+                    ; the DOCUMENT entity ended inside the internal subset —
+                    ; message BEFORE popping, then abort the run (allDone()).
+                    ; Without this the caller went on to read the DSC from an
+                    ; empty input stack (segfault).
+                    this.report0_at(ParserMessages.documentEndDtdSubset(), ps.current_input().token_start_location())
+                    ps.pop_input_stack()
+                    set rc: 1
                     set running: false
+                }
+                else
+                {
+                    ; end of an entity: pop it. When we drop below the subset's
+                    ; own level the subset is finished (an external subset ends
+                    ; here; a nested parameter entity returns to the subset).
+                    ps.pop_input_stack()
+                    if ps.get_input_level() < subset_level
+                        set running: false
+                }
             }
             else if token = tokenDsc
             {
@@ -3572,6 +4326,55 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         true
     }
 
+    ; extendUnquotedAttributeValue (parseAttribute.cxx:373): grow the current
+    ; token to the next S / non-SGML char / entity end / first TAGC char.
+    function extend_unquoted_attribute_value(this: Parser)
+    {
+        let ins ps.current_input()
+        var length ins.current_token_length()
+        let syn ps.get_syntax()
+        let tagc syn.delim_general_char(dTAGC, 0 as size_t)
+        let sset syn.char_set(setS)
+        var scanning true
+        while scanning
+        {
+            let c ins.token_char()
+            if c < 0
+                set scanning: false
+            else
+            {
+                let is_s sset.contains(c as u32)
+                let is_non_sgml this.is_non_sgml_char(c as u32)
+                if (is_s or is_non_sgml) or ((c as u32) = tagc)
+                    set scanning: false
+                else
+                    set length: length + (1 as size_t)
+            }
+        }
+        ins.end_token(length)
+    }
+
+    ; copy the current token into `text` as an attribute value with linear
+    ; per-char locations. The copy pins the run page: current_token_string's
+    ; buffer is transient, and a CDATA value is stored verbatim (no fold-copy
+    ; in set_value), so it would dangle and read as later token bytes.
+    function copy_unquoted_value(this: Parser, text: pointer[Text])
+    {
+        let ins ps.current_input()
+        let ts ins.current_token_string()
+        let tn ts.get_size()
+        let tstart ins.current_token_start_index()
+        let tlb host.allocate(tn * sizeof Location, alignof Location) as pointer[Location]
+        let torg ins.get_origin()
+        var tli: size_t 0
+        while tli < tn
+        {
+            set *(tlb + tli): Location(torg, (tstart + tli) as u32)
+            set tli: tli + 1
+        }
+        set *text: Text(StringC^host(ts.data_ptr(), ts.get_size()), tlb)
+    }
+
     ; parseAttributeParameter — read the next attribute-spec token, classify it,
     ; and skip separators. allow_vi permits a value-indicator (`=`).
     function parse_attribute_parameter(this: Parser, mode: int, allow_vi: bool, result: pointer[int], net: pointer[bool]) returns bool
@@ -3581,7 +4384,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             set token: ps.get_token(mode)
         if token = tokenEe
         {
-            this.err(0)
+            ; attributeSpecEntityEnd (parseAttribute.cxx): entity end outside
+            ; an attribute value literal.
+            this.report0_at(ParserMessages.attributeSpecEntityEnd(), ps.current_input().token_start_location())
             return false
         }
         else if (token = tokenEtago) or (token = tokenStago)
@@ -3596,14 +4401,16 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             ; NESTC (`/`) closes a net-enabling start tag. Under NETENABL IMMEDNET
             ; the NET (`>`) must immediately follow (`/>`): peek it and unget so
             ; do_content sees the tokenNet that closes the element. NETENABL ALL
-            ; net-enables with no immediate requirement; NETENABL NO is illegal.
+            ; net-enables with no immediate requirement; NETENABL NO requires
+            ; SHORTTAG YES (netEnablingStartTagShorttag, message only).
             let ne ps.get_sd().start_tag_net_enable()
             if ne = NET_ENABLE_NO
-                this.err(0)
+                this.report0_at(ParserMessages.netEnablingStartTagShorttag(), ps.current_input().token_start_location())
             else if ne = NET_ENABLE_IMMEDNET
             {
+                ; nestcWithoutNet: the NET must immediately follow the NESTC.
                 if ps.get_token(econnetMode) <> tokenNet
-                    this.err(0)
+                    this.report0_at(ParserMessages.nestcWithoutNet(), ps.current_input().token_start_location())
                 ps.current_input().unget_token()
             }
             set *net: true
@@ -3628,20 +4435,29 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
         else if (token = tokenLit) or (token = tokenLita)
         {
-            this.err(0)
+            ; a literal can only follow a VI (parseAttribute.cxx:~140).
+            if allow_vi
+                this.report0_at(ParserMessages.attributeSpecLiteral(), ps.current_input().token_start_location())
+            else
+                this.report0_at(ParserMessages.attributeSpecNameTokenExpected(), ps.current_input().token_start_location())
             return false
         }
         else if token = tokenVi
         {
             if allow_vi = false
             {
-                this.err(0)
+                this.report0_at(ParserMessages.attributeSpecNameTokenExpected(), ps.current_input().token_start_location())
                 return false
             }
             set *result: APT_VI
         }
         else
         {
+            ; tokenUnrecognized: the reference recovers it as an unquoted
+            ; attribute value (extendUnquotedAttributeValue ->
+            ; AttributeParameter::recoverUnquoted, parseAttribute.cxx:76) —
+            ; that machinery is the SHORTTAG attribute-spec recovery family,
+            ; not yet ported; err keeps the abort counted until it lands.
             this.err(0)
             return false
         }
@@ -3719,28 +4535,31 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         else if (token = tokenNameStart) or (token = tokenDigit) or (token = tokenLcUcNmchar)
         {
             ; unquoted (SHORTTAG) value — extend over name-token characters.
-            ; Copy the token onto the run page: current_token_string's buffer is
-            ; transient, and a CDATA value is stored verbatim (no fold-copy in
-            ; set_value), so it would dangle and read as later token bytes.
             this.extend_name_token(this.attribute_value_max_length(), ParserMessages.attributeValueLength())
-            let ins ps.current_input()
-            let ts ins.current_token_string()
-            ; per-char locations (linear: an unquoted value is one source token).
-            let tn ts.get_size()
-            let tstart ins.current_token_start_index()
-            let tlb host.allocate(tn * sizeof Location, alignof Location) as pointer[Location]
-            let torg ins.get_origin()
-            var tli: size_t 0
-            while tli < tn
-            {
-                set *(tlb + tli): Location(torg, (tstart + tli) as u32)
-                set tli: tli + 1
-            }
-            set *text: Text(StringC^host(ts.data_ptr(), ts.get_size()), tlb)
+            this.copy_unquoted_value(text)
+        }
+        else if (token = tokenUnrecognized) or (token = tokenEtago) or (token = tokenStago) or (token = tokenNestc)
+        {
+            ; unquotedAttributeValue (parseAttribute.cxx:~200): recovered as an
+            ; unquoted value running to the next separator/TAGC.
+            this.report0_at(ParserMessages.unquotedAttributeValue(), ps.current_input().token_start_location())
+            this.extend_unquoted_attribute_value()
+            this.copy_unquoted_value(text)
+        }
+        else if token = tokenEe
+        {
+            this.report0_at(ParserMessages.attributeSpecEntityEnd(), ps.current_input().token_start_location())
+            return false
+        }
+        else if (token = tokenTagc) or (token = tokenDsc) or (token = tokenVi)
+        {
+            ; attributeValueExpected: the VI was not followed by a value.
+            this.report0_at(ParserMessages.attributeValueExpected(), ps.current_input().token_start_location())
+            return false
         }
         else
         {
-            this.err(0)
+            ; no other token is possible here (the reference's CANNOT_HAPPEN).
             return false
         }
         if ok = false
@@ -4155,16 +4974,18 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         {
             if atts.token_index_unique(token, idx) = false
             {
-                ; attributeTokenNotUnique (WebSGML).
-                this.err(0)
-                return false
+                ; attributeTokenNotUnique (parseAttribute.cxx:110): the spec is
+                ; noted invalid and parsing CONTINUES (the reference returns 1).
+                atts.note_invalid_spec()
+                this.report1_at(ParserMessages.attributeTokenNotUnique(), token, ps.current_input().token_start_location())
+                return true
             }
         }
         let index idx as size_t
-        ; attributeNameShorttag: OMITNAME disabled makes the shorthand illegal
-        ; (the reference/scaly declarations enable it).
+        ; attributeNameShorttag (parseAttribute.cxx:115): OMITNAME disabled
+        ; makes the shorthand illegal (message only; the value still books).
         if ps.get_sd().attribute_omit_name() = false
-            this.err(0)
+            this.report0_at(ParserMessages.attributeNameShorttag(), ps.current_input().token_start_location())
         let ctx ps.get_attribute_context()
         atts.set_spec(index, ctx)
         let text host.allocate(sizeof Text, alignof Text) as pointer[Text]
@@ -4251,8 +5072,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else
             {
-                ; a VI with no preceding name — genuine syntax error.
-                this.err(0)
+                ; cur_parm can only be APT_VI here, and every head-position
+                ; parse_attribute_parameter call passes allow_vi = false, which
+                ; already rejects a bare VI (attributeSpecNameTokenExpected) —
+                ; unreachable (the reference's CANNOT_HAPPEN).
                 set ok: false
                 set running: false
             }
@@ -5153,13 +5976,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             set ent: uent
         }
 
-        ; checkEntlvl: nesting deeper than ENTLVL is a diagnostic only — the entity
-        ; is still stacked (C++ Entity::checkEntlvl messages and falls through; the
-        ; document entity is not counted). Recursion stays bounded by checkNotOpen,
-        ; which cannot let the same entity open twice.
+        ; checkEntlvl (Entity.cxx:583): nesting deeper than ENTLVL is a diagnostic
+        ; only — the entity is still stacked (the document entity is not counted).
+        ; Recursion stays bounded by checkNotOpen, which cannot let the same
+        ; entity open twice.
         let entlvl ps.get_syntax().get_quantity(qENTLVL)
         if (ps.get_input_level() - (1 as u32)) = entlvl
-            this.err(82)
+            this.report_num_at(ParserMessages.entlvl(), entlvl as u64, ps.current_input().token_start_location())
         ; checkNotOpen (Entity.cxx): a recursive entity reference. This fires from
         ; INSIDE the entity's replacement text; resolve_location walks the origin
         ; chain up to the reference in the enclosing source (the reference position
@@ -5279,10 +6102,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return true
         }
 
-        ; checkEntlvl: nesting deeper than ENTLVL is a diagnostic only.
+        ; checkEntlvl (Entity.cxx:583): nesting deeper than ENTLVL is a
+        ; diagnostic only.
         let entlvl ps.get_syntax().get_quantity(qENTLVL)
         if (ps.get_input_level() - (1 as u32)) = entlvl
-            this.err(82)
+            this.report_num_at(ParserMessages.entlvl(), entlvl as u64, ps.current_input().token_start_location())
         ; checkNotOpen: a recursive parameter-entity reference. Reported like the
         ; general-entity case; resolve_location fixes up the location up the chain.
         ; (Hard to provoke cleanly — a self-referential PE literal is expanded at
@@ -5621,7 +6445,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     if this.instance_declaration_not_allowed(decl_name)
                         this.report1_at(ParserMessages.instanceDeclaration(), spell, dloc)
                     else if (decl_name = R_USEMAP) or (decl_name = R_USELINK)
+                    {
+                        ; SHORTREF / LINK feature axes: the reference parses
+                        ; these in the instance (parseUsemapDecl /
+                        ; parseUselinkDecl) with NO diagnostic. err keeps the
+                        ; skip counted until the axes land.
                         this.err(0)
+                    }
                     else
                         this.report1_at(ParserMessages.noSuchDeclarationType(), spell, dloc)
                 }
@@ -6389,12 +7219,59 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
     ; doProlog (scoped): skip separators, dispatch the DOCTYPE declaration, and
     ; leave the input positioned at the first instance token.
+    ; prologRecover (parseDecl.cxx): after an invalid prolog character, skip
+    ; ahead to something that could open a declaration / PI / the instance.
+    function prolog_recover(this: Parser)
+    {
+        var skip_count: u32 0
+        let re_ch ps.get_syntax().standard_function(fRE)
+        var looping true
+        while looping
+        {
+            var token ps.get_token(proMode)
+            set skip_count: skip_count + (1 as u32)
+            if token = tokenUnrecognized
+            {
+                ; the `]>`-of-a-lost-subset heuristic: an MDC followed by S
+                ; ends the recovery.
+                set token: ps.get_token(mdMode)
+                if token = tokenMdc
+                {
+                    set token: ps.get_token(proMode)
+                    if token = tokenS
+                        return
+                }
+            }
+            if token = tokenUnrecognized
+            {
+                ; getChar() — consume the unmatched character.
+                let ins ps.current_input()
+                if ins.current_token_length() = (0 as size_t)
+                    ins.end_token(1 as size_t)
+            }
+            else if token = tokenEe
+                return
+            else if (token = tokenMdoMdc) or (token = tokenMdoCom) or (token = tokenMdoNameStart) or (token = tokenPio)
+            {
+                ps.current_input().unget_token()
+                return
+            }
+            else if token = tokenS
+            {
+                let cc ps.current_input().current_char()
+                if (cc = re_ch) and (skip_count >= (250 as u32))
+                    return
+            }
+        }
+    }
+
     function parse_prolog(this: Parser, base_dir: String) returns bool
     {
         ps.set_current_mode(proMode)
         ps.set_phase(PHASE_PROLOG)
         var running true
         var ok true
+        var prolog_tries: u32 0
         while running
         {
             let token ps.get_token(proMode)
@@ -6455,7 +7332,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if token = tokenEe
             {
-                ; end of the document before any content.
+                ; documentEndProlog (doProlog tokenEe): the document ended
+                ; before any content. This loop exits once a DOCTYPE (or an
+                ; implied DTD) is in hand, so hadDtd() is always false here.
+                this.report0_at(ParserMessages.documentEndProlog(), ps.current_input().token_start_location())
+                set ok: false
                 set running: false
             }
             else if token = tokenUnrecognized
@@ -6472,17 +7353,33 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     {
                         ps.current_input().unget_token()
                         this.imply_dtd(gi)
+                        set running: false
                     }
                     else
                     {
-                        ; prologCharacter — a character that can neither open a
-                        ; declaration nor start the instance. The reference retries
-                        ; (prologRecover, up to 10 tries); with no DTD to fall back
-                        ; on we stop here.
-                        this.err(46)
-                        set ok: false
+                        ; prologCharacter (parseDecl.cxx:74) — a character that can
+                        ; neither open a declaration nor start the instance; a
+                        ; non-SGML character reports its own message instead. Then
+                        ; recover (prologRecover) and keep scanning the prolog —
+                        ; after maxTries (10) rounds give up (notSgml).
+                        if this.report_non_sgml_param() = false
+                        {
+                            set prolog_tries: prolog_tries + (1 as u32)
+                            if prolog_tries >= (10 as u32)
+                            {
+                                this.report0_at(ParserMessages.notSgml(), ps.current_input().token_start_location())
+                                this.report0(ParserMessages.giveUp())
+                                set ok: false
+                                set running: false
+                            }
+                            else
+                            {
+                                let ct ps.current_token()
+                                this.report1_at(ParserMessages.prologCharacter(), ct, ps.current_input().token_start_location())
+                                this.prolog_recover()
+                            }
+                        }
                     }
-                    set running: false
                 }
                 else
                 {
