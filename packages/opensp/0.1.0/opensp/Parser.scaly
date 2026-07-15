@@ -4391,6 +4391,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
         else if (token = tokenEtago) or (token = tokenStago)
         {
+            ; unclosedStartTagShorttag (parseAttribute.cxx:304): a STAGO/ETAGO
+            ; inside the spec ends the tag; legal only under SHORTTAG STARTTAG
+            ; UNCLOSED YES (message only — the tag still ends here).
+            if ps.get_sd().start_tag_unclosed() = false
+                this.report0_at(ParserMessages.unclosedStartTagShorttag(), ps.current_input().token_start_location())
             let ins ps.current_input()
             ins.unget_token()
             set *net: false
@@ -4453,13 +4458,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
         else
         {
-            ; tokenUnrecognized: the reference recovers it as an unquoted
-            ; attribute value (extendUnquotedAttributeValue ->
-            ; AttributeParameter::recoverUnquoted, parseAttribute.cxx:76) —
-            ; that machinery is the SHORTTAG attribute-spec recovery family,
-            ; not yet ported; err keeps the abort counted until it lands.
-            this.err(0)
-            return false
+            ; tokenUnrecognized (parseAttribute.cxx:289): a genuine non-SGML
+            ; character is reported and aborts the spec; any other character is
+            ; recovered as an unquoted-value chunk — extended to the next
+            ; S / non-SGML / TAGC — for AttributeList::recoverUnquoted.
+            if this.report_non_sgml_param()
+                return false
+            this.extend_unquoted_attribute_value()
+            set *result: APT_RECOVER_UNQUOTED
         }
         true
     }
@@ -4534,7 +4540,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
         else if (token = tokenNameStart) or (token = tokenDigit) or (token = tokenLcUcNmchar)
         {
-            ; unquoted (SHORTTAG) value — extend over name-token characters.
+            ; unquoted (SHORTTAG) value — legal only under SHORTTAG ATTRIB
+            ; VALUE YES (parseAttribute.cxx:221; message at the value's first
+            ; char, the un-extended token start, verified 5:7 on `v=xy`). The
+            ; option-gated warnAttributeValueNotLiteral W stays unmodeled with
+            ; the other -w flags.
+            if ps.get_sd().attribute_value_not_literal() = false
+                this.report0_at(ParserMessages.attributeValueShorttag(), ps.current_input().token_start_location())
             this.extend_name_token(this.attribute_value_max_length(), ParserMessages.attributeValueLength())
             this.copy_unquoted_value(text)
         }
@@ -4571,6 +4583,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; and the makeSemantics half follows — the reference's message order.
         let sv_ok atts.set_value(host, index, text, ctx)
         this.validate_attribute_value(atts.declared_value(index), text, name, spec_length)
+        ; checkValue wraps makeValue (Attribute.h:637): notFixedValue /
+        ; noteCurrentAttribute fire after the validation messages, before the
+        ; makeSemantics ones.
+        this.check_attribute_value(atts, index)
         this.check_value_semantics(atts, index, text)
         sv_ok
     }
@@ -4907,6 +4923,255 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
     }
 
+    ; AttributeDefinition::checkValue (Attribute.cxx:617) — the wrapper around
+    ; makeValue for SPECIFIED values; two overrides exist:
+    ;   CURRENT (:719) noteCurrentAttribute — remember the value so a later tag
+    ;   omitting the attribute reuses it (ESIS-visible);
+    ;   FIXED (:840) — compare against the declared default, notFixedValue
+    ;   (E1, validate-gated) when they differ. The reference compares
+    ;   Text::fixedEqual (string + entity-item structure) for CDATA and the
+    ;   normalized strings for tokenized values; our Text carries no item
+    ;   structure, so both arms compare the value strings (value and default
+    ;   share one DeclaredValue, so their types always agree). Location:
+    ;   unlocated context.message = current token START (the literal's closing
+    ;   quote — same convention as the other makeValue messages, verified
+    ;   5:11 on `<doc v="2.0">`).
+    function check_attribute_value(this: Parser, atts: pointer[AttributeList], index: size_t)
+    {
+        let d atts.definition(index)
+        if d = null
+            return
+        if d.is_current()
+        {
+            let ctx ps.get_attribute_context()
+            let v atts.value(index)
+            ctx.note_current_attribute(d.get_current_index(), v)
+        }
+        if d.is_fixed()
+        {
+            if ps.validate()
+            {
+                let v atts.value(index)
+                let fixed d.get_default_value()
+                if (v <> null) and (fixed <> null)
+                {
+                    let vt v.get_text()
+                    let ft fixed.get_text()
+                    if (vt <> null) and (ft <> null)
+                    {
+                        let vs (*vt).string()
+                        let fs (*ft).string()
+                        if vs.equals(fs) = false
+                            this.report1_at(ParserMessages.notFixedValue(), d.get_name(), ps.current_input().token_start_location())
+                    }
+                }
+            }
+        }
+    }
+
+    ; AttributeList::recoverUnquoted (Attribute.cxx:1338) + the AttributeValue
+    ; overrides (TokenizedAttributeValue :289, CdataAttributeValue :1100): the
+    ; junk after the last specified value is adopted when that value is a
+    ; SINGLE contiguous data item ending exactly where the junk begins —
+    ; CDATA appends the junk (unquotedAttributeValue E0 at the junk start),
+    ; tokenized only reports (attributeValueChar E2: first junk char + attr
+    ; name). Item test under our per-char-location Text: same-origin
+    ; consecutive locations, abutting the junk token, AND byte-equal to the
+    ; origin's source chars — a folded char got its item location wrapped in a
+    ; MultiReplacementOrigin by Text::subst (Text.cxx:183), so the reference's
+    ; origin-pointer comparison FAILS then (verified: `t=a,b` aborts with
+    ; attributeSpecCharacter, `t=A,B` recovers with attributeValueChar).
+    ; Returns the reference's recoverUnquoted verdict: true = recovered, keep
+    ; parsing the spec; false = caller runs the unterminated-literal guess.
+    function recover_unquoted_spec(this: Parser, atts: pointer[AttributeList]) returns bool
+    {
+        let ins ps.current_input()
+        let nspec atts.n_spec_of()
+        if nspec = (0 as size_t)
+            return false
+        ; the LAST specified attribute (specIndex == nSpec-1); none found or a
+        ; null value -> the reference breaks out and returns 1 (recovered,
+        ; junk silently dropped).
+        let n_att atts.size()
+        var found false
+        var ai: size_t 0
+        var i: size_t 0
+        while i < n_att
+        {
+            if atts.specified(i)
+            {
+                if atts.spec_index(i) = nspec - (1 as size_t)
+                {
+                    set found: true
+                    set ai: i
+                    set i: n_att
+                }
+                else
+                    set i: i + 1
+            }
+            else
+                set i: i + 1
+        }
+        if found = false
+            return true
+        let val atts.value(ai)
+        if val = null
+            return true
+        if val.value_type() = AVT_IMPLIED
+            return false
+        let t val.get_text()
+        if t = null
+            return false
+        let n (*t).size()
+        let locs (*t).get_locs()
+        if (n = (0 as size_t)) or (locs = null)
+            return false
+        let str_loc ins.token_start_location()
+        let org0 (*locs).get_origin()
+        let idx0 (*locs).get_index()
+        if org0 = null
+            return false
+        if org0 <> str_loc.get_origin()
+            return false
+        if idx0 + (n as u32) <> str_loc.get_index()
+            return false
+        let vs (*t).string()
+        let contents org0.get_contents()
+        var j: size_t 0
+        while j < n
+        {
+            let lj *(locs + j)
+            if (lj.get_origin() <> org0) or (lj.get_index() <> idx0 + (j as u32))
+                return false
+            if contents <> null
+            {
+                if *(contents + ((idx0 as size_t) + j)) <> vs.get(j)
+                    return false
+            }
+            set j: j + 1
+        }
+        ; the junk token (transient — deep-copy before touching the input).
+        let ts ins.current_token_string()
+        let sn ts.get_size()
+        let sc StringC^host(ts.data_ptr(), sn)
+        if atts.tokenized(ai)
+        {
+            let c1 StringC^host(sc.data_ptr(), 1 as size_t)
+            this.report2_at(ParserMessages.attributeValueChar(), *c1, atts.name(ai), str_loc)
+            return true
+        }
+        ; CDATA: append the junk chars (linear locations from the junk start).
+        let comb host.allocate((n + sn) * (sizeof u32), alignof u32) as pointer[u32]
+        let clocs host.allocate((n + sn) * (sizeof Location), alignof Location) as pointer[Location]
+        var k: size_t 0
+        while k < n
+        {
+            set *(comb + k): vs.get(k)
+            set *(clocs + k): *(locs + k)
+            set k: k + 1
+        }
+        var m: size_t 0
+        while m < sn
+        {
+            set *(comb + n + m): sc.get(m)
+            set *(clocs + n + m): Location(org0, str_loc.get_index() + (m as u32))
+            set m: m + 1
+        }
+        let nsc StringC^host(comb, n + sn)
+        set *t: Text(*nsc, clocs)
+        this.report0_at(ParserMessages.unquotedAttributeValue(), str_loc)
+        true
+    }
+
+    ; AttributeValue::handleAsUnterminated (Attribute.cxx:1377) on a COMPLETED
+    ; value Text — the missing-closing-quote guess: reconstruct the item
+    ; structure (HuState replay over the per-char locations — contiguous
+    ; same-origin runs merge, exactly parse_literal's tracking), tail-strip
+    ; spaces from the last data item, and when it ends with the VI delimiter
+    ; report literalClosingDelimiter at the text's FIRST located char.
+    function value_handle_as_unterminated(this: Parser, t: pointer[Text]) returns bool
+    {
+        let n (*t).size()
+        if n = (0 as size_t)
+            return false
+        let locs (*t).get_locs()
+        if locs = null
+            return false
+        let s (*t).string()
+        let buf Array[u32]^host()
+        let hu host.allocate(sizeof HuState, alignof HuState) as pointer[HuState]
+        set *hu: HuState()
+        var i: size_t 0
+        while i < n
+        {
+            hu.note_data(buf, *(locs + i))
+            buf.add(s.get(i))
+            set i: i + 1
+        }
+        hu.close(buf)
+        if hu.have_last = false
+            return false
+        var ll hu.last_len
+        while (ll > (0 as size_t)) and (*(buf.get_buffer() + hu.last_start + ll - (1 as size_t)) = (0x20 as u32))
+            set ll: ll - (1 as size_t)
+        let syn ps.get_syntax()
+        let vn syn.delim_general_len(dVI)
+        if (vn = (0 as size_t)) or (ll < vn)
+            return false
+        var vj: size_t 0
+        while vj < vn
+        {
+            if *(buf.get_buffer() + hu.last_start + ll - vn + vj) <> syn.delim_general_char(dVI, vj)
+                return false
+            set vj: vj + 1
+        }
+        ; startLoc = the first char location with a real origin (:1389).
+        var first_loc Location()
+        var fi: size_t 0
+        while fi < n
+        {
+            let fl *(locs + fi)
+            if fl.get_origin() <> null
+            {
+                set first_loc: fl
+                set fi: n
+            }
+            else
+                set fi: fi + 1
+        }
+        this.report0_at(ParserMessages.literalClosingDelimiter(), first_loc)
+        true
+    }
+
+    ; AttributeList::handleAsUnterminated (Attribute.cxx:1357) — run the guess
+    ; on the last specified attribute's value text.
+    function atts_handle_as_unterminated(this: Parser, atts: pointer[AttributeList]) returns bool
+    {
+        let nspec atts.n_spec_of()
+        if nspec = (0 as size_t)
+            return false
+        let n_att atts.size()
+        var i: size_t 0
+        while i < n_att
+        {
+            if atts.specified(i)
+            {
+                if atts.spec_index(i) = nspec - (1 as size_t)
+                {
+                    let val atts.value(i)
+                    if val = null
+                        return false
+                    let t val.get_text()
+                    if t = null
+                        return false
+                    return this.value_handle_as_unterminated(t)
+                }
+            }
+            set i: i + 1
+        }
+        false
+    }
+
     ; the makeSemantics half of AttributeList::finish (Attribute.cxx:1246):
     ; an UNSPECIFIED attribute whose missing value is a real tokenized value
     ; gets its semantics (ID/IDREF booking, entity/notation resolution + the
@@ -4921,6 +5186,60 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         {
             if atts.specified(i) = false
             {
+                ; the makeMissingValue message half (finish's loop fires it in
+                ; the same iteration as the value's makeSemantics — Attribute
+                ; .cxx:1247): re-derive the virtual dispatch from the kind.
+                ; The CONREF exclusion (conref specified -> the NOTATION slot
+                ; gets NO makeMissingValue call at all, :1248) is skipped the
+                ; same way. Locations: unlocated context.message = the current
+                ; token's START (the TAGC — verified 5:4 / 7:21).
+                var mm_skip false
+                if atts.conref_of()
+                {
+                    let adl atts.get_def()
+                    if adl <> null
+                    {
+                        if adl.get_notation_index() = i
+                            set mm_skip: true
+                    }
+                }
+                if mm_skip = false
+                {
+                    let d atts.definition(i)
+                    if d <> null
+                    {
+                        let kind d.get_ad_kind()
+                        let ctx ps.get_attribute_context()
+                        if kind = ADK_REQUIRED
+                        {
+                            if ps.validate()
+                                this.report1_at(ParserMessages.requiredAttributeMissing(), d.get_name(), ps.current_input().token_start_location())
+                        }
+                        else if kind = ADK_CURRENT
+                        {
+                            if ctx.may_default_attribute()
+                            {
+                                ; finish stored getCurrentAttribute's result:
+                                ; still null = no occurrence specified yet.
+                                if atts.value(i) = null
+                                {
+                                    if ps.validate()
+                                        this.report1_at(ParserMessages.currentAttributeMissing(), d.get_name(), ps.current_input().token_start_location())
+                                }
+                            }
+                            else if ps.validate()
+                                this.report1_at(ParserMessages.attributeMissing(), d.get_name(), ps.current_input().token_start_location())
+                        }
+                        else if (kind = ADK_DEFAULT) or (kind = ADK_FIXED)
+                        {
+                            if ctx.may_default_attribute() = false
+                            {
+                                if ps.validate()
+                                    this.report1_at(ParserMessages.attributeMissing(), d.get_name(), ps.current_input().token_start_location())
+                            }
+                        }
+                    }
+                }
                 let v atts.value(i)
                 if v <> null
                 {
@@ -4984,6 +5303,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let index idx as size_t
         ; attributeNameShorttag (parseAttribute.cxx:115): OMITNAME disabled
         ; makes the shorthand illegal (message only; the value still books).
+        ; The else-arm's missingAttributeName (W0) is gated on the
+        ; warnMissingAttributeName option — unmodeled with the -w flags.
         if ps.get_sd().attribute_omit_name() = false
             this.report0_at(ParserMessages.attributeNameShorttag(), ps.current_input().token_start_location())
         let ctx ps.get_attribute_context()
@@ -5000,7 +5321,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         if (normsep > litlen) or (tsz > litlen - normsep)
             this.report_num_num_at(ParserMessages.normalizedAttributeValueLength(), litlen as u64, (tsz + normsep) as u64, ps.current_input().token_start_location())
         set *spec_length: *spec_length + tsz + normsep
-        atts.set_value(host, index, text, ctx)
+        ; checkValue wraps makeValueFromToken too (Attribute.h:648) — bind the
+        ; set_value result: it is this function's return value (tail position).
+        let sv_ok atts.set_value(host, index, text, ctx)
+        this.check_attribute_value(atts, index)
+        sv_ok
     }
 
     ; parseAttributeSpec — the attribute-spec loop: (name VI value)* up to the
@@ -5066,6 +5391,35 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 else if this.parse_attribute_parameter(mode, false, &cur_parm, net) = false
                 {
+                    set ok: false
+                    set running: false
+                }
+            }
+            else if cur_parm = APT_RECOVER_UNQUOTED
+            {
+                ; parseAttributeSpec's recoverUnquoted arm (parseAttribute.cxx
+                ; :70): adopted junk continues the spec loop; otherwise shrink
+                ; the token to its first character, try the missing-closing-
+                ; quote guess, and failing that report attributeSpecCharacter
+                ; (arg = that character) — the spec is abandoned either way.
+                if this.recover_unquoted_spec(atts)
+                {
+                    if this.parse_attribute_parameter(mode, false, &cur_parm, net) = false
+                    {
+                        set ok: false
+                        set running: false
+                    }
+                }
+                else
+                {
+                    let ins ps.current_input()
+                    ins.end_token(1 as size_t)
+                    if this.atts_handle_as_unterminated(atts) = false
+                    {
+                        let ts ins.current_token_string()
+                        let cs StringC^host(ts.data_ptr(), ts.get_size())
+                        this.report1_at(ParserMessages.attributeSpecCharacter(), *cs, ins.token_start_location())
+                    }
                     set ok: false
                     set running: false
                 }
