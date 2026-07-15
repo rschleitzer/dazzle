@@ -12,6 +12,7 @@ use opensp.Syntax.Syntax
 use opensp.Dtd.Dtd
 use opensp.ElementType.ElementType
 use opensp.ElementType.ElementDefinition
+use opensp.ElementType.RankStem
 use opensp.ContentToken.ContentToken
 use opensp.ContentToken.CmNode
 use opensp.ContentToken.CompiledModelGroup
@@ -1567,6 +1568,72 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let e ElementType.make(host, name, idx)
         dtd.insert_element_type(e)
         e
+    }
+
+    ; lookupCreateRankStem (parseDecl.cxx:846) — find or create the rank stem
+    ; named `name`. A NEWLY-created stem whose name is already a DEFINED element
+    ; type's generic identifier is a rankStemGenericIdentifier error (reported
+    ; here UNCONDITIONALLY, unlike the validate-gated loop in parseElementDecl).
+    function lookup_create_rank_stem(this: Parser, name: StringC) returns pointer[RankStem]
+    {
+        let dtd ps.get_def_dtd()
+        let existing dtd.lookup_rank_stem(name)
+        if existing <> null
+            return existing
+        let nidx dtd.n_rank_stem()
+        let r RankStem.make(host, name, nidx)
+        dtd.insert_rank_stem(r)
+        let e dtd.lookup_element_type(name)
+        if e <> null
+            if e.get_definition() <> null
+                this.report1_at(ParserMessages.rankStemGenericIdentifier(), name, ps.current_input().token_start_location())
+        r
+    }
+
+    ; completeRankStem (parseInstance.cxx:475) — a GI that is not itself an
+    ; element type may be a rank stem: build stem-name + current-rank-suffix and
+    ; look that up. noCurrentRank when the stem has no current rank suffix.
+    function complete_rank_stem(this: Parser, name: StringC) returns pointer[ElementType]
+    {
+        let dtd ps.get_current_dtd()
+        let rank_stem dtd.lookup_rank_stem(name)
+        if rank_stem = null
+            return null
+        let buf Array[u32]^host()
+        this.arg_append(buf, rank_stem.get_name())
+        if ps.append_current_rank(buf, rank_stem) = false
+        {
+            ; append failed — buf still holds just the stem name (the message arg).
+            let stem_name StringC^host(buf.get_buffer(), buf.get_length())
+            this.report1(ParserMessages.noCurrentRank(), stem_name)
+            return null
+        }
+        let full StringC^host(buf.get_buffer(), buf.get_length())
+        dtd.lookup_element_type(full)
+    }
+
+    ; handleRankedElement (parseInstance.cxx:488) — the element's rank suffix
+    ; becomes the current rank for every stem in every definition of its stem.
+    function handle_ranked_element(this: Parser, e: pointer[ElementType])
+    {
+        let def e.get_definition()
+        let rank_suffix def.get_rank_suffix()
+        let suf_ptr StringC^host(rank_suffix.data_ptr(), rank_suffix.get_size())
+        let rank_stem e.ranked_element_rank_stem()
+        var i: size_t 0
+        let nd rank_stem.n_definitions()
+        while i < nd
+        {
+            let d rank_stem.definition(i)
+            var j: size_t 0
+            let njs d.n_rank_stems()
+            while j < njs
+            {
+                ps.set_current_rank(d.rank_stem(j), suf_ptr)
+                set j: j + 1
+            }
+            set i: i + 1
+        }
     }
 
     function lookup_create_notation(this: Parser, name: StringC) returns pointer[Notation]
@@ -3148,29 +3215,79 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         if this.parse_param(allow_roc, decl_input_level, parm) = false
             return false
 
-        if parm.kind = P_NUMBER
-        {
-            ; RANK feature axis (parseDecl.cxx:571): a number here is a rank
-            ; suffix — the reference builds rank stems (lookupCreateRankStem,
-            ; setRank) and parses the declaration normally, with NO diagnostic.
-            ; Unported; err keeps the abort visible in the error count until
-            ; the axis lands.
-            this.err(50)
-            return false
-        }
-
-        ; resolve element types.
-        var elements Array[pointer[ElementType]]^host()
+        ; resolve element types. rank_suffix/rank_stems stay empty unless the
+        ; RANK branch below fills them (parseDecl.cxx:566-609).
+        let elements Array[pointer[ElementType]]^host()
+        let rank_stems Array[pointer[RankStem]]^host()
+        var rank_suffix StringC()
         let nn names.get_length()
         let nbuf names.get_buffer()
-        var k: size_t 0
-        while k < nn
+
+        if parm.kind = P_NUMBER
         {
-            let entry *(nbuf + k)
-            let e this.lookup_create_element(entry.name)
-            e.set_orig_name(entry.orig_name)
-            elements.add(e)
-            set k: k + 1
+            ; RANK (parseDecl.cxx:571): the number is the rank suffix. Element
+            ; types are named GI+suffix; each name also creates a rank stem.
+            ; warnRank (options().warnRank) — a `rank` warning — is off by
+            ; default (a -w flag), so no message here.
+            set rank_suffix: parm.token
+            let namelen_q ps.get_syntax().get_quantity(qNAMELEN) as size_t
+            var k: size_t 0
+            while k < nn
+            {
+                let entry *(nbuf + k)
+                let sbuf Array[u32]^host()
+                this.arg_append(sbuf, entry.name)
+                this.arg_append(sbuf, rank_suffix)
+                let suffixed StringC^host(sbuf.get_buffer(), sbuf.get_length())
+                ; genericIdentifierLength (parseDecl.cxx:578): only when the
+                ; SUFFIXED name exceeds NAMELEN but the plain name did not. Plain
+                ; message() = the current token's start (the rank number).
+                if (suffixed.get_size() > namelen_q) and (entry.name.get_size() <= namelen_q)
+                    this.report_num_at(ParserMessages.genericIdentifierLength(), namelen_q as u64, ps.current_input().token_start_location())
+                elements.add(this.lookup_create_element(suffixed))
+                rank_stems.add(this.lookup_create_rank_stem(entry.name))
+                set k: k + 1
+            }
+            ; a parameter separator is required between the rank suffix and the
+            ; omitted-tag/content parameter (parseDecl.cxx:594).
+            let peek ps.get_token(mdMinusMode)
+            if peek = tokenNameStart
+                this.report0(ParserMessages.psRequired())
+            ps.current_input().unget_token()
+            let allow_oc AllowedParams.a7(host, P_RESERVED_NAME + R_O, P_MINUS, P_RESERVED_NAME + R_CDATA, P_RESERVED_NAME + R_RCDATA, P_RESERVED_NAME + R_EMPTY, P_RESERVED_NAME + R_ANY, P_MODELGROUP)
+            if this.parse_param(allow_oc, decl_input_level, parm) = false
+                return false
+        }
+        else
+        {
+            var k: size_t 0
+            while k < nn
+            {
+                let entry *(nbuf + k)
+                let e this.lookup_create_element(entry.name)
+                e.set_orig_name(entry.orig_name)
+                elements.add(e)
+                set k: k + 1
+            }
+        }
+
+        ; rankStemGenericIdentifier (parseDecl.cxx:611): an element type whose GI
+        ; is also a rank stem name (validate-gated). Plain message() = the
+        ; current token's start (the last-parsed omission/content token).
+        if ps.validate()
+        {
+            let ddtd ps.get_def_dtd()
+            let rsloc ps.current_input().token_start_location()
+            var ri: size_t 0
+            let re elements.get_length()
+            let rbuf elements.get_buffer()
+            while ri < re
+            {
+                let el *(rbuf + ri)
+                if ddtd.lookup_rank_stem(el.get_name()) <> null
+                    this.report1_at(ParserMessages.rankStemGenericIdentifier(), el.get_name(), rsloc)
+                set ri: ri + 1
+            }
         }
 
         ; omitted-tag minimization.
@@ -3270,6 +3387,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
         def.compute_mode()
 
+        ; setRank (parseDecl.cxx:716): a ranked definition carries its suffix and
+        ; the full rank-stem group.
+        if rank_suffix.get_size() > (0 as size_t)
+            def.set_rank(rank_suffix, rank_stems)
+
+        let n_rank_stems rank_stems.get_length()
         var e_index: size_t 0
         let ecount elements.get_length()
         let ebuf elements.get_buffer()
@@ -3290,6 +3413,15 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     let loc ps.current_input().token_start_location()
                     this.report1_at(ParserMessages.duplicateElementDefinition(), gi, loc)
                 }
+            }
+            ; addDefinition (parseDecl.cxx:729): register the definition on this
+            ; element's rank stem (ranked declarations only). Bind the stem to a
+            ; local — a dereferenced-slot method receiver mis-plans (the slot
+            ; ADDRESS reaches the method as `this` instead of the pointer).
+            if n_rank_stems > (0 as size_t)
+            {
+                let rs *(rank_stems.get_buffer() + e_index)
+                rs.add_definition(def)
             }
             set e_index: e_index + 1
         }
@@ -6095,6 +6227,15 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let name this.name_folded()
         let dtd ps.get_current_dtd()
         var e dtd.lookup_element_type(name)
+        ; RANK (parseInstance.cxx:433): an unknown GI may complete a rank stem;
+        ; a ranked element updates the current rank for its stem group.
+        if ps.get_sd().rank()
+        {
+            if e = null
+                set e: this.complete_rank_stem(name)
+            else if e.is_ranked_element()
+                this.handle_ranked_element(e)
+        }
         if e = null
         {
             let cs ps.get_content_state()
@@ -6716,7 +6857,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         this.extend_name_token(this.namelen(), ParserMessages.nameLength())
         let name this.name_folded()
         let dtd ps.get_current_dtd()
-        let e dtd.lookup_element_type(name)
+        var e dtd.lookup_element_type(name)
+        ; RANK (parseInstance.cxx:1022): an unknown end-tag GI may complete a
+        ; rank stem (end tags do NOT update the current rank).
+        if ps.get_sd().rank()
+            if e = null
+                set e: this.complete_rank_stem(name)
         let loc ps.current_location()
         this.parse_end_tag_close()
         if e = null
@@ -13248,6 +13394,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         set sd: host.allocate(sizeof Sd, alignof Sd) as pointer[Sd]
         set *sd: Sd()
         sd.set_formal(true)
+        ; RANK YES is the ParserOptions default (Parser.cxx:39, opt.rank=1), so
+        ; the implied SGML declaration enables the RANK feature.
+        sd.set_rank(true)
         ; the document charset machinery (Parser.cxx:46-52): the implied
         ; declaration — one section with an EMPTY public id declaring
         ; 0..charMax — and the system-charset identity mapping. An explicit
