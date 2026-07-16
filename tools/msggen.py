@@ -149,8 +149,13 @@ def emit(def_file, entries, out):
         else:
             w("    ; %d%s\n" % (e.num, clause))
             w("    function %s() returns MessageType\n" % e.tag)
-            w('        MessageType(MessageFragment(%d as u32, StringC("%s")), Severity.%s)\n'
-              % (e.num, escape(e.text), SEVERITY[e.sev]))
+            if e.clause:
+                # MessageType::clauses_ — the -x "relevant clauses:" payload.
+                w('        MessageType(MessageFragment(%d as u32, StringC("%s")), Severity.%s, StringC("%s"))\n'
+                  % (e.num, escape(e.text), SEVERITY[e.sev], escape(e.clause)))
+            else:
+                w('        MessageType(MessageFragment(%d as u32, StringC("%s")), Severity.%s)\n'
+                  % (e.num, escape(e.text), SEVERITY[e.sev]))
         if e.aux_num is not None:
             w("\n")
             w("    ; %d (auxiliary fragment of %s)\n" % (e.aux_num, e.tag))

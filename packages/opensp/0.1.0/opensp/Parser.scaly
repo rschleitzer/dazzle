@@ -4872,27 +4872,35 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             if opt_et.warn_pi_entity
                 this.report0_at(ParserMessages.piEntity(), ps.current_input().token_start_location())
         }
-        else if parm.kind = (P_RESERVED_NAME + R_STARTTAG)
+        ; typeLocation (parseDecl.cxx:1678) — the bracket keyword's own token
+        ; start: the reference's BracketOrigin parents the synthesized open/
+        ; close delimiter chars there (the -e def-location walk lands on it).
+        var type_loc Location()
+        if parm.kind = (P_RESERVED_NAME + R_STARTTAG)
         {
             set bracketed: 1
+            set type_loc: ps.current_input().token_start_location()
             if opt_et.warn_bracket_entity
                 this.report0_at(ParserMessages.bracketEntity(), ps.current_input().token_start_location())
         }
         else if parm.kind = (P_RESERVED_NAME + R_ENDTAG)
         {
             set bracketed: 2
+            set type_loc: ps.current_input().token_start_location()
             if opt_et.warn_bracket_entity
                 this.report0_at(ParserMessages.bracketEntity(), ps.current_input().token_start_location())
         }
         else if parm.kind = (P_RESERVED_NAME + R_MS)
         {
             set bracketed: 3
+            set type_loc: ps.current_input().token_start_location()
             if opt_et.warn_bracket_entity
                 this.report0_at(ParserMessages.bracketEntity(), ps.current_input().token_start_location())
         }
         else if parm.kind = (P_RESERVED_NAME + R_MD)
         {
             set bracketed: 4
+            set type_loc: ps.current_input().token_start_location()
             if opt_et.warn_bracket_entity
                 this.report0_at(ParserMessages.bracketEntity(), ps.current_input().token_start_location())
         }
@@ -4909,7 +4917,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; does not alias the transient literal buffer (which later parsing reuses;
         ; a shallow store corrupted it to a later token by reference time).
         if bracketed = 0
+        {
             set iep.text: StringC^host(text_sc.data_ptr(), text_sc.get_size())
+            ; per-char replacement-text locations (Text::charLocation) — the -e
+            ; reporter's EntityOrigin::defLocation walk anchors messages inside
+            ; the entity at these. parse_literal built the buffer on host, so
+            ; the pointer is stable.
+            iep.set_def_locs(lt.get_locs())
+        }
         else
         {
             ; open/close delimiter strings per bracket kind (parseDecl.cxx:98).
@@ -4925,6 +4940,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else
                 this.append_delim_chars(wrap, dMDO)
+            let open_len wrap.get_length()
             this.arg_append(wrap, text_sc)
             if bracketed = 1
                 this.append_delim_chars(wrap, dTAGC)
@@ -4939,6 +4955,35 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 this.append_delim_chars(wrap, dMDC)
             let total wrap.get_length()
             set iep.text: StringC^host(wrap.get_buffer(), total)
+            ; per-char locations for the wrapped text: the literal chars keep
+            ; their parse_literal locations; the synthesized delimiter chars
+            ; carry the bracket keyword's location + chunk-relative offset —
+            ; the value the reference's BracketOrigin walk (parent typeLocation,
+            ; `index += loc.index()`) resolves to.
+            let wlocs Array[Location]^host()
+            var wi: size_t 0
+            while wi < open_len
+            {
+                wlocs.add(Location(type_loc.get_origin(), type_loc.get_index() + (wi as u32)))
+                set wi: wi + 1
+            }
+            let lit_locs lt.get_locs()
+            var li: size_t 0
+            while li < text_sc.get_size()
+            {
+                if lit_locs <> null
+                    wlocs.add(*(lit_locs + li))
+                else
+                    wlocs.add(Location())
+                set li: li + 1
+            }
+            var ci: size_t 0
+            while (open_len + text_sc.get_size() + ci) < total
+            {
+                wlocs.add(Location(type_loc.get_origin(), type_loc.get_index() + (ci as u32)))
+                set ci: ci + 1
+            }
+            iep.set_def_locs(wlocs.get_buffer())
             ; bracketedLitlen (parseDecl.cxx:134): only when the DELIMITERS
             ; push the interpreted text past LITLEN (the literal alone fits).
             let litlen ps.get_syntax().get_quantity(qLITLEN) as size_t
@@ -9540,6 +9585,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let child ParserState.make(host, null, ps.get_subdoc_level() + (1 as u32), PHASE_PROLOG)
         child.set_prog_name(ps.get_prog_name())
         child.set_output_utf8(ps.get_output_utf8())
+        ; the reporter options, -E limit and -f sink are app-global too.
+        child.set_reporter_options(ps.reporter_options)
+        child.set_error_limit(ps.get_error_limit())
+        child.set_msg_fd(ps.msg_fd)
         ; the subdoc parser shares the invoking parser's options (Parser.cxx
         ; params carry no options; the app's ParserOptions are global).
         child.set_options(ps.get_options())
@@ -10883,6 +10932,45 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         Parser.make_char_source(host, bytes, org)
     }
 
+    ; ParserState::startDtd's includes loop (-i): every name the driver's -i
+    ; options collected is defined in the new DTD as a parameter entity whose
+    ; replacement text is the reserved name INCLUDE — first-wins, so it
+    ; preempts the DTD's own declaration (which then reports duplicate under
+    ; -wduplicate). The name is folded through the entity subst table
+    ; (identity under NAMECASE ENTITY NO); the entity is marked used so
+    ; -wunused-param stays quiet; its definition location is null.
+    function insert_include_entities(this: Parser, dtd: pointer[Dtd])
+    {
+        let opts ps.get_options()
+        let inc opts.includes
+        if inc = null
+            return
+        let syn ps.get_syntax()
+        let rtext syn.reserved_name(R_INCLUDE)
+        let n inc.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let raw *(inc.get_buffer() + i)
+            let fb Array[u32]^host()
+            var ci: size_t 0
+            while ci < raw.get_size()
+            {
+                fb.add(syn.fold_entity(raw.get(ci)))
+                set ci: ci + 1
+            }
+            let nm StringC^host(fb.get_buffer(), fb.get_length())
+            let text StringC^host(rtext.data_ptr(), rtext.get_size())
+            let iep InternalEntity.make(host, nm, text, DT_SGML)
+            let iev *iep
+            let ent host.allocate(sizeof Entity, alignof Entity) as pointer[Entity]
+            set *ent: Entity.Internal(iev)
+            dtd.insert_entity(ent, true, false)
+            ps.note_entity_used(ent)
+            set i: i + 1
+        }
+    }
+
     ; ParserState::startDtd's PredefinedEntity loop: every entity the SGML
     ; declaration's SYNTAX ENTITIES section names (xml.dcl: "amp" 38, "lt" 60,
     ; "gt" 62, "quot" 34, "apos" 39) is inserted into the new DTD as an internal
@@ -10954,6 +11042,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let dtd Dtd.make(host, docname, ps.had_dtd() = false)
         ps.set_def_dtd(dtd)
         ps.set_current_dtd(dtd)
+        this.insert_include_entities(dtd)
         this.insert_predefined_entities(dtd)
 
         let allow_ext AllowedParams.a4(host, P_DSO, P_MDC, P_RESERVED_NAME + R_SYSTEM, P_RESERVED_NAME + R_PUBLIC)
@@ -13277,6 +13366,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let dtd Dtd.make(host, gi, true)
         ps.set_def_dtd(dtd)
         ps.set_current_dtd(dtd)
+        this.insert_include_entities(dtd)
         this.insert_predefined_entities(dtd)
         if csys.get_length() > (0 as size_t)
         {
@@ -13369,6 +13459,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         var prolog_tries: u32 0
         while running
         {
+            ; error-limit abort applies to the prolog too (the reference's
+            ; parseAll checks the handler's cancel pointer on every event
+            ; delivery, prolog declarations included).
+            if ps.is_cancelled()
+                return false
             let token ps.get_token(proMode)
             if token = tokenS
             {
@@ -17676,7 +17771,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             sd.set_start_tag_net_enable(NET_ENABLE_NO)
     }
 
-    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, charset_fixed: bool, active_links: pointer[Array[String]], options: pointer[ParserOptions], out_conforming: pointer[bool]) returns String
+    ; error_limit: ParserApp::errorLimit_ (-E, 0 = unlimited); reporter_options:
+    ; the REP_* mask (-e/-g/-n/-x); msg_fd: the message sink (-f, default 2);
+    ; prolog_only: -p (cancel at end-prolog).
+    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, charset_fixed: bool, active_links: pointer[Array[String]], options: pointer[ParserOptions], error_limit: u32, reporter_options: u32, msg_fd: int, prolog_only: bool, out_conforming: pointer[bool]) returns String
     {
         ; Record normalization (ExtendEntityManager, `lf` record type — the whole
         ; Unix corpus): insert one RS (0x0A) at the entity start, and translate
@@ -17694,6 +17792,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; the output coding system (identity vs UTF-8) the driver derived from
         ; the environment — governs the ESIS stdout bytes and stderr encoding.
         ps.set_output_utf8(output_utf8)
+        ps.set_error_limit(error_limit)
+        ps.set_reporter_options(reporter_options)
+        ps.set_msg_fd(msg_fd)
+        ps.set_prolog_only(prolog_only)
         ; the document's directory: every relative SYSTEM id (external DTD subset,
         ; external text entity in content) resolves against it. The declaration
         ; base starts here too and follows the external subset while it is parsed.
@@ -17886,10 +17988,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         if sd_failed = false
             set ok: parser.parse_document(table, base_dir)
         ; errorLimitExceeded (ParserApp.cxx): after the parse, if the error count
-        ; reached the limit, emit the locationless Info line (once). onsgmls prints
-        ; this last, after every queued diagnostic.
-        if (ERROR_LIMIT <> (0 as u32)) and (ps.get_n_errors() >= ERROR_LIMIT)
-            ps.report_error_limit(ERROR_LIMIT)
+        ; reached the limit (-E overrides the 200 default; 0 = unlimited), emit
+        ; the locationless Info line (once). onsgmls prints this last, after
+        ; every queued diagnostic.
+        let elim ps.get_error_limit()
+        if (elim <> (0 as u32)) and (ps.get_n_errors() >= elim)
+            ps.report_error_limit(elim)
         let conforming ok and (ps.get_n_errors() = (0 as u32))
         set *out_conforming: conforming
         Esis.write(host, ps, conforming)

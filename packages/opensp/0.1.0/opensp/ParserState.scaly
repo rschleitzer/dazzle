@@ -12,6 +12,7 @@ use opensp.Entity.Entity
 use opensp.Entity.InternalEntity
 use opensp.ContentState.ContentState
 use opensp.OpenElement.OpenElement
+use opensp.ContentToken.CmNode
 use opensp.ElementType.ElementType
 use opensp.ElementType.RankStem
 use opensp.Attribute.AttributeContext
@@ -114,9 +115,28 @@ define OS_PENDING_AFTER_RSRE: int 3
 define OS_PENDING_AFTER_MARKUP: int 4
 
 ; DEFAULT_ERROR_LIMIT (ParserApp.cxx): onsgmls cancels the parse once this many
-; error messages have been reported (the -E option changes it; we use the fixed
-; default). 0 would disable the limit.
+; error messages have been reported. The -E driver option overrides it at
+; runtime (ParserState.error_limit); 0 disables the limit.
 define ERROR_LIMIT: u32 200
+
+; MessageReporter::Option (MessageReporter.h) — the -e/-g/-n/-x reporter
+; flags, a bit mask on ParserState.reporter_options.
+define REP_OPEN_ENTITIES: u32 1
+define REP_OPEN_ELEMENTS: u32 2
+define REP_MESSAGE_NUMBERS: u32 4
+define REP_CLAUSES: u32 8
+
+; OpenElementInfo (Message.h:154) — one open element in the -g "open elements:"
+; snapshot: its gi, the last-matched token's element name (or #PCDATA) and
+; 1-based content-model type index, and whether the element was included.
+define OeInfo
+(
+    gi: StringC
+    match_type: StringC
+    match_index: u32
+    has_match: bool
+    included: bool
+)
 
 ; Message (Message.cs, minimal) — a dispatched diagnostic: its type
 ; (fragment + severity) and the source location where it occurred. The full C++
@@ -187,6 +207,13 @@ define KeptMessage
     has_aux: bool
     aux_text: StringC
     aux_loc: Location
+    ; MessageType::clauses_ (-x): pinned like msg_text.
+    msg_clauses: StringC
+    ; the -g open-element snapshot taken at REPORT time (Messenger::message
+    ; runs initMessage before keepMessages stores the Message, so a kept
+    ; message replays the elements open when it FIRED, not when it released).
+    ; null = option off / not in the instance.
+    oe_info: pointer[Array[OeInfo]]
 )
 
 ; LinkProcessOpenElement (LinkProcess.h:23) — one per open element while an
@@ -345,6 +372,15 @@ define ParserState
     ;     and the message stderr stream (write_stderr — no escaper there:
     ;     makeStdErr never calls setEscaper, unencodable chars are dropped). ---
     out_utf8: bool
+    ; --- MessageReporter::options_ — the -e/-g/-n/-x reporter flags (REP_*). ---
+    reporter_options: u32
+    ; --- ParserApp::errorLimit_ (-E): 0 = unlimited. ---
+    error_limit: u32
+    ; --- the message sink fd (-f error-file redirects it; default 2). ---
+    msg_fd: int
+    ; --- -p only-prolog (PrologMessageEventHandler::endProlog cancels the
+    ;     parse when the end-prolog event is delivered). ---
+    prolog_only: bool
     ; --- LINK axis (ParserState.cxx): the LPD being defined, the LPDs seen so
     ;     far (all) and the ACTIVE ones (lpd_), and the -a activation list. ---
     def_lpd: pointer[Lpd]
@@ -469,6 +505,10 @@ define ParserState
         set ps.decl_base_dir: String()
         set ps.prog_name: String()
         set ps.out_utf8: false
+        set ps.reporter_options: 0 as u32
+        set ps.error_limit: ERROR_LIMIT
+        set ps.msg_fd: 2
+        set ps.prolog_only: false
         set ps.def_lpd: null
         set ps.had_lpd: false
         set ps.active_lpds: Array[pointer[Lpd]]^host()
@@ -522,6 +562,25 @@ define ParserState
     function get_output_utf8(this: ParserState) returns bool
         out_utf8
 
+    ; ---- reporter options / error limit / message sink (driver flags) ------
+    function set_reporter_options(this: pointer[ParserState], opts: u32)
+        set this.reporter_options: opts
+
+    function reporter_option(this: ParserState, bit: u32) returns bool
+        (reporter_options & bit) <> (0 as u32)
+
+    function set_error_limit(this: pointer[ParserState], limit: u32)
+        set this.error_limit: limit
+
+    function get_error_limit(this: ParserState) returns u32
+        error_limit
+
+    function set_msg_fd(this: pointer[ParserState], fd: int)
+        set this.msg_fd: fd
+
+    function set_prolog_only(this: pointer[ParserState], v: bool)
+        set this.prolog_only: v
+
     ; ---- document base directory ------------------------------------------
     ; The caller's String outlives the parse (it is the onsgmls program's own
     ; document path), so the field aliases it rather than deep-copying.
@@ -565,6 +624,12 @@ define ParserState
             let lpd e.get_end_prolog_lpd() as pointer[Lpd]
             if lpd <> null
                 this.lp_init(lpd)
+            ; -p (only-prolog): PrologMessageEventHandler::endProlog cancels
+            ; the parse when the end-prolog event is delivered — the instance
+            ; is never parsed and no output is produced (the driver skips the
+            ; ESIS dump under -p).
+            if this.prolog_only
+                set this.cancelled: true
         }
         this.events.add(e)
     }
@@ -2111,8 +2176,9 @@ define ParserState
         {
             set this.n_errors: this.n_errors + (1 as u32)
             ; ErrorCountEventHandler::noteMessage — cancel exactly when the count
-            ; reaches the limit (`++errorCount_ == maxErrors_`).
-            if (ERROR_LIMIT <> (0 as u32)) and (this.n_errors = ERROR_LIMIT)
+            ; reaches the limit (`++errorCount_ == maxErrors_`; -E overrides,
+            ; 0 = unlimited).
+            if (this.error_limit <> (0 as u32)) and (this.n_errors = this.error_limit)
                 set this.cancelled: true
         }
     }
@@ -2168,6 +2234,7 @@ define ParserState
             set this.pass1_had_error: true
         }
         this.emit_message(&msg, args)
+        this.emit_oe_after(msg.get_loc(), this.capture_oe_info())
         this.dispatch_message(msg)
     }
 
@@ -2191,6 +2258,7 @@ define ParserState
         }
         var msg Message(type, loc)
         this.emit_message(&msg, args)
+        this.emit_oe_after(loc, this.capture_oe_info())
         this.dispatch_message(msg)
     }
 
@@ -2218,6 +2286,9 @@ define ParserState
         var msg Message(type, loc)
         this.emit_message(&msg, args)
         this.emit_aux_line(aux_text, args, aux_loc)
+        ; -g: after the aux line (dispatchMessage order: message, clauses,
+        ; aux, open elements).
+        this.emit_oe_after(loc, this.capture_oe_info())
         this.dispatch_message(msg)
     }
 
@@ -2238,6 +2309,11 @@ define ParserState
         let hp this.host
         let ttxt type.get_text()
         set km.msg_text: StringC^hp(ttxt.data_ptr(), ttxt.get_size())
+        let tcls type.get_clauses()
+        set km.msg_clauses: StringC^hp(tcls.data_ptr(), tcls.get_size())
+        ; -g snapshot at FIRE time (Messenger::message runs initMessage before
+        ; the Message is stored) — null when the option is off.
+        set km.oe_info: this.capture_oe_info()
         var sev_code KS_ERROR
         choose type.severity
             when x: Severity.Info
@@ -2449,13 +2525,15 @@ define ParserState
             set sev: Severity.QuantityError
         else if km.msg_sev = KS_IDREF
             set sev: Severity.IdrefError
-        let mt MessageType(MessageFragment(km.msg_number, km.msg_text), sev)
+        let mt MessageType(MessageFragment(km.msg_number, km.msg_text), sev, km.msg_clauses)
         var msg Message(mt, km.loc)
         if km.silent = false
         {
             this.emit_message(&msg, args)
             if km.has_aux
                 this.emit_aux_line(km.aux_text, args, km.aux_loc)
+            ; -g: the snapshot taken when the message FIRED (keep time).
+            this.emit_oe_after(km.loc, km.oe_info)
         }
         this.dispatch_message(msg)
     }
@@ -2485,6 +2563,8 @@ define ParserState
         set km2.has_aux: km.has_aux
         set km2.aux_text: km.aux_text
         set km2.aux_loc: km.aux_loc
+        set km2.msg_clauses: km.msg_clauses
+        set km2.oe_info: km.oe_info
         if this.n_pass1_kept < this.pass1_kept.get_length()
             this.pass1_kept.put(this.n_pass1_kept, km2)
         else
@@ -2550,7 +2630,7 @@ define ParserState
         let sev mt.severity_char()
         var args Vector[MessageArg](1 as size_t)
         set *(args.get(0 as size_t)): MessageArg.Num(limit as u64)
-        this.emit_message_noloc(txt, args, sev)
+        this.emit_message_noloc(txt, args, sev, mt.get_number())
     }
 
     ; resolve_location — a port of MessageReporter::locationHeader (the default
@@ -2631,6 +2711,360 @@ define ParserState
         null
     }
 
+    ; resolve_location_open — MessageReporter::locationHeader's openEntities
+    ; branch (-e): instead of resolving an entity-internal location up to the
+    ; reference site, STOP at the innermost named entity origin, print one
+    ; "In entity <name> included from <loc>" header line (the %2 location is
+    ; resolved recursively through this same walk, so nested references print
+    ; their own headers first), and anchor the message INSIDE the entity — an
+    ; external entity at its own file position, an internal one through the
+    ; per-char definition-location buffer (EntityOrigin::defLocation /
+    ; Text::charLocation) at the literal's source. emit_headers=false is the
+    ; follow-on-line variant (clauses/open-elements reuse the main line's
+    ; resolved position without reprinting headers).
+    function resolve_location_open(this: pointer[ParserState], loc: Location, rs_next_line: bool, emit_headers: bool, out_line: pointer[u32], out_col: pointer[u32]) returns pointer[Origin]
+    {
+        var index loc.get_index()
+        var org loc.get_origin()
+        var resolved: pointer[Origin] null
+        var done_header false
+        var walking true
+        while walking
+        {
+            if org = null
+                set walking: false
+            else
+            {
+                let ed org.get_entity_decl()
+                let par org.parent()
+                var head_arm false
+                if ed <> null
+                    set head_arm: true
+                if par.get_origin() = null
+                    set head_arm: true
+                if head_arm
+                {
+                    if done_header = false
+                    {
+                        ; reference: header only when the parent location names
+                        ; a real source (`if (parentInfo)`); the document
+                        ; origin (null parent) prints none.
+                        if (ed <> null) and emit_headers
+                        {
+                            if par.get_origin() <> null
+                            {
+                                let pidx par.get_index() + (org.get_ref_length() as u32)
+                                this.emit_in_entity_header(ed, Location(par.get_origin(), pidx))
+                            }
+                        }
+                        set done_header: true
+                    }
+                    if org.get_contents() <> null
+                    {
+                        set resolved: org
+                        set walking: false
+                    }
+                    else
+                    {
+                        ; EntityOrigin::defLocation — map the offset in the
+                        ; replacement text through the entity's per-char
+                        ; location buffer (Text::charLocation: an offset past
+                        ; the last char extrapolates from it), then continue
+                        ; the walk from the literal's source. No buffer (an
+                        ; untracked internal text) = no real source, exactly
+                        ; like a reference Text built without locations.
+                        var have_def false
+                        if ed <> null
+                        {
+                            let entp ed as pointer[Entity]
+                            let dl (*entp).internal_def_locs()
+                            let tsz (*entp).internal_text_size()
+                            if dl <> null
+                            {
+                                if tsz > (0 as size_t)
+                                {
+                                    var off index as size_t
+                                    var extra: u32 0
+                                    if off >= tsz
+                                    {
+                                        set extra: (off - (tsz - (1 as size_t))) as u32
+                                        set off: tsz - (1 as size_t)
+                                    }
+                                    let nl *(dl + off)
+                                    if nl.get_origin() <> null
+                                    {
+                                        set org: nl.get_origin()
+                                        set index: nl.get_index() + extra
+                                        set have_def: true
+                                    }
+                                }
+                            }
+                        }
+                        if have_def = false
+                            set walking: false
+                    }
+                }
+                else
+                {
+                    if org.get_entity_decl() <> null
+                        set index: par.get_index() + (org.get_ref_length() as u32)
+                    else
+                        set index: index + par.get_index()
+                    set org: par.get_origin()
+                }
+            }
+        }
+        if resolved <> null
+        {
+            resolved.line_col(index as size_t, rs_next_line, out_line, out_col)
+            return resolved
+        }
+        set *out_line: 0 as u32
+        set *out_col: 0 as u32
+        let ins this.current_input()
+        if ins <> null
+            ins.line_col(loc.get_index() as size_t, rs_next_line, out_line, out_col)
+        null
+    }
+
+    ; One "In entity <name> included from <file>:<line>[:<col>]" line — the
+    ; MessageReporterMessages::inNamedEntity header the -e walk prints (no
+    ; program-name prefix, %2 rendered with printLocation's column rules).
+    ; Prints nothing when the parent location resolves to no real source.
+    function emit_in_entity_header(this: pointer[ParserState], ed: pointer[void], parent_loc: Location)
+    {
+        var pline: u32 0
+        var pcol: u32 0
+        let presolved this.resolve_location_open(parent_loc, false, true, &pline, &pcol)
+        if presolved = null
+            return
+        var pfname StringC()
+        set pfname: presolved.get_file_name()
+
+        var buf u32[2048]
+        let bp buf as pointer[u32]
+        let cap 2048 as size_t
+        var p: size_t 0
+        let pre StringC("In entity ")
+        var i: size_t 0
+        while i < pre.get_size()
+        {
+            set p: ParserState.put_char(bp, cap, p, pre.get(i))
+            set i: i + 1
+        }
+        let entp ed as pointer[Entity]
+        let nm (*entp).get_name()
+        var ni: size_t 0
+        while ni < nm.get_size()
+        {
+            set p: ParserState.put_char(bp, cap, p, nm.get(ni))
+            set ni: ni + 1
+        }
+        let mid StringC(" included from ")
+        var mi: size_t 0
+        while mi < mid.get_size()
+        {
+            set p: ParserState.put_char(bp, cap, p, mid.get(mi))
+            set mi: mi + 1
+        }
+        var fi: size_t 0
+        while fi < pfname.get_size()
+        {
+            set p: ParserState.put_char(bp, cap, p, pfname.get(fi))
+            set fi: fi + 1
+        }
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+        set p: ParserState.put_dec(bp, cap, p, pline as u64)
+        var omit false
+        if (parent_loc.get_index() = (0 as u32)) and (pline = (1 as u32)) and (pcol = (0 as u32))
+        {
+            if presolved.get_buf_length() > (0 as size_t)
+                set omit: true
+        }
+        if pcol = COL_OMITTED
+            set omit: true
+        if omit = false
+        {
+            set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+            set p: ParserState.put_dec(bp, cap, p, pcol as u64)
+        }
+        set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
+        ParserState.write_stderr(bp, p, this.out_utf8, this.msg_fd)
+    }
+
+    ; ContentState::getOpenElementInfo (-g): one OeInfo per open element,
+    ; OUTERMOST FIRST, excluding the synthetic document-element container
+    ; (the reference sizes the vector to tagLevel). matchType/matchIndex
+    ; describe the element's last-matched content-model token: the matched
+    ; element's name (or RNI+PCDATA for a pcdata leaf) and typeIndex()+1;
+    ; both unset while the match state still sits on the initial position.
+    ; Returns null when the option is off or outside the instance
+    ; (ParserState::initMessage captures only inInstance).
+    function capture_oe_info(this: pointer[ParserState]) returns pointer[Array[OeInfo]]
+    {
+        if this.reporter_option(REP_OPEN_ELEMENTS) = false
+            return null
+        if this.in_instance = false
+            return null
+        let hp this.host
+        let v Array[OeInfo]^hp()
+        let cs this.content_state
+        let tl cs.tag_level_of() as size_t
+        ; rniPcdata — delimGeneral(dRNI) + reservedName(rPCDATA) ("#PCDATA").
+        let syn this.syntax
+        let pcb Array[u32]^hp()
+        if syn <> null
+        {
+            let rl syn.delim_general_len(dRNI)
+            var ri: size_t 0
+            while ri < rl
+            {
+                pcb.add(syn.delim_general_char(dRNI, ri))
+                set ri: ri + 1
+            }
+            ; R_PCDATA (Parser.scaly's reserved-name index; Syntax::rPCDATA).
+            let pn syn.reserved_name(39)
+            var pi: size_t 0
+            while pi < pn.get_size()
+            {
+                pcb.add(pn.get(pi))
+                set pi: pi + 1
+            }
+        }
+        let rni_pcdata StringC^hp(pcb.get_buffer(), pcb.get_length())
+        var j: size_t 0
+        while j < tl
+        {
+            ; v[0] = outermost real element = stack offset tl-1 from the top.
+            let oe cs.at_top(tl - (1 as size_t) - j)
+            var info OeInfo()
+            set info.gi: oe.get_type().get_name()
+            set info.match_type: StringC()
+            set info.match_index: 0 as u32
+            set info.has_match: false
+            set info.included: oe.get_included()
+            let tok oe.current_position()
+            if tok <> null
+            {
+                if tok.is_initial = false
+                {
+                    set info.match_index: tok.type_index + (1 as u32)
+                    set info.has_match: true
+                    if tok.element <> null
+                    {
+                        let et tok.element
+                        set info.match_type: et.get_name()
+                    }
+                    else
+                        set info.match_type: rni_pcdata
+                }
+            }
+            v.add(info)
+            set j: j + 1
+        }
+        v
+    }
+
+    ; The -g "open elements:" trailer line — MessageFormatter::formatOpenElements
+    ; rendered at the MAIN message's location (quiet resolve: -e headers are
+    ; not repeated). oe = the snapshot captured when the message fired.
+    function emit_oe_after(this: pointer[ParserState], loc: Location, oe: pointer[Array[OeInfo]])
+    {
+        if oe = null
+            return
+        if oe.get_length() = (0 as size_t)
+            return
+        var line: u32 0
+        var col: u32 0
+        var resolved: pointer[Origin] null
+        if this.reporter_option(REP_OPEN_ENTITIES)
+            set resolved: this.resolve_location_open(loc, false, false, &line, &col)
+        else
+            set resolved: this.resolve_location(loc, false, &line, &col)
+        var fname StringC()
+        if resolved <> null
+            set fname: resolved.get_file_name()
+
+        ; formatOpenElements (MessageFormatter.cxx:38): ` gi` per element;
+        ; a non-included element after the first appends `[n]` with the
+        ; PREVIOUS element's match index; at each included boundary (and at
+        ; the end) the previous element's last match renders as
+        ; ` (type[index])`.
+        var pay u32[1024]
+        let pp pay as pointer[u32]
+        let pcap 1024 as size_t
+        var p: size_t 0
+        let n oe.get_length()
+        var i: size_t 0
+        var brk false
+        while brk = false
+        {
+            var at_boundary false
+            if i > (0 as size_t)
+            {
+                if i = n
+                    set at_boundary: true
+                else
+                {
+                    let e2 *(oe.get_buffer() + i)
+                    if e2.included
+                        set at_boundary: true
+                }
+            }
+            if at_boundary
+            {
+                let prev *(oe.get_buffer() + (i - (1 as size_t)))
+                if prev.has_match
+                {
+                    set p: ParserState.put_char(pp, pcap, p, 0x20 as u32)
+                    set p: ParserState.put_char(pp, pcap, p, 0x28 as u32)
+                    var mi: size_t 0
+                    let mt prev.match_type
+                    while mi < mt.get_size()
+                    {
+                        set p: ParserState.put_char(pp, pcap, p, mt.get(mi))
+                        set mi: mi + 1
+                    }
+                    if prev.match_index <> (0 as u32)
+                    {
+                        set p: ParserState.put_char(pp, pcap, p, 0x5B as u32)
+                        set p: ParserState.put_dec(pp, pcap, p, prev.match_index as u64)
+                        set p: ParserState.put_char(pp, pcap, p, 0x5D as u32)
+                    }
+                    set p: ParserState.put_char(pp, pcap, p, 0x29 as u32)
+                }
+            }
+            if i = n
+                set brk: true
+            else
+            {
+                let e *(oe.get_buffer() + i)
+                set p: ParserState.put_char(pp, pcap, p, 0x20 as u32)
+                var gi2: size_t 0
+                let g e.gi
+                while gi2 < g.get_size()
+                {
+                    set p: ParserState.put_char(pp, pcap, p, g.get(gi2))
+                    set gi2: gi2 + 1
+                }
+                if (i > (0 as size_t)) and (e.included = false)
+                {
+                    let prev2 *(oe.get_buffer() + (i - (1 as size_t)))
+                    if prev2.match_index <> (0 as u32)
+                    {
+                        set p: ParserState.put_char(pp, pcap, p, 0x5B as u32)
+                        set p: ParserState.put_dec(pp, pcap, p, prev2.match_index as u64)
+                        set p: ParserState.put_char(pp, pcap, p, 0x5D as u32)
+                    }
+                }
+                set i: i + 1
+            }
+        }
+        let hp this.host
+        let payload StringC^hp(pp, p)
+        this.emit_ref_line(resolved, fname, line, col, loc.get_index(), StringC("open elements:"), payload)
+    }
+
     ; emit_message — one diagnostic line to stderr, byte-identical to onsgmls's
     ; plain MessageReporter::dispatchMessage:
     ;   <prog>:<file>:<line>:<col>:<sev>: <formatted text>\n
@@ -2642,7 +3076,14 @@ define ParserState
         let loc msg.get_loc()
         var line: u32 0
         var col: u32 0
-        let resolved this.resolve_location(loc, false, &line, &col)
+        ; -e (open-entities): the walk variant prints the "In entity ..."
+        ; header lines and anchors inside the entity's definition instead of
+        ; resolving up to the reference.
+        var resolved: pointer[Origin] null
+        if this.reporter_option(REP_OPEN_ENTITIES)
+            set resolved: this.resolve_location_open(loc, false, true, &line, &col)
+        else
+            set resolved: this.resolve_location(loc, false, &line, &col)
         var fname StringC()
         if resolved <> null
             set fname: resolved.get_file_name()
@@ -2700,7 +3141,13 @@ define ParserState
             set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
             var omit_col false
             if (loc.get_index() = (0 as u32)) and (line = (1 as u32)) and (col = (0 as u32))
-                set omit_col: true
+            {
+                ; only when the position sits ON the synthetic leading RS —
+                ; an EMPTY entity has none (buffer length 0) and renders a
+                ; real column 0 (`file:1:0:E: end of document in prolog`).
+                if resolved.get_buf_length() > (0 as size_t)
+                    set omit_col: true
+            }
             if col = COL_OMITTED
                 set omit_col: true
             if omit_col = false
@@ -2708,6 +3155,22 @@ define ParserState
                 set p: ParserState.put_dec(bp, cap, p, col as u64)
                 set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
             }
+        }
+
+        ; -n (message numbers): `<module>.<number>:` between the location and
+        ; the severity tag. The reference prints `(unsigned long)type->module()`
+        ; — the ADDRESS of libModule, different on every run under ASLR (probed:
+        ; two invocations render two values). Byte-fidelity is impossible for a
+        ; nondeterministic reference; the port renders the deterministic
+        ; stand-in 0. The number half is the .msg catalog number (per-file
+        ; bases: Parser=0, CmdLineApp=4000, EntityApp=4100, ParserApp=4200,
+        ; Reporter=5000) and matches the reference exactly.
+        if this.reporter_option(REP_MESSAGE_NUMBERS)
+        {
+            set p: ParserState.put_char(bp, cap, p, 0x30 as u32)
+            set p: ParserState.put_char(bp, cap, p, 0x2E as u32)
+            set p: ParserState.put_dec(bp, cap, p, msg.get_type().get_number() as u64)
+            set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
         }
 
         ; severity ':' ' '
@@ -2723,7 +3186,84 @@ define ParserState
 
         set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
 
-        ParserState.write_stderr(bp, p, this.out_utf8)
+        ParserState.write_stderr(bp, p, this.out_utf8, this.msg_fd)
+
+        ; -x (references): a second, severity-less line `<prog>:<file>:<line>:
+        ; <col>: relevant clauses:  <clauses>` for a message whose type carries
+        ; an ISO clause reference — same resolved location as the main line
+        ; (dispatchMessage reuses externalInfo+off; note the double space: the
+        ; relevantClauses fragment ends in ": " and the renderer adds " ").
+        if this.reporter_option(REP_CLAUSES)
+        {
+            let cls msg.get_type().get_clauses()
+            ; two spaces: the relevantClauses fragment text ends in ": " and
+            ; the reference appends `" " << clauses` after it.
+            if cls.get_size() > (0 as size_t)
+                this.emit_ref_line(resolved, fname, line, col, loc.get_index(), StringC("relevant clauses:  "), cls)
+        }
+    }
+
+    ; The shared -x/-g trailer-line renderer: `<prog>:<file>:<line>[:<col>]:
+    ; <label><payload>` at the MAIN message's already-resolved location (no
+    ; fresh origin walk — the reference prints these with the main line's
+    ; externalInfo/off pair, so -e headers are not repeated).
+    function emit_ref_line(this: pointer[ParserState], resolved: pointer[Origin], fname: StringC, line: u32, col: u32, loc_index: u32, lbl: StringC, payload: StringC)
+    {
+        var buf u32[2048]
+        let bp buf as pointer[u32]
+        let cap 2048 as size_t
+        var p: size_t 0
+
+        let pn this.prog_name
+        var pi: size_t 0
+        while pi < pn.get_length()
+        {
+            set p: ParserState.put_char(bp, cap, p, (*(pn.get_buffer() + pi)) as u32)
+            set pi: pi + 1
+        }
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+
+        if resolved <> null
+        {
+            var fi: size_t 0
+            while fi < fname.get_size()
+            {
+                set p: ParserState.put_char(bp, cap, p, fname.get(fi))
+                set fi: fi + 1
+            }
+            set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+            set p: ParserState.put_dec(bp, cap, p, line as u64)
+            var omit_col false
+            if (loc_index = (0 as u32)) and (line = (1 as u32)) and (col = (0 as u32))
+            {
+                if resolved.get_buf_length() > (0 as size_t)
+                    set omit_col: true
+            }
+            if col = COL_OMITTED
+                set omit_col: true
+            if omit_col = false
+            {
+                set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+                set p: ParserState.put_dec(bp, cap, p, col as u64)
+            }
+            set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+        }
+        set p: ParserState.put_char(bp, cap, p, 0x20 as u32)
+
+        var li: size_t 0
+        while li < lbl.get_size()
+        {
+            set p: ParserState.put_char(bp, cap, p, lbl.get(li))
+            set li: li + 1
+        }
+        var yi: size_t 0
+        while yi < payload.get_size()
+        {
+            set p: ParserState.put_char(bp, cap, p, payload.get(yi))
+            set yi: yi + 1
+        }
+        set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
+        ParserState.write_stderr(bp, p, this.out_utf8, this.msg_fd)
     }
 
     ; emit_aux_line — the auxiliary line onsgmls prints under a message with a
@@ -2734,7 +3274,13 @@ define ParserState
     {
         var line: u32 0
         var col: u32 0
-        let resolved this.resolve_location(loc, true, &line, &col)
+        ; -e: the aux location gets its own locationHeader call in the
+        ; reference — so its "In entity ..." header lines print here too.
+        var resolved: pointer[Origin] null
+        if this.reporter_option(REP_OPEN_ENTITIES)
+            set resolved: this.resolve_location_open(loc, true, true, &line, &col)
+        else
+            set resolved: this.resolve_location(loc, true, &line, &col)
         var fname StringC()
         if resolved <> null
             set fname: resolved.get_file_name()
@@ -2777,14 +3323,14 @@ define ParserState
         set p: p + added
 
         set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
-        ParserState.write_stderr(bp, p, this.out_utf8)
+        ParserState.write_stderr(bp, p, this.out_utf8, this.msg_fd)
     }
 
     ; emit_message_noloc — a diagnostic with NO source location (a Messenger
     ; message issued by the driver, e.g. errorLimitExceeded): `<prog>:<sev>: <text>`.
     ; onsgmls's dispatchMessage omits the file:line:col entirely when the location
     ; has a null origin.
-    function emit_message_noloc(this: pointer[ParserState], text: StringC, args: Vector[MessageArg], sev_char: u32)
+    function emit_message_noloc(this: pointer[ParserState], text: StringC, args: Vector[MessageArg], sev_char: u32, number: u32)
     {
         var buf u32[2048]
         let bp buf as pointer[u32]
@@ -2800,6 +3346,17 @@ define ParserState
         }
         set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
 
+        ; -n: `<module>.<number>:` directly after the program name when the
+        ; message has no location (probed: `onsgmls:<addr>.4202:I: maximum
+        ; number of errors ...`); module stand-in 0, see emit_message.
+        if this.reporter_option(REP_MESSAGE_NUMBERS)
+        {
+            set p: ParserState.put_char(bp, cap, p, 0x30 as u32)
+            set p: ParserState.put_char(bp, cap, p, 0x2E as u32)
+            set p: ParserState.put_dec(bp, cap, p, number as u64)
+            set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+        }
+
         set p: ParserState.put_char(bp, cap, p, sev_char)
         set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
         set p: ParserState.put_char(bp, cap, p, 0x20 as u32)
@@ -2809,7 +3366,7 @@ define ParserState
         set p: p + added
 
         set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
-        ParserState.write_stderr(bp, p, this.out_utf8)
+        ParserState.write_stderr(bp, p, this.out_utf8, this.msg_fd)
     }
 
     ; append one Char to a u32 buffer (bounds-checked).
@@ -2852,12 +3409,13 @@ define ParserState
         p
     }
 
-    ; Encode n Chars per the output coding system and write them to stderr
-    ; (fd 2) in one blocking write, exactly as onsgmls flushes each formatted
-    ; message. The stderr stream (CmdLineApp::makeStdErr) uses the same coding
-    ; system as stdout but has NO escaper, so under identity a Char > 0xFF in
-    ; a diagnostic is silently dropped (handleUnencodable with a null escaper).
-    function write_stderr(out: pointer[u32], n: size_t, utf8: bool)
+    ; Encode n Chars per the output coding system and write them to the
+    ; message sink (fd 2, or the -f error file) in one blocking write, exactly
+    ; as onsgmls flushes each formatted message. The stderr stream
+    ; (CmdLineApp::makeStdErr) uses the same coding system as stdout but has
+    ; NO escaper, so under identity a Char > 0xFF in a diagnostic is silently
+    ; dropped (handleUnencodable with a null escaper).
+    function write_stderr(out: pointer[u32], n: size_t, utf8: bool, fd: int)
     {
         var bytes u8[8192]
         let b bytes as pointer[u8]
@@ -2902,7 +3460,7 @@ define ParserState
             }
             set i: i + (1 as size_t)
         }
-        write(2 as int, b as pointer[void], w)
+        write(fd, b as pointer[void], w)
     }
 
     function get_n_messages(this: ParserState) returns u32

@@ -1,15 +1,39 @@
-; onsgmls — the OpenSP drop-in event-dump program (Stage 4 Increment 3).
+; onsgmls — the OpenSP drop-in event-dump program.
 ;
-; A minimal onsgmls: read an SGML document, parse it, and write the ESIS event
-; stream to stdout — the harness tests/sgml/run.sh measures against the
-; reference onsgmls (ROADMAP-dazzle.md Part I, the corpus counter). The full
-; NsgmlsApp CLI (flags, catalogs, message output, the whole markup Event set)
-; is Stage 5; this is the event-dump core that starts ticking the counter.
+; Reads an SGML document, parses it, writes the ESIS event stream to stdout
+; and every diagnostic to stderr (or the -f error file), byte-identical to
+; James Clark's onsgmls (the harness tests/sgml/run.sh measures against it).
 ;
-; Scope (Stage 4 Increment 3): a well-formed document with an INTERNAL DTD
-; subset and explicit tags — parse_to_esis drives prolog (DOCTYPE) + content and
-; Esis.write emits the ESIS. Exit 0 when conforming (no errors), else 1, matching
-; onsgmls.
+; The CLI is the reference option surface (NsgmlsApp -> ParserApp ->
+; EntityApp -> CmdLineApp), scanned by the ported getopt clone (Options.scaly:
+; clustered shorts, unique-prefix --long names, `--` terminator, the
+; ?/-/= signal chars rendered as invalid/ambiguous/erroneous-argument
+; errors + the "--help" info line, exit 1). Options implemented so far:
+;
+;   -a/--activate NAME     activate a link type
+;   -w/--warning TYPE      enable a warning / validation flag
+;   -E/--max-errors NUMBER error limit (0 = unlimited; bad value -> E + default)
+;   -i/--include NAME      define parameter entity NAME as "INCLUDE"
+;   -e/--open-entities     describe open entities in error messages
+;   -g/--open-elements     show open elements in error messages
+;   -n/--error-numbers     show message numbers in error messages
+;   -x/--references        show relevant ISO 8879 clauses in error messages
+;   -f/--error-file FILE   write error messages to FILE (truncates)
+;   -v/--version           print the version banner (parse continues)
+;   -s/--no-output         suppress the ESIS output (messages still print)
+;   -p/--only-prolog       parse only the prolog (no output)
+;   -B/--batch-mode        parse each remaining argument as its own document
+;   -d, -r, -u             NsgmlsApp aliases for -wduplicate/-wdefault/-wundefined
+;
+; NOT yet ported (their axes are later sessions; they render "invalid
+; option", where the reference would accept them): -o/-l/-t (SgmlsEventHandler
+; output flags + RAST), -A (architectures/ArcEngine), -c/-m/-C/-D/-R (the
+; entity-manager catalog/search axis), -b (coding-system names), -h (usage
+; text; renders from the full registry once every option exists). Multiple
+; SYSIDs outside -B (mergeSystemIds: all files parse as ONE entity) are not
+; merged yet — the first file wins. With NO file argument (or `-`) the
+; document is read from stdin under the storage id `<OSFD>0`, as the
+; reference's makeSystemId does.
 
 package scaly 0.1.0
 package opensp 0.1.0
@@ -18,6 +42,14 @@ use opensp
 use opensp.Parser.Parser
 use opensp.StringC.StringC
 use opensp.ParserOptions.ParserOptions
+use opensp.ParserState.ParserState
+use opensp.Options.Options
+use opensp.Options.LongOpt
+use opensp.Message.MessageType
+use opensp.Message.MessageArg
+use opensp.Message.MessageFormatter
+use opensp.CmdLineAppMessages.CmdLineAppMessages
+use opensp.ParserAppMessages.ParserAppMessages
 use scaly.io.File
 use scaly.io.Path
 use scaly.io.Console
@@ -25,7 +57,24 @@ use scaly.memory.Page
 use scaly.memory.root_pages.getenv
 use scaly.containers.String
 use scaly.containers.Array
+use scaly.containers.Vector
 use scaly.fiber.Io
+
+; creat(2): open write-only, create + TRUNCATE — exactly the reference's
+; FileOutputByteStream::open (probed: a pre-existing -f file is truncated,
+; despite fHelp saying "Append"). Non-variadic, so a direct extern is fine
+; (open(2) is variadic — containment rule (b) would force the shim).
+function creat(path: pointer[const_char], mode: u32) returns i32 extern
+; strerror(3) + the shim's errno accessor (rule (c)) — the openFileError %2.
+; Prototypes match the package-side declarations (Storage.scaly, fiber).
+function strerror(code: i32) returns pointer[const_char] extern
+function scaly_eio_errno() returns i32 extern
+
+; MessageReporter::options_ bits — keep in sync with ParserState.scaly REP_*.
+define ONS_REP_OPEN_ENTITIES: u32 1
+define ONS_REP_OPEN_ELEMENTS: u32 2
+define ONS_REP_MESSAGE_NUMBERS: u32 4
+define ONS_REP_CLAUSES: u32 8
 
 ; case-insensitive exact match of a NUL-terminated env value against an ASCII
 ; key, CmdLineApp::stringMatches / CodingSystemKitImpl::match: each value char
@@ -100,123 +149,367 @@ function output_is_utf8(is_fixed: bool) returns bool
     false
 }
 
-; app-level diagnostic line on stderr (fd 2), no location segment:
-; `<prog>:<sev>: <text>` — CmdLineApp messages (e.g. unknownWarning) render
-; without any storage id. The newline is a numeric LF byte (see Console).
-function eline(prog: String, mid: String, arg: String, tail: String)
+; One app-level diagnostic line on stderr — a CmdLineApp message with no
+; location segment: `<prog>:[0.<number>:]<sev>: <formatted text>`. Honors -n
+; (message numbers; module stand-in 0, see ParserState.emit_message) with
+; option-order sensitivity: only options processed BEFORE this message count.
+function app_msg(prog: String, utf8: bool, rep_numbers: bool, mt: MessageType, args: Vector[MessageArg])
 {
-    Io.write_all(2 as i32, prog.get_buffer() as pointer[void], prog.get_length())
-    Io.write_all(2 as i32, mid.get_buffer() as pointer[void], mid.get_length())
-    Io.write_all(2 as i32, arg.get_buffer() as pointer[void], arg.get_length())
-    Io.write_all(2 as i32, tail.get_buffer() as pointer[void], tail.get_length())
-    var nl: u8 (10 as u8)
-    let nl_ptr &nl
-    Io.write_all(2 as i32, nl_ptr as pointer[void], 1 as size_t)
+    var buf u32[2048]
+    let bp buf as pointer[u32]
+    let cap 2048 as size_t
+    var p: size_t 0
+    var pi: size_t 0
+    while pi < prog.get_length()
+    {
+        set p: ParserState.put_char(bp, cap, p, (*(prog.get_buffer() + pi)) as u32)
+        set pi: pi + 1
+    }
+    set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+    if rep_numbers
+    {
+        set p: ParserState.put_char(bp, cap, p, 0x30 as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x2E as u32)
+        set p: ParserState.put_dec(bp, cap, p, mt.get_number() as u64)
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+    }
+    set p: ParserState.put_char(bp, cap, p, mt.severity_char())
+    set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+    set p: ParserState.put_char(bp, cap, p, 0x20 as u32)
+    let fmt MessageFormatter()
+    let added fmt.format(mt.get_text(), args, bp + p, cap - p, false)
+    set p: p + added
+    set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
+    ParserState.write_stderr(bp, p, utf8, 2)
 }
 
-function main(argc: int, argv: pointer[pointer[char]]) returns int
+function app_msg0(prog: String, utf8: bool, rep_numbers: bool, mt: MessageType)
 {
-    if argc < 2
-        return 2
-    ; -a<name> / -a <name> (repeatable): activate a link type (ParserApp's
-    ; 'a' option). -w<type> / -w <type> (repeatable): enable a warning /
-    ; validation flag (ParserApp's 'w' option; unknown types render
-    ; unknownWarning app-level and do NOT affect the exit code). The first
-    ; non-option argument is the document path — the drop-in parses no other
-    ; options.
-    let anchor0 String("x")
-    let arg_host Page.get(anchor0.get_buffer() as pointer[void])
-    let active_links Array[String]^arg_host()
-    let warn_args Array[String]^arg_host()
-    var path_ptr: pointer[char] null
-    var ai: int 1
-    while ai < argc
+    let args Vector[MessageArg]()
+    app_msg(prog, utf8, rep_numbers, mt, args)
+}
+
+function app_msg1(prog: String, utf8: bool, rep_numbers: bool, mt: MessageType, arg: StringC)
+{
+    var args Vector[MessageArg](1 as size_t)
+    set *(args.get(0 as size_t)): MessageArg.Str(arg)
+    app_msg(prog, utf8, rep_numbers, mt, args)
+}
+
+; tcstoul semantics for the -E argument (ParserApp.cxx:110): skip leading
+; whitespace, one optional sign, decimal digits; the WHOLE argument must be
+; consumed, and the unsigned-long value must fit UINT_MAX. A negated nonzero
+; value wraps past UINT_MAX (rejected); "-0" is 0 and valid (limit off).
+function parse_error_limit(a: pointer[char], out_ok: pointer[bool]) returns u32
+{
+    set *out_ok: false
+    var i: size_t 0
+    var scanning true
+    while scanning
     {
-        let a *(argv + ai)
-        let av String(a)
-        var opt_char: u8 0 as u8
-        if av.get_length() >= (2 as size_t)
+        let c (*(a + i)) as u32
+        if (c = (0x20 as u32)) or ((c >= (0x09 as u32)) and (c <= (0x0D as u32)))
+            set i: i + 1
+        else
+            set scanning: false
+    }
+    var minus false
+    let sc (*(a + i)) as u32
+    if sc = (0x2B as u32)
+        set i: i + 1
+    else if sc = (0x2D as u32)
+    {
+        set minus: true
+        set i: i + 1
+    }
+    var n: u64 0
+    var digits: size_t 0
+    var overflow false
+    var reading true
+    while reading
+    {
+        let c (*(a + i)) as u32
+        if (c >= (0x30 as u32)) and (c <= (0x39 as u32))
         {
-            if av.get(0) = (0x2D as u8)
-            {
-                if av.get(1) = (0x61 as u8)
-                    set opt_char: 0x61 as u8
-                if av.get(1) = (0x77 as u8)
-                    set opt_char: 0x77 as u8
-            }
-        }
-        if opt_char <> (0 as u8)
-        {
-            var opt_val String()
-            var have_val false
-            if av.get_length() > (2 as size_t)
-            {
-                set opt_val: String((a + (2 as size_t)) as pointer[const_char])
-                set have_val: true
-            }
-            else
-            {
-                set ai: ai + 1
-                if ai < argc
-                {
-                    set opt_val: String(*(argv + ai))
-                    set have_val: true
-                }
-            }
-            if have_val
-            {
-                if opt_char = (0x61 as u8)
-                    active_links.add(opt_val)
-                else
-                    warn_args.add(opt_val)
-            }
+            if n > (1844674407370955161 as u64)
+                set overflow: true
+            set n: (n * (10 as u64)) + ((c - (0x30 as u32)) as u64)
+            set digits: digits + 1
+            set i: i + 1
         }
         else
-        {
-            if path_ptr = null
-                set path_ptr: a
-        }
-        set ai: ai + 1
+            set reading: false
     }
-    if path_ptr = null
-        return 2
-    let path String(path_ptr)
+    if digits = (0 as size_t)
+        return 0 as u32
+    if ((*(a + i)) as u32) <> (0 as u32)
+        return 0 as u32
+    if overflow
+        return 0 as u32
+    if minus and (n <> (0 as u64))
+        return 0 as u32
+    if n > (4294967295 as u64)
+        return 0 as u32
+    set *out_ok: true
+    n as u32
+}
+
+; Read fd 0 to EOF — the `<OSFD>0` storage object makeSystemId builds for a
+; missing or `-` file argument.
+function read_stdin_to_string() returns String
+{
+    let bytes Array[u8]()
+    var buf u8[65536]
+    let bp buf as pointer[void]
+    var reading true
+    while reading
+    {
+        let r Io.read(0 as i32, bp, 65536 as size_t)
+        if r <= (0 as i64)
+            set reading: false
+        else
+        {
+            let n r as size_t
+            var i: size_t 0
+            while i < n
+            {
+                bytes.add(*((buf as pointer[u8]) + i))
+                set i: i + 1
+            }
+        }
+    }
+    String(bytes.get_buffer() as pointer[const_char], bytes.get_length())
+}
+
+; Parse one document and print its ESIS (unless suppressed). Returns the
+; per-document exit status (0 conforming, 1 not).
+function process_document(doc_arg: pointer[char], prog_name: String, out_utf8: bool, is_fixed: bool, active_links: pointer[Array[String]], opts: pointer[ParserOptions], error_limit: u32, reporter_options: u32, msg_fd: int, prolog_only: bool, suppress: bool) returns int
+{
+    var use_stdin false
+    if doc_arg = null
+        set use_stdin: true
+    else
+    {
+        ; a lone "-" names stdin (EntityApp::makeSystemId).
+        if ((*(doc_arg + (0 as size_t))) as u32) = (0x2D as u32)
+        {
+            if ((*(doc_arg + (1 as size_t))) as u32) = (0 as u32)
+                set use_stdin: true
+        }
+    }
+    var path String("<OSFD>0")
+    var contents String()
+    var base_dir String()
+    if use_stdin
+        set contents: read_stdin_to_string()
+    else
+    {
+        set path: String(doc_arg as pointer[const_char])
+        set contents: File.read_to_string(path)
+        ; external DTD subsets resolve their (relative) system ids against
+        ; the document's directory.
+        set base_dir: Path.get_directory_name(path)
+    }
     ; onsgmls displays the document's storage id (the path as given) in every
-    ; diagnostic, prefixed by the program name (argv[0]); build both.
+    ; diagnostic, prefixed by the program name (argv[0]).
     let doc_name StringC(path.to_c_string())
-    let prog_name String(*argv)
-    let contents File.read_to_string(path)
     ; Anchor the run region on the (small, page-hosted) path String — NOT on the
     ; document buffer: a document larger than PAGE_SIZE lands in an oversized
     ; bucket, and Page.get on an oversized object masks to a bogus page header.
     let host Page.get(path.get_buffer() as pointer[void])
-    ; external DTD subsets resolve their (relative) system ids against the
-    ; document's directory.
-    let base_dir Path.get_directory_name(path)
-    ; the -w axis: apply each -w argument via the enableWarning table; an
-    ; unknown type renders `<prog>:E: unknown warning type "<arg>"` on stderr
-    ; BEFORE any parse output (option-processing time) and is otherwise
-    ; ignored (the real onsgmls exit code is unaffected).
-    let opts ParserOptions.make(host)
-    let nw warn_args.get_length()
-    var wi: size_t 0
-    while wi < nw
-    {
-        let wv *(warn_args.get_buffer() + wi)
-        if opts.enable_warning(wv) = false
-        {
-            let mid String(":E: unknown warning type \"")
-            let tail String("\"")
-            eline(prog_name, mid, wv, tail)
-        }
-        set wi: wi + 1
-    }
     var conforming false
-    let is_fixed charset_fixed()
-    let out_utf8 output_is_utf8(is_fixed)
-    let esis Parser.parse_to_esis(host, contents, base_dir, doc_name, prog_name, out_utf8, is_fixed, &active_links, opts, &conforming)
-    Console.print(esis.to_c_string())
+    let esis Parser.parse_to_esis(host, contents, base_dir, doc_name, prog_name, out_utf8, is_fixed, active_links, opts, error_limit, reporter_options, msg_fd, prolog_only, &conforming)
+    ; -s (MessageEventHandler) and -p (PrologMessageEventHandler) print no
+    ; ESIS at all — not even the conformance marker.
+    if (suppress = false) and (prolog_only = false)
+        Console.print(esis.to_c_string())
     if conforming
         return 0
     1
+}
+
+function main(argc: int, argv: pointer[pointer[char]]) returns int
+{
+    let prog_name String(*argv)
+    ; the coding systems come from the environment (initCodingSystem runs in
+    ; the CmdLineApp constructor) — they govern option-time messages too.
+    let is_fixed charset_fixed()
+    let out_utf8 output_is_utf8(is_fixed)
+
+    let anchor0 String("x")
+    let arg_host Page.get(anchor0.get_buffer() as pointer[void])
+
+    ; ---- the option registry, in reference registration order (CmdLineApp,
+    ;      EntityApp, ParserApp, NsgmlsApp) — implemented options only; see
+    ;      the header comment for the axes still to come. ----
+    let reg Array[LongOpt]^arg_host()
+    reg.add(LongOpt(String("error-file"), 0x66 as u32, true))
+    reg.add(LongOpt(String("version"), 0x76 as u32, false))
+    reg.add(LongOpt(String("activate"), 0x61 as u32, true))
+    reg.add(LongOpt(String("max-errors"), 0x45 as u32, true))
+    reg.add(LongOpt(String("open-entities"), 0x65 as u32, false))
+    reg.add(LongOpt(String("open-elements"), 0x67 as u32, false))
+    reg.add(LongOpt(String("error-numbers"), 0x6E as u32, false))
+    reg.add(LongOpt(String("references"), 0x78 as u32, false))
+    reg.add(LongOpt(String("include"), 0x69 as u32, true))
+    reg.add(LongOpt(String("warning"), 0x77 as u32, true))
+    reg.add(LongOpt(String("batch-mode"), 0x42 as u32, false))
+    reg.add(LongOpt(String("only-prolog"), 0x70 as u32, false))
+    reg.add(LongOpt(String("no-output"), 0x73 as u32, false))
+    reg.add(LongOpt(String(), 0x64 as u32, false))
+    reg.add(LongOpt(String(), 0x72 as u32, false))
+    reg.add(LongOpt(String(), 0x75 as u32, false))
+
+    let active_links Array[String]^arg_host()
+    let opts ParserOptions.make(arg_host)
+    var error_limit: u32 200
+    var reporter_options: u32 0
+    var prolog_only false
+    var suppress false
+    var batch false
+    var error_file: pointer[char] null
+
+    let os Options.make(arg_host, argc, argv, &reg)
+    var c: u32 0
+    var scanning os.get(&c)
+    while scanning
+    {
+        if (c = (0x3F as u32)) or (c = (0x2D as u32)) or (c = (0x3D as u32))
+        {
+            ; CmdLineApp::processOptions error rendering: a long option's
+            ; name comes from the raw argv cell (up to '=', 79 chars); a
+            ; short option is its single char. Note a short option with a
+            ; MISSING argument also lands here as '?' — the reference
+            ; renders it as "invalid option", missingOptionArgError is dead.
+            var nbuf u32[80]
+            let nb nbuf as pointer[u32]
+            var nlen: size_t 0
+            if os.get_opt() = (0 as u32)
+            {
+                let cell *(argv + (os.get_ind() - 1))
+                var ti: size_t 2
+                var copying true
+                while copying
+                {
+                    let tc (*(cell + ti)) as u32
+                    if (tc = (0 as u32)) or (tc = (0x3D as u32)) or (nlen >= (79 as size_t))
+                        set copying: false
+                    else
+                    {
+                        set *(nb + nlen): tc
+                        set nlen: nlen + 1
+                        set ti: ti + 1
+                    }
+                }
+            }
+            else
+            {
+                set *nb: os.get_opt()
+                set nlen: 1
+            }
+            let oname StringC(nb, nlen)
+            var emt CmdLineAppMessages.invalidOptionError()
+            if c = (0x2D as u32)
+                set emt: CmdLineAppMessages.ambiguousOptionError()
+            if c = (0x3D as u32)
+                set emt: CmdLineAppMessages.erroneousOptionArgError()
+            app_msg1(prog_name, out_utf8, (reporter_options & ONS_REP_MESSAGE_NUMBERS) <> (0 as u32), emt, oname)
+            app_msg0(prog_name, out_utf8, (reporter_options & ONS_REP_MESSAGE_NUMBERS) <> (0 as u32), CmdLineAppMessages.tryHelpOptionForInfo())
+            return 1
+        }
+        else if c = (0x61 as u32)
+            active_links.add(String(os.get_arg() as pointer[const_char]))
+        else if c = (0x77 as u32)
+        {
+            let wv String(os.get_arg() as pointer[const_char])
+            if opts.enable_warning(wv) = false
+                app_msg1(prog_name, out_utf8, (reporter_options & ONS_REP_MESSAGE_NUMBERS) <> (0 as u32), ParserAppMessages.unknownWarning(), StringC(os.get_arg() as pointer[const_char]))
+        }
+        else if c = (0x45 as u32)
+        {
+            var ok_lim false
+            let lim parse_error_limit(os.get_arg(), &ok_lim)
+            if ok_lim
+                set error_limit: lim
+            else
+                app_msg0(prog_name, out_utf8, (reporter_options & ONS_REP_MESSAGE_NUMBERS) <> (0 as u32), ParserAppMessages.badErrorLimit())
+        }
+        else if c = (0x69 as u32)
+        {
+            if opts.includes = null
+                set opts.includes: Array[StringC]^arg_host()
+            let iv StringC^arg_host(os.get_arg() as pointer[const_char])
+            opts.includes.add(iv)
+        }
+        else if c = (0x65 as u32)
+            set reporter_options: reporter_options | ONS_REP_OPEN_ENTITIES
+        else if c = (0x67 as u32)
+            set reporter_options: reporter_options | ONS_REP_OPEN_ELEMENTS
+        else if c = (0x6E as u32)
+            set reporter_options: reporter_options | ONS_REP_MESSAGE_NUMBERS
+        else if c = (0x78 as u32)
+            set reporter_options: reporter_options | ONS_REP_CLAUSES
+        else if c = (0x64 as u32)
+            opts.enable_warning(String("duplicate"))
+        else if c = (0x72 as u32)
+            opts.enable_warning(String("default"))
+        else if c = (0x75 as u32)
+            opts.enable_warning(String("undefined"))
+        else if c = (0x76 as u32)
+        {
+            ; versionInfo: `"OpenSP" version "1.5.2"`, Info, parse continues.
+            var vargs Vector[MessageArg](2 as size_t)
+            set *(vargs.get(0 as size_t)): MessageArg.Str(StringC("OpenSP"))
+            set *(vargs.get(1 as size_t)): MessageArg.Str(StringC("1.5.2"))
+            app_msg(prog_name, out_utf8, (reporter_options & ONS_REP_MESSAGE_NUMBERS) <> (0 as u32), CmdLineAppMessages.versionInfo(), vargs)
+        }
+        else if c = (0x66 as u32)
+            set error_file: os.get_arg()
+        else if c = (0x42 as u32)
+            set batch: true
+        else if c = (0x70 as u32)
+            set prolog_only: true
+        else if c = (0x73 as u32)
+            set suppress: true
+        set scanning: os.get(&c)
+    }
+
+    ; -f: opened AFTER the option loop (processOptions does), so option-time
+    ; messages always reach the real stderr; open failure aborts with the
+    ; openFileError message (%2 = strerror text, unquoted).
+    var msg_fd: int 2
+    if error_file <> null
+    {
+        let fd creat(error_file as pointer[const_char], 0x1B6 as u32)
+        if fd = ((0 - 1) as i32)
+        {
+            var fargs Vector[MessageArg](2 as size_t)
+            set *(fargs.get(0 as size_t)): MessageArg.Str(StringC(error_file as pointer[const_char]))
+            set *(fargs.get(1 as size_t)): MessageArg.Raw(StringC(strerror(scaly_eio_errno())))
+            app_msg(prog_name, out_utf8, (reporter_options & ONS_REP_MESSAGE_NUMBERS) <> (0 as u32), CmdLineAppMessages.openFileError(), fargs)
+            return 1
+        }
+        set msg_fd: fd as int
+    }
+
+    let first_arg os.get_ind()
+    if batch
+    {
+        ; NsgmlsApp::processArguments batch mode: each argument is its own
+        ; parse; the ESIS streams concatenate and the exit status is the max.
+        var ret 0
+        var ai first_arg
+        while ai < argc
+        {
+            let r process_document(*(argv + ai), prog_name, out_utf8, is_fixed, &active_links, opts, error_limit, reporter_options, msg_fd, prolog_only, suppress)
+            if r > ret
+                set ret: r
+            set ai: ai + 1
+        }
+        return ret
+    }
+    var doc_arg: pointer[char] null
+    if first_arg < argc
+        set doc_arg: *(argv + first_arg)
+    process_document(doc_arg, prog_name, out_utf8, is_fixed, &active_links, opts, error_limit, reporter_options, msg_fd, prolog_only, suppress)
 }
