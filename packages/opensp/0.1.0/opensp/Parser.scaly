@@ -36,6 +36,7 @@ use opensp.Entity.SubdocEntity
 use opensp.ExternalId.ExternalId
 use opensp.Storage.Storage
 use opensp.ShortReferenceMap.ShortReferenceMap
+use opensp.ParserOptions.ParserOptions
 use opensp.ParserState.ParserState
 use opensp.ParserState.LpdEntityRef
 use opensp.Lpd.Lpd
@@ -4526,6 +4527,40 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             ; p/s definition lines).
             let hid ExternalId.make(host, id)
             nt.set_external_id(*hid, ps.current_location())
+            ; Notation::generateSystemId (Notation.cxx:36, called from
+            ; parseDecl.cxx:1603): the catalog lookup (system id / PUBLIC /
+            ; NOTATION-name tables, SOEntityCatalog.cxx:427) resolves the
+            ; external id — a declared system id always resolves
+            ; (expandSystemId); a miss with neither warns under
+            ; -wnotation-sysid (W, arg = the folded notation name, at the
+            ; MDC token start — probed 4:64/5:25 vs real onsgmls).
+            var resolved hid.has_system_id()
+            let cat ps.get_entity_catalog()
+            if (resolved = false) and (cat <> null)
+            {
+                if hid.has_public_id()
+                {
+                    let bypub cat.lookup_public(hid.get_public_id())
+                    if bypub.get_length() > (0 as size_t)
+                        set resolved: true
+                }
+                if resolved = false
+                {
+                    let nn8 this.stringc_to_bytes(nt.get_name())
+                    let byname cat.lookup_notation(nn8, ps.get_sd().namecase_general())
+                    if byname.get_length() > (0 as size_t)
+                        set resolved: true
+                }
+            }
+            if resolved = false
+            {
+                let opt ps.get_options()
+                if opt.warn_notation_system_id
+                {
+                    let wname nt.get_name()
+                    this.report1_at(ParserMessages.cannotGenerateSystemIdNotation(), wname, ps.current_input().token_start_location())
+                }
+            }
         }
         true
     }
@@ -4828,6 +4863,17 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                         set replace: true
                 }
             }
+            if replace = false
+            {
+                ; parseDecl.cxx:1900: the losing re-declaration of #DEFAULT
+                ; warns under -wduplicate, arg = the RNI-rendered name.
+                let opt ps.get_options()
+                if opt.warn_duplicate_entity
+                {
+                    let dflt this.rni_reserved_name(R_DEFAULT)
+                    this.report1_at(ParserMessages.duplicateEntityDeclaration(), dflt, ps.current_input().token_start_location())
+                }
+            }
             if replace
             {
                 dtd.set_default_entity(entity)
@@ -4877,12 +4923,27 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 ; parseDecl.cxx:1917: a definition from an ACTIVE LPD REPLACES
                 ; an earlier one that is not from an active LPD (this is what
                 ; makes the LPD's entities win in pass 2's instance).
+                var replaced false
                 if ps.entity_decl_in_active_lpd(entity)
                 {
                     if ps.entity_decl_in_active_lpd(inserted) = false
                     {
                         dtd.insert_entity(entity, is_parameter, true)
                         this.generate_system_id(entity, is_parameter)
+                        set replaced: true
+                    }
+                }
+                if replaced = false
+                {
+                    ; parseDecl.cxx:1922: the ignored re-declaration warns
+                    ; under -wduplicate (parameter vs general by declType).
+                    let opt ps.get_options()
+                    if opt.warn_duplicate_entity
+                    {
+                        if is_parameter
+                            this.report1_at(ParserMessages.duplicateParameterEntityDeclaration(), name, ps.current_input().token_start_location())
+                        else
+                            this.report1_at(ParserMessages.duplicateEntityDeclaration(), name, ps.current_input().token_start_location())
                     }
                 }
             }
@@ -9011,6 +9072,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let child ParserState.make(host, null, ps.get_subdoc_level() + (1 as u32), PHASE_PROLOG)
         child.set_prog_name(ps.get_prog_name())
         child.set_output_utf8(ps.get_output_utf8())
+        ; the subdoc parser shares the invoking parser's options (Parser.cxx
+        ; params carry no options; the app's ParserOptions are global).
+        child.set_options(ps.get_options())
         child.set_base_dir(sbase)
         child.set_decl_base_dir(sbase)
         child.set_sd(ps.get_sd())
@@ -12214,6 +12278,17 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                             let ins ps.current_input()
                             let cloc ins.token_start_location()
                             this.report0_at(ParserMessages.documentElementUndefined(), cloc)
+                        }
+                    }
+                    else
+                    {
+                        ; parseDecl.cxx:2399: any OTHER referenced-but-never-
+                        ; declared element warns under -wundefined.
+                        let opt ps.get_options()
+                        if opt.warn_undefined_element
+                        {
+                            let un p.get_name()
+                            this.report1_at(ParserMessages.dtdUndefinedElement(), un, ps.current_input().token_start_location())
                         }
                     }
                     if def = null
@@ -16725,7 +16800,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             return false
         if b.valid = false
             return false
-        ; setSdOverrides: -w CLI overrides — none in the drop-in.
+        ; setSdOverrides (parseSd.cxx:745): the -w validation flags override
+        ; the freshly built declaration.
+        Parser.apply_sd_overrides(ps.get_options(), b.sd)
         if b.sd.formal()
         {
             var fe: size_t 0
@@ -16785,7 +16862,72 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; A concept STATIC so a user program resolves it across packages. `base_dir`
     ; is the document's directory — external DTD subsets (SYSTEM/PUBLIC) resolve
     ; their (relative) system ids against it.
-    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, charset_fixed: bool, active_links: pointer[Array[String]], out_conforming: pointer[bool]) returns String
+    ; setSdOverrides (Parser.cxx:124) — the -w validation flags override the
+    ; SGML declaration; applied to the implied Sd (Parser.cxx:48) AND to the
+    ; freshly built one after a parsed declaration (parseSd.cxx:745).
+    function apply_sd_overrides(opt: pointer[ParserOptions], sd: pointer[Sd])
+    {
+        if opt.type_valid <> OPT_SGML_DECL_TYPE_VALID
+        {
+            let tv opt.type_valid <> 0
+            sd.set_type_valid(tv)
+            sd.set_boolean_feature(SDF_IMPLYDEFATTLIST, not tv)
+            if tv
+                sd.set_implydef_element(IMPLYDEF_ELEMENT_NO)
+            else
+                sd.set_implydef_element(IMPLYDEF_ELEMENT_YES)
+            sd.set_boolean_feature(SDF_IMPLYDEFENTITY, not tv)
+            sd.set_boolean_feature(SDF_IMPLYDEFNOTATION, not tv)
+        }
+        if opt.fully_declared
+        {
+            sd.set_boolean_feature(SDF_IMPLYDEFATTLIST, false)
+            sd.set_implydef_element(IMPLYDEF_ELEMENT_NO)
+            sd.set_boolean_feature(SDF_IMPLYDEFENTITY, false)
+            sd.set_boolean_feature(SDF_IMPLYDEFNOTATION, false)
+        }
+        if opt.fully_tagged
+        {
+            sd.set_boolean_feature(SDF_DATATAG, false)
+            sd.set_boolean_feature(SDF_RANK, false)
+            sd.set_boolean_feature(SDF_OMITTAG, false)
+            sd.set_boolean_feature(SDF_STARTTAGEMPTY, false)
+            sd.set_boolean_feature(SDF_ATTRIBOMITNAME, false)
+        }
+        if opt.amply_tagged
+        {
+            sd.set_boolean_feature(SDF_DATATAG, false)
+            sd.set_boolean_feature(SDF_RANK, false)
+            sd.set_boolean_feature(SDF_OMITTAG, false)
+            sd.set_boolean_feature(SDF_ATTRIBOMITNAME, false)
+            sd.set_implydef_element(IMPLYDEF_ELEMENT_YES)
+        }
+        if opt.amply_tagged_anyother
+        {
+            sd.set_boolean_feature(SDF_DATATAG, false)
+            sd.set_boolean_feature(SDF_RANK, false)
+            sd.set_boolean_feature(SDF_OMITTAG, false)
+            sd.set_boolean_feature(SDF_ATTRIBOMITNAME, false)
+            sd.set_implydef_element(IMPLYDEF_ELEMENT_ANYOTHER)
+        }
+        if opt.valid
+            sd.set_type_valid(true)
+        if opt.entity_ref
+            sd.set_entity_ref(ENTITY_REF_NONE)
+        if opt.external_entity_ref
+            sd.set_entity_ref(ENTITY_REF_INTERNAL)
+        if opt.integral
+            sd.set_integrally_stored(true)
+        if opt.no_unclosed_tag
+        {
+            sd.set_boolean_feature(SDF_STARTTAGUNCLOSED, false)
+            sd.set_boolean_feature(SDF_ENDTAGUNCLOSED, false)
+        }
+        if opt.no_net
+            sd.set_start_tag_net_enable(NET_ENABLE_NO)
+    }
+
+    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, charset_fixed: bool, active_links: pointer[Array[String]], options: pointer[ParserOptions], out_conforming: pointer[bool]) returns String
     {
         ; Record normalization (ExtendEntityManager, `lf` record type — the whole
         ; Unix corpus): insert one RS (0x0A) at the entity start, and translate
@@ -16796,6 +16938,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; record types are deferred; the corpus is LF.)
         let ps ParserState.make(host, null, 0 as u32, PHASE_PROLOG)
         ps.set_prog_name(prog_name)
+        ; the -w axis: the driver's ParserOptions (enableWarning already
+        ; applied); null keeps the defaults ParserState.make installed.
+        if options <> null
+            ps.set_options(options)
         ; the output coding system (identity vs UTF-8) the driver derived from
         ; the environment — governs the ESIS stdout bytes and stderr encoding.
         ps.set_output_utf8(output_utf8)
@@ -16848,6 +16994,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         sd.set_number_feature(SDNF_SIMPLE, 1000 as u32)
         sd.set_boolean_feature(SDF_IMPLICIT, true)
         sd.set_number_feature(SDNF_EXPLICIT, 1 as u32)
+        ; setSdOverrides on the implied/provisional Sd (Parser.cxx:48) — the
+        ; -w validation flags apply even while the SGML declaration parses.
+        Parser.apply_sd_overrides(ps.get_options(), sd)
         ; the document charset machinery (Parser.cxx:46-52): the implied
         ; declaration — one section with an EMPTY public id declaring
         ; 0..charMax — and the system-charset identity mapping. An explicit
