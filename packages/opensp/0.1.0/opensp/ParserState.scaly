@@ -16,6 +16,7 @@ use opensp.ElementType.ElementType
 use opensp.ElementType.RankStem
 use opensp.Attribute.AttributeContext
 use opensp.Attribute.AttributeValue
+use opensp.AttributeList.AttributeList
 use opensp.Recognizer.Recognizer
 use opensp.ModeInfo.ModeInfo
 use opensp.XcharMap.XcharMap
@@ -29,7 +30,13 @@ use opensp.Message.Severity
 use opensp.Message.MessageArg
 use opensp.Message.MessageFormatter
 use opensp.ParserAppMessages.ParserAppMessages
+use opensp.ParserMessages.ParserMessages
 use opensp.Event.Event
+use opensp.Lpd.Lpd
+use opensp.Lpd.LinkSet
+use opensp.Lpd.SourceLinkRule
+use opensp.Lpd.IdLinkRuleGroup
+use opensp.Lpd.LinkSetTable
 
 ; ParserState — a slice of ParserState.cs (the 1627-LOC parser god-object). This
 ; increment ports the STATE SCAFFOLD the parse methods read and mutate — the
@@ -181,6 +188,38 @@ define KeptMessage
     aux_loc: Location
 )
 
+; LinkProcessOpenElement (LinkProcess.h:23) — one per open element while an
+; active complex LPD drives link processing: the link set CURRENT for the
+; element's content, the set to RESTORE on uselink #RESTORE, and the POSTLINK
+; state applied when the element ends.
+define LpOpen
+(
+    current: pointer[LinkSet]
+    restore: pointer[LinkSet]
+    post: pointer[LinkSet]
+    post_restore: bool
+)
+
+; LpdEntityRef (LpdEntityRef.h) — one entity consulted through the pass-1 DTD
+; during the pass-2 prolog; checkEntityStability re-resolves it at the end of
+; the pass-2 prolog and reports unstableLpd*Entity on any difference.
+define LpdEntityRef
+(
+    entity: pointer[Entity]
+    is_parameter: bool
+    looked_at_default: bool
+    found_in_pass1: bool
+)
+
+; EntityDecl::setDeclIn's LPD half (EntityDecl.h): the port's Entity union
+; carries no decl-in fields, so entities declared inside an LPD subset register
+; here (keyed by pointer identity — every definition is a distinct object).
+define LpdEntityDecl
+(
+    entity: pointer[Entity]
+    active: bool
+)
+
 define ParserState
 (
     host: pointer[Page]
@@ -289,6 +328,45 @@ define ParserState
     ;     and the message stderr stream (write_stderr — no escaper there:
     ;     makeStdErr never calls setEscaper, unencodable chars are dropped). ---
     out_utf8: bool
+    ; --- LINK axis (ParserState.cxx): the LPD being defined, the LPDs seen so
+    ;     far (all) and the ACTIVE ones (lpd_), and the -a activation list. ---
+    def_lpd: pointer[Lpd]
+    had_lpd: bool
+    active_lpds: Array[pointer[Lpd]]
+    all_lpds: Array[pointer[Lpd]]
+    active_link_types: Array[StringC]
+    active_link_types_substed: bool
+    ; resultAttributeSpecMode_ — result element specs in explicit link rules
+    ; resolve entities/notations against the RESULT dtd.
+    result_attribute_spec_mode: bool
+    ; --- pass 1 / pass 2 (setPass2Start/maybeStartPass2): with LINK admitted
+    ;     and link types activated, the whole document parses TWICE — pass 1
+    ;     discovers which LPDs activate (its non-error messages buffer in
+    ;     pass1_kept and are DISCARDED when pass 2 starts; errors pass through
+    ;     immediately and veto pass 2), pass 2 re-parses with the pass-1 base
+    ;     DTD available for entity-stability checking. ---
+    pass2: bool
+    allow_pass2: bool
+    had_pass2_start: bool
+    pass2_start_index: size_t
+    pass1_dtd: pointer[Dtd]
+    pass1_had_error: bool
+    pass1_kept: Array[KeptMessage]
+    n_pass1_kept: size_t
+    pass1_events_mark: size_t
+    ; --- entity-stability tracking (noteReferencedEntity/checkEntityStability)
+    ;     + the entity->declared-in-LPD side table (see LpdEntityDecl). ---
+    lpd_entity_refs: Array[LpdEntityRef]
+    lpd_entity_decls: Array[LpdEntityDecl]
+    ; --- the link process (LinkProcess.cxx; app-side in the reference, driven
+    ;     here at event-queue time — the queue point IS the handler's stream
+    ;     position). Initialized by the EndPrologEvent that carries an active
+    ;     complex LPD. lp_open is the open-element stack (top = last). ---
+    have_link_process: bool
+    lp_lpd: pointer[Lpd]
+    lp_name: pointer[StringC]
+    lp_open: Array[LpOpen]
+    lp_depth: size_t
 )
 {
     function make(host: pointer[Page], entity_manager: pointer[EntityManager], subdoc_level: u32, final_phase: int) returns pointer[ParserState]
@@ -355,6 +433,29 @@ define ParserState
         set ps.decl_base_dir: String()
         set ps.prog_name: String()
         set ps.out_utf8: false
+        set ps.def_lpd: null
+        set ps.had_lpd: false
+        set ps.active_lpds: Array[pointer[Lpd]]^host()
+        set ps.all_lpds: Array[pointer[Lpd]]^host()
+        set ps.active_link_types: Array[StringC]^host()
+        set ps.active_link_types_substed: false
+        set ps.result_attribute_spec_mode: false
+        set ps.pass2: false
+        set ps.allow_pass2: false
+        set ps.had_pass2_start: false
+        set ps.pass2_start_index: 0
+        set ps.pass1_dtd: null
+        set ps.pass1_had_error: false
+        set ps.pass1_kept: Array[KeptMessage]^host()
+        set ps.n_pass1_kept: 0
+        set ps.pass1_events_mark: 0
+        set ps.lpd_entity_refs: Array[LpdEntityRef]^host()
+        set ps.lpd_entity_decls: Array[LpdEntityDecl]^host()
+        set ps.have_link_process: false
+        set ps.lp_lpd: null
+        set ps.lp_name: null
+        set ps.lp_open: Array[LpOpen]^host()
+        set ps.lp_depth: 0
         ps
     }
 
@@ -394,7 +495,35 @@ define ParserState
         content_state
 
     ; ---- event stream (Stage 4) ------------------------------------------
+    ; The queue point IS the reference handler's stream position: the LINK
+    ; axis' link process (SgmlsEventHandler's linkProcess_) runs here on the
+    ; element events (and initializes off the EndPrologEvent), attaching the
+    ; matched rule's link attributes to the start event for the writer.
     function queue_event(this: pointer[ParserState], e: pointer[Event])
+    {
+        let ty e.get_type()
+        if ty = EV_START_ELEMENT
+        {
+            if this.have_link_process
+                this.lp_start_element(e)
+        }
+        else if ty = EV_END_ELEMENT
+        {
+            if this.have_link_process
+                this.lp_end_element()
+        }
+        else if ty = EV_END_PROLOG
+        {
+            let lpd e.get_end_prolog_lpd() as pointer[Lpd]
+            if lpd <> null
+                this.lp_init(lpd)
+        }
+        this.events.add(e)
+    }
+
+    ; a raw append that BYPASSES the link process — the subdoc splice (the
+    ; child parse ran its own link process, mirroring SgmlsSubdocState's swap).
+    function queue_event_raw(this: pointer[ParserState], e: pointer[Event])
         this.events.add(e)
 
     function n_events(this: ParserState) returns size_t
@@ -572,8 +701,41 @@ define ParserState
     ; With no activated doctype the reference falls back to the BASE DTD.
     function start_instance(this: pointer[ParserState], host: pointer[Page])
     {
-        let dtd this.base_dtd()
+        ; the doctype-activation loop (ParserState.cxx:452): an ACTIVATED
+        ; document type (-a naming a DOCTYPE) becomes the current DTD — at most
+        ; one, and never alongside an activated link type.
+        var dtd: pointer[Dtd] null
+        let nd this.dtd_stack.get_length()
+        var di: size_t 0
+        var scanning true
+        while scanning and (di < nd)
+        {
+            let cand *(this.dtd_stack.get_buffer() + di)
+            let cname cand.get_name()
+            if this.should_activate_link(cname)
+            {
+                if this.active_lpds.get_length() > (0 as size_t)
+                {
+                    let args0 Vector[MessageArg]()
+                    this.report(ParserMessages.activeDocLink(), args0)
+                    set scanning: false
+                }
+                else if dtd <> null
+                {
+                    let args1 Vector[MessageArg]()
+                    this.report(ParserMessages.sorryActiveDoctypes(), args1)
+                    set scanning: false
+                }
+                else
+                    set dtd: cand
+            }
+            set di: di + 1
+        }
+        if dtd = null
+            set dtd: this.base_dtd()
         set this.current_dtd: dtd
+        ; idTable_.clear() (ParserState.cxx:476) — load-bearing for pass 2.
+        set this.id_table: IdTable.make(host)
         this.content_state.start_content(host, dtd)
         set this.current_mode: econMode
         set this.in_instance: true
@@ -774,6 +936,536 @@ define ParserState
 
     function dtd_at(this: ParserState, i: size_t) returns pointer[Dtd]
         *(dtd_stack.get_buffer() + i)
+
+    ; ---- LINK axis: LPD registry (ParserState.cxx:258-273, 765-807) --------
+    function have_def_lpd(this: ParserState) returns bool
+        def_lpd <> null
+
+    function get_def_lpd(this: ParserState) returns pointer[Lpd]
+        def_lpd
+
+    ; startLpd: while an LPD is being defined the DEF (and current) DTD is the
+    ; LPD's SOURCE DTD — entity/attlist declarations in the subset act on it.
+    function start_lpd(this: pointer[ParserState], lpd: pointer[Lpd])
+    {
+        set this.def_lpd: lpd
+        set this.def_dtd: lpd.get_source_dtd()
+        set this.current_dtd: lpd.get_source_dtd()
+    }
+
+    ; endLpd: an ACTIVE lpd joins the activation list, every lpd joins allLpd_;
+    ; the current DTD stays the source DTD (the reference does not clear it).
+    function end_lpd(this: pointer[ParserState])
+    {
+        set this.had_lpd: true
+        let l this.def_lpd
+        if l.is_active()
+            this.active_lpds.add(l)
+        this.all_lpds.add(l)
+        set this.def_lpd: null
+        set this.def_dtd: null
+        set this.current_mode: proMode
+    }
+
+    function get_had_lpd(this: ParserState) returns bool
+        had_lpd
+
+    function lookup_lpd(this: ParserState, name: StringC) returns pointer[Lpd]
+    {
+        let n all_lpds.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let l *(all_lpds.get_buffer() + i)
+            let lname l.get_name()
+            if lname.equals(name)
+                return l
+            set i: i + 1
+        }
+        null
+    }
+
+    function n_active_lpds(this: ParserState) returns size_t
+        active_lpds.get_length()
+
+    function active_lpd_at(this: ParserState, i: size_t) returns pointer[Lpd]
+        *(active_lpds.get_buffer() + i)
+
+    ; activateLinkType (the -a option): only before parsing passes the first
+    ; prolog declaration (linkActivateTooLate otherwise).
+    function add_active_link_type(this: pointer[ParserState], name: StringC)
+    {
+        var too_late true
+        if this.had_pass2_start = false
+        {
+            if this.pass2 = false
+                set too_late: false
+        }
+        if too_late
+        {
+            let args Vector[MessageArg]()
+            this.report(ParserMessages.linkActivateTooLate(), args)
+            return
+        }
+        let hp this.host
+        this.active_link_types.add(StringC^hp(name.data_ptr(), name.get_size()))
+    }
+
+    function n_active_link_types(this: ParserState) returns size_t
+        active_link_types.get_length()
+
+    function active_link_type_at(this: ParserState, i: size_t) returns StringC
+        *(active_link_types.get_buffer() + i)
+
+    ; a subdocument parse inherits the parent's activation list
+    ; (inheritActiveLinkTypes, ParserState.cxx:83).
+    function inherit_active_link_types(this: pointer[ParserState], parent: pointer[ParserState])
+    {
+        let n (*parent).n_active_link_types()
+        var i: size_t 0
+        while i < n
+        {
+            this.active_link_types.add((*parent).active_link_type_at(i))
+            set i: i + 1
+        }
+    }
+
+    ; shouldActivateLink (ParserState.cxx:773): the -a names fold through the
+    ; general substitution table ONCE (first use), then plain equality.
+    function should_activate_link(this: pointer[ParserState], name: StringC) returns bool
+    {
+        if this.active_link_types_substed = false
+        {
+            let syn this.syntax
+            let hp this.host
+            let n this.active_link_types.get_length()
+            var i: size_t 0
+            while i < n
+            {
+                let old *(this.active_link_types.get_buffer() + i)
+                let sz old.get_size()
+                let nb hp.allocate(sz * (4 as size_t), 4) as pointer[u32]
+                var j: size_t 0
+                while j < sz
+                {
+                    set *(nb + j): syn.fold(old.get(j))
+                    set j: j + 1
+                }
+                ; bind the construction to a local before the put (the
+                ; construction-as-argument silent-misplan class).
+                let folded StringC^hp(nb, sz)
+                this.active_link_types.put(i, *folded)
+                set i: i + 1
+            }
+            set this.active_link_types_substed: true
+        }
+        let n2 this.active_link_types.get_length()
+        var k: size_t 0
+        while k < n2
+        {
+            let alt *(this.active_link_types.get_buffer() + k)
+            if alt.equals(name)
+                return true
+            set k: k + 1
+        }
+        false
+    }
+
+    ; ---- resultAttributeSpecMode (result element specs resolve entities and
+    ; notations against the RESULT dtd) ---------------------------------------
+    function set_result_attribute_spec_mode(this: pointer[ParserState])
+        set this.result_attribute_spec_mode: true
+
+    function clear_result_attribute_spec_mode(this: pointer[ParserState])
+        set this.result_attribute_spec_mode: false
+
+    function in_result_attribute_spec_mode(this: ParserState) returns bool
+        result_attribute_spec_mode
+
+    ; ---- the link process (LinkProcess.cxx), driven at queue_event time ----
+    function lp_init(this: pointer[ParserState], lpd: pointer[Lpd])
+    {
+        set this.have_link_process: true
+        set this.lp_lpd: lpd
+        let hp this.host
+        ; the owner name printed on `a` records — one stable copy.
+        let nm lpd.get_name()
+        let sp hp.allocate(sizeof StringC, alignof StringC) as pointer[StringC]
+        set *sp: StringC^hp(nm.data_ptr(), nm.get_size())
+        set this.lp_name: sp
+        set this.lp_open: Array[LpOpen]^hp()
+        var top LpOpen()
+        let ini lpd.initial_link_set_of()
+        set top.current: ini
+        set top.restore: ini
+        set top.post: null
+        set top.post_restore: false
+        this.lp_open.add(top)
+        set this.lp_depth: 1
+    }
+
+    function lp_push(this: pointer[ParserState], o: LpOpen)
+    {
+        if this.lp_depth < this.lp_open.get_length()
+            this.lp_open.put(this.lp_depth, o)
+        else
+            this.lp_open.add(o)
+        set this.lp_depth: this.lp_depth + (1 as size_t)
+    }
+
+    ; LinkProcess::startElement — select the applicable link rule (ID link
+    ; rules first, then the current link set's rules for the element; onsgmls
+    ; never overrides selectLinkRule, so rule 0 is always selected), push the
+    ; open-element entry, attach the rule's link attributes to the event.
+    function lp_start_element(this: pointer[ParserState], e: pointer[Event])
+    {
+        let lpd this.lp_lpd
+        let element e.get_element_type()
+        let atts e.get_attributes()
+        var id StringC()
+        if atts <> null
+            set id: atts.get_id()
+        if id.get_size() > (0 as size_t)
+        {
+            let grp lpd.lookup_id_link(id)
+            if grp <> null
+            {
+                let rule grp.link_rule(0 as size_t)
+                this.lp_push_rule(rule)
+                e.set_link_attributes(rule.attributes(), this.lp_name)
+                if rule.is_associated_with(element) = false
+                {
+                    var args Vector[MessageArg](2 as size_t)
+                    let ename element.get_name()
+                    set *(args.get(0 as size_t)): MessageArg.Str(ename)
+                    set *(args.get(1 as size_t)): MessageArg.Str(id)
+                    this.report_at(ParserMessages.idlinkElementType(), args, e.get_markup_loc())
+                }
+                return
+            }
+        }
+        let buf this.lp_open.get_buffer()
+        let top buf + (this.lp_depth - (1 as size_t))
+        let cur top.current
+        let n cur.n_link_rules(element)
+        if n > (0 as size_t)
+        {
+            let rule cur.link_rule(element, 0 as size_t)
+            this.lp_push_rule(rule)
+            e.set_link_attributes(rule.attributes(), this.lp_name)
+            return
+        }
+        ; no applicable rule: a plain open element, the current set carries.
+        var plain LpOpen()
+        set plain.current: cur
+        set plain.restore: cur
+        set plain.post: null
+        set plain.post_restore: false
+        this.lp_push(plain)
+    }
+
+    ; LinkProcessOpenElement(cur, rule) — the rule's USELINK (if any) becomes
+    ; current for the element's content; POSTLINK applies when it ends.
+    function lp_push_rule(this: pointer[ParserState], rule: pointer[SourceLinkRule])
+    {
+        let buf this.lp_open.get_buffer()
+        let top buf + (this.lp_depth - (1 as size_t))
+        let cur top.current
+        var o LpOpen()
+        var eff cur
+        let ul rule.get_uselink() as pointer[LinkSet]
+        if ul <> null
+            set eff: ul
+        set o.current: eff
+        set o.restore: cur
+        set o.post: rule.get_postlink() as pointer[LinkSet]
+        set o.post_restore: rule.get_postlink_restore()
+        this.lp_push(o)
+    }
+
+    ; LinkProcess::endElement — pop; POSTLINK (or its #RESTORE form) rewrites
+    ; the PARENT's current link set.
+    function lp_end_element(this: pointer[ParserState])
+    {
+        if this.lp_depth <= (1 as size_t)
+            return
+        let buf this.lp_open.get_buffer()
+        let top buf + (this.lp_depth - (1 as size_t))
+        set this.lp_depth: this.lp_depth - (1 as size_t)
+        let head buf + (this.lp_depth - (1 as size_t))
+        if top.post <> null
+            set head.current: top.post
+        else if top.post_restore
+            set head.current: head.restore
+    }
+
+    ; LinkProcess::uselink — a USELINK declaration for the ACTIVE lpd rewrites
+    ; the current open element's link set (#RESTORE restores the entry state).
+    function lp_uselink(this: pointer[ParserState], link_set: pointer[LinkSet], restore: bool, lpd: pointer[Lpd])
+    {
+        if this.have_link_process = false
+            return
+        if lpd <> this.lp_lpd
+            return
+        let buf this.lp_open.get_buffer()
+        let head buf + (this.lp_depth - (1 as size_t))
+        if restore
+            set head.current: head.restore
+        else if link_set <> null
+            set head.current: link_set
+    }
+
+    ; ---- pass 1 / pass 2 (setPass2Start / maybeStartPass2) ------------------
+    ; Runs at every prolog markup declaration (once): with LINK admitted and
+    ; link types activated, pass-1 buffering begins — the rewind point is the
+    ; declaration's own token start.
+    function set_pass2_start(this: pointer[ParserState])
+    {
+        if this.had_pass2_start
+            return
+        set this.had_pass2_start: true
+        var want false
+        if this.pass2 = false
+        {
+            let csd this.sd
+            if csd.link()
+            {
+                if this.active_link_types.get_length() > (0 as size_t)
+                    set want: true
+            }
+        }
+        if want
+        {
+            set this.allow_pass2: true
+            set this.pass1_had_error: false
+            set this.n_pass1_kept: 0
+            set this.pass1_events_mark: this.events.get_length()
+            let ins this.current_input()
+            let tsl ins.token_start_location()
+            set this.pass2_start_index: tsl.get_index() as size_t
+        }
+        else
+            set this.allow_pass2: false
+    }
+
+    function get_pass2(this: ParserState) returns bool
+        pass2
+
+    function get_allow_pass2(this: ParserState) returns bool
+        allow_pass2
+
+    function get_pass1_had_error(this: ParserState) returns bool
+        pass1_had_error
+
+    function get_pass2_start_index(this: ParserState) returns size_t
+        pass2_start_index
+
+    function get_pass1_dtd(this: ParserState) returns pointer[Dtd]
+        pass1_dtd
+
+    ; discard the events queued since setPass2Start (pass1Handler.clear()).
+    function truncate_events(this: pointer[ParserState], n: size_t)
+    {
+        let hp this.host
+        let fresh Array[pointer[Event]]^hp()
+        let buf this.events.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            fresh.add(*(buf + i))
+            set i: i + 1
+        }
+        set this.events: fresh
+    }
+
+    ; maybeStartPass2's state reset (ParserState.cxx:140-185): the pass-1 base
+    ; DTD survives as pass1_dtd, pass-1 events since the start point are
+    ; discarded, everything else returns to the prolog state. The caller
+    ; rewinds the input and re-runs the prolog.
+    function reset_for_pass2(this: pointer[ParserState])
+    {
+        set this.special_parse_input_level: 0 as u32
+        set this.marked_section_level: 0 as u32
+        set this.marked_section_special_level: 0 as u32
+        set this.n_ms_start_locations: 0
+        set this.current_mode: proMode
+        set this.had_lpd: false
+        set this.allow_pass2: false
+        set this.had_pass2_start: false
+        set this.in_instance: false
+        set this.in_start_tag: false
+        set this.in_end_tag: false
+        set this.def_dtd: null
+        set this.def_lpd: null
+        set this.pass1_dtd: this.base_dtd()
+        let hp this.host
+        set this.dtd_stack: Array[pointer[Dtd]]^hp()
+        set this.current_dtd: null
+        set this.phase: PHASE_PROLOG
+        set this.pass2: true
+        set this.active_lpds: Array[pointer[Lpd]]^hp()
+        set this.all_lpds: Array[pointer[Lpd]]^hp()
+        this.truncate_events(this.pass1_events_mark)
+        ; syntax back to the PROLOG syntax (SCOPE INSTANCE may have switched).
+        set this.syntax: this.prolog_syntax
+        this.attribute_context.set_syntax(this.prolog_syntax)
+        ; OutputState back to its initial single level.
+        set this.os_state: Array[int]^hp()
+        this.os_state.add(OS_AFTER_START_TAG)
+        set this.os_depth: 1 as u32
+        ; pop the whole input stack (the caller pushes the rewound document).
+        set this.input_stack: Array[pointer[InputSource]]^hp()
+        set this.input_level: 0 as u32
+        set this.n_input_level_element_index: 0
+    }
+
+    ; ---- entity decl-in-LPD side table + stability tracking ----------------
+    ; EntityDecl::setDeclIn's LPD half: the Entity union carries no decl-in
+    ; fields, so LPD-subset definitions register here (pointer identity).
+    function note_lpd_entity_decl(this: pointer[ParserState], ent: pointer[Entity], active: bool)
+    {
+        var d LpdEntityDecl()
+        set d.entity: ent
+        set d.active: active
+        this.lpd_entity_decls.add(d)
+    }
+
+    function entity_decl_in_active_lpd(this: ParserState, ent: pointer[Entity]) returns bool
+    {
+        let n lpd_entity_decls.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let d lpd_entity_decls.get_buffer() + i
+            if d.entity = ent
+                return d.active
+            set i: i + 1
+        }
+        false
+    }
+
+    ; noteReferencedEntity (ParserState.cxx:590) — a set keyed on the ref.
+    function note_referenced_entity(this: pointer[ParserState], ent: pointer[Entity], is_parameter: bool, found_in_pass1: bool, looked_at_default: bool)
+    {
+        let n this.lpd_entity_refs.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let r this.lpd_entity_refs.get_buffer() + i
+            if r.entity = ent
+            {
+                if (r.looked_at_default = looked_at_default) and (r.found_in_pass1 = found_in_pass1)
+                    return
+            }
+            set i: i + 1
+        }
+        var nr LpdEntityRef()
+        set nr.entity: ent
+        set nr.is_parameter: is_parameter
+        set nr.looked_at_default: looked_at_default
+        set nr.found_in_pass1: found_in_pass1
+        this.lpd_entity_refs.add(nr)
+    }
+
+    function n_lpd_entity_refs(this: ParserState) returns size_t
+        lpd_entity_refs.get_length()
+
+    function lpd_entity_ref_at(this: ParserState, i: size_t) returns pointer[LpdEntityRef]
+        lpd_entity_refs.get_buffer() + i
+
+    function clear_lpd_entity_refs(this: pointer[ParserState])
+    {
+        let hp this.host
+        set this.lpd_entity_refs: Array[LpdEntityRef]^hp()
+    }
+
+    ; ---- pass-aware entity lookup (ParserState::lookupEntity's prolog slice:
+    ; result-attribute mode resolves against the RESULT dtd; the pass-2 prolog
+    ; consults the pass-1 base DTD for entities declared in active LPDs and
+    ; notes every consult for checkEntityStability). ------------------------
+    function lookup_entity_pass_aware(this: pointer[ParserState], is_parameter: bool, name: StringC) returns pointer[Entity]
+    {
+        var dtd this.current_dtd
+        if this.result_attribute_spec_mode
+        {
+            set dtd: null
+            let dl this.def_lpd
+            if dl <> null
+                set dtd: dl.get_result_dtd()
+        }
+        if dtd = null
+            return null
+        let entity dtd.lookup_entity(is_parameter, name)
+        if this.in_instance = false
+        {
+            if this.pass2 and dtd.get_is_base() and (this.result_attribute_spec_mode = false)
+            {
+                var consult true
+                if entity <> null
+                {
+                    if (*this).entity_decl_in_active_lpd(entity)
+                        set consult: false
+                }
+                if consult
+                {
+                    let p1 this.pass1_dtd
+                    if p1 <> null
+                    {
+                        let entity1 p1.lookup_entity(is_parameter, name)
+                        if entity1 <> null
+                        {
+                            if (*this).entity_decl_in_active_lpd(entity1)
+                            {
+                                this.note_referenced_entity(entity1, is_parameter, true, false)
+                                return entity1
+                            }
+                        }
+                        if entity <> null
+                            this.note_referenced_entity(entity, is_parameter, false, false)
+                    }
+                }
+            }
+        }
+        entity
+    }
+
+    ; the default-entity half of the same consult (ParserState.cxx:529-543).
+    function default_entity_pass_aware(this: pointer[ParserState], dtd: pointer[Dtd]) returns pointer[Entity]
+    {
+        var entity dtd.get_default_entity()
+        if this.in_instance = false
+        {
+            if this.pass2 and dtd.get_is_base() and (this.result_attribute_spec_mode = false)
+            {
+                var consult true
+                if entity <> null
+                {
+                    if (*this).entity_decl_in_active_lpd(entity)
+                        set consult: false
+                }
+                if consult
+                {
+                    let p1 this.pass1_dtd
+                    if p1 <> null
+                    {
+                        let entity1 p1.get_default_entity()
+                        var used_pass1 false
+                        if entity1 <> null
+                        {
+                            if (*this).entity_decl_in_active_lpd(entity1)
+                            {
+                                set used_pass1: true
+                                set entity: entity1
+                            }
+                        }
+                        if entity <> null
+                            this.note_referenced_entity(entity, false, used_pass1, true)
+                    }
+                }
+            }
+        }
+        entity
+    }
 
     ; ---- phase + tag flags ------------------------------------------------
     function set_phase(this: pointer[ParserState], phase: int)
@@ -1231,8 +1923,18 @@ define ParserState
         if this.keeping_messages
         {
             let args Vector[MessageArg]()
-            this.keep_message(type, args, msg.get_loc(), true, false, StringC(), Location())
+            this.keep_message(type, args, msg.get_loc(), true, false, StringC(), Location(), false)
             return
+        }
+        if this.is_pass1_buffering()
+        {
+            if type.is_error() = false
+            {
+                let args Vector[MessageArg]()
+                this.keep_message(type, args, msg.get_loc(), true, false, StringC(), Location(), true)
+                return
+            }
+            set this.pass1_had_error: true
         }
         this.dispatch_message(msg)
     }
@@ -1246,8 +1948,17 @@ define ParserState
         this.init_message(&msg)
         if this.keeping_messages
         {
-            this.keep_message(type, args, msg.get_loc(), false, false, StringC(), Location())
+            this.keep_message(type, args, msg.get_loc(), false, false, StringC(), Location(), false)
             return
+        }
+        if this.is_pass1_buffering()
+        {
+            if type.is_error() = false
+            {
+                this.keep_message(type, args, msg.get_loc(), false, false, StringC(), Location(), true)
+                return
+            }
+            set this.pass1_had_error: true
         }
         this.emit_message(&msg, args)
         this.dispatch_message(msg)
@@ -1259,8 +1970,17 @@ define ParserState
     {
         if this.keeping_messages
         {
-            this.keep_message(type, args, loc, false, false, StringC(), Location())
+            this.keep_message(type, args, loc, false, false, StringC(), Location(), false)
             return
+        }
+        if this.is_pass1_buffering()
+        {
+            if type.is_error() = false
+            {
+                this.keep_message(type, args, loc, false, false, StringC(), Location(), true)
+                return
+            }
+            set this.pass1_had_error: true
         }
         var msg Message(type, loc)
         this.emit_message(&msg, args)
@@ -1276,8 +1996,17 @@ define ParserState
     {
         if this.keeping_messages
         {
-            this.keep_message(type, args, loc, false, true, aux_text, aux_loc)
+            this.keep_message(type, args, loc, false, true, aux_text, aux_loc, false)
             return
+        }
+        if this.is_pass1_buffering()
+        {
+            if type.is_error() = false
+            {
+                this.keep_message(type, args, loc, false, true, aux_text, aux_loc, true)
+                return
+            }
+            set this.pass1_had_error: true
         }
         var msg Message(type, loc)
         this.emit_message(&msg, args)
@@ -1290,7 +2019,9 @@ define ParserState
     function keep_messages(this: pointer[ParserState])
         set this.keeping_messages: true
 
-    function keep_message(this: pointer[ParserState], type: MessageType, args: Vector[MessageArg], loc: Location, silent: bool, has_aux: bool, aux_text: StringC, aux_loc: Location)
+    ; to_pass1: store into the Pass1EventHandler buffer instead of the
+    ; speculation buffer (non-error messages during pass-1 buffering).
+    function keep_message(this: pointer[ParserState], type: MessageType, args: Vector[MessageArg], loc: Location, silent: bool, has_aux: bool, aux_text: StringC, aux_loc: Location, to_pass1: bool)
     {
         var km KeptMessage()
         set km.msg_number: type.fragment.number
@@ -1414,17 +2145,144 @@ define ParserState
         set km.has_aux: has_aux
         set km.aux_text: StringC^hp(aux_text.data_ptr(), aux_text.get_size())
         set km.aux_loc: aux_loc
-        if this.n_kept < this.kept_messages.get_length()
-            this.kept_messages.put(this.n_kept, km)
+        if to_pass1
+        {
+            if this.n_pass1_kept < this.pass1_kept.get_length()
+                this.pass1_kept.put(this.n_pass1_kept, km)
+            else
+                this.pass1_kept.add(km)
+            set this.n_pass1_kept: this.n_pass1_kept + (1 as size_t)
+        }
         else
-            this.kept_messages.add(km)
-        set this.n_kept: this.n_kept + (1 as size_t)
+        {
+            if this.n_kept < this.kept_messages.get_length()
+                this.kept_messages.put(this.n_kept, km)
+            else
+                this.kept_messages.add(km)
+            set this.n_kept: this.n_kept + (1 as size_t)
+        }
     }
 
     function discard_kept_messages(this: pointer[ParserState])
     {
         set this.keeping_messages: false
         set this.n_kept: 0
+    }
+
+    ; whether pass-1 buffering is live (allowPass2 set, pass 2 not yet started):
+    ; non-error messages divert into pass1_kept, errors pass through and veto
+    ; pass 2 (Pass1EventHandler::message).
+    function is_pass1_buffering(this: ParserState) returns bool
+    {
+        if allow_pass2 = false
+            return false
+        pass2 = false
+    }
+
+    ; emit + count ONE kept message (the release path's per-entry body, shared
+    ; with the pass-1 flush).
+    function emit_kept_at(this: pointer[ParserState], km: pointer[KeptMessage])
+    {
+        var n_args: size_t 0
+        if km.a0_kind <> KA_NONE
+            set n_args: 1
+        if km.a1_kind <> KA_NONE
+            set n_args: 2
+        if km.a2_kind <> KA_NONE
+            set n_args: 3
+        var args Vector[MessageArg](n_args)
+        ; rebuild each slot with a DIRECT construction — a MessageArg
+        ; returned from a helper reads as a local-page reference to the
+        ; escape checker when stored through the vector pointer.
+        if n_args > (0 as size_t)
+        {
+            if km.a0_kind = KA_STR
+                set *(args.get(0 as size_t)): MessageArg.Str(km.a0_str)
+            else if km.a0_kind = KA_NUM
+                set *(args.get(0 as size_t)): MessageArg.Num(km.a0_num)
+            else if km.a0_kind = KA_ORD
+                set *(args.get(0 as size_t)): MessageArg.Ord(km.a0_num)
+            else if km.a0_kind = KA_VEC
+                set *(args.get(0 as size_t)): MessageArg.Vec(km.a0_vec)
+            else
+                set *(args.get(0 as size_t)): MessageArg.Raw(km.a0_str)
+        }
+        if n_args > (1 as size_t)
+        {
+            if km.a1_kind = KA_STR
+                set *(args.get(1 as size_t)): MessageArg.Str(km.a1_str)
+            else if km.a1_kind = KA_NUM
+                set *(args.get(1 as size_t)): MessageArg.Num(km.a1_num)
+            else if km.a1_kind = KA_ORD
+                set *(args.get(1 as size_t)): MessageArg.Ord(km.a1_num)
+            else if km.a1_kind = KA_VEC
+                set *(args.get(1 as size_t)): MessageArg.Vec(km.a1_vec)
+            else
+                set *(args.get(1 as size_t)): MessageArg.Raw(km.a1_str)
+        }
+        if n_args > (2 as size_t)
+        {
+            if km.a2_kind = KA_STR
+                set *(args.get(2 as size_t)): MessageArg.Str(km.a2_str)
+            else if km.a2_kind = KA_NUM
+                set *(args.get(2 as size_t)): MessageArg.Num(km.a2_num)
+            else if km.a2_kind = KA_ORD
+                set *(args.get(2 as size_t)): MessageArg.Ord(km.a2_num)
+            else if km.a2_kind = KA_VEC
+                set *(args.get(2 as size_t)): MessageArg.Vec(km.a2_vec)
+            else
+                set *(args.get(2 as size_t)): MessageArg.Raw(km.a2_str)
+        }
+        var sev Severity.Error
+        if km.msg_sev = KS_INFO
+            set sev: Severity.Info
+        else if km.msg_sev = KS_WARNING
+            set sev: Severity.Warning
+        else if km.msg_sev = KS_QUANTITY
+            set sev: Severity.QuantityError
+        else if km.msg_sev = KS_IDREF
+            set sev: Severity.IdrefError
+        let mt MessageType(MessageFragment(km.msg_number, km.msg_text), sev)
+        var msg Message(mt, km.loc)
+        if km.silent = false
+        {
+            this.emit_message(&msg, args)
+            if km.has_aux
+                this.emit_aux_line(km.aux_text, args, km.aux_loc)
+        }
+        this.dispatch_message(msg)
+    }
+
+    ; field-wise copy of a kept message into the pass-1 buffer (a by-value
+    ; load of the wide struct does not round-trip — the S27 rule).
+    function pass1_store(this: pointer[ParserState], km: pointer[KeptMessage])
+    {
+        var km2 KeptMessage()
+        set km2.msg_number: km.msg_number
+        set km2.msg_text: km.msg_text
+        set km2.msg_sev: km.msg_sev
+        set km2.loc: km.loc
+        set km2.a0_kind: km.a0_kind
+        set km2.a0_str: km.a0_str
+        set km2.a0_num: km.a0_num
+        set km2.a0_vec: km.a0_vec
+        set km2.a1_kind: km.a1_kind
+        set km2.a1_str: km.a1_str
+        set km2.a1_num: km.a1_num
+        set km2.a1_vec: km.a1_vec
+        set km2.a2_kind: km.a2_kind
+        set km2.a2_str: km.a2_str
+        set km2.a2_num: km.a2_num
+        set km2.a2_vec: km.a2_vec
+        set km2.silent: km.silent
+        set km2.has_aux: km.has_aux
+        set km2.aux_text: km.aux_text
+        set km2.aux_loc: km.aux_loc
+        if this.n_pass1_kept < this.pass1_kept.get_length()
+            this.pass1_kept.put(this.n_pass1_kept, km2)
+        else
+            this.pass1_kept.add(km2)
+        set this.n_pass1_kept: this.n_pass1_kept + (1 as size_t)
     }
 
     function release_kept_messages(this: pointer[ParserState])
@@ -1436,78 +2294,44 @@ define ParserState
             ; access the entry through a POINTER — a by-value load of the wide
             ; struct does not round-trip (see the decomposed-args note above).
             let km this.kept_messages.get_buffer() + i
-            var n_args: size_t 0
-            if km.a0_kind <> KA_NONE
-                set n_args: 1
-            if km.a1_kind <> KA_NONE
-                set n_args: 2
-            if km.a2_kind <> KA_NONE
-                set n_args: 3
-            var args Vector[MessageArg](n_args)
-            ; rebuild each slot with a DIRECT construction — a MessageArg
-            ; returned from a helper reads as a local-page reference to the
-            ; escape checker when stored through the vector pointer.
-            if n_args > (0 as size_t)
+            ; released messages route through the pass-1 filter exactly like
+            ; directly-reported ones (the handler sits downstream of release).
+            var to_pass1 false
+            if this.is_pass1_buffering()
             {
-                if km.a0_kind = KA_STR
-                    set *(args.get(0 as size_t)): MessageArg.Str(km.a0_str)
-                else if km.a0_kind = KA_NUM
-                    set *(args.get(0 as size_t)): MessageArg.Num(km.a0_num)
-                else if km.a0_kind = KA_ORD
-                    set *(args.get(0 as size_t)): MessageArg.Ord(km.a0_num)
-                else if km.a0_kind = KA_VEC
-                    set *(args.get(0 as size_t)): MessageArg.Vec(km.a0_vec)
-                else
-                    set *(args.get(0 as size_t)): MessageArg.Raw(km.a0_str)
+                if (km.msg_sev = KS_INFO) or (km.msg_sev = KS_WARNING)
+                    set to_pass1: true
             }
-            if n_args > (1 as size_t)
+            if to_pass1
+                this.pass1_store(km)
+            else
             {
-                if km.a1_kind = KA_STR
-                    set *(args.get(1 as size_t)): MessageArg.Str(km.a1_str)
-                else if km.a1_kind = KA_NUM
-                    set *(args.get(1 as size_t)): MessageArg.Num(km.a1_num)
-                else if km.a1_kind = KA_ORD
-                    set *(args.get(1 as size_t)): MessageArg.Ord(km.a1_num)
-                else if km.a1_kind = KA_VEC
-                    set *(args.get(1 as size_t)): MessageArg.Vec(km.a1_vec)
-                else
-                    set *(args.get(1 as size_t)): MessageArg.Raw(km.a1_str)
+                if this.is_pass1_buffering()
+                    set this.pass1_had_error: true
+                this.emit_kept_at(km)
             }
-            if n_args > (2 as size_t)
-            {
-                if km.a2_kind = KA_STR
-                    set *(args.get(2 as size_t)): MessageArg.Str(km.a2_str)
-                else if km.a2_kind = KA_NUM
-                    set *(args.get(2 as size_t)): MessageArg.Num(km.a2_num)
-                else if km.a2_kind = KA_ORD
-                    set *(args.get(2 as size_t)): MessageArg.Ord(km.a2_num)
-                else if km.a2_kind = KA_VEC
-                    set *(args.get(2 as size_t)): MessageArg.Vec(km.a2_vec)
-                else
-                    set *(args.get(2 as size_t)): MessageArg.Raw(km.a2_str)
-            }
-            var sev Severity.Error
-            if km.msg_sev = KS_INFO
-                set sev: Severity.Info
-            else if km.msg_sev = KS_WARNING
-                set sev: Severity.Warning
-            else if km.msg_sev = KS_QUANTITY
-                set sev: Severity.QuantityError
-            else if km.msg_sev = KS_IDREF
-                set sev: Severity.IdrefError
-            let mt MessageType(MessageFragment(km.msg_number, km.msg_text), sev)
-            var msg Message(mt, km.loc)
-            if km.silent = false
-            {
-                this.emit_message(&msg, args)
-                if km.has_aux
-                    this.emit_aux_line(km.aux_text, args, km.aux_loc)
-            }
-            this.dispatch_message(msg)
             set i: i + (1 as size_t)
         }
         set this.n_kept: 0
     }
+
+    ; maybeStartPass2's no-pass-2 arm: replay the buffered pass-1 messages
+    ; through the real stream, in buffered order (they trail any pass-through
+    ; errors, exactly like the reference's queue drain).
+    function flush_pass1_messages(this: pointer[ParserState])
+    {
+        var i: size_t 0
+        while i < this.n_pass1_kept
+        {
+            let km this.pass1_kept.get_buffer() + i
+            this.emit_kept_at(km)
+            set i: i + (1 as size_t)
+        }
+        set this.n_pass1_kept: 0
+    }
+
+    function discard_pass1_messages(this: pointer[ParserState])
+        set this.n_pass1_kept: 0
 
     ; errorLimitExceeded (ParserApp.cxx): emitted once, after the parse, iff the
     ; error count reached the limit. Severity Info (does NOT raise the error
