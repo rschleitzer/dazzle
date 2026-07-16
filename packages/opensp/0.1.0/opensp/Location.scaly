@@ -1,4 +1,5 @@
 use scaly.memory.Page
+use scaly.containers.Array
 use opensp.StringC.StringC
 
 ; Source locations — Location.cs / InputSource.cs.
@@ -91,7 +92,7 @@ define Location (origin: pointer[Origin](null), index: u32(0))
 ; reference location's index when resolving a location up through this origin, so
 ; a diagnostic from inside the entity prints the position JUST PAST the reference
 ; in the enclosing source. Zero for a real backing source (no reference).
-define Origin (ref_location: Location, entity_decl: pointer[void](null), file_name: StringC, contents: pointer[u32](null), length: size_t(0), ref_length: size_t(0))
+define Origin (ref_location: Location, entity_decl: pointer[void](null), file_name: StringC, contents: pointer[u32](null), length: size_t(0), ref_length: size_t(0), pushed_rs: pointer[Array[size_t]](null))
 {
     init()
     {
@@ -101,6 +102,7 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set contents: null
         set length: 0
         set ref_length: 0
+        set pushed_rs: null
     }
 
     init(ref_location: Location)
@@ -111,6 +113,7 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set contents: null
         set length: 0
         set ref_length: 0
+        set pushed_rs: null
     }
 
     init(ref_location: Location, entity_decl: pointer[void])
@@ -121,6 +124,7 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set contents: null
         set length: 0
         set ref_length: 0
+        set pushed_rs: null
     }
 
     ; EntityOrigin::make(entity, refLocation, refLength, markup): an entity origin
@@ -133,6 +137,7 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set contents: null
         set length: 0
         set this.ref_length: ref_length
+        set pushed_rs: null
     }
 
     ; Origin.parent() == InputSourceOriginImpl.parent() => refLocation_.
@@ -183,6 +188,42 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
     ;           RE (verified: `9:9:E: document type does not allow ...`);
     ;   true  — an AUX line (`start tag was here`): the line the RS opens,
     ;           columnNumber 0 → COL_OMITTED (verified: `file:10: start ...`).
+    ; a pushed-back `&#RS;` char (push_char_ref) sits IN the shared buffer at
+    ; `idx` but is NOT a record boundary of the source — line_col skips it.
+    ; Recorded once per position (a pass-2 re-parse pushes the same slot again).
+    function note_pushed_rs(this: pointer[Origin], idx: size_t)
+    {
+        if this.pushed_rs = null
+        {
+            let hp Page.get(this as pointer[void])
+            set this.pushed_rs: Array[size_t]^hp()
+        }
+        let n this.pushed_rs.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            if *(this.pushed_rs.get_buffer() + i) = idx
+                return
+            set i: i + 1
+        }
+        this.pushed_rs.add(idx)
+    }
+
+    function is_pushed_rs(this: Origin, idx: size_t) returns bool
+    {
+        if pushed_rs = null
+            return false
+        let n pushed_rs.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            if *(pushed_rs.get_buffer() + i) = idx
+                return true
+            set i: i + 1
+        }
+        false
+    }
+
     function line_col(this: Origin, index: size_t, rs_next_line: bool, out_line: pointer[u32], out_col: pointer[u32])
     {
         if contents = null
@@ -201,8 +242,11 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         {
             if *(contents + i) = (0x0A as u32)
             {
-                set line: line + (1 as u32)
-                set last_rs: i + (1 as size_t)
+                if this.is_pushed_rs(i) = false
+                {
+                    set line: line + (1 as u32)
+                    set last_rs: i + (1 as size_t)
+                }
             }
             set i: i + 1
         }
@@ -210,9 +254,12 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         {
             if *(contents + index) = (0x0A as u32)
             {
-                set *out_line: line + (1 as u32)
-                set *out_col: COL_OMITTED
-                return
+                if this.is_pushed_rs(index) = false
+                {
+                    set *out_line: line + (1 as u32)
+                    set *out_col: COL_OMITTED
+                    return
+                }
             }
         }
         if line = (0 as u32)
@@ -413,11 +460,12 @@ define InputSource (origin: pointer[Origin](null), contents: pointer[u32](null),
     ; reference leaves location indexes unshifted and corrects file offsets
     ; through the origin's NamedCharRef table; our buffer index IS the
     ; location index, so all three cursors step back together and later
-    ; locations stay correct by construction. Residual (conscious): the
-    ; overwrite edits the shared origin buffer, so a pushed RS (10) from
-    ; `&#RS;` adds a line boundary that shifts line/col of LATER diagnostics
-    ; in this source (line_col rescans the buffer); no other pushed char can
-    ; be a line boundary.
+    ; locations stay correct by construction. The overwrite edits the shared
+    ; origin buffer, so a pushed RS (10) from `&#RS;` would read as a line
+    ; boundary to line_col and shift line/col of LATER positions (probed:
+    ; a `&#RS;`-led SHORTREF pushed every -oline L record one line high) —
+    ; the origin records pushed-RS positions and line_col skips them; no
+    ; other pushed char can be a line boundary.
     function push_char_ref(this: InputSource, c: u32)
     {
         if start_index = (0 as size_t)
@@ -426,6 +474,14 @@ define InputSource (origin: pointer[Origin](null), contents: pointer[u32](null),
         set cur_index: start_index
         set start_loc_index: start_loc_index - (1 as u32)
         set *(contents + start_index): c
+        ; a pushed RS would otherwise read as a record boundary to line_col
+        ; (the shared-buffer overwrite) — record it so line/col of LATER
+        ; positions stay true (`&#RS;` was the only line-boundary push).
+        if c = (0x0A as u32)
+        {
+            if origin <> null
+                origin.note_pushed_rs(start_index)
+        }
     }
 
     function test() returns int

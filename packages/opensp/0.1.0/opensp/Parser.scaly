@@ -1719,6 +1719,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; buf — filled by lit_reference_entity's non-squeeze SDATA arm, the
         ; ESIS attribute writer renders those ranges between `\|` markers.
         let sruns Array[size_t]^host()
+        ; non-SGML items (Text::addNonSgmlChar): flat (index, char) pairs —
+        ; the CDATA-attribute-literal arm below records where a non-SGML
+        ; numeric char ref sat; -ononsgml renders `\%N;` there.
+        let nsitems Array[size_t]^host()
         let space (0x20 as u32)
         ; startLoc (parseCommon.cxx:78) — the opening LIT/LITA delimiter, the
         ; token the caller consumed just before calling: the location of the
@@ -1953,7 +1957,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                             ; parameter literals — reports
                             ; numericCharRefLiteralNonSgml (E1, at the REFC)
                             ; and drops the char, the literal continuing.
-                            if ((lit_mode = alitMode) or (lit_mode = alitaMode)) = false
+                            if (lit_mode = alitMode) or (lit_mode = alitaMode)
+                            {
+                                ; Text::addNonSgmlChar — remember the item's
+                                ; position for the -ononsgml attribute writer.
+                                nsitems.add(buf.get_length())
+                                nsitems.add(ch as size_t)
+                            }
+                            else
                                 this.report_num_at(ParserMessages.numericCharRefLiteralNonSgml(), ch as u64, refc_loc)
                         }
                     }
@@ -2105,7 +2116,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         var srp: pointer[Array[size_t]] null
         if sruns.get_length() > (0 as size_t)
             set srp: sruns
-        set *out_text: Text(sc, locbuf.get_buffer(), srp)
+        var nsp: pointer[Array[size_t]] null
+        if nsitems.get_length() > (0 as size_t)
+            set nsp: nsitems
+        set *out_text: Text(sc, locbuf.get_buffer(), srp, nsp)
         true
     }
 
@@ -2164,7 +2178,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 ; a comment in a parameter separator (parseParam.cxx:44): parse
                 ; it and continue; it warns under -wps-comment AFTER the parse.
-                if this.parse_comment(comMode) = false
+                if this.parse_comment(comMode, null) = false
                     return false
                 let opt_pc ps.get_options()
                 if opt_pc.warn_ps_comment
@@ -4629,6 +4643,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         if dv.tokenized() = false
         {
             this.validate_attribute_value(dv, text, attribute_name, &dummy_spec)
+            ; DataDeclaredValue::makeValue — see AttributeList.set_value.
+            let dnt dv.get_data_notation()
+            if dnt <> null
+                return AttributeValue.make_cdata_data(host, text, dnt, dv.get_data_attributes())
             return AttributeValue.make_cdata(host, text)
         }
         ; tokenized: NAMECASE-fold the value (general subst — TokenizedDeclaredValue
@@ -4750,29 +4768,62 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             ; Notation::generateSystemId (Notation.cxx:36, called from
             ; parseDecl.cxx:1603): the catalog lookup (system id / PUBLIC /
             ; NOTATION-name tables, SOEntityCatalog.cxx:427) resolves the
-            ; external id — a declared system id always resolves
-            ; (expandSystemId); a miss with neither warns under
-            ; -wnotation-sysid (W, arg = the folded notation name, at the
-            ; MDC token start — probed 4:64/5:25 vs real onsgmls).
-            var resolved hid.has_system_id()
+            ; external id and stamps the EFFECTIVE system id (the
+            ; -onotation-sysid f-record, stored without the `<OSFILE>` prefix
+            ; like the entity path) — a declared system id always resolves
+            ; (expandSystemId, against the declaring source's directory); a
+            ; miss with neither warns under -wnotation-sysid (W, arg = the
+            ; folded notation name, at the MDC token start — probed 4:64/5:25
+            ; vs real onsgmls).
+            var eff String()
+            var have false
             let cat ps.get_entity_catalog()
-            if (resolved = false) and (cat <> null)
+            if cat <> null
             {
-                if hid.has_public_id()
+                if hid.has_system_id()
                 {
-                    let bypub cat.lookup_public(hid.get_public_id())
-                    if bypub.get_length() > (0 as size_t)
-                        set resolved: true
+                    let bysys cat.lookup_system(hid.get_system_id())
+                    if bysys.get_length() > (0 as size_t)
+                    {
+                        set eff: bysys
+                        set have: true
+                    }
                 }
-                if resolved = false
+                if (have = false) and hid.has_public_id()
+                {
+                    let bypub cat.lookup_public_entry(hid.get_public_id(), hid.has_system_id())
+                    if bypub.get_length() > (0 as size_t)
+                    {
+                        set eff: bypub
+                        set have: true
+                    }
+                }
+                if have = false
                 {
                     let nn8 this.stringc_to_bytes(nt.get_name())
                     let byname cat.lookup_notation(nn8, ps.get_sd().namecase_general())
                     if byname.get_length() > (0 as size_t)
-                        set resolved: true
+                    {
+                        set eff: byname
+                        set have: true
+                    }
                 }
             }
-            if resolved = false
+            if (have = false) and hid.has_system_id()
+            {
+                let nbase ps.get_decl_base_dir()
+                if nbase.get_length() = (0 as size_t)
+                    set eff: hid.get_system_id()
+                else
+                    set eff: Path.join(nbase, hid.get_system_id())
+                set have: true
+            }
+            if have
+            {
+                let heff String^host(eff)
+                nt.set_effective_system(*heff)
+            }
+            else
             {
                 let opt ps.get_options()
                 if opt.warn_notation_system_id
@@ -5276,8 +5327,86 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         if entity.is_external() = false
             return
         let id entity.get_external_id()
-        if id.has_system_id()
+        ; ExternalEntity::generateSystemId (Entity.cxx:127): the catalog lookup
+        ; (SOEntityCatalog::lookup, :427) resolves the external id — SYSTEM
+        ; entry keyed by the declared system id, then PUBLIC entry (with a
+        ; declared system id only an OVERRIDE entry applies), then ENTITY-name
+        ; entry (parameter entities keyed `%name`; namecase entity is off by
+        ; default so the match is exact), else the declared system id itself
+        ; expands against the declaring source's directory. A hit stamps the
+        ; effective system id (the ESIS f-record, stored WITHOUT the `<OSFILE>`
+        ; prefix — the writer adds it); only a total miss warns.
+        var eff String()
+        var have false
+        let cat ps.get_entity_catalog()
+        if cat <> null
+        {
+            if id.has_system_id()
+            {
+                let bysys cat.lookup_system(id.get_system_id())
+                if bysys.get_length() > (0 as size_t)
+                {
+                    set eff: bysys
+                    set have: true
+                }
+            }
+            if (have = false) and id.has_public_id()
+            {
+                let bypub cat.lookup_public_entry(id.get_public_id(), id.has_system_id())
+                if bypub.get_length() > (0 as size_t)
+                {
+                    set eff: bypub
+                    set have: true
+                }
+            }
+            if have = false
+            {
+                let nm8 this.stringc_to_bytes(entity.get_name())
+                var key nm8
+                if is_parameter
+                {
+                    ; the parameter-entity table key is peroDelim() + name.
+                    let kb Array[u8]^host()
+                    let syn ps.get_syntax()
+                    let pl syn.delim_general_len(dPERO)
+                    var pj: size_t 0
+                    while pj < pl
+                    {
+                        kb.add(syn.delim_general_char(dPERO, pj) as u8)
+                        set pj: pj + 1
+                    }
+                    var ki: size_t 0
+                    while ki < nm8.get_length()
+                    {
+                        kb.add(nm8.get(ki))
+                        set ki: ki + 1
+                    }
+                    let kp String^host(kb.get_buffer() as pointer[const_char], kb.get_length())
+                    set key: *kp
+                }
+                let byname cat.lookup_entity(key)
+                if byname.get_length() > (0 as size_t)
+                {
+                    set eff: byname
+                    set have: true
+                }
+            }
+        }
+        if (have = false) and id.has_system_id()
+        {
+            let ebase entity.get_base_dir()
+            if ebase.get_length() = (0 as size_t)
+                set eff: id.get_system_id()
+            else
+                set eff: Path.join(ebase, id.get_system_id())
+            set have: true
+        }
+        if have
+        {
+            let heff String^host(eff)
+            entity.set_effective_system(*heff)
             return
+        }
         let loc ps.current_input().token_start_location()
         if id.has_public_id()
         {
@@ -5662,7 +5791,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; parseComment (parseCommon.cxx): read a comment body up to the closing COM
     ; (`--`). The markup capture is not wanted for ESIS; just consume the chars.
     ; tokenEe inside a comment is an error.
-    function parse_comment(this: Parser, mode: int) returns bool
+    ; `collect` (non-null only from parse_comment_decl under -ocomment) gathers
+    ; the comment's chars — the reference's Markup::addCommentChar capture.
+    function parse_comment(this: Parser, mode: int, collect: pointer[Array[u32]]) returns bool
     {
         ; startLoc (parseCommon.cxx:537) — where the comment opened; the
         ; auxiliary "comment started here" line points at it.
@@ -5697,7 +5828,23 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     this.report1_at(ParserMessages.sdCommentSignificant(), ts, ins.token_start_location())
                 }
             }
-            ; else: a comment character (already consumed by get_token) — continue
+            else
+            {
+                ; a comment character run (already consumed by get_token) —
+                ; captured only when a collector rides along (-ocomment).
+                if collect <> null
+                {
+                    let cins ps.current_input()
+                    let cts cins.current_token_string()
+                    let ctn cts.get_size()
+                    var cti: size_t 0
+                    while cti < ctn
+                    {
+                        collect.add(cts.get(cti))
+                        set cti: cti + 1
+                    }
+                }
+            }
         }
         ok
     }
@@ -5819,8 +5966,22 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; the caller just consumed); the "comment declaration started here"
         ; auxiliaries point at it.
         let mdo_loc ps.current_input().token_start_location()
-        if this.parse_comment(comMode) = false
+        ; -ocomment (eventsWanted().wantCommentDecls()): capture the comment
+        ; segments and queue a CommentDeclEvent at the end — in EVERY context
+        ; (prolog events too; the writer's inDocument_ gate drops those).
+        var segs: pointer[Array[StringC]] null
+        if ps.output_flag(OF_COMMENT)
+            set segs: Array[StringC]^host()
+        var col: pointer[Array[u32]] null
+        if segs <> null
+            set col: Array[u32]^host()
+        if this.parse_comment(comMode, col) = false
             return false
+        if segs <> null
+        {
+            let s0 StringC^host(col.get_buffer(), col.get_length())
+            segs.add(*s0)
+        }
         var running true
         var ok true
         while running
@@ -5836,13 +5997,21 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if token = tokenCom
             {
-                if this.parse_comment(comMode) = false
+                var col2: pointer[Array[u32]] null
+                if segs <> null
+                    set col2: Array[u32]^host()
+                if this.parse_comment(comMode, col2) = false
                 {
                     set ok: false
                     set running: false
                 }
                 else
                 {
+                    if segs <> null
+                    {
+                        let s2 StringC^host(col2.get_buffer(), col2.get_length())
+                        segs.add(*s2)
+                    }
                     ; parseDecl.cxx:3602: a second comment warns under
                     ; -wcomment-decl-multiple.
                     let opt_cm ps.get_options()
@@ -5881,6 +6050,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 set running: false
             }
         }
+        ; the CommentDeclEvent (parseDecl.cxx end of parseCommentDecl) — only a
+        ; successfully terminated declaration emits.
+        if ok and (segs <> null)
+            ps.queue_event(Event.make_comment(host, segs, mdo_loc))
         ok
     }
 
@@ -6702,10 +6875,28 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         if (token = tokenLit) or (token = tokenLita)
         {
             let lita token = tokenLita
+            ; literalDelimInfo (parseAttribute.cxx / parseCommon.cxx:79): with
+            ; markup capture on, the literal's opening delimiter becomes the
+            ; Text's FIRST item — handleAsUnterminated then anchors at the
+            ; QUOTE, not the first char (probed: -otagomit shifts the
+            ; reference's column by one). Start-tag specs (tagMode) capture
+            ; under instance markup = -otagomit; declaration specs (asMode)
+            ; under prolog markup = -ocomment.
+            let lit_open ps.current_input().token_start_location()
             if atts.tokenized(index)
                 set ok: this.parse_tokenized_attribute_value_literal(lita, text)
             else
                 set ok: this.parse_attribute_value_literal(lita, text)
+            if ok
+            {
+                var delim_info false
+                if mode = tagMode
+                    set delim_info: ps.output_flag(OF_TAG_OMISSION)
+                else
+                    set delim_info: ps.output_flag(OF_COMMENT)
+                if delim_info
+                    text.set_delim_loc(lit_open)
+            }
         }
         else if (token = tokenNameStart) or (token = tokenDigit) or (token = tokenLcUcNmchar)
         {
@@ -6803,7 +6994,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         this.generate_system_id(copy, false)
         ps.note_defaulted_entity(copy)
         if ps.is_in_instance()
+        {
             ps.add_instance_defaulted(copy)
+            ; ParserState.cxx:560: the freshly-copied instance default fires
+            ; EntityDefaultedEvent (the -oentity `I<name> …` at first use; a
+            ; cache hit above does NOT re-fire — probed: `&bar; &bar;` = one I).
+            if ps.output_flag(OF_ENTITY)
+                ps.queue_event(Event.make_entity_defaulted(host, copy, Location()))
+        }
         else
             dtd.insert_entity(copy, false, false)
         copy
@@ -7364,19 +7562,23 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 return false
             set vj: vj + 1
         }
-        ; startLoc = the first char location with a real origin (:1389).
-        var first_loc Location()
-        var fi: size_t 0
-        while fi < n
+        ; startLoc = the first ITEM location with a real origin (:1389) — the
+        ; startDelim item (markup capture on) precedes every char.
+        var first_loc (*t).get_delim_loc()
+        if first_loc.get_origin() = null
         {
-            let fl *(locs + fi)
-            if fl.get_origin() <> null
+            var fi: size_t 0
+            while fi < n
             {
-                set first_loc: fl
-                set fi: n
+                let fl *(locs + fi)
+                if fl.get_origin() <> null
+                {
+                    set first_loc: fl
+                    set fi: n
+                }
+                else
+                    set fi: fi + 1
             }
-            else
-                set fi: fi + 1
         }
         this.report0_at(ParserMessages.literalClosingDelimiter(), first_loc)
         true
@@ -7763,6 +7965,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let ev Event.make_start(host, e, loc)
         ev.set_markup_loc(mloc)
         ev.set_attributes(atts)
+        ; a REAL start tag (the reference's markup under wantInstanceMarkup) —
+        ; -otagomit prints `o` only for events WITHOUT this.
+        ev.set_has_markup()
         ev
     }
 
@@ -8361,7 +8566,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             this.report1_at(mt_notopen, name, loc)
             return null
         }
-        Event.make_end(host, e, loc)
+        let ee Event.make_end(host, e, loc)
+        ; a REAL end tag — see do_parse_start_tag's has_markup note.
+        ee.set_has_markup()
+        ee
     }
 
     ; parseEndTagClose (parseInstance.cxx:1036) — consume the end tag's close:
@@ -8429,6 +8637,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         if (token = tokenNet) and net
         {
             let endev Event.make_end(host, e, ps.current_location())
+            endev.set_has_markup()
             if included
                 endev.set_included()
             ps.queue_event(endev)
@@ -8443,6 +8652,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             if opt_e.warn_empty_tag
                 this.report0_at(ParserMessages.emptyEndTag(), ps.current_input().token_start_location())
             let endev Event.make_end(host, e, ps.current_location())
+            endev.set_has_markup()
             if included
                 endev.set_included()
             ps.queue_event(endev)
@@ -8472,7 +8682,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 let cs ps.get_content_state()
                 if cs.element_is_open(end.get_element_type())
                 {
-                    let endev2 Event.make_end(host, e, start_loc)
+                    ; implyEmptyElementEnd (parseInstance.cxx:947): the implied
+                    ; end event carries the CURRENT location, not the start's
+                    ; (probed: -oline anchors `)content` on the line of the
+                    ; token that implied it).
+                    let endev2 Event.make_end(host, e, ps.current_location())
                     if included
                         endev2.set_included()
                     ps.queue_event(endev2)
@@ -8485,16 +8699,19 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 let gi_notopen end.get_element_type().get_name()
                 this.report1_at(mt_notopen, gi_notopen, end.get_loc())
             }
-            let endev4 Event.make_end(host, e, start_loc)
+            let endev4 Event.make_end(host, e, ps.current_location())
             if included
                 endev4.set_included()
             ps.queue_event(endev4)
             ps.note_end_element(included)
             return
         }
-        ; not the element's end: unget and imply the end at the start location.
+        ; not the element's end: imply the end at the CURRENT location — the
+        ; peeked token's start (implyEmptyElementEnd runs BEFORE ungetToken) —
+        ; then unget.
+        let imply_loc ps.current_input().token_start_location()
         ps.current_input().unget_token()
-        let endev3 Event.make_end(host, e, start_loc)
+        let endev3 Event.make_end(host, e, imply_loc)
         if included
             endev3.set_included()
         ps.queue_event(endev3)
@@ -8552,6 +8769,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let e ce.get_type()
         ps.note_end_element(ce.get_included())
         let endev Event.make_end(host, e, loc)
+        ; the NET null end tag carries markup (parseNullEndTag: dNET).
+        endev.set_has_markup()
         if ce.get_included()
             endev.set_included()
         ps.queue_event(endev)
@@ -8952,6 +9171,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         {
             let syn_ms ps.get_syntax()
             let shift ((syn_ms.delim_general_len(dMDO) + syn_ms.delim_general_len(dDSO)) as u32)
+            ; with instance markup wanted (-otagomit: addInstanceMarkup sets
+            ; markedSections_) the reference's markup is REAL — it carries the
+            ; MDO/DSO entries and the walk reports TRUE positions; the shift
+            ; artifact exists only on the warn-only discard markup (probed:
+            ; -otagomit renders 5:8 where the plain run renders 5:5).
+            let no_shift ps.output_flag(OF_TAG_OMISSION)
             var si: size_t 0
             let sn ps.ms_s_count()
             while si < sn
@@ -8959,7 +9184,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 let item ps.ms_s_item_at(si)
                 let iloc item.loc
                 var rloc iloc
-                if item.synced = false
+                if (item.synced = false) and (no_shift = false)
                     set rloc: Location(iloc.get_origin(), iloc.get_index() - shift)
                 this.report0_at(ParserMessages.instanceStatusKeywordSpecS(), rloc)
                 set si: si + 1
@@ -9585,8 +9810,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let child ParserState.make(host, null, ps.get_subdoc_level() + (1 as u32), PHASE_PROLOG)
         child.set_prog_name(ps.get_prog_name())
         child.set_output_utf8(ps.get_output_utf8())
-        ; the reporter options, -E limit and -f sink are app-global too.
+        ; the reporter options, -E limit, -f sink and -o output flags are
+        ; app-global too.
         child.set_reporter_options(ps.reporter_options)
+        child.set_output_flags(ps.get_output_flags())
         child.set_error_limit(ps.get_error_limit())
         child.set_msg_fd(ps.msg_fd)
         ; the subdoc parser shares the invoking parser's options (Parser.cxx
@@ -10110,7 +10337,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 if c = rs
                     ps.note_rs()
                 else if c = re
-                    ps.queue_re()
+                    ps.queue_re(Location(org, (start_idx + j) as u32))
                 else
                 {
                     ps.note_data()
@@ -10203,10 +10430,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 {
                     ; doContent (parseInstance.cxx:119): pcdata is accepted and
                     ; data noted BEFORE translation; a char the fixed internal
-                    ; charset cannot represent (translate false) or a declared
-                    ; NON-SGML char (UNUSED range — is_sgml false; the
-                    ; reference's NonSgmlCharEvent, which onsgmls's default
-                    ; output ignores) emits NO data — silently dropped.
+                    ; charset cannot represent (translate false) emits nothing;
+                    ; a declared NON-SGML char (UNUSED range — is_sgml false)
+                    ; emits a NonSgmlCharEvent (parseInstance.cxx:126): the
+                    ; default output drops it, -ononsgml renders `\%N;` inline.
                     this.accept_pcdata(loc)
                     ps.note_data()
                     var is_sgml true
@@ -10217,6 +10444,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                             let scp StringC^host(&ch, 1 as size_t)
                             let cev Event.make_data(host, *scp, loc)
                             ps.queue_event(cev)
+                        }
+                        else
+                        {
+                            let nsp StringC^host(&ch, 1 as size_t)
+                            ps.queue_event(Event.make_nonsgml(host, *nsp, loc))
                         }
                     }
                 }
@@ -10322,7 +10554,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             else if token = tokenRe
             {
                 this.accept_pcdata(ps.current_input().token_start_location())
-                ps.queue_re()
+                ps.queue_re(ps.current_input().token_start_location())
             }
             else if token = tokenRs
             {
@@ -10409,6 +10641,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let loc ps.current_input().token_start_location()
         let stev Event.make_start(host, e, loc)
         stev.set_attributes(atts)
+        stev.set_has_markup()
         this.accept_start_tag(e, stev, false)
     }
 
@@ -10433,6 +10666,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
         let e cs.current_element().get_type()
         let endev Event.make_end(host, e, ps.current_input().token_start_location())
+        endev.set_has_markup()
         this.accept_end_tag(endev)
     }
 
@@ -10974,9 +11208,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; ParserState::startDtd's PredefinedEntity loop: every entity the SGML
     ; declaration's SYNTAX ENTITIES section names (xml.dcl: "amp" 38, "lt" 60,
     ; "gt" 62, "quot" 34, "apos" 39) is inserted into the new DTD as an internal
-    ; text entity whose replacement text is that one Char. `&lt;` in content then
-    ; resolves through the ordinary entity path. The reference declaration names
-    ; none, so a catalog-less document is unaffected.
+    ; CDATA entity (PredefinedEntity : InternalCdataEntity — the -oentity
+    ; I-record types CDATA, and a content reference emits a DataEvent, never
+    ; re-scans) whose replacement text is that one Char. The reference
+    ; declaration names none, so a catalog-less document is unaffected.
     function insert_predefined_entities(this: Parser, dtd: pointer[Dtd])
     {
         let syn ps.get_syntax()
@@ -10988,7 +11223,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             set ch: syn.entity_char(i)
             let nm syn.entity_name(i)
             let text StringC^host(&ch, 1 as size_t)
-            let iep InternalEntity.make(host, nm, text, DT_SGML)
+            let iep InternalEntity.make(host, nm, text, DT_CDATA)
             let iev *iep
             let ent host.allocate(sizeof Entity, alignof Entity) as pointer[Entity]
             set *ent: Entity.Internal(iev)
@@ -12411,6 +12646,47 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             set i: i + 1
         }
         let ev Event.make_end_prolog(host, complex_lpd as pointer[void], names, atts_list, ps.current_location())
+        ; -oentity (SgmlsEventHandler::endProlog): the writer defines EVERY
+        ; general entity of the DTD up front, in the reference's
+        ; Dtd::generalEntityIter order = the NamedTable BUCKET order —
+        ; re-derived through an IdTable exactly like check_dtd_notations
+        ; (insertion order feeds the same hash/growth).
+        if ps.output_flag(OF_ENTITY)
+        {
+            let dtd_ge ps.get_current_dtd()
+            if dtd_ge <> null
+            {
+                let nge dtd_ge.n_entities(false)
+                let t IdTable.make(host)
+                var gi: size_t 0
+                while gi < nge
+                {
+                    let ge dtd_ge.entity_at(false, gi)
+                    if ge <> null
+                    {
+                        let gname ge.get_name()
+                        t.lookup_create(host, gname)
+                    }
+                    set gi: gi + (1 as size_t)
+                }
+                let ges Array[pointer[Entity]]^host()
+                let nb (*t).bucket_count()
+                var b: size_t 0
+                while b < nb
+                {
+                    let slot (*t).bucket_at(b)
+                    if slot <> null
+                    {
+                        let sname slot.get_name()
+                        let ent dtd_ge.lookup_entity(false, sname)
+                        if ent <> null
+                            ges.add(ent)
+                    }
+                    set b: b + (1 as size_t)
+                }
+                ev.set_general_entities(ges)
+            }
+        }
         ps.queue_event(ev)
     }
 
@@ -13937,7 +14213,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             else if token = tokenCom
             {
-                if this.parse_comment(sdcomMode) = false
+                if this.parse_comment(sdcomMode, null) = false
                     return false
             }
             else if (token = tokenDso) or (token = tokenGrpo) or (token = tokenMinusGrpo) or (token = tokenPlusGrpo) or (token = tokenRni) or (token = tokenPeroNameStart) or (token = tokenPeroGrpo)
@@ -17774,7 +18050,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; error_limit: ParserApp::errorLimit_ (-E, 0 = unlimited); reporter_options:
     ; the REP_* mask (-e/-g/-n/-x); msg_fd: the message sink (-f, default 2);
     ; prolog_only: -p (cancel at end-prolog).
-    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, charset_fixed: bool, active_links: pointer[Array[String]], options: pointer[ParserOptions], error_limit: u32, reporter_options: u32, msg_fd: int, prolog_only: bool, out_conforming: pointer[bool]) returns String
+    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, charset_fixed: bool, active_links: pointer[Array[String]], options: pointer[ParserOptions], error_limit: u32, reporter_options: u32, output_flags: u32, msg_fd: int, prolog_only: bool, out_conforming: pointer[bool]) returns String
     {
         ; Record normalization (ExtendEntityManager, `lf` record type — the whole
         ; Unix corpus): insert one RS (0x0A) at the entity start, and translate
@@ -17794,6 +18070,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.set_output_utf8(output_utf8)
         ps.set_error_limit(error_limit)
         ps.set_reporter_options(reporter_options)
+        ; the -o output flags (SgmlsEventHandler outputFlags): the ESIS writer
+        ; reads them, and the parser gates the -o-only event payloads.
+        ps.set_output_flags(output_flags)
         ps.set_msg_fd(msg_fd)
         ps.set_prolog_only(prolog_only)
         ; the document's directory: every relative SYSTEM id (external DTD subset,

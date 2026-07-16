@@ -341,8 +341,12 @@ define ParserState
     ; --- Event stream (Stage 4): the content events in document order ---
     events: Array[pointer[Event]]
     ; --- OutputState (RS/RE record-boundary shaping): a per-output-level state
-    ;     stack + live depth (grows on an included element, shrinks on its end). ---
+    ;     stack + live depth (grows on an included element, shrinks on its end).
+    ;     os_re_loc parallels os_state: the pending RE's OWN location
+    ;     (OutputStateLevel::reLocation) — the flushed RE data event carries
+    ;     it, not the flush position (-oline resolves it to the RE's line). ---
     os_state: Array[int]
+    os_re_loc: Array[Location]
     os_depth: u32
     ; --- IMPLYDEF (set from Sd) ---
     implydef_element: int
@@ -374,6 +378,10 @@ define ParserState
     out_utf8: bool
     ; --- MessageReporter::options_ — the -e/-g/-n/-x reporter flags (REP_*). ---
     reporter_options: u32
+    ; --- SgmlsEventHandler output flags (OF_*, the -o axis): the writer reads
+    ;     them, and the parser gates the -o-only event payloads (comment
+    ;     capture, the endProlog entity sweep, entity-defaulted events). ---
+    output_flags: u32
     ; --- ParserApp::errorLimit_ (-E): 0 = unlimited. ---
     error_limit: u32
     ; --- the message sink fd (-f error-file redirects it; default 2). ---
@@ -498,6 +506,8 @@ define ParserState
         set ps.events: Array[pointer[Event]]^host()
         set ps.os_state: Array[int]^host()
         ps.os_state.add(OS_AFTER_START_TAG)
+        set ps.os_re_loc: Array[Location]^host()
+        ps.os_re_loc.add(Location())
         set ps.os_depth: 1 as u32
         set ps.implydef_element: 0
         set ps.implydef_attlist: false
@@ -506,6 +516,7 @@ define ParserState
         set ps.prog_name: String()
         set ps.out_utf8: false
         set ps.reporter_options: 0 as u32
+        set ps.output_flags: 0 as u32
         set ps.error_limit: ERROR_LIMIT
         set ps.msg_fd: 2
         set ps.prolog_only: false
@@ -568,6 +579,16 @@ define ParserState
 
     function reporter_option(this: ParserState, bit: u32) returns bool
         (reporter_options & bit) <> (0 as u32)
+
+    ; ---- SgmlsEventHandler output flags (the -o axis) ----------------------
+    function set_output_flags(this: pointer[ParserState], flags: u32)
+        set this.output_flags: flags
+
+    function get_output_flags(this: ParserState) returns u32
+        output_flags
+
+    function output_flag(this: ParserState, bit: u32) returns bool
+        (output_flags & bit) <> (0 as u32)
 
     function set_error_limit(this: pointer[ParserState], limit: u32)
         set this.error_limit: limit
@@ -659,7 +680,15 @@ define ParserState
     function os_has_pending(this: ParserState) returns bool
         os_top() > OS_AFTER_DATA
 
-    ; emit one RE (0x0D) as a character-data event (the flushed pending RE).
+    ; the pending RE's own location (OutputStateLevel::reLocation).
+    function os_top_re_loc(this: ParserState) returns Location
+        *(os_re_loc.get_buffer() + ((os_depth - (1 as u32)) as size_t))
+
+    function os_set_top_re_loc(this: pointer[ParserState], loc: Location)
+        this.os_re_loc.put((this.os_depth - (1 as u32)) as size_t, loc)
+
+    ; emit one RE (0x0D) as a character-data event (the flushed pending RE) —
+    ; located at the RE's OWN position (ReEvent(&re_, top().reLocation, …)).
     function os_emit_re(this: pointer[ParserState])
     {
         let re (*this.syntax).standard_function(fRE)
@@ -667,26 +696,33 @@ define ParserState
         let bp buf as pointer[u32]
         set *bp: re
         let sc StringC(bp, 1 as size_t)
-        let loc this.current_location()
+        let loc (*this).os_top_re_loc()
         let ev Event.make_data(this.host, sc, loc)
         this.queue_event(ev)
     }
 
-    ; handleRe — a record end (RE) at the current position.
-    function queue_re(this: pointer[ParserState])
+    ; handleRe — a record end (RE) at `loc` (OutputState.cxx:33).
+    function queue_re(this: pointer[ParserState], loc: Location)
     {
         let st this.os_top()
         if st = OS_AFTER_START_TAG
             this.os_set_top(OS_AFTER_RSRE)
         else if (st = OS_AFTER_RSRE) or (st = OS_AFTER_DATA)
+        {
             this.os_set_top(OS_PENDING_AFTER_RSRE)
+            this.os_set_top_re_loc(loc)
+        }
         else if st = OS_PENDING_AFTER_RSRE
         {
             this.os_emit_re()
             this.os_set_top(OS_PENDING_AFTER_RSRE)
+            this.os_set_top_re_loc(loc)
         }
         else if st = OS_PENDING_AFTER_MARKUP
+        {
+            ; the NEW RE is the ignored one; the pending RE keeps its location.
             this.os_set_top(OS_PENDING_AFTER_RSRE)
+        }
     }
 
     function note_rs(this: pointer[ParserState])
@@ -720,9 +756,15 @@ define ParserState
         if included
         {
             if this.os_depth < (this.os_state.get_length() as u32)
+            {
                 this.os_state.put(this.os_depth as size_t, OS_AFTER_START_TAG)
+                this.os_re_loc.put(this.os_depth as size_t, Location())
+            }
             else
+            {
                 this.os_state.add(OS_AFTER_START_TAG)
+                this.os_re_loc.add(Location())
+            }
             set this.os_depth: this.os_depth + (1 as u32)
         }
         else
@@ -1425,6 +1467,8 @@ define ParserState
         ; OutputState back to its initial single level.
         set this.os_state: Array[int]^hp()
         this.os_state.add(OS_AFTER_START_TAG)
+        set this.os_re_loc: Array[Location]^hp()
+        this.os_re_loc.add(Location())
         set this.os_depth: 1 as u32
         ; pop the whole input stack (the caller pushes the rewound document).
         set this.input_stack: Array[pointer[InputSource]]^hp()
@@ -1664,6 +1708,11 @@ define ParserState
         if dtd = null
             return null
         let entity dtd.lookup_entity(is_parameter, name)
+        ; ParserState.cxx:522: the found-entity arm that is NOT the pass-2
+        ; prolog consult dispatches an EntityDefaultedEvent — with -oentity the
+        ; writer re-prints the entity's definition at EVERY reference (probed:
+        ; each `&foo;` re-emits `Ifoo TEXT hello` and splits the data run).
+        var pass2_consulted false
         if this.in_instance = false
         {
             if this.pass2 and dtd.get_is_base() and (this.result_attribute_spec_mode = false)
@@ -1676,6 +1725,7 @@ define ParserState
                 }
                 if consult
                 {
+                    set pass2_consulted: true
                     let p1 this.pass1_dtd
                     if p1 <> null
                     {
@@ -1698,7 +1748,17 @@ define ParserState
         ; current DTD marks it used (the pass-1 active-LPD return above does
         ; NOT) — feeds the -wunused-param sweep.
         if entity <> null
+        {
             this.note_entity_used(entity)
+            if pass2_consulted = false
+            {
+                if (this.output_flags & OF_ENTITY) <> (0 as u32)
+                {
+                    let hp this.host
+                    this.queue_event(Event.make_entity_defaulted(hp, entity, Location()))
+                }
+            }
+        }
         entity
     }
 
@@ -2708,6 +2768,50 @@ define ParserState
         let ins this.current_input()
         if ins <> null
             ins.line_col(loc.get_index() as size_t, rs_next_line, out_line, out_col)
+        null
+    }
+
+    ; resolve_location_sos — SgmlsEventHandler::outputLocation1's walk (the
+    ; -oline L records): like resolve_location it walks to the first origin
+    ; with a real backing source, but each step takes the PARENT'S OWN index
+    ; (`index = loc.index()` — outputLocation1 never adds the reference
+    ; length, unlike the message walk), and an index sitting ON an inserted
+    ; RS resolves to the line the RS STARTS (probed: a `&#RS;B`-shortref
+    ; replacement anchors on the NEW line; keeprsre RS data chunks likewise).
+    function resolve_location_sos(this: ParserState, loc: Location, out_line: pointer[u32], out_col: pointer[u32]) returns pointer[Origin]
+    {
+        var index loc.get_index()
+        var org loc.get_origin()
+        var resolved: pointer[Origin] null
+        var walking true
+        while walking
+        {
+            if org = null
+                set walking: false
+            else if org.get_contents() <> null
+            {
+                set resolved: org
+                set walking: false
+            }
+            else
+            {
+                let par org.parent()
+                if par.get_origin() = null
+                    set walking: false
+                else
+                {
+                    set index: par.get_index()
+                    set org: par.get_origin()
+                }
+            }
+        }
+        if resolved <> null
+        {
+            resolved.line_col(index as size_t, true, out_line, out_col)
+            return resolved
+        }
+        set *out_line: 0 as u32
+        set *out_col: 0 as u32
         null
     }
 
