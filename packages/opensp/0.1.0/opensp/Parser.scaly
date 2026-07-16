@@ -35,6 +35,9 @@ use opensp.Entity.ExternalDataEntity
 use opensp.Entity.SubdocEntity
 use opensp.ExternalId.ExternalId
 use opensp.Storage.Storage
+use opensp.EntityManager.EmConfig
+use scaly.memory.runtime.fopen
+use scaly.memory.runtime.fclose
 use opensp.ShortReferenceMap.ShortReferenceMap
 use opensp.ParserOptions.ParserOptions
 use opensp.ParserState.ParserState
@@ -71,6 +74,10 @@ use opensp.ParserAppMessages.ParserAppMessages
 use opensp.PosixStorageMessages.PosixStorageMessages
 use opensp.EntityCatalog.CatalogParser
 use opensp.EntityCatalog.EntityCatalog
+use opensp.EntityCatalog.CatLookup
+use opensp.EntityCatalog.CatMsg
+use opensp.EntityCatalog.SubCatalog
+use opensp.EntityCatalog.CatChain
 use opensp.SdParser.SdParser
 use opensp.CharsetDecl.CharsetDecl
 use opensp.CharsetDecl.CharsetDeclRange
@@ -79,6 +86,11 @@ use opensp.Id.Id
 use opensp.Id.IdTable
 use scaly.io.File
 use scaly.io.Path
+
+; strerror(3)/errno for the catalog-file open failures (same declarations as
+; Storage.scaly — extern declares must type-match across the whole root).
+function strerror(code: i32) returns pointer[const_char] extern
+function scaly_eio_errno() returns i32 extern
 
 ; Parser — the FIRST slice of Parser.cs (the 11801-LOC integration tail): the
 ; prolog + DTD declaration-subset parser. It drives ParserState.get_token(mode)
@@ -4769,56 +4781,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             ; parseDecl.cxx:1603): the catalog lookup (system id / PUBLIC /
             ; NOTATION-name tables, SOEntityCatalog.cxx:427) resolves the
             ; external id and stamps the EFFECTIVE system id (the
-            ; -onotation-sysid f-record, stored without the `<OSFILE>` prefix
-            ; like the entity path) — a declared system id always resolves
-            ; (expandSystemId, against the declaring source's directory); a
-            ; miss with neither warns under -wnotation-sysid (W, arg = the
-            ; folded notation name, at the MDC token start — probed 4:64/5:25
-            ; vs real onsgmls).
-            var eff String()
-            var have false
-            let cat ps.get_entity_catalog()
-            if cat <> null
-            {
-                if hid.has_system_id()
-                {
-                    let bysys cat.lookup_system(hid.get_system_id())
-                    if bysys.get_length() > (0 as size_t)
-                    {
-                        set eff: bysys
-                        set have: true
-                    }
-                }
-                if (have = false) and hid.has_public_id()
-                {
-                    let bypub cat.lookup_public_entry(hid.get_public_id(), hid.has_system_id())
-                    if bypub.get_length() > (0 as size_t)
-                    {
-                        set eff: bypub
-                        set have: true
-                    }
-                }
-                if have = false
-                {
-                    let nn8 this.stringc_to_bytes(nt.get_name())
-                    let byname cat.lookup_notation(nn8, ps.get_sd().namecase_general())
-                    if byname.get_length() > (0 as size_t)
-                    {
-                        set eff: byname
-                        set have: true
-                    }
-                }
-            }
-            if (have = false) and hid.has_system_id()
-            {
-                let nbase ps.get_decl_base_dir()
-                if nbase.get_length() = (0 as size_t)
-                    set eff: hid.get_system_id()
-                else
-                    set eff: Path.join(nbase, hid.get_system_id())
-                set have: true
-            }
-            if have
+            ; -onotation-sysid f-record, stored as the full FSI text) — a
+            ; declared system id always resolves (expandSystemId, against the
+            ; declaring source's directory); a miss with neither warns under
+            ; -wnotation-sysid (W, arg = the folded notation name, at the MDC
+            ; token start — probed 4:64/5:25 vs real onsgmls).
+            let nn8 this.stringc_to_bytes(nt.get_name())
+            let eff this.catalog_effective_id(hid.has_system_id(), hid.get_system_id(), hid.has_public_id(), hid.get_public_id(), nn8, CAT_NOTATION, ps.get_sd().namecase_general(), ps.get_decl_base_dir())
+            if eff.get_length() > (0 as size_t)
             {
                 let heff String^host(eff)
                 nt.set_effective_system(*heff)
@@ -5314,6 +5284,63 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
     }
 
+    ; SOEntityCatalog::lookup + the effective-id FSI rendering: resolve an
+    ; external id through the catalog (SYSTEM entry -> PUBLIC entry with the
+    ; override gate and DELEGATE prefixes -> name-table entry, cross-kind
+    ; contests won by the lower catalog number) and return the effective
+    ; system id as the FULL formal-system-identifier text the f-record
+    ; prints: `<OSFILE>path` for a resolved entry or the declared-system-id
+    ; fallback (expandSystemId against the declaring source's directory), and
+    ; `<CATALOG PUBLIC="pub"><OSFILE>delegate.cat` for a DELEGATE hit (the
+    ; reference defers delegate resolution to open time — probed verbatim).
+    ; Empty = total miss (the caller warns).
+    function catalog_effective_id(this: Parser, has_sys: bool, sys8: String, has_pub: bool, pub8: String, name_key: String, name_decl_type: int, name_subst: bool, decl_base: String) returns String
+    {
+        let cat ps.get_entity_catalog()
+        if cat <> null
+        {
+            let lk cat.lookup_external(has_sys, sys8, has_pub, pub8, name_key, name_decl_type, name_subst)
+            if lk.found
+            {
+                let fsi Array[u8]^host()
+                if lk.delegated
+                {
+                    this.append_bytes(fsi, String("<CATALOG PUBLIC=\""))
+                    this.append_bytes(fsi, pub8)
+                    this.append_bytes(fsi, String("\"><OSFILE>"))
+                    this.append_bytes(fsi, lk.delegate_catalog)
+                }
+                else
+                {
+                    this.append_bytes(fsi, String("<OSFILE>"))
+                    this.append_bytes(fsi, lk.path)
+                }
+                let out String^host(fsi.get_buffer() as pointer[const_char], fsi.get_length())
+                return *out
+            }
+        }
+        if has_sys
+        {
+            let resolved EntityCatalog.resolve_target(decl_base, sys8)
+            let fsi2 Array[u8]^host()
+            this.append_bytes(fsi2, String("<OSFILE>"))
+            this.append_bytes(fsi2, resolved)
+            let out2 String^host(fsi2.get_buffer() as pointer[const_char], fsi2.get_length())
+            return *out2
+        }
+        String()
+    }
+
+    function append_bytes(this: Parser, acc: pointer[Array[u8]], s: String)
+    {
+        var i: size_t 0
+        while i < s.get_length()
+        {
+            acc.add(s.get(i))
+            set i: i + 1
+        }
+    }
+
     ; ExternalEntity::generateSystemId (Entity.cxx:127), run at define time.
     ; With a system id the storage manager resolves it (our effective id is the
     ; base-dir join computed lazily at use sites) — silent. With only a public
@@ -5334,74 +5361,35 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; entry (parameter entities keyed `%name`; namecase entity is off by
         ; default so the match is exact), else the declared system id itself
         ; expands against the declaring source's directory. A hit stamps the
-        ; effective system id (the ESIS f-record, stored WITHOUT the `<OSFILE>`
-        ; prefix — the writer adds it); only a total miss warns.
-        var eff String()
-        var have false
-        let cat ps.get_entity_catalog()
-        if cat <> null
+        ; effective system id (the ESIS f-record, stored as the FULL FSI text
+        ; — the writer prints it verbatim); only a total miss warns.
+        let nm8 this.stringc_to_bytes(entity.get_name())
+        var key nm8
+        if is_parameter
         {
-            if id.has_system_id()
+            ; the parameter-entity table key is peroDelim() + name.
+            let kb Array[u8]^host()
+            let syn ps.get_syntax()
+            let pl syn.delim_general_len(dPERO)
+            var pj: size_t 0
+            while pj < pl
             {
-                let bysys cat.lookup_system(id.get_system_id())
-                if bysys.get_length() > (0 as size_t)
-                {
-                    set eff: bysys
-                    set have: true
-                }
+                kb.add(syn.delim_general_char(dPERO, pj) as u8)
+                set pj: pj + 1
             }
-            if (have = false) and id.has_public_id()
+            var ki: size_t 0
+            while ki < nm8.get_length()
             {
-                let bypub cat.lookup_public_entry(id.get_public_id(), id.has_system_id())
-                if bypub.get_length() > (0 as size_t)
-                {
-                    set eff: bypub
-                    set have: true
-                }
+                kb.add(nm8.get(ki))
+                set ki: ki + 1
             }
-            if have = false
-            {
-                let nm8 this.stringc_to_bytes(entity.get_name())
-                var key nm8
-                if is_parameter
-                {
-                    ; the parameter-entity table key is peroDelim() + name.
-                    let kb Array[u8]^host()
-                    let syn ps.get_syntax()
-                    let pl syn.delim_general_len(dPERO)
-                    var pj: size_t 0
-                    while pj < pl
-                    {
-                        kb.add(syn.delim_general_char(dPERO, pj) as u8)
-                        set pj: pj + 1
-                    }
-                    var ki: size_t 0
-                    while ki < nm8.get_length()
-                    {
-                        kb.add(nm8.get(ki))
-                        set ki: ki + 1
-                    }
-                    let kp String^host(kb.get_buffer() as pointer[const_char], kb.get_length())
-                    set key: *kp
-                }
-                let byname cat.lookup_entity(key)
-                if byname.get_length() > (0 as size_t)
-                {
-                    set eff: byname
-                    set have: true
-                }
-            }
+            let kp String^host(kb.get_buffer() as pointer[const_char], kb.get_length())
+            set key: *kp
         }
-        if (have = false) and id.has_system_id()
-        {
-            let ebase entity.get_base_dir()
-            if ebase.get_length() = (0 as size_t)
-                set eff: id.get_system_id()
-            else
-                set eff: Path.join(ebase, id.get_system_id())
-            set have: true
-        }
-        if have
+        ; NAMECASE ENTITY is NO in every syntax the port models — entity-name
+        ; entries match exactly (syntax.namecaseEntity() default).
+        let eff this.catalog_effective_id(id.has_system_id(), id.get_system_id(), id.has_public_id(), id.get_public_id(), key, CAT_ENTITY, false, entity.get_base_dir())
+        if eff.get_length() > (0 as size_t)
         {
             let heff String^host(eff)
             entity.set_effective_system(*heff)
@@ -18047,10 +18035,115 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             sd.set_start_tag_net_enable(NET_ENABLE_NO)
     }
 
+    ; widen a byte identifier into a host-pinned StringC message arg.
+    function widen_arg(host: pointer[Page], s: String) returns StringC
+    {
+        let n s.get_length()
+        let buf host.allocate(n * (4 as size_t), 4) as pointer[u32]
+        var i: size_t 0
+        while i < n
+        {
+            set *(buf + i): s.get(i) as u32
+            set i: i + 1
+        }
+        StringC(buf, n)
+    }
+
+    ; replay the diagnostics one catalog file collected, in fire order,
+    ; through the parser Messenger: located messages render `file:line:col`
+    ; against the catalog file's origin, unlocated ones (a BASE probe
+    ; failure) render the app shape — both count.
+    function replay_catalog_msgs(host: pointer[Page], ps: pointer[ParserState], msgs: pointer[Array[CatMsg]])
+    {
+        let n msgs.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let m *(msgs.get_buffer() + i)
+            var args Vector[MessageArg]()
+            if m.kind = CMK_STR
+            {
+                var a1 Vector[MessageArg](1 as size_t)
+                set *(a1.get(0 as size_t)): MessageArg.Str(Parser.widen_arg(host, m.a1))
+                set args: a1
+            }
+            else if m.kind = CMK_STR_RAW
+            {
+                var a2 Vector[MessageArg](2 as size_t)
+                set *(a2.get(0 as size_t)): MessageArg.Str(Parser.widen_arg(host, m.a1))
+                set *(a2.get(1 as size_t)): MessageArg.Raw(Parser.widen_arg(host, m.a2))
+                set args: a2
+            }
+            if m.has_loc
+                ps.report_at(m.mt, args, m.loc)
+            else
+                ps.report_noloc(m.mt, args)
+            set i: i + 1
+        }
+    }
+
+    ; CatalogParser::parseCatalog driven from the outside (the port's
+    ; CatalogParser is a pure collector): open + decode one catalog file,
+    ; scan it into `cat`, replay its diagnostics, then recurse into its
+    ; CATALOG chain requests (each must exist; a failed open reports at the
+    ; CATALOG entry's location — the reference's ParentLocationMessenger).
+    ; `chain` is the inclusion ancestry for the loop check; a file already in
+    ; its own ancestry reports inLoop at its inclusion location and parses no
+    ; further (the reference break at the first CATALOG entry).
+    function parse_catalog_file(host: pointer[Page], ps: pointer[ParserState], cat: pointer[EntityCatalog], path: String, must_exist: bool, chain: pointer[CatChain], has_incl: bool, incl_loc: Location)
+    {
+        let hpath String^host(path)
+        let f fopen(hpath.to_c_string(), "rb")
+        if f = null
+        {
+            if must_exist
+            {
+                var args Vector[MessageArg](2 as size_t)
+                set *(args.get(0 as size_t)): MessageArg.Str(Parser.widen_arg(host, *hpath))
+                set *(args.get(1 as size_t)): MessageArg.Raw(StringC(strerror(scaly_eio_errno())))
+                if has_incl
+                    ps.report_at(PosixStorageMessages.openSystemCall(), args, incl_loc)
+                else
+                    ps.report_noloc(PosixStorageMessages.openSystemCall(), args)
+            }
+            return
+        }
+        let closed fclose(f)
+        let text File.read_to_string(*hpath)
+
+        let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+        set *org: Origin()
+        org.set_file_name(StringC^host(hpath.to_c_string()))
+        let src Parser.make_char_source(host, text, org)
+
+        let cat_dir Path.get_directory_name(*hpath)
+        var in_loop false
+        if chain <> null
+            set in_loop: chain.contains(*hpath)
+        let link host.allocate(sizeof CatChain, alignof CatChain) as pointer[CatChain]
+        set *link: CatChain(*hpath, chain)
+
+        let msgs Array[CatMsg]^host()
+        let subs Array[SubCatalog]^host()
+        let cp CatalogParser()
+        cp.parse_into(host, cat, org.get_contents(), org.get_buf_length(), org, cat_dir, in_loop, incl_loc, msgs, subs)
+        cat.end_catalog()
+        Parser.replay_catalog_msgs(host, ps, msgs)
+
+        let nsubs subs.get_length()
+        var si: size_t 0
+        while si < nsubs
+        {
+            let sub *(subs.get_buffer() + si)
+            Parser.parse_catalog_file(host, ps, cat, sub.sysid, true, link, true, sub.loc)
+            set si: si + 1
+        }
+    }
+
     ; error_limit: ParserApp::errorLimit_ (-E, 0 = unlimited); reporter_options:
     ; the REP_* mask (-e/-g/-n/-x); msg_fd: the message sink (-f, default 2);
     ; prolog_only: -p (cancel at end-prolog).
-    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, charset_fixed: bool, active_links: pointer[Array[String]], options: pointer[ParserOptions], error_limit: u32, reporter_options: u32, output_flags: u32, msg_fd: int, prolog_only: bool, out_conforming: pointer[bool]) returns String
+    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, charset_fixed: bool, active_links: pointer[Array[String]], options: pointer[ParserOptions], error_limit: u32, reporter_options: u32, output_flags: u32, msg_fd: int, prolog_only: bool, em_cfg: pointer[EmConfig], out_conforming: pointer[bool]) returns String
     {
         ; Record normalization (ExtendEntityManager, `lf` record type — the whole
         ; Unix corpus): insert one RS (0x0A) at the entity start, and translate
@@ -18145,27 +18238,68 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let parser Parser.make(host, ps)
         let table ModeInfo.build_table(host)
 
-        ; catalog: SGMLDECL binding + PUBLIC resolution for the SD parse.
+        ; ---- the entity catalog (SOCatalogManagerImpl::makeCatalog) --------
+        ; ONE merged catalog per run, files in the reference order: the -c/-m
+        ; command-line catalogs (must exist — a missing one reports the
+        ; location-less openSystemCall E and counts), then the document's
+        ; implicit `catalog` (unless SP_USE_DOCUMENT_CATALOG said NO), then
+        ; the SGML_CATALOG_FILES entries (silent when missing). CATALOG
+        ; entries chain depth-first after their own file, with the ancestry
+        ; loop check. The catalog is installed even when empty — lookups on a
+        ; catalog with no entries all miss, like the reference's.
+        let catalog EntityCatalog.make(host)
+        var n_must: size_t 0
+        var n_cats: size_t 0
+        if em_cfg <> null
+        {
+            set n_must: em_cfg.n_must_exist
+            let cs em_cfg.catalog_sysids
+            if cs <> null
+                set n_cats: cs.get_length()
+        }
+        var ci: size_t 0
+        while ci < n_must
+        {
+            if ci < n_cats
+            {
+                let cs2 em_cfg.catalog_sysids
+                let cp *(cs2.get_buffer() + ci)
+                Parser.parse_catalog_file(host, ps, catalog, cp, true, null, false, Location())
+            }
+            set ci: ci + 1
+        }
+        var use_doc_cat true
+        if em_cfg <> null
+            set use_doc_cat: em_cfg.use_doc_catalog
+        if use_doc_cat
+        {
+            var cat_path base_dir
+            if base_dir.get_length() = (0 as size_t)
+                set cat_path: String("catalog")
+            else
+                set cat_path: Path.join(base_dir, String("catalog"))
+            Parser.parse_catalog_file(host, ps, catalog, cat_path, false, null, false, Location())
+        }
+        set ci: n_must
+        while ci < n_cats
+        {
+            let cs3 em_cfg.catalog_sysids
+            let cp2 *(cs3.get_buffer() + ci)
+            Parser.parse_catalog_file(host, ps, catalog, cp2, false, null, false, Location())
+            set ci: ci + 1
+        }
+        ps.set_entity_catalog(catalog)
+
+        ; catalog: SGMLDECL binding for the SD parse (first-wins entry).
         var have_decl false
         var decl_text String()
         var decl_name StringC()
-        var cat_path base_dir
-        if base_dir.get_length() = (0 as size_t)
-            set cat_path: String("catalog")
-        else
-            set cat_path: Path.join(base_dir, String("catalog"))
-        if File.exists(cat_path)
+        let decl_path catalog.lookup_sgmldecl()
+        if (decl_path.get_length() <> (0 as size_t)) and File.exists(decl_path)
         {
-            let cat_text File.read_to_string(cat_path)
-            let catalog CatalogParser().parse(cat_text, base_dir)
-            ps.set_entity_catalog(catalog)
-            let decl_path catalog.lookup_sgmldecl()
-            if (decl_path.get_length() <> (0 as size_t)) and File.exists(decl_path)
-            {
-                set decl_text: File.read_to_string(decl_path)
-                set decl_name: StringC(decl_path.to_c_string())
-                set have_decl: true
-            }
+            set decl_text: File.read_to_string(decl_path)
+            set decl_name: StringC(decl_path.to_c_string())
+            set have_decl: true
         }
 
         let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
