@@ -1,0 +1,504 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.ParserState.ParserState
+use opensp.Event.Event
+use opensp.Attribute.AttributeValue
+use opensp.Attribute.AttributeContext
+use opensp.Attribute.AttributeDefinition
+use opensp.Attribute.Text
+use opensp.AttributeList.AttributeList
+use opensp.AttributeList.AttributeDefinitionList
+use opensp.ElementType.ElementType
+use opensp.ElementType.ElementDefinition
+use opensp.Entity.Entity
+use opensp.Notation.Notation
+use opensp.ExternalId.ExternalId
+use opensp.Dtd.Dtd
+use opensp.Syntax.Syntax
+use opensp.Sd.Sd
+use opensp.OpenElement.OpenElement
+use opensp.ContentState.ContentState
+use opensp.Parser.Parser
+use opensp.ModeInfo.ModeInfo
+use opensp.Location.InputSource
+use opensp.Location.Origin
+use opensp.Storage.Storage
+
+; ArcEngine — a Scaly port of James Clark's OpenSP ArcEngine (lib/ArcEngine.cxx
+; + lib/ArcProcessor.h), the -A architectural-form processor (ISO/IEC 10744
+; AFDR). Unlike the reference's streaming EventHandler chain, this runs as a
+; POST-PARSE PASS over the materialized event queue (ParserState.events) — the
+; same shape the RAST writer uses (Rast.scaly). The base document's events
+; drive one ArcProcessor per ArcBase architecture; the processor consults a
+; META-DTD (parsed on demand from the architecture's ArcDTD entity), maps each
+; base element/attribute onto its architectural form, and GENERATES a fresh
+; event stream. For the -A <name> selection (SelectOneArcDirector) only the
+; matching architecture's generated stream is rendered; the base stream and any
+; non-selected architecture go to a null sink.
+;
+; STATUS: the af-1 core path (single ArcBase, ArcFormA=architecture name, plain
+; CDATA/#REQUIRED attribute mapping via buildAttributeMapRest, no suppression /
+; renamer / token-map / #CONTENT / notation-data-form). The remaining reference
+; surface (considerSupr/considerIgnD/considerNamer, token maps, emitArcContent,
+; autoForm bridge, ArcQuant, the full supportAttributes table, mungeMetaDtd
+; data entities) lands as the af-2..19 fixtures are driven green.
+
+; openElementFlags_ bits (ArcEngine.cxx suppressForm/…): only the ones the
+; af-1 path needs plus the frame marker.
+define ARC_IS_ARC: u32 0x0001
+define ARC_IGNORE_DATA: u32 0x0002
+define ARC_RECOVER_DATA: u32 0x0004
+
+define ArcProcessor
+(
+    valid: bool
+    name: StringC
+    doc_dtd: pointer[Dtd]
+    meta_dtd: pointer[Dtd]
+    doc_sd: pointer[Sd]
+    doc_syntax: pointer[Syntax]
+    meta_syntax: pointer[Syntax]
+    cs: pointer[ContentState]
+    ctx: pointer[AttributeContext]
+    form_att_name: StringC
+    arc_doc_f: StringC
+    host: pointer[Page]
+    out: pointer[Array[pointer[Event]]]
+    open_flags: pointer[Array[u32]]
+    n_flags: size_t
+)
+{
+    function make(host: pointer[Page], name: StringC) returns pointer[ArcProcessor]
+    {
+        let p host.allocate(sizeof ArcProcessor, alignof ArcProcessor) as pointer[ArcProcessor]
+        set p.valid: false
+        set p.name: name
+        set p.doc_dtd: null
+        set p.meta_dtd: null
+        set p.doc_sd: null
+        set p.doc_syntax: null
+        set p.meta_syntax: null
+        set p.cs: null
+        set p.ctx: null
+        set p.form_att_name: StringC()
+        set p.arc_doc_f: StringC()
+        set p.host: host
+        set p.out: null
+        set p.open_flags: Array[u32]^host()
+        set p.n_flags: 0 as size_t
+        p
+    }
+
+    function flags_push(this: pointer[ArcProcessor], v: u32)
+    {
+        if this.n_flags < this.open_flags.get_length()
+            this.open_flags.put(this.n_flags, v)
+        else
+            this.open_flags.add(v)
+        set this.n_flags: this.n_flags + (1 as size_t)
+    }
+
+    function flags_top(this: ArcProcessor) returns u32
+    {
+        if n_flags = (0 as size_t)
+            return 0 as u32
+        *(open_flags.get_buffer() + (n_flags - (1 as size_t)))
+    }
+
+    function flags_pop(this: pointer[ArcProcessor])
+    {
+        if this.n_flags > (0 as size_t)
+            set this.n_flags: this.n_flags - (1 as size_t)
+    }
+
+    ; init (ArcProcessor::init, ArcEngine.cxx:779): resolve the ArcBase notation,
+    ; read the ArcDTD support attribute, parse the meta-DTD, set up content state.
+    function setup(this: pointer[ArcProcessor], host: pointer[Page], ps: pointer[ParserState], doc_dtd: pointer[Dtd], sd: pointer[Sd], syntax: pointer[Syntax])
+    {
+        set this.doc_dtd: doc_dtd
+        set this.doc_sd: sd
+        set this.doc_syntax: syntax
+        set this.meta_syntax: syntax
+        set this.host: host
+
+        let notation doc_dtd.lookup_notation(this.name)
+        if notation = null
+            return
+
+        ; read the ArcDTD attribute off the notation's attribute definition.
+        let nad notation.get_attribute_def()
+        var arc_dtd StringC()
+        if nad <> null
+        {
+            let al AttributeList.make(host, nad)
+            let nctx AttributeContext.make(host, syntax, false, true)
+            al.finish(nctx)
+            let adi al.attribute_index(ArcEngine.fold_sc(host, syntax, StringC("ArcDTD")))
+            if adi >= 0
+            {
+                let v al.value(adi as size_t)
+                if v <> null
+                {
+                    let t v.get_text()
+                    if t <> null
+                        set arc_dtd: t.string()
+                }
+            }
+        }
+        if arc_dtd.get_size() = (0 as size_t)
+            return
+
+        ; ArcDocF and ArcFormA default to the architecture name (subst'd).
+        set this.arc_doc_f: this.name
+        set this.form_att_name: this.name
+
+        ; the meta-DTD entity (ArcDTD names a general entity in the doc DTD).
+        let ent doc_dtd.lookup_entity(false, arc_dtd)
+        if ent = null
+            return
+        if ent.is_external() = false
+            return
+        let meta_sysid ent.get_external_id().get_system_id()
+        let base_dir ps.get_decl_base_dir()
+
+        let mdtd ArcEngine.parse_meta_dtd(host, ps, this.arc_doc_f, base_dir, meta_sysid, sd, syntax)
+        if mdtd = null
+            return
+        set this.meta_dtd: mdtd
+
+        let doc_et mdtd.get_document_element_type()
+        if doc_et = null
+            return
+        let def doc_et.get_definition()
+        if def = null
+            return
+        if def.undefined()
+            return
+
+        let cs ContentState.make(host)
+        cs.start_content(host, mdtd)
+        set this.cs: cs
+        set this.ctx: AttributeContext.make(host, this.meta_syntax, true, true)
+        set this.valid: true
+    }
+
+    ; considerForm (ArcEngine.cxx:1727, af-1 subset): the ArcFormA attribute on
+    ; the base element names the architectural element type.
+    function consider_form(this: pointer[ArcProcessor], atts: pointer[AttributeList]) returns pointer[ElementType]
+    {
+        if atts = null
+            return null
+        let idx atts.attribute_index(this.form_att_name)
+        if idx < 0
+            return null
+        let val atts.value(idx as size_t)
+        if val = null
+            return null
+        let txt val.get_text()
+        if txt = null
+            return null
+        let meta_name ArcEngine.fold_sc(this.host, this.meta_syntax, txt.string())
+        this.meta_dtd.lookup_element_type(meta_name)
+    }
+
+    ; mapAttributes (ArcEngine.cxx:1432) + buildAttributeMapRest (af-1 subset):
+    ; each architectural attribute takes its value from the same-named base
+    ; attribute.
+    function map_attributes(this: pointer[ArcProcessor], host: pointer[Page], from_atts: pointer[AttributeList], meta_et: pointer[ElementType]) returns pointer[AttributeList]
+    {
+        let meta_def meta_et.get_attribute_def()
+        let to AttributeList.make(host, meta_def)
+        if meta_def <> null
+        {
+            if from_atts <> null
+            {
+                var i: size_t 0
+                while i < meta_def.size()
+                {
+                    let mdef meta_def.def(i)
+                    if mdef <> null
+                    {
+                        let mname (*mdef).get_name()
+                        let fidx from_atts.attribute_index(mname)
+                        if fidx >= 0
+                        {
+                            let val from_atts.value(fidx as size_t)
+                            if val <> null
+                            {
+                                let txt val.get_text()
+                                if txt <> null
+                                {
+                                    to.set_spec(i, this.ctx)
+                                    to.set_value(host, i, txt, this.ctx)
+                                }
+                            }
+                        }
+                    }
+                    set i: i + (1 as size_t)
+                }
+            }
+        }
+        to.finish(this.ctx)
+        to
+    }
+
+    ; processStartElement (ArcEngine.cxx:1286, af-1 subset).
+    function process_start_element(this: pointer[ArcProcessor], host: pointer[Page], ev: pointer[Event])
+    {
+        let atts ev.get_attributes()
+        let meta_et this.consider_form(atts)
+        if meta_et = null
+        {
+            this.flags_push(0 as u32)
+            return
+        }
+        let to this.map_attributes(host, atts, meta_et)
+        let gen Event.make_start(host, meta_et, ev.get_loc())
+        gen.set_attributes(to)
+        this.cs.current_element().try_transition(meta_et)
+        this.cs.push_element(OpenElement.make(host, meta_et, false, false, this.cs.get_the_empty_map(), ev.get_loc()))
+        this.out.add(gen)
+        this.flags_push(ARC_IS_ARC)
+    }
+
+    ; processData (ArcEngine.cxx:1409, af-1 subset): architectural iff the
+    ; current architectural element admits PCDATA.
+    function process_data_arc(this: pointer[ArcProcessor]) returns bool
+    {
+        if (this.flags_top() & ARC_IGNORE_DATA) <> (0 as u32)
+            return false
+        let ce this.cs.current_element()
+        if (ce.declared_empty() = false) and ce.try_transition_pcdata()
+            return true
+        false
+    }
+
+    ; processEndElement (ArcEngine.cxx:2029).
+    function process_end_element(this: pointer[ArcProcessor], host: pointer[Page], ev: pointer[Event])
+    {
+        let was_arc (this.flags_top() & ARC_IS_ARC) <> (0 as u32)
+        this.flags_pop()
+        if was_arc
+        {
+            let et this.cs.current_element().get_type()
+            let gen Event.make_end(host, et, ev.get_loc())
+            this.out.add(gen)
+            this.cs.pop_element()
+        }
+    }
+}
+
+define ArcEngine ( )
+{
+    ; fold a StringC through the general substitution table (NAMECASE GENERAL).
+    function fold_sc(host: pointer[Page], syntax: pointer[Syntax], s: StringC) returns StringC
+    {
+        let n s.get_size()
+        let buf host.allocate((n + (1 as size_t)) * (4 as size_t), 4) as pointer[u32]
+        var i: size_t 0
+        while i < n
+        {
+            set *(buf + i): syntax.fold(s.get(i))
+            set i: i + (1 as size_t)
+        }
+        StringC(buf, n)
+    }
+
+    function is_s(syntax: pointer[Syntax], c: u32) returns bool
+    {
+        if c = syntax.standard_function(fSPACE)
+            return true
+        if c = syntax.standard_function(fRS)
+            return true
+        if c = syntax.standard_function(fRE)
+            return true
+        if c = (9 as u32)
+            return true
+        false
+    }
+
+    ; parse an external meta-DTD file into a fresh Dtd (ArcProcessor::init's
+    ; sub-parse; models SgmlParser::Params{entityType=dtd}). Reuses the port's
+    ; declaration-subset parser on a child ParserState sharing the parent's
+    ; entity manager / catalog / options; the Dtd is queried straight off the
+    ; local pointer (no end_dtd, which would move it to the stack).
+    function parse_meta_dtd(host: pointer[Page], ps: pointer[ParserState], doctype_name: StringC, base_dir: String, sysid: String, sd: pointer[Sd], syntax: pointer[Syntax]) returns pointer[Dtd]
+    {
+        let child ParserState.make(host, null, 0 as u32, PHASE_DECL_SUBSET)
+        child.set_sd(sd)
+        let meta_syn Syntax^host(*sd)
+        child.set_syntax(meta_syn)
+
+        let mdtd Dtd.make(host, doctype_name, true)
+        child.set_def_dtd(mdtd)
+        child.set_current_dtd(mdtd)
+
+        let p Parser.make(host, child)
+        let table ModeInfo.build_table(host)
+        p.install_recognizers(table)
+
+        let storage Storage.OsFile(base_dir)
+        let bytes storage.read(sysid)
+        if bytes.get_length() = (0 as size_t)
+            return null
+
+        ; a sentinel bottom input (empty) stands in for the document entity: the
+        ; external-subset end-of-entity handling pops the meta-DTD source and
+        ; checks input_level < subset_level, so the meta-DTD must sit ABOVE
+        ; something — otherwise the pop empties the stack and the next
+        ; current_input() dereferences null (parse_doctype keeps the doc entity
+        ; below the external subset for the same reason).
+        let borg host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+        set *borg: Origin()
+        let bbuf host.allocate(4 as size_t, 4) as pointer[u32]
+        let bsrc host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
+        set *bsrc: InputSource(borg, bbuf, 0 as size_t)
+        child.push_input(bsrc)
+
+        let bn bytes.get_length()
+        let buf host.allocate(bn * (4 as size_t), 4) as pointer[u32]
+        var ci: size_t 0
+        while ci < bn
+        {
+            set *(buf + ci): bytes.get(ci) as u32
+            set ci: ci + (1 as size_t)
+        }
+        let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+        set *org: Origin()
+        let src host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
+        set *src: InputSource(org, buf, bn)
+        child.push_input(src)
+        p.parse_decl_subset(child.get_input_level(), true)
+        mdtd
+    }
+
+    ; scan a PI's data for `IS10744 ArcBase name...` and append one ArcProcessor
+    ; per architecture name (ArcEngineImpl::pi, ArcEngine.cxx:220, ArcBase form).
+    function scan_arcbase_pi(host: pointer[Page], syntax: pointer[Syntax], data: StringC, is10744: StringC, arc_base: StringC, procs: pointer[Array[pointer[ArcProcessor]]])
+    {
+        let dn data.get_size()
+        let i10n is10744.get_size()
+        if dn <= i10n
+            return
+        var j: size_t 0
+        while j < i10n
+        {
+            if syntax.fold(data.get(j)) <> is10744.get(j)
+                return
+            set j: j + (1 as size_t)
+        }
+        var i i10n
+        if ArcEngine.is_s(syntax, data.get(i)) = false
+            return
+        while (i < dn) and ArcEngine.is_s(syntax, data.get(i))
+            set i: i + (1 as size_t)
+        if i >= dn
+            return
+        var start i
+        while (i < dn) and (ArcEngine.is_s(syntax, data.get(i)) = false)
+            set i: i + (1 as size_t)
+        let tok ArcEngine.fold_sc(host, syntax, data.substr(start, i - start))
+        if tok.equals(arc_base) = false
+            return
+        var more true
+        while more
+        {
+            while (i < dn) and ArcEngine.is_s(syntax, data.get(i))
+                set i: i + (1 as size_t)
+            if i >= dn
+                set more: false
+            else
+            {
+                set start: i
+                while (i < dn) and (ArcEngine.is_s(syntax, data.get(i)) = false)
+                    set i: i + (1 as size_t)
+                let nm ArcEngine.fold_sc(host, syntax, data.substr(start, i - start))
+                procs.add(ArcProcessor.make(host, nm))
+            }
+        }
+    }
+
+    ; drive the base event stream through a processor, generating the
+    ; architectural stream into p.out.
+    function run_events(host: pointer[Page], ps: pointer[ParserState], p: pointer[ArcProcessor])
+    {
+        let n ps.n_events()
+        var k: size_t 0
+        while k < n
+        {
+            let ev ps.get_event(k)
+            let ty ev.get_type()
+            if ty = EV_START_ELEMENT
+                p.process_start_element(host, ev)
+            else if ty = EV_END_ELEMENT
+                p.process_end_element(host, ev)
+            else if ty = EV_DATA
+            {
+                if p.process_data_arc()
+                    p.out.add(Event.make_data(host, ev.get_data(), ev.get_loc()))
+            }
+            else if ty = EV_SDATA
+            {
+                if p.process_data_arc()
+                    p.out.add(Event.make_sdata(host, ev.get_data(), ev.get_loc()))
+            }
+            set k: k + (1 as size_t)
+        }
+    }
+
+    ; ArcEngine::parseAll + SelectOneArcDirector (ArcEngine.cxx:147/157): build
+    ; the processors from the ArcBase PIs, init each, and replace the event
+    ; queue with the SELECTED architecture's generated stream (empty when the
+    ; selection matches no architecture — the reference's null handler).
+    function transform(host: pointer[Page], ps: pointer[ParserState], arc_names: pointer[Array[String]]) returns bool
+    {
+        if arc_names = null
+            return false
+        if arc_names.get_length() = (0 as size_t)
+            return false
+        let doc_dtd ps.base_dtd()
+        if doc_dtd = null
+            return false
+        let sd ps.get_sd()
+        let syntax ps.get_instance_syntax()
+        if syntax = null
+            return false
+
+        let arc_base ArcEngine.fold_sc(host, syntax, StringC("ArcBase"))
+        let is10744 ArcEngine.fold_sc(host, syntax, StringC("IS10744"))
+
+        let procs Array[pointer[ArcProcessor]]^host()
+        let n ps.n_events()
+        var k: size_t 0
+        while k < n
+        {
+            let ev ps.get_event(k)
+            if ev.get_type() = EV_PI
+                ArcEngine.scan_arcbase_pi(host, syntax, ev.get_data(), is10744, arc_base, procs)
+            set k: k + (1 as size_t)
+        }
+
+        let sel ArcEngine.fold_sc(host, syntax, StringC((*(arc_names.get_buffer())).to_c_string()))
+        let result Array[pointer[Event]]^host()
+        var pi: size_t 0
+        while pi < procs.get_length()
+        {
+            let p *(procs.get_buffer() + pi)
+            p.setup(host, ps, doc_dtd, sd, syntax)
+            if p.name.equals(sel)
+            {
+                if p.valid
+                {
+                    set p.out: result
+                    ArcEngine.run_events(host, ps, p)
+                }
+            }
+            set pi: pi + (1 as size_t)
+        }
+        ps.set_events(result)
+        true
+    }
+}
