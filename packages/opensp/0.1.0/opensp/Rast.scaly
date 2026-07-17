@@ -1,0 +1,1033 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use opensp.StringC.StringC
+use opensp.ParserState.ParserState
+use opensp.ParserState.RastShared
+use opensp.ParserState.RastSubdocParse
+use opensp.Event.Event
+use opensp.Attribute.AttributeValue
+use opensp.Attribute.Attribute
+use opensp.Attribute.AttributeSemantics
+use opensp.Attribute.Text
+use opensp.AttributeList.AttributeList
+use opensp.AttributeList.AttributeDefinitionList
+use opensp.ElementType.ElementType
+use opensp.Entity.Entity
+use opensp.Entity.InternalEntity
+use opensp.Entity.ExternalDataEntity
+use opensp.Entity.SubdocEntity
+use opensp.Notation.Notation
+use opensp.ExternalId.ExternalId
+use opensp.Lpd.Lpd
+use opensp.Lpd.LinkSet
+use opensp.Lpd.SourceLinkRule
+use opensp.Esis.Esis
+
+; Rast — the RAST result writer (nsgmls/RastEventHandler.cxx, ISO/IEC 13673
+; conformance output; the -t option). Walks the ParserState event queue and
+; renders the RAST text; the PARSE-TIME halves of the reference handler (the
+; rast-* PI interpretation, the parse-subdoc queue, the RastLinkProcess
+; selectLinkRule override, the attribute-subdoc nested parses and every
+; message) already ran at event-queue time — see ParserState.rast_* and
+; Parser.rast_* — so rendering here is side-effect-free.
+;
+; RAST format essentials:
+;   |data|                  data lines, wrapped at 60 columns
+;   !markup!                markup lines (attribute values, replacement text,
+;                           public/system ids), same wrapping
+;   #RS #RE #TAB #<N>       unprintable chars on their own line
+;   [GI ...] [/GI]          start (with attribute block) / end element
+;   NAME=                   one attribute; value lines follow
+;   #IMPLIED #SDATA-TEXT #END-SDATA #CDATA-INTERNAL #NDATA-EXTERNAL ...
+;   #PUBLIC #SYSTEM #EMPTY #NONE   external id info
+;   [&NAME ...]             external data / subdoc entity reference
+;   #SUBDOC #PARSED-SUBDOCUMENT    subdoc info (nested document renders inline)
+;   [? ...]                 processing instruction
+;   #ACTIVE-LINK= #SIMPLE-LINK= #LINK-RULE #RESULT= #LINK-SET-INFO #INITIAL
+;
+; On ANY error (errorCount != 0 at the end) the whole file is replaced by a
+; single marker line: #RAST-PI-ERROR when a message went through the RAST
+; handler's own Messenger (piErrorCount != 0), else #ERROR — the reference's
+; XRastEventHandler truncate-and-mark end().
+;
+; The output leaves through the same output coding system as the ESIS stream
+; (identity or UTF-8), but WITHOUT the `\#N;` escaper — the reference opens
+; the RAST EncodeOutputCharStream without setEscaper, so an identity-
+; unencodable char (> 0xFF) is dropped silently.
+
+; the reference's attribute-type enum (RastSubdocState::AttributeType) — each
+; keeps its own sort-order cache.
+define RT_DTD: int 0
+define RT_LINK: int 1
+define RT_RESULT: int 2
+define RT_SIMPLE: int 3
+
+; the per-document writer state (RastSubdocState's writer half) — swapped
+; around each nested subdocument parse's event range.
+define RastDocState
+(
+    ; the document's ParserState (rast_active_types = the PI-declared active
+    ; link types this document's #ACTIVE-LINK blocks render).
+    doc_ps: pointer[ParserState]
+    had_doc_element: bool
+    have_lp: bool
+    lpd: pointer[Lpd]
+    ; the link process' current link set as of the last rendered event.
+    cur_ls: pointer[LinkSet]
+    simple_names: pointer[Array[StringC]]
+    simple_atts: pointer[Array[pointer[AttributeList]]]
+    ; attributeSortOrder_[nAttributeType], per attribute-definition-list index.
+    sort_dtd: pointer[Array[pointer[Array[size_t]]]]
+    sort_link: pointer[Array[pointer[Array[size_t]]]]
+    sort_result: pointer[Array[pointer[Array[size_t]]]]
+    sort_simple: pointer[Array[pointer[Array[size_t]]]]
+)
+
+; the writer (RastEventHandler's non-per-document half).
+define RastW
+(
+    host: pointer[Page]
+    acc: pointer[Array[u8]]
+    utf8: bool
+    line_length: int
+    ; the attribute-subdoc FIFO (parse-time results) and its render head.
+    results: pointer[Array[RastSubdocParse]]
+    next_result: size_t
+)
+
+define Rast
+{
+    ; ---- low-level output --------------------------------------------------
+    ; one Char through the output coding system; identity drops > 0xFF (no
+    ; escaper on the RAST stream).
+    function put_char(w: pointer[RastW], c: u32)
+    {
+        if w.utf8
+        {
+            Esis.put_utf8(w.acc, c)
+            return
+        }
+        if c < (0x100 as u32)
+            w.acc.add(c as u8)
+    }
+
+    function put_lit(w: pointer[RastW], s: String)
+    {
+        let n s.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            w.acc.add(s.get(i))
+            set i: i + 1
+        }
+    }
+
+    function put_nl(w: pointer[RastW])
+        w.acc.add(0x0A as u8)
+
+    ; a name / literal StringC straight to the stream (names never wrap).
+    function put_name(w: pointer[RastW], sc: StringC)
+    {
+        let n sc.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            Rast.put_char(w, sc.get(i))
+            set i: i + 1
+        }
+    }
+
+    ; ---- RastPrintable + lines (RastEventHandler.cxx:51/557) ---------------
+    ; printable = the 95 ASCII graphic chars + space; the table value IS the
+    ; char code (v_[c] = 32 + index over " !\"...~"), so lexCmp's printable
+    ; ordering is plain ASCII order.
+    function printable(c: u32) returns u32
+    {
+        if (c >= (0x20 as u32)) and (c <= (0x7E as u32))
+            return c
+        0 as u32
+    }
+
+    function flush_line(w: pointer[RastW], ty: u8)
+    {
+        if w.line_length > 0
+        {
+            w.acc.add(ty)
+            Rast.put_nl(w)
+            set w.line_length: 0
+        }
+    }
+
+    function line_char(w: pointer[RastW], ty: u8, c: u32)
+    {
+        if Rast.printable(c) <> (0 as u32)
+        {
+            if w.line_length = 60
+            {
+                w.acc.add(ty)
+                Rast.put_nl(w)
+                set w.line_length: 0
+            }
+            if w.line_length = 0
+                w.acc.add(ty)
+            Rast.put_char(w, c)
+            set w.line_length: w.line_length + 1
+            return
+        }
+        Rast.flush_line(w, ty)
+        if c = (0x0A as u32)
+            Rast.put_lit(w, String("#RS\n"))
+        else if c = (0x0D as u32)
+            Rast.put_lit(w, String("#RE\n"))
+        else if c = (0x09 as u32)
+            Rast.put_lit(w, String("#TAB\n"))
+        else
+        {
+            w.acc.add(0x23 as u8)
+            Esis.put_dec(w.acc, c)
+            Rast.put_nl(w)
+        }
+    }
+
+    function lines(w: pointer[RastW], ty: u8, sc: StringC)
+    {
+        let n sc.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            Rast.line_char(w, ty, sc.get(i))
+            set i: i + 1
+        }
+    }
+
+    ; 8-bit strings (public / system identifiers).
+    function lines_bytes(w: pointer[RastW], ty: u8, s: String)
+    {
+        let n s.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            Rast.line_char(w, ty, s.get(i) as u32)
+            set i: i + 1
+        }
+    }
+
+    ; ---- lexCmp (RastEventHandler.cxx:615) ---------------------------------
+    ; printable chars precede non-printable ones; printables in ASCII order,
+    ; non-printables in document character set order.
+    function lex_cmp(s1: StringC, s2: StringC) returns int
+    {
+        let n1 s1.get_size()
+        let n2 s2.get_size()
+        var i: size_t 0
+        var going true
+        while going
+        {
+            if i >= n1
+            {
+                if i >= n2
+                    return 0
+                return -1
+            }
+            if i >= n2
+                return 1
+            let c1 s1.get(i)
+            let c2 s2.get(i)
+            if c1 <> c2
+            {
+                let a1 Rast.printable(c1)
+                let a2 Rast.printable(c2)
+                if a1 = (0 as u32)
+                {
+                    if a2 = (0 as u32)
+                    {
+                        if c1 < c2
+                            return -1
+                        return 1
+                    }
+                    return 1
+                }
+                if a2 = (0 as u32)
+                    return -1
+                if a1 < a2
+                    return -1
+                return 1
+            }
+            set i: i + 1
+        }
+        0
+    }
+
+    ; ---- doc state ----------------------------------------------------------
+    function make_doc_state(host: pointer[Page], ps: pointer[ParserState]) returns pointer[RastDocState]
+    {
+        let d host.allocate(sizeof RastDocState, alignof RastDocState) as pointer[RastDocState]
+        set d.doc_ps: ps
+        set d.had_doc_element: false
+        set d.have_lp: false
+        set d.lpd: null
+        set d.cur_ls: null
+        set d.simple_names: null
+        set d.simple_atts: null
+        set d.sort_dtd: Array[pointer[Array[size_t]]]^host()
+        set d.sort_link: Array[pointer[Array[size_t]]]^host()
+        set d.sort_result: Array[pointer[Array[size_t]]]^host()
+        set d.sort_simple: Array[pointer[Array[size_t]]]^host()
+        d
+    }
+
+    function sort_cache(d: pointer[RastDocState], ty: int) returns pointer[Array[pointer[Array[size_t]]]]
+    {
+        if ty = RT_LINK
+            return d.sort_link
+        if ty = RT_RESULT
+            return d.sort_result
+        if ty = RT_SIMPLE
+            return d.sort_simple
+        d.sort_dtd
+    }
+
+    ; ---- external id / entity info ------------------------------------------
+    function external_id_info(w: pointer[RastW], id: ExternalId)
+    {
+        if id.has_public_id()
+        {
+            Rast.put_lit(w, String("#PUBLIC\n"))
+            let pub id.get_public_id()
+            if pub.get_length() = (0 as size_t)
+                Rast.put_lit(w, String("#EMPTY\n"))
+            else
+            {
+                Rast.lines_bytes(w, 0x21 as u8, pub)
+                Rast.flush_line(w, 0x21 as u8)
+            }
+        }
+        var want_system id.has_system_id()
+        if id.has_public_id() = false
+            set want_system: true
+        if want_system
+        {
+            Rast.put_lit(w, String("#SYSTEM\n"))
+            if id.has_system_id() = false
+                Rast.put_lit(w, String("#NONE\n"))
+            else
+            {
+                let sys id.get_system_id()
+                if sys.get_length() = (0 as size_t)
+                    Rast.put_lit(w, String("#EMPTY\n"))
+                else
+                {
+                    Rast.lines_bytes(w, 0x21 as u8, sys)
+                    Rast.flush_line(w, 0x21 as u8)
+                }
+            }
+        }
+    }
+
+    function internal_entity_info(w: pointer[RastW], i: InternalEntity)
+    {
+        w.acc.add(0x23 as u8)
+        if i.get_data_type() = DT_CDATA
+            w.acc.add(0x43 as u8)
+        else
+            w.acc.add(0x53 as u8)
+        Rast.put_lit(w, String("DATA-INTERNAL\n"))
+        let text i.get_text()
+        Rast.lines(w, 0x21 as u8, text)
+        Rast.flush_line(w, 0x21 as u8)
+    }
+
+    function external_entity_info(w: pointer[RastW], d: pointer[RastDocState], x: ExternalDataEntity, ty: int)
+    {
+        let dt x.get_data_type()
+        var c: u8 0
+        if dt = DT_CDATA
+            set c: 0x43 as u8
+        else if dt = DT_SDATA
+            set c: 0x53 as u8
+        else if dt = DT_NDATA
+            set c: 0x4E as u8
+        else
+            return
+        w.acc.add(0x23 as u8)
+        w.acc.add(c)
+        Rast.put_lit(w, String("DATA-EXTERNAL\n"))
+        Rast.external_id_info(w, x.get_external_id())
+        let ntv x.get_notation()
+        if ntv <> null
+        {
+            let nt ntv as pointer[Notation]
+            Rast.put_lit(w, String("#NOTATION="))
+            Rast.put_name(w, nt.get_name())
+            Rast.put_nl(w)
+            Rast.external_id_info(w, nt.get_external_id())
+        }
+        var aty RT_DTD
+        if ty = RT_RESULT
+            set aty: RT_RESULT
+        Rast.attribute_info(w, d, x.get_attributes() as pointer[AttributeList], aty)
+    }
+
+    ; subdocEntityInfo's WRITER half: #SUBDOC + external id, then the nested
+    ; document (parsed at event-queue time) inline. `bracket` selects the
+    ; content-reference form (the caller already printed `[&name`).
+    function subdoc_entity_info(w: pointer[RastW], s: SubdocEntity, parsed: bool, child_ps: pointer[void], events: pointer[Array[pointer[Event]]])
+    {
+        Rast.put_lit(w, String("#SUBDOC\n"))
+        Rast.external_id_info(w, s.get_external_id())
+        if parsed
+        {
+            Rast.put_lit(w, String("#PARSED-SUBDOCUMENT\n"))
+            if events <> null
+            {
+                let host w.host
+                let child Rast.make_doc_state(host, child_ps as pointer[ParserState])
+                Rast.render_range(w, child, events.get_buffer(), 0 as size_t, events.get_length())
+            }
+        }
+    }
+
+    ; ---- attributeInfo (RastEventHandler.cxx:650) ---------------------------
+    function attribute_info(w: pointer[RastW], d: pointer[RastDocState], atts: pointer[AttributeList], ty: int)
+    {
+        if atts = null
+            return
+        let length atts.size()
+        if length = (0 as size_t)
+            return
+        let def_index atts.def_index()
+        ; a non-empty list always carries its definition list; the guard only
+        ; protects the cache growth loop from a corrupt index.
+        if def_index = ADL_NONE
+            return
+        let cache Rast.sort_cache(d, ty)
+        while cache.get_length() <= def_index
+            cache.add(null as pointer[Array[size_t]])
+        var order *(cache.get_buffer() + def_index)
+        var recompute false
+        if order = null
+            set recompute: true
+        else if order.get_length() <> length
+            set recompute: true
+        if ty = RT_SIMPLE
+            set recompute: true
+        if recompute
+        {
+            let host w.host
+            set order: Array[size_t]^host()
+            var i0: size_t 0
+            while i0 < length
+            {
+                order.add(i0)
+                set i0: i0 + 1
+            }
+            ; insertion sort by lexCmp over the attribute names.
+            var i1: size_t 1
+            while i1 < length
+            {
+                let tem *(order.get_buffer() + i1)
+                let tname atts.name(tem)
+                var j i1
+                var moving true
+                while moving
+                {
+                    if j > (0 as size_t)
+                    {
+                        let prev *(order.get_buffer() + (j - (1 as size_t)))
+                        if Rast.lex_cmp(atts.name(prev), tname) <= 0
+                            set moving: false
+                        else
+                        {
+                            order.put(j, prev)
+                            set j: j - (1 as size_t)
+                        }
+                    }
+                    else
+                        set moving: false
+                }
+                order.put(j, tem)
+                set i1: i1 + 1
+            }
+            cache.put(def_index, order)
+        }
+        var j2: size_t 0
+        while j2 < length
+        {
+            ; re-read through the cache — attributeSortOrder_ may be grown by
+            ; a data-attribute recursion (the reference's comment).
+            let cache2 Rast.sort_cache(d, ty)
+            let order2 *(cache2.get_buffer() + def_index)
+            let i *(order2.get_buffer() + j2)
+            Rast.put_name(w, atts.name(i))
+            w.acc.add(0x3D as u8)
+            Rast.put_nl(w)
+            let v atts.value(i)
+            if v <> null
+            {
+                let vk v.value_type()
+                if vk = AVT_IMPLIED
+                    Rast.put_lit(w, String("#IMPLIED\n"))
+                else if vk = AVT_TOKENIZED
+                {
+                    Rast.lines(w, 0x21 as u8, v.get_string())
+                    Rast.flush_line(w, 0x21 as u8)
+                }
+                else
+                    Rast.value_cdata(w, v)
+            }
+            let a atts.attribute(i)
+            let sem a.get_semantics()
+            if sem <> null
+            {
+                let ntv sem.get_notation()
+                if ntv <> null
+                {
+                    let nt ntv as pointer[Notation]
+                    Rast.external_id_info(w, nt.get_external_id())
+                }
+                let ne sem.n_entities()
+                var k: size_t 0
+                while k < ne
+                {
+                    let entv sem.entity(k)
+                    if entv <> null
+                    {
+                        let ent entv as pointer[Entity]
+                        choose *ent
+                            when x: ExternalData
+                                Rast.external_entity_info(w, d, x, ty)
+                            when s: Subdoc
+                            {
+                                ; pop the parse-time FIFO (order matches: both
+                                ; walks visit attributes in RAST sort order).
+                                var parsed false
+                                var cps: pointer[void] null
+                                var evs: pointer[Array[pointer[Event]]] null
+                                if w.next_result < w.results.get_length()
+                                {
+                                    let entry w.results.get_buffer() + w.next_result
+                                    set w.next_result: w.next_result + (1 as size_t)
+                                    set parsed: entry.parsed
+                                    set cps: entry.child_ps
+                                    set evs: entry.events
+                                }
+                                Rast.subdoc_entity_info(w, s, parsed, cps, evs)
+                            }
+                            when in2: Internal
+                                Rast.internal_entity_info(w, in2)
+                            else
+                            {
+                            }
+                    }
+                    Rast.put_lit(w, String("#END-ENTITY\n"))
+                    set k: k + 1
+                }
+            }
+            set j2: j2 + 1
+        }
+    }
+
+    ; the CDATA value body (the reference's TextIter loop): data/cdata
+    ; segments as markup lines, sdata runs bracketed by #SDATA-TEXT /
+    ; #END-SDATA, non-SGML chars as #<N> lines.
+    function value_cdata(w: pointer[RastW], v: pointer[AttributeValue])
+    {
+        let vs v.get_string()
+        let vt v.get_text()
+        var runs: pointer[Array[size_t]] null
+        var nsi: pointer[Array[size_t]] null
+        if vt <> null
+        {
+            set runs: (*vt).get_sdata_runs()
+            set nsi: (*vt).get_nonsgml_items()
+        }
+        let vn vs.get_size()
+        var nr: size_t 0
+        if runs <> null
+            set nr: runs.get_length()
+        var nn: size_t 0
+        if nsi <> null
+            set nn: nsi.get_length()
+        var pos: size_t 0
+        var ri: size_t 0
+        var ni: size_t 0
+        var going true
+        while going
+        {
+            if (ri >= nr) and (ni >= nn)
+            {
+                if vn > pos
+                {
+                    let tail StringC(vs.data_ptr() + pos, vn - pos)
+                    Rast.lines(w, 0x21 as u8, tail)
+                }
+                set going: false
+            }
+            else
+            {
+                var next_s vn
+                if ri < nr
+                {
+                    set next_s: *(runs.get_buffer() + ri)
+                    if next_s > vn
+                        set next_s: vn
+                }
+                var next_n vn
+                if ni < nn
+                {
+                    set next_n: *(nsi.get_buffer() + ni)
+                    if next_n > vn
+                        set next_n: vn
+                }
+                var take_sdata ri < nr
+                if take_sdata and (ni < nn)
+                    if next_n < next_s
+                        set take_sdata: false
+                if take_sdata
+                {
+                    var rs next_s
+                    var re *(runs.get_buffer() + ri + (1 as size_t))
+                    if re > vn
+                        set re: vn
+                    if rs > pos
+                    {
+                        let seg_before StringC(vs.data_ptr() + pos, rs - pos)
+                        Rast.lines(w, 0x21 as u8, seg_before)
+                    }
+                    Rast.flush_line(w, 0x21 as u8)
+                    Rast.put_lit(w, String("#SDATA-TEXT\n"))
+                    if re > rs
+                    {
+                        let seg_sdata StringC(vs.data_ptr() + rs, re - rs)
+                        Rast.lines(w, 0x21 as u8, seg_sdata)
+                    }
+                    Rast.flush_line(w, 0x21 as u8)
+                    Rast.put_lit(w, String("#END-SDATA\n"))
+                    set pos: re
+                    set ri: ri + (2 as size_t)
+                }
+                else
+                {
+                    if next_n > pos
+                    {
+                        let seg_before StringC(vs.data_ptr() + pos, next_n - pos)
+                        Rast.lines(w, 0x21 as u8, seg_before)
+                    }
+                    Rast.flush_line(w, 0x21 as u8)
+                    ; the non-SGML char lives in the side pair, not the string
+                    ; (position = insertion point, cf. Esis.put_value_cdata).
+                    let nc *(nsi.get_buffer() + ni + (1 as size_t))
+                    w.acc.add(0x23 as u8)
+                    Esis.put_dec(w.acc, nc as u32)
+                    Rast.put_nl(w)
+                    set pos: next_n
+                    set ni: ni + (2 as size_t)
+                }
+            }
+        }
+        Rast.flush_line(w, 0x21 as u8)
+    }
+
+    ; ---- link info (activeLinks / simpleLinkInfo / impliedSourceLinkRules) --
+    function n_implied(d: pointer[RastDocState]) returns size_t
+    {
+        if d.have_lp = false
+            return 0 as size_t
+        if d.cur_ls = null
+            return 0 as size_t
+        (*d.cur_ls).n_implied_link_rules()
+    }
+
+    function implied_source_link_rules(w: pointer[RastW], d: pointer[RastDocState])
+    {
+        let ls d.cur_ls
+        let n (*ls).n_implied_link_rules()
+        let host w.host
+        let order Array[size_t]^host()
+        var i: size_t 0
+        while i < n
+        {
+            order.add(i)
+            set i: i + 1
+        }
+        var i1: size_t 1
+        while i1 < n
+        {
+            let tem *(order.get_buffer() + i1)
+            let trule (*ls).implied_link_rule(tem)
+            let tt trule.get_result_type()
+            let tname tt.get_name()
+            var j i1
+            var moving true
+            while moving
+            {
+                if j > (0 as size_t)
+                {
+                    ; the reference compares against the rule at the SLOT index
+                    ; (impliedLinkRule(j - 1)), not through the sort order.
+                    let prule (*ls).implied_link_rule(j - (1 as size_t))
+                    let pt prule.get_result_type()
+                    if Rast.lex_cmp(pt.get_name(), tname) <= 0
+                        set moving: false
+                    else
+                    {
+                        order.put(j, *(order.get_buffer() + (j - (1 as size_t))))
+                        set j: j - (1 as size_t)
+                    }
+                }
+                else
+                    set moving: false
+            }
+            order.put(j, tem)
+            set i1: i1 + 1
+        }
+        var i2: size_t 0
+        while i2 < n
+        {
+            let rule (*ls).implied_link_rule(*(order.get_buffer() + i2))
+            let rt rule.get_result_type()
+            w.acc.add(0x5B as u8)
+            Rast.put_name(w, rt.get_name())
+            let ratts rule.get_result_attributes()
+            var have_atts false
+            if ratts <> null
+            {
+                if ratts.size() > (0 as size_t)
+                    set have_atts: true
+            }
+            if have_atts
+            {
+                Rast.put_nl(w)
+                Rast.attribute_info(w, d, ratts, RT_RESULT)
+            }
+            Rast.put_lit(w, String("]\n"))
+            set i2: i2 + 1
+        }
+    }
+
+    function active_links(w: pointer[RastW], d: pointer[RastDocState])
+    {
+        let types d.doc_ps.get_rast_active_types()
+        let n types.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let name *(types.get_buffer() + i)
+            Rast.put_lit(w, String("#ACTIVE-LINK="))
+            Rast.put_name(w, name)
+            Rast.put_nl(w)
+            if d.have_lp
+            {
+                let lname d.lpd.get_name()
+                if lname.equals(name)
+                {
+                    if Rast.n_implied(d) > (0 as size_t)
+                    {
+                        Rast.put_lit(w, String("#INITIAL\n"))
+                        Rast.implied_source_link_rules(w, d)
+                    }
+                }
+            }
+            ; an invalid name already reported at parse time; output-wise the
+            ; block closes regardless.
+            Rast.put_lit(w, String("#END-ACTIVE-LINK\n"))
+            set i: i + 1
+        }
+    }
+
+    function simple_link_info(w: pointer[RastW], d: pointer[RastDocState])
+    {
+        if d.simple_names = null
+            return
+        let types d.doc_ps.get_rast_active_types()
+        let n types.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let aname *(types.get_buffer() + i)
+            let ns d.simple_names.get_length()
+            var j: size_t 0
+            while j < ns
+            {
+                let sname *(d.simple_names.get_buffer() + j)
+                if sname.equals(aname)
+                {
+                    Rast.put_lit(w, String("#SIMPLE-LINK="))
+                    Rast.put_name(w, sname)
+                    Rast.put_nl(w)
+                    if d.simple_atts <> null
+                    {
+                        let satts *(d.simple_atts.get_buffer() + j)
+                        if satts <> null
+                        {
+                            if satts.size() > (0 as size_t)
+                                Rast.attribute_info(w, d, satts, RT_SIMPLE)
+                        }
+                    }
+                    Rast.put_lit(w, String("#END-SIMPLE-LINK\n"))
+                    set j: ns
+                }
+                else
+                    set j: j + 1
+            }
+            set i: i + 1
+        }
+    }
+
+    ; ---- element events ------------------------------------------------------
+    function start_element(w: pointer[RastW], d: pointer[RastDocState], ev: pointer[Event])
+    {
+        Rast.flush_line(w, 0x7C as u8)
+        if d.had_doc_element = false
+        {
+            let types d.doc_ps.get_rast_active_types()
+            if types.get_length() > (0 as size_t)
+            {
+                Rast.active_links(w, d)
+                Rast.simple_link_info(w, d)
+            }
+            set d.had_doc_element: true
+        }
+        w.acc.add(0x5B as u8)
+        let et ev.get_element_type()
+        Rast.put_name(w, et.get_name())
+        var had_newline false
+        let atts ev.get_attributes()
+        if atts <> null
+        {
+            if atts.size() > (0 as size_t)
+            {
+                set had_newline: true
+                Rast.put_nl(w)
+                Rast.attribute_info(w, d, atts, RT_DTD)
+            }
+        }
+        if d.have_lp
+        {
+            let snap ev.get_link_set_after()
+            if snap <> null
+                set d.cur_ls: snap as pointer[LinkSet]
+            if Rast.n_implied(d) > (0 as size_t)
+            {
+                if had_newline = false
+                {
+                    Rast.put_nl(w)
+                    set had_newline: true
+                }
+                Rast.put_lit(w, String("#LINK-SET-INFO\n"))
+                Rast.implied_source_link_rules(w, d)
+            }
+            let rulev ev.get_link_rule()
+            if rulev <> null
+            {
+                if had_newline = false
+                {
+                    Rast.put_nl(w)
+                    set had_newline: true
+                }
+                let rule rulev as pointer[SourceLinkRule]
+                Rast.put_lit(w, String("#LINK-RULE\n"))
+                Rast.attribute_info(w, d, rule.attributes(), RT_LINK)
+                var is_explicit false
+                if d.lpd <> null
+                {
+                    if d.lpd.get_kind() = LPD_EXPLICIT
+                        set is_explicit: true
+                }
+                if is_explicit
+                {
+                    Rast.put_lit(w, String("#RESULT="))
+                    let rt rule.get_result_type()
+                    if rt <> null
+                    {
+                        Rast.put_name(w, rt.get_name())
+                        Rast.put_nl(w)
+                        Rast.attribute_info(w, d, rule.get_result_attributes(), RT_RESULT)
+                    }
+                    else
+                        Rast.put_lit(w, String("#IMPLIED\n"))
+                }
+            }
+        }
+        Rast.put_lit(w, String("]\n"))
+    }
+
+    function end_element(w: pointer[RastW], d: pointer[RastDocState], ev: pointer[Event])
+    {
+        Rast.flush_line(w, 0x7C as u8)
+        Rast.put_lit(w, String("[/"))
+        let et ev.get_element_type()
+        Rast.put_name(w, et.get_name())
+        Rast.put_lit(w, String("]\n"))
+        if d.have_lp
+        {
+            let snap ev.get_link_set_after()
+            if snap <> null
+                set d.cur_ls: snap as pointer[LinkSet]
+            if Rast.n_implied(d) > (0 as size_t)
+            {
+                Rast.put_lit(w, String("#LINK-SET-INFO\n"))
+                Rast.implied_source_link_rules(w, d)
+                Rast.put_lit(w, String("#END-LINK-SET-INFO\n"))
+            }
+        }
+    }
+
+    ; ---- the walk ------------------------------------------------------------
+    ; renders events until an EV_END_SUBDOC (the enclosing subdocument's end
+    ; bracket — returns its index) or the end of the range.
+    function render_range(w: pointer[RastW], d: pointer[RastDocState], buf: pointer[pointer[Event]], start: size_t, n: size_t) returns size_t
+    {
+        var i start
+        while i < n
+        {
+            let ev *(buf + i)
+            let ty ev.get_type()
+            if ty = EV_END_SUBDOC
+                return i
+            if ty = EV_START_ELEMENT
+                Rast.start_element(w, d, ev)
+            else if ty = EV_END_ELEMENT
+                Rast.end_element(w, d, ev)
+            else if ty = EV_DATA
+                Rast.lines(w, 0x7C as u8, ev.get_data())
+            else if ty = EV_SDATA
+            {
+                Rast.flush_line(w, 0x7C as u8)
+                Rast.put_lit(w, String("#SDATA-TEXT\n"))
+                Rast.lines(w, 0x21 as u8, ev.get_data())
+                Rast.flush_line(w, 0x21 as u8)
+                Rast.put_lit(w, String("#END-SDATA\n"))
+            }
+            else if ty = EV_PI
+            {
+                Rast.flush_line(w, 0x7C as u8)
+                Rast.put_lit(w, String("[?"))
+                let data ev.get_data()
+                if data.get_size() > (0 as size_t)
+                {
+                    Rast.put_nl(w)
+                    Rast.lines(w, 0x7C as u8, data)
+                    Rast.flush_line(w, 0x7C as u8)
+                }
+                Rast.put_lit(w, String("]\n"))
+            }
+            else if ty = EV_ENTITY_REF
+            {
+                let ent ev.get_entity()
+                choose *ent
+                    when x: ExternalData
+                    {
+                        Rast.flush_line(w, 0x7C as u8)
+                        Rast.put_lit(w, String("[&"))
+                        Rast.put_name(w, x.get_name())
+                        Rast.put_nl(w)
+                        Rast.external_entity_info(w, d, x, RT_DTD)
+                        Rast.put_lit(w, String("]\n"))
+                    }
+                    else
+                    {
+                    }
+            }
+            else if ty = EV_START_SUBDOC
+            {
+                let ent2 ev.get_entity()
+                choose *ent2
+                    when s: Subdoc
+                    {
+                        Rast.flush_line(w, 0x7C as u8)
+                        Rast.put_lit(w, String("[&"))
+                        Rast.put_name(w, s.get_name())
+                        Rast.put_nl(w)
+                        Rast.put_lit(w, String("#SUBDOC\n"))
+                        Rast.external_id_info(w, s.get_external_id())
+                        if ev.get_subdoc_parsed()
+                            Rast.put_lit(w, String("#PARSED-SUBDOCUMENT\n"))
+                    }
+                    else
+                    {
+                    }
+                ; the spliced child events render under the CHILD's doc state
+                ; (RastSubdocState swap); the matching end bracket closes it.
+                var child d
+                let cps ev.get_child_ps()
+                if cps <> null
+                {
+                    let host w.host
+                    set child: Rast.make_doc_state(host, cps as pointer[ParserState])
+                }
+                set i: Rast.render_range(w, child, buf, i + (1 as size_t), n)
+                Rast.put_lit(w, String("]\n"))
+            }
+            else if ty = EV_NONSGML
+            {
+                Rast.flush_line(w, 0x7C as u8)
+                let nsc ev.get_data()
+                if nsc.get_size() > (0 as size_t)
+                {
+                    w.acc.add(0x23 as u8)
+                    Esis.put_dec(w.acc, nsc.get(0 as size_t))
+                    Rast.put_nl(w)
+                }
+            }
+            else if ty = EV_END_PROLOG
+            {
+                let lpdv ev.get_end_prolog_lpd()
+                if lpdv <> null
+                {
+                    let lpd lpdv as pointer[Lpd]
+                    set d.have_lp: true
+                    set d.lpd: lpd
+                    set d.cur_ls: lpd.initial_link_set_of()
+                }
+                set d.simple_names: ev.get_simple_link_names()
+                set d.simple_atts: ev.get_simple_link_atts()
+            }
+            else if ty = EV_USELINK
+            {
+                let snap2 ev.get_link_set_after()
+                if snap2 <> null
+                    set d.cur_ls: snap2 as pointer[LinkSet]
+                if d.have_lp
+                {
+                    if Rast.n_implied(d) > (0 as size_t)
+                    {
+                        Rast.flush_line(w, 0x7C as u8)
+                        Rast.put_lit(w, String("#LINK-SET-INFO\n"))
+                        Rast.implied_source_link_rules(w, d)
+                        Rast.put_lit(w, String("#END-LINK-SET-INFO\n"))
+                    }
+                }
+            }
+            ; EV_APPINFO / EV_COMMENT / EV_ENTITY_DEFAULTED: not RAST events.
+            set i: i + (1 as size_t)
+        }
+        i
+    }
+
+    ; ---- entry ----------------------------------------------------------------
+    ; Render the whole document's RAST text; with any error the file is just
+    ; the marker line (XRastEventHandler::end + truncateOutput).
+    function write(host: pointer[Page], ps: pointer[ParserState]) returns String
+    {
+        let rsh ps.get_rast()
+        if ps.get_n_errors() <> (0 as u32)
+        {
+            if rsh.get_pi_errors() <> (0 as u32)
+                return String("#RAST-PI-ERROR\n")
+            return String("#ERROR\n")
+        }
+        let acc Array[u8]^host()
+        let w host.allocate(sizeof RastW, alignof RastW) as pointer[RastW]
+        set w.host: host
+        set w.acc: acc
+        set w.utf8: ps.get_output_utf8()
+        set w.line_length: 0
+        set w.results: rsh.get_results()
+        set w.next_result: 0
+        let d Rast.make_doc_state(host, ps)
+        Rast.render_range(w, d, ps.events_buffer(), 0 as size_t, ps.n_events())
+        String(acc.get_buffer() as pointer[const_char], acc.get_length())
+    }
+}

@@ -17,6 +17,7 @@ use opensp.ElementType.ElementType
 use opensp.ElementType.RankStem
 use opensp.Attribute.AttributeContext
 use opensp.Attribute.AttributeValue
+use opensp.Attribute.Text
 use opensp.AttributeList.AttributeList
 use opensp.Recognizer.Recognizer
 use opensp.ModeInfo.ModeInfo
@@ -34,6 +35,7 @@ use opensp.Message.MessageArg
 use opensp.Message.MessageFormatter
 use opensp.ParserAppMessages.ParserAppMessages
 use opensp.ParserMessages.ParserMessages
+use opensp.RastEventHandlerMessages.RastEventHandlerMessages
 use opensp.PosixStorageMessages.PosixStorageMessages
 use opensp.Event.Event
 use opensp.Lpd.Lpd
@@ -287,6 +289,48 @@ define MsSItem
     synced: bool
 )
 
+; RAST (-t): one nested subdoc parse triggered from an ENTITY-attribute's
+; semantics (RastEventHandler::attributeInfo -> subdocEntityInfo). The parse
+; runs at event-queue time (the reference parses at delivery time — stderr
+; interleaving); the writer pops these in FIFO order, which matches its own
+; attribute walk exactly (both walks visit attributes in RAST sort order).
+define RastSubdocParse
+(
+    parsed: bool
+    events: pointer[Array[pointer[Event]]]
+    child_ps: pointer[void]
+)
+
+; RAST state shared across a whole run (parent document + every nested subdoc
+; parse — the RastEventHandler globals, as opposed to the per-document
+; RastSubdocState whose fields live per-ParserState below).
+define RastShared
+(
+    ; the attribute-subdoc FIFO (see RastSubdocParse).
+    results: pointer[Array[RastSubdocParse]]
+    ; piErrorCount_ — any message dispatched through the RAST handler's own
+    ; Messenger counts; #RAST-PI-ERROR instead of #ERROR when non-zero.
+    pi_errors: u32
+)
+{
+    function make(host: pointer[Page]) returns pointer[RastShared]
+    {
+        let r host.allocate(sizeof RastShared, alignof RastShared) as pointer[RastShared]
+        set r.results: Array[RastSubdocParse]^host()
+        set r.pi_errors: 0 as u32
+        r
+    }
+
+    function note_pi_error(this: pointer[RastShared])
+        set this.pi_errors: this.pi_errors + (1 as u32)
+
+    function get_pi_errors(this: RastShared) returns u32
+        pi_errors
+
+    function get_results(this: RastShared) returns pointer[Array[RastSubdocParse]]
+        results
+}
+
 define ParserState
 (
     host: pointer[Page]
@@ -477,6 +521,32 @@ define ParserState
     pending_opens: pointer[Array[PendingOpen]]
     pending_open_next: size_t
     in_pending_flush: bool
+    ; --- RAST (-t): the run-global shared half (null = RAST off) plus the
+    ;     per-document RastSubdocState (RastEventHandler.h:73) — a subdoc
+    ;     child ParserState starts these fresh, exactly like the reference's
+    ;     swap/init around a nested parse. ---
+    rast: pointer[RastShared]
+    ; parseSubdocQueue_ (0/1 per rast-parse-subdoc PI) + consumed head.
+    rast_psq: Array[int]
+    rast_psq_head: size_t
+    ; linkRuleQueue_ (the rast-link-rule: PI payloads) + consumed head.
+    rast_lrq_pi: Array[StringC]
+    rast_lrq_loc: Array[Location]
+    rast_lrq_head: size_t
+    ; hadActiveLpdOrDtd_ / activeLpdOrDtdLocation_ / activeLinkTypes_ — the
+    ; PI-declared active link types (NOT the -a list, which never renders
+    ; #ACTIVE-LINK blocks).
+    rast_had_active: bool
+    rast_active_loc: Location
+    rast_active_types: Array[StringC]
+    ; hadDocumentElement_ (parse-time half: the invalidActiveLinkType check).
+    rast_had_doc_element: bool
+    ; the endProlog simple-link stash (the writer reads the event; this feeds
+    ; the parse-time first-element check).
+    rast_simple_names: pointer[Array[StringC]]
+    ; pass-1 interleave marks: events.length at each pass-1 kept message, so
+    ; the no-pass2 replay interprets buffered rast PIs in stream order.
+    pass1_kept_marks: Array[size_t]
 )
 {
     function make(host: pointer[Page], entity_manager: pointer[EntityManager], subdoc_level: u32, final_phase: int) returns pointer[ParserState]
@@ -589,7 +659,389 @@ define ParserState
         set ps.pending_opens: null
         set ps.pending_open_next: 0
         set ps.in_pending_flush: false
+        set ps.rast: null
+        set ps.rast_psq: Array[int]^host()
+        set ps.rast_psq_head: 0
+        set ps.rast_lrq_pi: Array[StringC]^host()
+        set ps.rast_lrq_loc: Array[Location]^host()
+        set ps.rast_lrq_head: 0
+        set ps.rast_had_active: false
+        set ps.rast_active_loc: Location()
+        set ps.rast_active_types: Array[StringC]^host()
+        set ps.rast_had_doc_element: false
+        set ps.rast_simple_names: null
+        set ps.pass1_kept_marks: Array[size_t]^host()
         ps
+    }
+
+    ; ---- RAST (-t) --------------------------------------------------------
+    function set_rast(this: pointer[ParserState], r: pointer[RastShared])
+        set this.rast: r
+
+    function get_rast(this: ParserState) returns pointer[RastShared]
+        rast
+
+    function rast_on(this: ParserState) returns bool
+        rast <> null
+
+    function get_rast_active_types(this: pointer[ParserState]) returns pointer[Array[StringC]]
+    {
+        return &this.rast_active_types
+    }
+
+    ; the writer's raw view of the event queue.
+    function events_buffer(this: ParserState) returns pointer[pointer[Event]]
+        events.get_buffer()
+
+    ; the queue itself (a captured attribute-subdoc parse hands its whole
+    ; event array to the RAST FIFO).
+    function get_events(this: pointer[ParserState]) returns pointer[Array[pointer[Event]]]
+    {
+        return &this.events
+    }
+
+    function get_lp_lpd(this: ParserState) returns pointer[Lpd]
+        lp_lpd
+
+    ; the current top link set (the RAST uselink event's snapshot source);
+    ; null while no link process runs.
+    function lp_current_set(this: ParserState) returns pointer[void]
+    {
+        if have_link_process = false
+            return null
+        if lp_depth = (0 as size_t)
+            return null
+        let top lp_open.get_buffer() + (lp_depth - (1 as size_t))
+        top.current as pointer[void]
+    }
+
+    function get_have_link_process(this: ParserState) returns bool
+        have_link_process
+
+    ; RastLinkProcess / interpretRastPi dispatch their messages through the
+    ; handler's own Messenger, whose dispatchMessage bumps piErrorCount_ for
+    ; every error — the end() marker then reads #RAST-PI-ERROR.
+    function rast_report0(this: pointer[ParserState], mt: MessageType, loc: Location)
+    {
+        let args Vector[MessageArg]()
+        this.report_at(mt, args, loc)
+        this.rast.note_pi_error()
+    }
+
+    function rast_report1(this: pointer[ParserState], mt: MessageType, arg: StringC, loc: Location)
+    {
+        var args Vector[MessageArg](1 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Str(arg)
+        this.report_at(mt, args, loc)
+        this.rast.note_pi_error()
+    }
+
+    ; parseNextSubdoc — pop the front of the parse-subdoc queue (empty = no).
+    function rast_next_subdoc(this: pointer[ParserState]) returns bool
+    {
+        if this.rast_psq_head >= this.rast_psq.get_length()
+            return false
+        let v *(this.rast_psq.get_buffer() + this.rast_psq_head)
+        set this.rast_psq_head: this.rast_psq_head + (1 as size_t)
+        v <> 0
+    }
+
+    ; string equality / prefix over the PI data (RastEventHandler.cxx equal/
+    ; prefix — the rast-* keyword strings are ASCII, execToInternal identity).
+    function rast_lit_equal(data: StringC, lit: String) returns bool
+    {
+        let n lit.get_length()
+        if data.get_size() <> n
+            return false
+        var i: size_t 0
+        while i < n
+        {
+            if data.get(i) <> (lit.get(i) as u32)
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    function rast_lit_prefix(data: StringC, lit: String) returns bool
+    {
+        let n lit.get_length()
+        if data.get_size() < n
+            return false
+        var i: size_t 0
+        while i < n
+        {
+            if data.get(i) <> (lit.get(i) as u32)
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; interpretRastPi (RastEventHandler.cxx:362) — runs at the PI event's
+    ; delivery point. Returns nothing; an uninterpretable rast-* PI reports
+    ; invalidRastPiError at the event's location.
+    function rast_interpret_pi(this: pointer[ParserState], e: pointer[Event])
+    {
+        let data e.get_data()
+        ; the dispatch gate: dataLength >= 4 and the first 4 chars equal the
+        ; first 4 of "rast-parse-subdoc:yes" (i.e. "rast").
+        if data.get_size() < (4 as size_t)
+            return
+        if ParserState.rast_lit_prefix(data, String("rast")) = false
+            return
+        if ParserState.rast_lit_equal(data, String("rast-parse-subdoc:no"))
+        {
+            this.rast_psq.add(0)
+            return
+        }
+        if ParserState.rast_lit_equal(data, String("rast-parse-subdoc:yes"))
+        {
+            this.rast_psq.add(1)
+            return
+        }
+        if ParserState.rast_lit_prefix(data, String("rast-active-lpd:"))
+        {
+            ; one shot per document; later rast-active-lpd PIs are silently
+            ; valid no-ops.
+            if this.rast_had_active
+                return
+            set this.rast_had_active: true
+            set this.rast_active_loc: e.get_loc()
+            let hp this.host
+            let pfx 16 as size_t
+            let n data.get_size()
+            var p pfx
+            var start p
+            var ok true
+            var scanning true
+            while scanning
+            {
+                var at_sep p >= n
+                if at_sep = false
+                {
+                    if data.get(p) = (0x2C as u32)
+                        set at_sep: true
+                }
+                if at_sep
+                {
+                    let len p - start
+                    if len = (0 as size_t)
+                    {
+                        ; an empty name = an invalid PI (the whole PI reports).
+                        set ok: false
+                        set scanning: false
+                    }
+                    else
+                    {
+                        let name StringC^hp(data.data_ptr() + start, len)
+                        ; duplicate check against the accumulated list.
+                        let na this.rast_active_types.get_length()
+                        var di: size_t 0
+                        while di < na
+                        {
+                            let prev *(this.rast_active_types.get_buffer() + di)
+                            if prev.equals(name)
+                            {
+                                (*this).rast_report1(RastEventHandlerMessages.duplicateActiveLinkType(), name, this.rast_active_loc)
+                                set di: na
+                            }
+                            else
+                                set di: di + 1
+                        }
+                        this.rast_active_types.add(name)
+                        if p >= n
+                            set scanning: false
+                        else
+                        {
+                            set p: p + (1 as size_t)
+                            set start: p
+                        }
+                    }
+                }
+                else
+                    set p: p + (1 as size_t)
+            }
+            if ok = false
+            {
+                (*this).rast_report0(RastEventHandlerMessages.invalidRastPiError(), e.get_loc())
+                return
+            }
+            ; parser_->activateLinkType for every accumulated name (the
+            ; reference loops the whole list; linkActivateTooLate applies).
+            let na2 this.rast_active_types.get_length()
+            var ai: size_t 0
+            while ai < na2
+            {
+                this.add_active_link_type(*(this.rast_active_types.get_buffer() + ai))
+                set ai: ai + 1
+            }
+            return
+        }
+        if ParserState.rast_lit_prefix(data, String("rast-link-rule:"))
+        {
+            let hp2 this.host
+            let pfx2 15 as size_t
+            this.rast_lrq_pi.add(StringC^hp2(data.data_ptr() + pfx2, data.get_size() - pfx2))
+            this.rast_lrq_loc.add(e.get_loc())
+            return
+        }
+        (*this).rast_report0(RastEventHandlerMessages.invalidRastPiError(), e.get_loc())
+    }
+
+    ; RastLinkProcess::selectLinkRule — called only when more than one link
+    ; rule applies. Consumes the front of the rast-link-rule PI queue; with an
+    ; empty queue reports multipleLinkRules at the element's location. Returns
+    ; the selected index (0 on any failure, like the reference).
+    function rast_select_link_rule(this: pointer[ParserState], cands: pointer[Array[pointer[AttributeList]]], loc: Location) returns size_t
+    {
+        if this.rast_lrq_head >= this.rast_lrq_pi.get_length()
+        {
+            if cands.get_length() > (0 as size_t)
+                (*this).rast_report0(RastEventHandlerMessages.multipleLinkRules(), loc)
+            return 0 as size_t
+        }
+        let value *(this.rast_lrq_pi.get_buffer() + this.rast_lrq_head)
+        let ploc *(this.rast_lrq_loc.get_buffer() + this.rast_lrq_head)
+        set this.rast_lrq_head: this.rast_lrq_head + (1 as size_t)
+        ; selectLinkRulePi: match the PI value against each candidate list's
+        ; attribute values (cdata via the text string, tokenized via the
+        ; tokenized string).
+        var have false
+        var selected: size_t 0
+        let nc cands.get_length()
+        var i: size_t 0
+        while i < nc
+        {
+            let a *(cands.get_buffer() + i)
+            var matched false
+            let na a.size()
+            var j: size_t 0
+            while j < na
+            {
+                let v a.value(j)
+                if v <> null
+                {
+                    let vt v.value_type()
+                    if vt = AVT_CDATA
+                    {
+                        let t v.get_text()
+                        if t <> null
+                        {
+                            if (*t).string().equals(value)
+                                set matched: true
+                        }
+                    }
+                    else if vt = AVT_TOKENIZED
+                    {
+                        if v.get_string().equals(value)
+                            set matched: true
+                    }
+                }
+                if matched
+                    set j: na
+                else
+                    set j: j + 1
+            }
+            if matched
+            {
+                if have
+                {
+                    (*this).rast_report0(RastEventHandlerMessages.multipleLinkRuleMatch(), ploc)
+                    return 0 as size_t
+                }
+                set have: true
+                set selected: i
+            }
+            set i: i + 1
+        }
+        if have = false
+        {
+            (*this).rast_report0(RastEventHandlerMessages.noLinkRuleMatch(), ploc)
+            return 0 as size_t
+        }
+        selected
+    }
+
+    ; the first-start-element activeLinks() check (RastEventHandler.cxx:220,
+    ; message half): a PI-declared link type naming neither the active complex
+    ; LPD nor an active simple LPD reports invalidActiveLinkType at the
+    ; rast-active-lpd PI's location. The OUTPUT half renders in the writer.
+    function rast_note_first_element(this: pointer[ParserState])
+    {
+        if this.rast_had_doc_element
+            return
+        set this.rast_had_doc_element: true
+        let n this.rast_active_types.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let name *(this.rast_active_types.get_buffer() + i)
+            var found false
+            if this.have_link_process
+            {
+                let lname *(this.lp_name)
+                if lname.equals(name)
+                    set found: true
+            }
+            if found = false
+            {
+                if this.rast_simple_names <> null
+                {
+                    let ns this.rast_simple_names.get_length()
+                    var j: size_t 0
+                    while j < ns
+                    {
+                        let sn *(this.rast_simple_names.get_buffer() + j)
+                        if sn.equals(name)
+                        {
+                            set found: true
+                            set j: ns
+                        }
+                        else
+                            set j: j + 1
+                    }
+                }
+            }
+            if found = false
+                (*this).rast_report1(RastEventHandlerMessages.invalidActiveLinkType(), name, this.rast_active_loc)
+            set i: i + 1
+        }
+    }
+
+    ; the no-pass2 replay (maybeStartPass2's release loop): the reference
+    ; replays pass-1 events and kept messages as ONE interleaved queue — the
+    ; port emits each kept message after interpreting the buffered rast PIs
+    ; that preceded it (pass1_kept_marks), then interprets the rest.
+    function flush_pass1_messages_rast(this: pointer[ParserState])
+    {
+        var ei this.pass1_events_mark
+        var i: size_t 0
+        while i < this.n_pass1_kept
+        {
+            var mark this.events.get_length()
+            if i < this.pass1_kept_marks.get_length()
+                set mark: *(this.pass1_kept_marks.get_buffer() + i)
+            while ei < mark
+            {
+                let ev *(this.events.get_buffer() + ei)
+                if ev.get_type() = EV_PI
+                    this.rast_interpret_pi(ev)
+                set ei: ei + (1 as size_t)
+            }
+            let km this.pass1_kept.get_buffer() + i
+            this.emit_kept_at(km)
+            set i: i + (1 as size_t)
+        }
+        set this.n_pass1_kept: 0
+        let ne this.events.get_length()
+        while ei < ne
+        {
+            let ev2 *(this.events.get_buffer() + ei)
+            if ev2.get_type() = EV_PI
+                this.rast_interpret_pi(ev2)
+            set ei: ei + (1 as size_t)
+        }
     }
 
     ; ---- diagnostic program name -----------------------------------------
@@ -717,13 +1169,28 @@ define ParserState
         else if ty = EV_END_ELEMENT
         {
             if this.have_link_process
-                this.lp_end_element()
+                this.lp_end_element(e)
+        }
+        else if ty = EV_PI
+        {
+            ; RAST: rast-* PIs interpret at the event's DELIVERY point — not
+            ; while pass-1 buffering (discarded events are never interpreted;
+            ; the no-pass2 replay interprets them via flush_pass1_messages_rast).
+            if this.rast <> null
+            {
+                if (*this).is_pass1_buffering() = false
+                    this.rast_interpret_pi(e)
+            }
         }
         else if ty = EV_END_PROLOG
         {
             let lpd e.get_end_prolog_lpd() as pointer[Lpd]
             if lpd <> null
                 this.lp_init(lpd)
+            ; RAST: stash the simple-link names for the first-start-element
+            ; activeLinks check (the writer reads the event itself).
+            if this.rast <> null
+                set this.rast_simple_names: e.get_simple_link_names()
             ; -p (only-prolog): PrologMessageEventHandler::endProlog cancels
             ; the parse when the end-prolog event is delivered — the instance
             ; is never parsed and no output is produced (the driver skips the
@@ -1369,8 +1836,11 @@ define ParserState
 
     ; LinkProcess::startElement — select the applicable link rule (ID link
     ; rules first, then the current link set's rules for the element; onsgmls
-    ; never overrides selectLinkRule, so rule 0 is always selected), push the
-    ; open-element entry, attach the rule's link attributes to the event.
+    ; never overrides selectLinkRule, so with more than one rule index 0 is
+    ; selected silently — under RAST (-t) the RastLinkProcess override consumes
+    ; the rast-link-rule PI queue), push the open-element entry, attach the
+    ; rule (and its link attributes) to the event, snapshot the post-push
+    ; current link set for the RAST writer.
     function lp_start_element(this: pointer[ParserState], e: pointer[Event])
     {
         let lpd this.lp_lpd
@@ -1384,9 +1854,26 @@ define ParserState
             let grp lpd.lookup_id_link(id)
             if grp <> null
             {
-                let rule grp.link_rule(0 as size_t)
+                var sel: size_t 0
+                let nr grp.n_link_rules()
+                if (nr > (1 as size_t)) and (this.rast <> null)
+                {
+                    let hp this.host
+                    let cands Array[pointer[AttributeList]]^hp()
+                    var ci: size_t 0
+                    while ci < nr
+                    {
+                        let r2 grp.link_rule(ci)
+                        cands.add(r2.attributes())
+                        set ci: ci + 1
+                    }
+                    set sel: this.rast_select_link_rule(cands, e.get_markup_loc())
+                }
+                let rule grp.link_rule(sel)
                 this.lp_push_rule(rule)
                 e.set_link_attributes(rule.attributes(), this.lp_name)
+                e.set_link_rule(rule as pointer[void])
+                this.lp_snapshot(e)
                 if rule.is_associated_with(element) = false
                 {
                     var args Vector[MessageArg](2 as size_t)
@@ -1404,9 +1891,25 @@ define ParserState
         let n cur.n_link_rules(element)
         if n > (0 as size_t)
         {
-            let rule cur.link_rule(element, 0 as size_t)
+            var sel2: size_t 0
+            if (n > (1 as size_t)) and (this.rast <> null)
+            {
+                let hp2 this.host
+                let cands2 Array[pointer[AttributeList]]^hp2()
+                var ci2: size_t 0
+                while ci2 < n
+                {
+                    let r3 cur.link_rule(element, ci2)
+                    cands2.add(r3.attributes())
+                    set ci2: ci2 + 1
+                }
+                set sel2: this.rast_select_link_rule(cands2, e.get_markup_loc())
+            }
+            let rule cur.link_rule(element, sel2)
             this.lp_push_rule(rule)
             e.set_link_attributes(rule.attributes(), this.lp_name)
+            e.set_link_rule(rule as pointer[void])
+            this.lp_snapshot(e)
             return
         }
         ; no applicable rule: a plain open element, the current set carries.
@@ -1416,6 +1919,16 @@ define ParserState
         set plain.post: null
         set plain.post_restore: false
         this.lp_push(plain)
+        this.lp_snapshot(e)
+    }
+
+    ; stamp the current (top) link set on the event (the RAST writer's view of
+    ; the link process at this stream position).
+    function lp_snapshot(this: pointer[ParserState], e: pointer[Event])
+    {
+        let buf this.lp_open.get_buffer()
+        let top buf + (this.lp_depth - (1 as size_t))
+        e.set_link_set_after(top.current as pointer[void])
     }
 
     ; LinkProcessOpenElement(cur, rule) — the rule's USELINK (if any) becomes
@@ -1438,11 +1951,15 @@ define ParserState
     }
 
     ; LinkProcess::endElement — pop; POSTLINK (or its #RESTORE form) rewrites
-    ; the PARENT's current link set.
-    function lp_end_element(this: pointer[ParserState])
+    ; the PARENT's current link set. Snapshots the post-pop set on the event
+    ; for the RAST writer's end-element #LINK-SET-INFO block.
+    function lp_end_element(this: pointer[ParserState], e: pointer[Event])
     {
         if this.lp_depth <= (1 as size_t)
+        {
+            this.lp_snapshot(e)
             return
+        }
         let buf this.lp_open.get_buffer()
         let top buf + (this.lp_depth - (1 as size_t))
         set this.lp_depth: this.lp_depth - (1 as size_t)
@@ -1451,6 +1968,7 @@ define ParserState
             set head.current: top.post
         else if top.post_restore
             set head.current: head.restore
+        this.lp_snapshot(e)
     }
 
     ; LinkProcess::uselink — a USELINK declaration for the ACTIVE lpd rewrites
@@ -2702,6 +3220,12 @@ define ParserState
                 this.pass1_kept.put(this.n_pass1_kept, km)
             else
                 this.pass1_kept.add(km)
+            ; RAST interleave mark: how many events were queued when this
+            ; message was kept (flush_pass1_messages_rast's replay order).
+            if this.n_pass1_kept < this.pass1_kept_marks.get_length()
+                this.pass1_kept_marks.put(this.n_pass1_kept, this.events.get_length())
+            else
+                this.pass1_kept_marks.add(this.events.get_length())
             set this.n_pass1_kept: this.n_pass1_kept + (1 as size_t)
         }
         else

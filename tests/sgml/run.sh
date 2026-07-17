@@ -31,6 +31,8 @@
 #                         WITHOUT copying local source into this tree
 #   SP_ENV="K=V K=V"      environment prefix (e.g. SP_CHARSET_FIXED=YES SP_ENCODING=XML)
 #   EXTRA_ARGS="..."      extra args before DOC (e.g. a leading xml.dcl, -c catalog)
+#   RAST=1                run with -t <tmpfile> and compare it against the
+#                         entry's expected.rast golden (the -t RAST axis)
 
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -69,7 +71,7 @@ for entry in "$HERE"/corpus/*/ "$HERE"/corpus-private/*/; do
   name="$(basename "$entry")"
   case "$name" in $FILTER) ;; *) continue ;; esac
 
-  DOC=""; BASE="entry"; SP_ENV=""; EXTRA_ARGS=""; WORKDIR=""
+  DOC=""; BASE="entry"; SP_ENV=""; EXTRA_ARGS=""; WORKDIR=""; RAST=0
   # shellcheck disable=SC1091
   . "$entry/manifest"
   [ -n "$DOC" ] || { echo "  $name: manifest missing DOC" >&2; continue; }
@@ -88,7 +90,10 @@ for entry in "$HERE"/corpus/*/ "$HERE"/corpus-private/*/; do
   fi
 
   got_esis="$TMP/$name.esis"; got_exit="$TMP/$name.exit"
-  ( cd "$workdir" && env $SP_ENV "$BIN" $EXTRA_ARGS "$DOC" ) \
+  got_rast="$TMP/$name.rast"; rm -f "$got_rast"
+  RAST_ARGS=""
+  [ "$RAST" = "1" ] && RAST_ARGS="-t $got_rast"
+  ( cd "$workdir" && env $SP_ENV "$BIN" $RAST_ARGS $EXTRA_ARGS "$DOC" ) \
     >"$got_esis" 2>"$TMP/$name.err"
   echo $? >"$got_exit"
 
@@ -98,6 +103,7 @@ for entry in "$HERE"/corpus/*/ "$HERE"/corpus-private/*/; do
     cp "$got_esis" "$entry/expected.esis"
     cp "$got_exit" "$entry/expected.exit"
     cp "$TMP/$name.err.norm" "$entry/expected.err"
+    [ "$RAST" = "1" ] && cp "$got_rast" "$entry/expected.rast"
     echo "  blessed $name"
     total=$((total+1)); ok=$((ok+1))
     continue
@@ -113,14 +119,19 @@ for entry in "$HERE"/corpus/*/ "$HERE"/corpus-private/*/; do
   if [ -f "$entry/expected.err" ]; then
     diff -q "$entry/expected.err" "$TMP/$name.err.norm" >/dev/null 2>&1 || err_ok=0
   fi
+  rast_ok=1
+  if [ "$RAST" = "1" ]; then
+    diff -q "$entry/expected.rast" "$got_rast" >/dev/null 2>&1 || rast_ok=0
+  fi
   if diff -q "$entry/expected.esis" "$got_esis" >/dev/null 2>&1 \
      && [ "$(cat "$entry/expected.exit" 2>/dev/null)" = "$(cat "$got_exit")" ] \
-     && [ "$err_ok" -eq 1 ]; then
+     && [ "$err_ok" -eq 1 ] && [ "$rast_ok" -eq 1 ]; then
     ok=$((ok+1))
   else
     failed="$failed $name"
     reason="exit want=$(cat "$entry/expected.exit" 2>/dev/null) got=$(cat "$got_exit")"
     [ "$err_ok" -eq 0 ] && reason="$reason; stderr differs"
+    [ "$rast_ok" -eq 0 ] && reason="$reason; rast differs"
     echo "  MISMATCH $name ($reason)"
   fi
 done

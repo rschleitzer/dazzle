@@ -44,6 +44,8 @@ use opensp.ParserOptions.ParserOptions
 use opensp.ParserState.ParserState
 use opensp.ParserState.LpdEntityRef
 use opensp.ParserState.MsSItem
+use opensp.ParserState.RastShared
+use opensp.ParserState.RastSubdocParse
 use opensp.Lpd.Lpd
 use opensp.Lpd.LinkSet
 use opensp.Lpd.SourceLinkRule
@@ -53,6 +55,7 @@ use opensp.ContentState.ContentState
 use opensp.OpenElement.OpenElement
 use opensp.Event.Event
 use opensp.Esis.Esis
+use opensp.Rast.Rast
 use opensp.Recognizer.Recognizer
 use opensp.ModeInfo.ModeInfo
 use opensp.SdParser.SdParam
@@ -8207,10 +8210,17 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         {
             let ev *(events.get_buffer() + i)
             if ev.get_type() = EV_START_ELEMENT
+            {
                 ps.note_start_element(ev.is_included())
+                this.rast_pre_start(ev)
+                ps.queue_event(ev)
+                this.rast_post_start(ev)
+            }
             else
+            {
                 ps.note_end_element(ev.is_included())
-            ps.queue_event(ev)
+                ps.queue_event(ev)
+            }
             set i: i + 1
         }
     }
@@ -8572,6 +8582,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         if ps.get_content_state().tag_level_of() = taglvl_q
             this.report_num_at(ParserMessages.taglvlOpenElements(), taglvl_q as u64, ps.current_input().token_start_location())
         ps.note_start_element(event.is_included())
+        this.rast_pre_start(event)
         if this.must_omit_end(e)
         {
             if ps.get_sd().empty_element_normal()
@@ -8581,6 +8592,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 let included event.is_included()
                 let sloc event.get_loc()
                 ps.queue_event(event)
+                this.rast_post_start(event)
                 this.end_tag_empty_element(e, net, included, sloc)
             }
             else
@@ -8588,6 +8600,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 ; EMPTY element: emit start immediately followed by an implied end.
                 ps.note_end_element(event.is_included())
                 ps.queue_event(event)
+                this.rast_post_start(event)
                 let endev Event.make_end(host, e, event.get_loc())
                 if event.is_included()
                     endev.set_included()
@@ -8611,6 +8624,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let oe OpenElement.make(host, e, net, event.is_included(), map, event.get_markup_loc())
         ps.push_element_mode(oe)
         ps.queue_event(event)
+        this.rast_post_start(event)
     }
 
     function parse_end_tag(this: Parser) returns pointer[Event]
@@ -9836,7 +9850,22 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
         ; START bracket — the writer flushes the parent data run, defines the
         ; subdoc entity on first use (s/f/S), then emits `{name`.
-        ps.queue_event(Event.make_start_subdoc(host, ent, ref_start))
+        let start_ev Event.make_start_subdoc(host, ent, ref_start)
+        ps.queue_event(start_ev)
+
+        ; RAST (-t): whether the referenced document parses at all is decided
+        ; by the rast-parse-subdoc PI queue (RastEventHandler::subdocEntityInfo
+        ; -> parseNextSubdoc; an empty queue means NO). An unparsed subdoc is
+        ; never opened — no SgmlParser exists, so no open failure reports.
+        if ps.rast_on()
+        {
+            if ps.rast_next_subdoc() = false
+            {
+                ps.queue_event(Event.make_end_subdoc(host, ent, ref_start))
+                return
+            }
+            start_ev.set_subdoc_parsed()
+        }
 
         ; open the referenced document (effective system id = sysid resolved
         ; against the declaring file's directory). On failure the openSystemCall
@@ -9880,8 +9909,15 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         child.set_sd(ps.get_sd())
         child.set_syntaxes(ps.get_prolog_syntax(), ps.get_instance_syntax())
         ; subdocInheritActiveLinkTypes (SgmlsEventHandler::subdocEntity): the
-        ; child inherits the -a activation list.
-        child.inherit_active_link_types(ps)
+        ; child inherits the -a activation list — the RAST handler passes 0
+        ; (activation comes from the child's own rast-active-lpd PIs).
+        if ps.rast_on()
+        {
+            child.set_rast(ps.get_rast())
+            start_ev.set_child_ps(child as pointer[void])
+        }
+        else
+            child.inherit_active_link_types(ps)
         let cat ps.get_entity_catalog()
         if cat <> null
             child.set_entity_catalog(cat)
@@ -9922,6 +9958,224 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
 
         ; END bracket — `}name`.
         ps.queue_event(Event.make_end_subdoc(host, ent, ref_start))
+    }
+
+    ; ---- RAST (-t): the start-element delivery hooks -----------------------
+    ; The reference RastEventHandler processes a StartElementEvent at delivery
+    ; time: activeLinks() at the first element, then attributeInfo over the
+    ; DTD attributes (whose ENTITY semantics may nested-parse subdocuments),
+    ; then the link process (selectLinkRule — run by lp_start_element inside
+    ; queue_event), then the link rule's own attribute lists. The message and
+    ; nested-parse SIDE EFFECTS run here at the queue position; the writer
+    ; renders the text later from the events + the shared FIFO.
+    function rast_pre_start(this: Parser, event: pointer[Event])
+    {
+        if ps.rast_on() = false
+            return
+        ps.rast_note_first_element()
+        this.rast_scan_attrs(event.get_attributes())
+    }
+
+    function rast_post_start(this: Parser, event: pointer[Event])
+    {
+        if ps.rast_on() = false
+            return
+        let rulev event.get_link_rule()
+        if rulev = null
+            return
+        let rule rulev as pointer[SourceLinkRule]
+        this.rast_scan_attrs(rule.attributes())
+        ; #RESULT attributes render only for an EXPLICIT lpd with a present
+        ; result element — mirror the writer's consumption exactly.
+        let lpd ps.get_lp_lpd()
+        if lpd <> null
+        {
+            if lpd.get_kind() = LPD_EXPLICIT
+            {
+                if rule.get_result_type() <> null
+                    this.rast_scan_attrs(rule.get_result_attributes())
+            }
+        }
+    }
+
+    ; walk an attribute list exactly like the writer's attributeInfo (RAST
+    ; sort order, then each attribute's ENTITY semantics in value order),
+    ; running the parse-time side effects: an external data entity recurses
+    ; into its data attributes, a subdoc entity consumes the parse-subdoc
+    ; queue and (maybe) nested-parses.
+    function rast_scan_attrs(this: Parser, atts: pointer[AttributeList])
+    {
+        if atts = null
+            return
+        let length atts.size()
+        if length = (0 as size_t)
+            return
+        let order Array[size_t]^host()
+        var i0: size_t 0
+        while i0 < length
+        {
+            order.add(i0)
+            set i0: i0 + 1
+        }
+        var i1: size_t 1
+        while i1 < length
+        {
+            let tem *(order.get_buffer() + i1)
+            let tname atts.name(tem)
+            var j i1
+            var moving true
+            while moving
+            {
+                if j > (0 as size_t)
+                {
+                    let prev *(order.get_buffer() + (j - (1 as size_t)))
+                    if Rast.lex_cmp(atts.name(prev), tname) <= 0
+                        set moving: false
+                    else
+                    {
+                        order.put(j, prev)
+                        set j: j - (1 as size_t)
+                    }
+                }
+                else
+                    set moving: false
+            }
+            order.put(j, tem)
+            set i1: i1 + 1
+        }
+        var j2: size_t 0
+        while j2 < length
+        {
+            let i *(order.get_buffer() + j2)
+            let a atts.attribute(i)
+            let sem a.get_semantics()
+            if sem <> null
+            {
+                let ne sem.n_entities()
+                var k: size_t 0
+                while k < ne
+                {
+                    let entv sem.entity(k)
+                    if entv <> null
+                    {
+                        let ent entv as pointer[Entity]
+                        choose *ent
+                            when x: ExternalData
+                                this.rast_scan_attrs(x.get_attributes() as pointer[AttributeList])
+                            when s: Subdoc
+                            {
+                                ; the nested parse's origin anchors at the
+                                ; k-th value token (TokenizedAttributeValue::
+                                ; tokenLocation — EntityOrigin::make's loc).
+                                var tok_loc ps.current_location()
+                                let v2 atts.value(i)
+                                if v2 <> null
+                                {
+                                    let t2 v2.get_text()
+                                    if t2 <> null
+                                    {
+                                        var tstart: size_t 0
+                                        if k > (0 as size_t)
+                                        {
+                                            let si v2.get_space_index()
+                                            if si <> null
+                                            {
+                                                if (k - (1 as size_t)) < si.get_length()
+                                                    set tstart: *(si.get_buffer() + (k - (1 as size_t))) + (1 as size_t)
+                                            }
+                                        }
+                                        if (*t2).has_locs()
+                                            set tok_loc: (*t2).loc_at(tstart)
+                                    }
+                                }
+                                this.rast_parse_attr_subdoc(ent, tok_loc)
+                            }
+                            else
+                            {
+                            }
+                    }
+                    set k: k + 1
+                }
+            }
+            set j2: j2 + 1
+        }
+    }
+
+    ; RastEventHandler::subdocEntityInfo for an ENTITY-attribute subdoc: pop
+    ; the parse-subdoc queue; when it says yes, run the nested parse NOW (the
+    ; reference parses inside attributeInfo — message order) and capture the
+    ; child's events for the writer's FIFO.
+    function rast_parse_attr_subdoc(this: Parser, ent: pointer[Entity], tok_loc: Location)
+    {
+        var entry RastSubdocParse()
+        set entry.parsed: ps.rast_next_subdoc()
+        set entry.events: null
+        set entry.child_ps: null
+        let rsh ps.get_rast()
+        if entry.parsed = false
+        {
+            rsh.get_results().add(entry)
+            return
+        }
+        var fsi String()
+        var sbase String()
+        choose *ent
+            when s: Subdoc
+            {
+                let id s.get_external_id()
+                let f0 this.entity_fsi(id, s.get_base_dir())
+                set fsi: String^host(f0)
+                set sbase: String^host(s.get_base_dir())
+            }
+            else
+                return
+        var src: pointer[InputSource] null
+        var sfound String()
+        if fsi.get_length() <> (0 as size_t)
+        {
+            let sorg host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+            set *sorg: Origin()
+            set src: this.fsi_open(fsi, sorg, tok_loc, tok_loc, 0, &sfound)
+        }
+        if sfound.get_length() > (0 as size_t)
+        {
+            let sfdir Path.get_directory_name(sfound)
+            let sb2 String^host(sfdir)
+            set sbase: sb2
+        }
+        let child ParserState.make(host, null, ps.get_subdoc_level() + (1 as u32), PHASE_PROLOG)
+        child.set_prog_name(ps.get_prog_name())
+        child.set_output_utf8(ps.get_output_utf8())
+        child.set_reporter_options(ps.reporter_options)
+        child.set_output_flags(ps.get_output_flags())
+        child.set_error_limit(ps.get_error_limit())
+        child.set_msg_fd(ps.msg_fd)
+        child.set_options(ps.get_options())
+        child.set_base_dir(sbase)
+        child.set_decl_base_dir(sbase)
+        child.set_sd(ps.get_sd())
+        child.set_syntaxes(ps.get_prolog_syntax(), ps.get_instance_syntax())
+        ; subdocInheritActiveLinkTypes = 0 under RAST; the shared half threads.
+        child.set_rast(rsh)
+        let cat ps.get_entity_catalog()
+        if cat <> null
+            child.set_entity_catalog(cat)
+        let sub_parser Parser.make(host, child)
+        if child.get_subdoc_level() = (ps.get_sd().subdoc() + (1 as u32))
+            sub_parser.report_num_at(ParserMessages.subdocLevel(), ps.get_sd().subdoc() as u64, Location())
+        if src = null
+            sub_parser.report0_at(ParserMessages.documentEndProlog(), Location())
+        else
+        {
+            child.push_input(src)
+            let table ModeInfo.build_table(host)
+            sub_parser.install_recognizers(table)
+            sub_parser.parse_document(table, sbase)
+        }
+        ps.add_subdoc_counts(child)
+        set entry.events: child.get_events()
+        set entry.child_ps: child as pointer[void]
+        rsh.get_results().add(entry)
     }
 
     ; parseEntityReference(isParameter=1) (parseCommon.cxx:428) + the declReference/
@@ -12999,7 +13253,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; UselinkEvent only for an ACTIVE lpd (else ignored markup) — the
         ; port drives the link process at parse time (the queue position).
         if lpd.is_active()
+        {
             ps.lp_uselink(link_set, restore, lpd)
+            ; RAST: the writer's uselink block (post-uselink snapshot; the
+            ; reference prints #LINK-SET-INFO off the CURRENT set even when
+            ; the uselink named another lpd and was a no-op).
+            if ps.rast_on()
+                ps.queue_event_raw(Event.make_uselink(host, ps.lp_current_set(), ps.current_location()))
+        }
         true
     }
 
@@ -13020,7 +13281,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             set no_pass2: true
         if no_pass2
         {
-            ps.flush_pass1_messages()
+            ; RAST: the reference replays pass-1 events and kept messages as
+            ; one interleaved queue — buffered rast PIs interpret in order.
+            if ps.rast_on()
+                ps.flush_pass1_messages_rast()
+            else
+                ps.flush_pass1_messages()
             return false
         }
         ps.discard_pass1_messages()
@@ -18789,7 +19055,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; catalog build (Parser.cxx:67-99): -C maps it through the catalogs'
     ; DOCUMENT entry, search dirs and -R apply, and open failures report
     ; through the parser Messenger (no ESIS at all on a failed open).
-    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, charset_fixed: bool, active_links: pointer[Array[String]], options: pointer[ParserOptions], error_limit: u32, reporter_options: u32, output_flags: u32, msg_fd: int, prolog_only: bool, em_cfg: pointer[EmConfig], doc_specs: pointer[Array[String]], out_conforming: pointer[bool]) returns String
+    function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, charset_fixed: bool, active_links: pointer[Array[String]], options: pointer[ParserOptions], error_limit: u32, reporter_options: u32, output_flags: u32, msg_fd: int, prolog_only: bool, rast: bool, em_cfg: pointer[EmConfig], doc_specs: pointer[Array[String]], out_conforming: pointer[bool]) returns String
     {
         ; Record normalization (ExtendEntityManager, `lf` record type — the whole
         ; Unix corpus): insert one RS (0x0A) at the entity start, and translate
@@ -18814,6 +19080,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.set_output_flags(output_flags)
         ps.set_msg_fd(msg_fd)
         ps.set_prolog_only(prolog_only)
+        ; -t: the returned string is the RAST file's content instead of the
+        ; ESIS stream (XRastEventHandler replaces SgmlsEventHandler); the
+        ; parse-time RAST semantics key off ps.rast.
+        if rast
+            ps.set_rast(RastShared.make(host))
         ; the EntityApp surface (-D search dirs, -R) — every entity open
         ; resolves through it.
         ps.set_em_config(em_cfg)
@@ -19053,6 +19324,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     set *(nargs.get(0 as size_t)): MessageArg.Str(Parser.widen_arg(host, *cfstr))
                     ps.report_noloc(CatalogMessages.noDocumentEntry(), nargs)
                     set *out_conforming: false
+                    if rast
+                        return Rast.write(host, ps)
                     return String()
                 }
                 set dspec: mapped
@@ -19076,6 +19349,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 else
                     ps.report_noloc(PosixStorageMessages.openSystemCall(), eargs)
                 set *out_conforming: false
+                if rast
+                    return Rast.write(host, ps)
                 return String()
             }
             let dpath String^host(rpath)
@@ -19198,6 +19473,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             {
                 ps.flush_pending_opens(true)
                 set *out_conforming: false
+                if rast
+                    return Rast.write(host, ps)
                 return String()
             }
         }
@@ -19246,6 +19523,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             parser.report_raw_at(ParserMessages.sdMissingCharacters(), init_arg, ps.current_location())
             parser.report0_at(ParserMessages.giveUp(), ps.current_location())
             set *out_conforming: false
+            if rast
+                return Rast.write(host, ps)
             return Esis.write(host, ps, false)
         }
 
@@ -19338,6 +19617,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             ps.report_error_limit(elim)
         let conforming ok and (ps.get_n_errors() = (0 as u32))
         set *out_conforming: conforming
+        if rast
+            return Rast.write(host, ps)
         Esis.write(host, ps, conforming)
     }
 
