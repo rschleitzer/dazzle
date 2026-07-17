@@ -1,0 +1,787 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use opensp.CharsetRegistry.CharsetRegistryIter
+use opensp.CharsetRegistry.CharsetRegistry
+
+; CodingSystemKit — the OUTPUT half of CodingSystemKitImpl (CodingSystemKit.cxx)
+; plus the concrete output encoders (IdentityCodingSystem/UTF8/Fixed2/Fixed4/
+; UTF16/Unicode/EUCJP/SJIS/Big5CodingSystem.cxx encoder halves and
+; TranslateCodingSystem.cxx's TranslateEncoder). It backs the -b option: the
+; ESIS/RAST writers accumulate the char stream as internal UTF-8 bytes and
+; `transcode` re-encodes the whole stream through the selected system.
+;
+; The kit's system charset is ISO 10646 (iso10646Desc), the only internal
+; charset this port models (SP_SYSTEM_CHARSET is not consulted — the input
+; side is Unicode-internal throughout), so the reference's
+; `univToDesc(univ) -> sysChar` is the identity and an encode map is simply
+; map[univ] = desc_code + add, built with the same CharsetRegistry iteration
+; as TranslateCodingSystem::makeEncoder (last desc entry wins on overlap,
+; CharMap::setChar overwrite order).
+;
+; Escaping (EncodeOutputCharStream::handleUnencodable): encoders derived from
+; RecoveringEncoder route an unencodable Char to the stream's escaper —
+; SgmlsEventHandler::escaper writes `\#<decimal>;` back through the SAME
+; encoder (a temporary stream over the same Encoder; the chars of the escape
+; sequence are themselves translated, e.g. `\` lands as the fullwidth reverse
+; solidus under the JIS maps). Plain-Encoder systems DROP unencodable chars.
+; A TranslateEncoder's SUB-encoder never has a handler (the reference's
+; `FIXME set unencodeable handler for underlying encoder`) — a char the map
+; resolves but the sub bctf cannot express drops silently, bug-for-bug.
+
+; encoder kinds (CodingSystemId, restricted to what an OUTPUT system needs;
+; XML's makeEncoder returns the UTF-8 encoder, so XML lookups yield OENC_UTF8)
+define OENC_IDENTITY: int 0
+define OENC_UTF8: int 1
+define OENC_FIXED2: int 2
+define OENC_FIXED4: int 3
+define OENC_UTF16: int 4
+define OENC_UNICODE: int 5
+define OENC_EUC: int 6
+define OENC_SJIS: int 7
+define OENC_BIG5: int 8
+define OENC_TRANSLATE: int 9
+
+; TranslateCodingSystem::Desc tables (CodingSystemKit.cxx), as
+; (registration-number, add) pairs. Numbers are the CR_* constants
+; (CharsetRegistry.scaly): 1 ISO646_ASCII_G0, 2 ISO646_C0, 3 ISO6429,
+; 4..12 ISO8859_1..9, 15 KOI8_R, 16 ISO646_JIS_G0, 17 JIS0201, 18 JIS0208,
+; 19 JIS0212, 20 GB2312, 21 KSC5601, 22 BIG5.
+define OENC_DESC_JIS: u32[] [2, 0, 16, 0, 3, 0x80, 17, 0x80, 18, 0x8080,]
+define OENC_DESC_JIS2: u32[] [2, 0, 16, 0, 3, 0x80, 17, 0x80, 18, 0x8080, 19, 0x8000,]
+define OENC_DESC_GB: u32[] [2, 0, 1, 0, 3, 0x80, 20, 0x8080,]
+define OENC_DESC_BIG5: u32[] [2, 0, 1, 0, 22, 0,]
+define OENC_DESC_KSC: u32[] [2, 0, 1, 0, 3, 0x80, 21, 0x8080,]
+define OENC_DESC_ISO8859_1: u32[] [2, 0, 1, 0, 3, 0x80, 4, 0x80,]
+define OENC_DESC_ISO8859_2: u32[] [2, 0, 1, 0, 3, 0x80, 5, 0x80,]
+define OENC_DESC_ISO8859_3: u32[] [2, 0, 1, 0, 3, 0x80, 6, 0x80,]
+define OENC_DESC_ISO8859_4: u32[] [2, 0, 1, 0, 3, 0x80, 7, 0x80,]
+define OENC_DESC_ISO8859_5: u32[] [2, 0, 1, 0, 3, 0x80, 8, 0x80,]
+define OENC_DESC_ISO8859_6: u32[] [2, 0, 1, 0, 3, 0x80, 9, 0x80,]
+define OENC_DESC_ISO8859_7: u32[] [2, 0, 1, 0, 3, 0x80, 10, 0x80,]
+define OENC_DESC_ISO8859_8: u32[] [2, 0, 1, 0, 3, 0x80, 11, 0x80,]
+define OENC_DESC_ISO8859_9: u32[] [2, 0, 1, 0, 3, 0x80, 12, 0x80,]
+; KOI8-R: only the GR part is registered (reference FIXME — koi8-r does not
+; follow the ISO control/graphic model), so C0/ASCII + the 0x80-added table.
+define OENC_DESC_KOI8: u32[] [2, 0, 1, 0, 15, 0x80,]
+
+; the encoder value the driver selects (outputCodingSystem_): a simple kind,
+; or OENC_TRANSLATE with the sub bctf, the 64K encode map and the map's
+; illegal (default) char.
+define OutputEncoder
+(
+    kind: int
+    sub: int
+    map: pointer[u32]
+    illegal: u32
+)
+{
+    init()
+    {
+        set kind: OENC_IDENTITY
+        set sub: OENC_IDENTITY
+        set map: null
+        set illegal: 0 as u32
+    }
+}
+
+; translate-system selectors for make_encoder (`which`; 0 = a simple kind)
+define OENC_T_ISO8859_1: int 1
+define OENC_T_ISO8859_2: int 2
+define OENC_T_ISO8859_3: int 3
+define OENC_T_ISO8859_4: int 4
+define OENC_T_ISO8859_5: int 5
+define OENC_T_ISO8859_6: int 6
+define OENC_T_ISO8859_7: int 7
+define OENC_T_ISO8859_8: int 8
+define OENC_T_ISO8859_9: int 9
+define OENC_T_KOI8: int 10
+define OENC_T_EUCJP: int 11
+define OENC_T_EUCCN: int 12
+define OENC_T_EUCKR: int 13
+define OENC_T_SJIS: int 14
+define OENC_T_BIG5: int 15
+
+define CodingSystemKit
+{
+    ; TranslateCodingSystem::makeEncoder — the encode CharMap. 64K entries
+    ; (every charset the descs reference is BMP), default illegalChar.
+    function make_translate(host: pointer[Page], desc: pointer[u32], n_pairs: size_t, sub: int, illegal: u32, e: pointer[OutputEncoder])
+    {
+        let map host.allocate(0x40000 as size_t, 4 as size_t) as pointer[u32]
+        var i: size_t 0
+        while i < (0x10000 as size_t)
+        {
+            set *(map + i): illegal
+            set i: i + 1
+        }
+        var p: size_t 0
+        while p < n_pairs
+        {
+            let number *(desc + p * (2 as size_t))
+            let add *(desc + p * (2 as size_t) + (1 as size_t))
+            var it CharsetRegistryIter()
+            if CharsetRegistry.make_iter(number as int, &it)
+            {
+                var dmin: u32 0
+                var dmax: u32 0
+                var univ: u32 0
+                while it.next(&dmin, &dmax, &univ)
+                {
+                    var k: u32 0
+                    let n (dmax - dmin) + (1 as u32)
+                    while k < n
+                    {
+                        let u univ + k
+                        if u < (0x10000 as u32)
+                            set *(map + (u as size_t)): dmin + add + k
+                        set k: k + (1 as u32)
+                    }
+                }
+            }
+            set p: p + (1 as size_t)
+        }
+        set e.kind: OENC_TRANSLATE
+        set e.sub: sub
+        set e.map: map
+        set e.illegal: illegal
+    }
+
+    ; page-allocate a fresh OutputEncoder (identity default). The allocation
+    ; MUST happen inside this package: a cross-package `sizeof OutputEncoder`
+    ; in the driver miscompiles (the layout isn't visible there), so the
+    ; driver calls this factory instead of allocating the record itself.
+    function new_encoder(host: pointer[Page]) returns pointer[OutputEncoder]
+    {
+        let e host.allocate(sizeof OutputEncoder, alignof OutputEncoder) as pointer[OutputEncoder]
+        set *e: OutputEncoder()
+        e
+    }
+
+    ; the environment default (initCodingSystem's fallback): the identity
+    ; system, or UTF-8 when the driver derived output_utf8 from the
+    ; environment. Callers outside this module use this instead of naming the
+    ; OENC_* kind constants (which are module-gated).
+    function make_default(host: pointer[Page], utf8: bool, e: pointer[OutputEncoder])
+    {
+        var k OENC_IDENTITY
+        if utf8
+            set k: OENC_UTF8
+        CodingSystemKit.make_encoder(host, k, 0, e)
+    }
+
+    ; fill `e` for a lookup result: which = 0 is the simple `kind`, otherwise
+    ; one of the OENC_T_* translate systems (CodingSystemKitImpl's
+    ; TranslateCodingSystem members with their desc/sub/illegal wiring).
+    function make_encoder(host: pointer[Page], kind: int, which: int, e: pointer[OutputEncoder])
+    {
+        if which = 0
+        {
+            set e.kind: kind
+            set e.sub: OENC_IDENTITY
+            set e.map: null
+            set e.illegal: 0 as u32
+            return
+        }
+        var d: pointer[u32] null
+        var np: size_t 4
+        var sub OENC_IDENTITY
+        var illegal: u32 0x100
+        if which = OENC_T_ISO8859_1
+            set d: OENC_DESC_ISO8859_1
+        else if which = OENC_T_ISO8859_2
+            set d: OENC_DESC_ISO8859_2
+        else if which = OENC_T_ISO8859_3
+            set d: OENC_DESC_ISO8859_3
+        else if which = OENC_T_ISO8859_4
+            set d: OENC_DESC_ISO8859_4
+        else if which = OENC_T_ISO8859_5
+            set d: OENC_DESC_ISO8859_5
+        else if which = OENC_T_ISO8859_6
+            set d: OENC_DESC_ISO8859_6
+        else if which = OENC_T_ISO8859_7
+            set d: OENC_DESC_ISO8859_7
+        else if which = OENC_T_ISO8859_8
+            set d: OENC_DESC_ISO8859_8
+        else if which = OENC_T_ISO8859_9
+            set d: OENC_DESC_ISO8859_9
+        else if which = OENC_T_KOI8
+        {
+            set d: OENC_DESC_KOI8
+            set np: 3
+        }
+        else if which = OENC_T_EUCJP
+        {
+            set d: OENC_DESC_JIS2
+            set np: 6
+            set sub: OENC_EUC
+            set illegal: 0x8000 as u32
+        }
+        else if which = OENC_T_EUCCN
+        {
+            set d: OENC_DESC_GB
+            set np: 4
+            set sub: OENC_EUC
+            set illegal: 0x8000 as u32
+        }
+        else if which = OENC_T_EUCKR
+        {
+            set d: OENC_DESC_KSC
+            set np: 4
+            set sub: OENC_EUC
+            set illegal: 0x8000 as u32
+        }
+        else if which = OENC_T_SJIS
+        {
+            set d: OENC_DESC_JIS
+            set np: 5
+            set sub: OENC_SJIS
+            set illegal: 0x8000 as u32
+        }
+        else if which = OENC_T_BIG5
+        {
+            set d: OENC_DESC_BIG5
+            set np: 3
+            set sub: OENC_BIG5
+            set illegal: 0x0080 as u32
+        }
+        CodingSystemKit.make_translate(host, d, np, sub, illegal, e)
+    }
+
+    ; CodingSystemKitImpl::match — exact-length, per-char case-insensitive.
+    function name_matches(name: String, key: String) returns bool
+    {
+        let n name.get_length()
+        if n <> key.get_length()
+            return false
+        var i: size_t 0
+        while i < n
+        {
+            var c (name.get(i)) as u32
+            if (c >= (0x61 as u32)) and (c <= (0x7A as u32))
+                set c: c - (0x20 as u32)
+            var k (key.get(i)) as u32
+            if (k >= (0x61 as u32)) and (k <= (0x7A as u32))
+                set k: k - (0x20 as u32)
+            if c <> k
+                return false
+            set i: i + (1 as size_t)
+        }
+        true
+    }
+
+    ; CmdLineApp::lookupCodingSystem + the two CodingSystemKitImpl name
+    ; tables. bctf mode (internal charset = doc charset, no SP_CHARSET_FIXED)
+    ; consults bctfTable_; fixed mode consults encodingTable_ (the full table:
+    ; the kit's system charset is ISO 10646). WINDOWS/MS-DOS/WUNICODE are
+    ; WIN32-only makeCodingSystem arms — on these targets they yield 0 just
+    ; like a miss, so they are simply absent here. Returns false = unknown
+    ; (also for names of MAX_CS_NAME 50 chars or more — nothing that long is
+    ; in either table).
+    function lookup(name: String, is_bctf: bool, out_kind: pointer[int], out_which: pointer[int]) returns bool
+    {
+        set *out_kind: OENC_IDENTITY
+        set *out_which: 0
+        if is_bctf
+        {
+            if CodingSystemKit.name_matches(name, String("IDENTITY"))
+                return true
+            if CodingSystemKit.name_matches(name, String("FIXED-2"))
+            {
+                set *out_kind: OENC_FIXED2
+                return true
+            }
+            if CodingSystemKit.name_matches(name, String("FIXED-4"))
+            {
+                set *out_kind: OENC_FIXED4
+                return true
+            }
+            if CodingSystemKit.name_matches(name, String("UTF-8"))
+            {
+                set *out_kind: OENC_UTF8
+                return true
+            }
+            if CodingSystemKit.name_matches(name, String("EUC"))
+            {
+                set *out_kind: OENC_EUC
+                return true
+            }
+            if CodingSystemKit.name_matches(name, String("SJIS"))
+            {
+                set *out_kind: OENC_SJIS
+                return true
+            }
+            if CodingSystemKit.name_matches(name, String("BIG5"))
+            {
+                set *out_kind: OENC_BIG5
+                return true
+            }
+            return false
+        }
+        if CodingSystemKit.name_matches(name, String("UTF-8"))
+        {
+            set *out_kind: OENC_UTF8
+            return true
+        }
+        if CodingSystemKit.name_matches(name, String("UCS-2")) or CodingSystemKit.name_matches(name, String("ISO-10646-UCS-2"))
+        {
+            set *out_kind: OENC_FIXED2
+            return true
+        }
+        if CodingSystemKit.name_matches(name, String("UCS-4")) or CodingSystemKit.name_matches(name, String("ISO-10646-UCS-4")) or CodingSystemKit.name_matches(name, String("UTF-32"))
+        {
+            set *out_kind: OENC_FIXED4
+            return true
+        }
+        if CodingSystemKit.name_matches(name, String("UNICODE"))
+        {
+            set *out_kind: OENC_UNICODE
+            return true
+        }
+        if CodingSystemKit.name_matches(name, String("UTF-16"))
+        {
+            set *out_kind: OENC_UTF16
+            return true
+        }
+        if CodingSystemKit.name_matches(name, String("XML"))
+        {
+            set *out_kind: OENC_UTF8
+            return true
+        }
+        var which 0
+        if CodingSystemKit.name_matches(name, String("IS8859-1")) or CodingSystemKit.name_matches(name, String("ISO-8859-1"))
+            set which: OENC_T_ISO8859_1
+        else if CodingSystemKit.name_matches(name, String("IS8859-2")) or CodingSystemKit.name_matches(name, String("ISO-8859-2"))
+            set which: OENC_T_ISO8859_2
+        else if CodingSystemKit.name_matches(name, String("IS8859-3")) or CodingSystemKit.name_matches(name, String("ISO-8859-3"))
+            set which: OENC_T_ISO8859_3
+        else if CodingSystemKit.name_matches(name, String("IS8859-4")) or CodingSystemKit.name_matches(name, String("ISO-8859-4"))
+            set which: OENC_T_ISO8859_4
+        else if CodingSystemKit.name_matches(name, String("IS8859-5")) or CodingSystemKit.name_matches(name, String("ISO-8859-5"))
+            set which: OENC_T_ISO8859_5
+        else if CodingSystemKit.name_matches(name, String("IS8859-6")) or CodingSystemKit.name_matches(name, String("ISO-8859-6"))
+            set which: OENC_T_ISO8859_6
+        else if CodingSystemKit.name_matches(name, String("IS8859-7")) or CodingSystemKit.name_matches(name, String("ISO-8859-7"))
+            set which: OENC_T_ISO8859_7
+        else if CodingSystemKit.name_matches(name, String("IS8859-8")) or CodingSystemKit.name_matches(name, String("ISO-8859-8"))
+            set which: OENC_T_ISO8859_8
+        else if CodingSystemKit.name_matches(name, String("IS8859-9")) or CodingSystemKit.name_matches(name, String("ISO-8859-9"))
+            set which: OENC_T_ISO8859_9
+        else if CodingSystemKit.name_matches(name, String("KOI8-R")) or CodingSystemKit.name_matches(name, String("KOI8"))
+            set which: OENC_T_KOI8
+        else if CodingSystemKit.name_matches(name, String("EUC-JP"))
+            set which: OENC_T_EUCJP
+        else if CodingSystemKit.name_matches(name, String("EUC-CN")) or CodingSystemKit.name_matches(name, String("GB2312")) or CodingSystemKit.name_matches(name, String("CN-GB"))
+            set which: OENC_T_EUCCN
+        else if CodingSystemKit.name_matches(name, String("EUC-KR"))
+            set which: OENC_T_EUCKR
+        else if CodingSystemKit.name_matches(name, String("SJIS")) or CodingSystemKit.name_matches(name, String("SHIFT_JIS"))
+            set which: OENC_T_SJIS
+        else if CodingSystemKit.name_matches(name, String("BIG5")) or CodingSystemKit.name_matches(name, String("CN-BIG5"))
+            set which: OENC_T_BIG5
+        if which = 0
+            return false
+        set *out_which: which
+        set *out_kind: OENC_TRANSLATE
+        true
+    }
+
+    ; ---- the concrete encoders ------------------------------------------------
+
+    function put_utf8(acc: pointer[Array[u8]], c: u32)
+    {
+        if c < (0x80 as u32)
+            acc.add(c as u8)
+        else if c < (0x800 as u32)
+        {
+            acc.add(((0xC0 as u32) | (c >> (6 as u32))) as u8)
+            acc.add(((0x80 as u32) | (c & (0x3F as u32))) as u8)
+        }
+        else if c < (0x10000 as u32)
+        {
+            acc.add(((0xE0 as u32) | (c >> (12 as u32))) as u8)
+            acc.add(((0x80 as u32) | ((c >> (6 as u32)) & (0x3F as u32))) as u8)
+            acc.add(((0x80 as u32) | (c & (0x3F as u32))) as u8)
+        }
+        else
+        {
+            acc.add(((0xF0 as u32) | (c >> (18 as u32))) as u8)
+            acc.add(((0x80 as u32) | ((c >> (12 as u32)) & (0x3F as u32))) as u8)
+            acc.add(((0x80 as u32) | ((c >> (6 as u32)) & (0x3F as u32))) as u8)
+            acc.add(((0x80 as u32) | (c & (0x3F as u32))) as u8)
+        }
+    }
+
+    ; UTF16Encoder::output — big-endian, surrogate pairs above the BMP.
+    function put_utf16(acc: pointer[Array[u8]], c: u32)
+    {
+        if c < (0x10000 as u32)
+        {
+            acc.add(((c >> (8 as u32)) & (0xFF as u32)) as u8)
+            acc.add((c & (0xFF as u32)) as u8)
+        }
+        else
+        {
+            let y ((c - (0x10000 as u32)) / (0x400 as u32)) + (0xD800 as u32)
+            let z ((c - (0x10000 as u32)) % (0x400 as u32)) + (0xDC00 as u32)
+            acc.add(((y >> (8 as u32)) & (0xFF as u32)) as u8)
+            acc.add((y & (0xFF as u32)) as u8)
+            acc.add(((z >> (8 as u32)) & (0xFF as u32)) as u8)
+            acc.add((z & (0xFF as u32)) as u8)
+        }
+    }
+
+    ; EUCJPEncoder::output — pure bit-split on the 0x8080 mask, never fails.
+    function put_euc(acc: pointer[Array[u8]], c: u32)
+    {
+        let mask c & (0x8080 as u32)
+        if mask = (0 as u32)
+            acc.add((c & (0xFF as u32)) as u8)
+        else if mask = (0x8080 as u32)
+        {
+            acc.add(((c >> (8 as u32)) & (0xFF as u32)) as u8)
+            acc.add((c & (0xFF as u32)) as u8)
+        }
+        else if mask = (0x0080 as u32)
+        {
+            acc.add(0x8E as u8)
+            acc.add((c & (0xFF as u32)) as u8)
+        }
+        else
+        {
+            acc.add(0x8F as u8)
+            acc.add(((c >> (8 as u32)) & (0xFF as u32)) as u8)
+            acc.add((c & (0x7F as u32)) as u8)
+        }
+    }
+
+    ; SJISEncoder::output — returns false when the char is unencodable (the
+    ; caller decides between the escaper and the silent sub-encoder drop).
+    function put_sjis(acc: pointer[Array[u8]], c: u32) returns bool
+    {
+        let mask c & (0x8080 as u32)
+        if mask = (0 as u32)
+        {
+            acc.add((c & (0xFF as u32)) as u8)
+            return true
+        }
+        if mask = (0x8080 as u32)
+        {
+            let c1 (c >> (8 as u32)) & (0x7F as u32)
+            let c2 c & (0x7F as u32)
+            var out1: u32 0
+            if c1 < (33 as u32)
+                set out1: 0
+            else if c1 < (95 as u32)
+                set out1: ((c1 + (1 as u32)) >> (1 as u32)) + (112 as u32)
+            else if c1 < (127 as u32)
+                set out1: ((c1 + (1 as u32)) >> (1 as u32)) + (176 as u32)
+            if out1 <> (0 as u32)
+            {
+                var out2: u32 0
+                if (c1 & (1 as u32)) <> (0 as u32)
+                {
+                    if c2 < (33 as u32)
+                        set out2: 0
+                    else if c2 <= (95 as u32)
+                        set out2: c2 + (31 as u32)
+                    else if c2 <= (126 as u32)
+                        set out2: c2 + (32 as u32)
+                }
+                else
+                {
+                    if ((33 as u32) <= c2) and (c2 <= (126 as u32))
+                        set out2: c2 + (126 as u32)
+                }
+                if out2 <> (0 as u32)
+                {
+                    acc.add(out1 as u8)
+                    acc.add(out2 as u8)
+                    return true
+                }
+                return false
+            }
+            return false
+        }
+        if mask = (0x0080 as u32)
+        {
+            if ((161 as u32) <= c) and (c <= (223 as u32))
+            {
+                acc.add((c & (0xFF as u32)) as u8)
+                return true
+            }
+            return false
+        }
+        false
+    }
+
+    ; Big5Encoder::output — returns false when unencodable (plain Encoder:
+    ; direct use drops; as a translate sub it drops too).
+    function put_big5(acc: pointer[Array[u8]], c: u32) returns bool
+    {
+        if c < (0x80 as u32)
+        {
+            acc.add(c as u8)
+            return true
+        }
+        if (c & (0x8000 as u32)) <> (0 as u32)
+        {
+            acc.add(((c >> (8 as u32)) & (0xFF as u32)) as u8)
+            acc.add((c & (0xFF as u32)) as u8)
+            return true
+        }
+        false
+    }
+
+    ; the escaper (SgmlsEventHandler::escaper): `\#<decimal>;` written back
+    ; through the same encoder — each escape char is re-encoded (and could in
+    ; principle recurse; every table maps the ASCII escape chars).
+    function put_escape(enc: pointer[OutputEncoder], acc: pointer[Array[u8]], c: u32, escaper: bool)
+    {
+        CodingSystemKit.out_char(enc, 0x5C as u32, acc, escaper)
+        CodingSystemKit.out_char(enc, 0x23 as u32, acc, escaper)
+        var digits u8[16]
+        let dp digits as pointer[u8]
+        var v c
+        var count: size_t 0
+        var go true
+        while go
+        {
+            set *(dp + count): (((0x30 as u32) + (v % (10 as u32))) as u8)
+            set count: count + (1 as size_t)
+            set v: v / (10 as u32)
+            if v = (0 as u32)
+                set go: false
+        }
+        var i count
+        while i > (0 as size_t)
+        {
+            set i: i - (1 as size_t)
+            CodingSystemKit.out_char(enc, (*(dp + i)) as u32, acc, escaper)
+        }
+        CodingSystemKit.out_char(enc, 0x3B as u32, acc, escaper)
+    }
+
+    ; one Char through the output coding system. `escaper` is the stream's
+    ; SgmlsEventHandler::escaper (set for ESIS stdout, unset for RAST) — it
+    ; only ever fires for the RecoveringEncoder-derived systems (Identity,
+    ; Fixed2, SJIS, Translate); the plain-Encoder systems drop.
+    function out_char(enc: pointer[OutputEncoder], c: u32, acc: pointer[Array[u8]], escaper: bool)
+    {
+        let kind enc.kind
+        if kind = OENC_UTF8
+        {
+            CodingSystemKit.put_utf8(acc, c)
+            return
+        }
+        if kind = OENC_IDENTITY
+        {
+            if c < (0x100 as u32)
+            {
+                acc.add(c as u8)
+                return
+            }
+            if escaper
+                CodingSystemKit.put_escape(enc, acc, c, escaper)
+            return
+        }
+        if kind = OENC_FIXED2
+        {
+            if c > (0xFFFF as u32)
+            {
+                if escaper
+                    CodingSystemKit.put_escape(enc, acc, c, escaper)
+                return
+            }
+            acc.add(((c >> (8 as u32)) & (0xFF as u32)) as u8)
+            acc.add((c & (0xFF as u32)) as u8)
+            return
+        }
+        if kind = OENC_FIXED4
+        {
+            acc.add(((c >> (24 as u32)) & (0xFF as u32)) as u8)
+            acc.add(((c >> (16 as u32)) & (0xFF as u32)) as u8)
+            acc.add(((c >> (8 as u32)) & (0xFF as u32)) as u8)
+            acc.add((c & (0xFF as u32)) as u8)
+            return
+        }
+        if (kind = OENC_UTF16) or (kind = OENC_UNICODE)
+        {
+            CodingSystemKit.put_utf16(acc, c)
+            return
+        }
+        if kind = OENC_EUC
+        {
+            CodingSystemKit.put_euc(acc, c)
+            return
+        }
+        if kind = OENC_SJIS
+        {
+            ; direct SJIS is a RecoveringEncoder — unencodable escapes.
+            if CodingSystemKit.put_sjis(acc, c) = false
+            {
+                if escaper
+                    CodingSystemKit.put_escape(enc, acc, c, escaper)
+            }
+            return
+        }
+        if kind = OENC_BIG5
+        {
+            ; direct Big5 is a plain Encoder — unencodable drops.
+            let ok CodingSystemKit.put_big5(acc, c)
+            return
+        }
+        ; OENC_TRANSLATE: map-level illegal escapes; a mapped char the sub
+        ; bctf cannot express drops (the sub encoder has no handler).
+        var mapped enc.illegal
+        if c < (0x10000 as u32)
+            set mapped: *(enc.map + (c as size_t))
+        if mapped = enc.illegal
+        {
+            if escaper
+                CodingSystemKit.put_escape(enc, acc, c, escaper)
+            return
+        }
+        if enc.sub = OENC_EUC
+        {
+            CodingSystemKit.put_euc(acc, mapped)
+            return
+        }
+        if enc.sub = OENC_SJIS
+        {
+            let ok CodingSystemKit.put_sjis(acc, mapped)
+            return
+        }
+        if enc.sub = OENC_BIG5
+        {
+            let ok CodingSystemKit.put_big5(acc, mapped)
+            return
+        }
+        ; identity sub (the 8-bit translate systems)
+        if mapped < (0x100 as u32)
+            acc.add(mapped as u8)
+    }
+
+    ; Re-encode a writer's internal UTF-8 char stream through the selected
+    ; output coding system. `bom` = Encoder::startFile at stream creation —
+    ; only UnicodeEncoder writes one: the byteOrderMark in HOST byte order
+    ; (all four LP64 targets are little-endian, so FF FE) followed by
+    ; big-endian UTF-16 content, bug-for-bug with the reference.
+    function transcode(host: pointer[Page], enc: pointer[OutputEncoder], internal: String, escaper: bool, bom: bool) returns String
+    {
+        if enc.kind = OENC_UTF8
+            return internal
+        let acc Array[u8]^host()
+        if bom and (enc.kind = OENC_UNICODE)
+        {
+            acc.add(0xFF as u8)
+            acc.add(0xFE as u8)
+        }
+        let buf internal.get_buffer()
+        let n internal.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let b0 (*(buf + i)) as u32
+            var c b0
+            var extra: size_t 0
+            if (b0 & (0x80 as u32)) = (0 as u32)
+                set extra: 0
+            else if (b0 & (0xE0 as u32)) = (0xC0 as u32)
+            {
+                set c: b0 & (0x1F as u32)
+                set extra: 1
+            }
+            else if (b0 & (0xF0 as u32)) = (0xE0 as u32)
+            {
+                set c: b0 & (0x0F as u32)
+                set extra: 2
+            }
+            else
+            {
+                set c: b0 & (0x07 as u32)
+                set extra: 3
+            }
+            var k: size_t 0
+            while k < extra
+            {
+                set i: i + (1 as size_t)
+                if i >= n
+                    break
+                set c: (c << (6 as u32)) | (((*(buf + i)) as u32) & (0x3F as u32))
+                set k: k + (1 as size_t)
+            }
+            CodingSystemKit.out_char(enc, c, acc, escaper)
+            set i: i + (1 as size_t)
+        }
+        String(acc.get_buffer() as pointer[const_char], acc.get_length())
+    }
+
+    function test() returns int
+    {
+        let anchor String("k")
+        let host Page.get(anchor.get_buffer() as pointer[void])
+
+        ; identity escapes >0xFF through the escaper (`é` stays, U+20AC -> \#8364;)
+        var e0 OutputEncoder()
+        CodingSystemKit.make_encoder(host, OENC_IDENTITY, 0, &e0)
+        var acc0 Array[u8]()
+        CodingSystemKit.out_char(&e0, 0xE9 as u32, &acc0, true)
+        CodingSystemKit.out_char(&e0, 0x20AC as u32, &acc0, true)
+        if acc0.get_length() <> (8 as size_t)
+            return -1
+        if *(acc0.get_buffer()) <> (0xE9 as u8)
+            return -2
+        if *(acc0.get_buffer() + (1 as size_t)) <> (0x5C as u8)
+            return -3
+
+        ; EUC bctf splits on the 0x8080 mask: 0xE9 -> SS2 0x8E 0xE9
+        var e1 OutputEncoder()
+        CodingSystemKit.make_encoder(host, OENC_EUC, 0, &e1)
+        var acc1 Array[u8]()
+        CodingSystemKit.out_char(&e1, 0xE9 as u32, &acc1, true)
+        if acc1.get_length() <> (2 as size_t)
+            return -4
+        if *(acc1.get_buffer()) <> (0x8E as u8)
+            return -5
+
+        ; ISO-8859-1 translate: é -> 0xE9, € -> illegal -> \#8364; (plain `\`)
+        var e2 OutputEncoder()
+        CodingSystemKit.make_encoder(host, OENC_TRANSLATE, OENC_T_ISO8859_1, &e2)
+        var acc2 Array[u8]()
+        CodingSystemKit.out_char(&e2, 0xE9 as u32, &acc2, true)
+        CodingSystemKit.out_char(&e2, 0x20AC as u32, &acc2, true)
+        if acc2.get_length() <> (8 as size_t)
+            return -6
+        if *(acc2.get_buffer()) <> (0xE9 as u8)
+            return -7
+        if *(acc2.get_buffer() + (1 as size_t)) <> (0x5C as u8)
+            return -8
+
+        ; NB the CJK translate systems (EUC-JP/SJIS/BIG5/GB/KSC) are exercised
+        ; end-to-end and A/B-verified against onsgmls -b in the corpus fixtures
+        ; (synth-bctf-*/synth-encoding-*), not here: their escape-prefix byte
+        ; (`\` via the contested JIS-G0/JIS0208 U+005C mapping) is not asserted
+        ; as a raw unit here.
+
+        ; transcode: internal UTF-8 `A é` to UNICODE = BOM + UTF-16BE
+        var acc4 Array[u8]()
+        acc4.add(0x41 as u8)
+        acc4.add(0xC3 as u8)
+        acc4.add(0xA9 as u8)
+        let s4 String(acc4.get_buffer() as pointer[const_char], acc4.get_length())
+        var e4 OutputEncoder()
+        CodingSystemKit.make_encoder(host, OENC_UNICODE, 0, &e4)
+        let t4 CodingSystemKit.transcode(host, &e4, s4, false, true)
+        if t4.get_length() <> (6 as size_t)
+            return -12
+        if *(t4.get_buffer()) <> (0xFF as u8)
+            return -13
+        if *(t4.get_buffer() + (3 as size_t)) <> (0x41 as u8)
+            return -14
+        if *(t4.get_buffer() + (5 as size_t)) <> (0xE9 as u8)
+            return -15
+
+        0
+    }
+}

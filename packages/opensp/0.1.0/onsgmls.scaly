@@ -36,6 +36,11 @@
 ;                          #RAST-PI-ERROR marker; open failure -> openFileError
 ;                          + exit 1. Under -B the per-document file name is
 ;                          FILE concatenated with the argument.
+;   -h/--help              print the usage text to stdout and exit 0 (parses
+;                          nothing; only the flag is set during the option
+;                          loop, so a later -b/-f still applies; a failing -f
+;                          still aborts first). The registry advertises -A too,
+;                          for byte-identical output, though its axis is unported.
 ;   -c/--catalog SYSID     use catalog SYSID (must exist; missing -> E);
 ;                          repeatable; SGML_CATALOG_FILES appends more
 ;                          (silent when missing); the document's own
@@ -49,11 +54,20 @@
 ;   -m SYSID               NsgmlsApp alias for -c
 ;   -d, -l, -r, -u         NsgmlsApp aliases for -wduplicate / -oline /
 ;                          -wdefault / -wundefined
+;   -b/--bctf NAME         select the OUTPUT coding system (stdout ESIS or
+;   -b/--encoding NAME     the -t RAST file; stderr stays on the environment
+;                          system). Without SP_CHARSET_FIXED the long name is
+;                          --bctf and NAME is a BCTF (IDENTITY FIXED-2 FIXED-4
+;                          UTF-8 EUC SJIS BIG5); with it the long name is
+;                          --encoding and NAME is an encoding (UTF-8 UCS-2/4
+;                          UTF-16/32 UNICODE XML ISO-8859-1..9 KOI8-R EUC-JP/
+;                          CN/KR SJIS BIG5 ...). Unknown NAME -> app-level
+;                          unknownBctf/unknownEncoding E (exit unaffected) and
+;                          the environment default reapplies.
 ;
 ; NOT yet ported (their axes are later sessions; they render "invalid
 ; option", where the reference would accept them):
-; -A (architectures/ArcEngine), -b (coding-system names), -h (usage
-; text; renders from the full registry once every option exists).
+; -A (architectures/ArcEngine).
 ; Multiple SYSIDs outside -B merge into ONE document entity
 ; (mergeSystemIds): per-file storage ids and line numbers (the Origin
 ; segment table), per-file declaration bases, per-file implicit `catalog`
@@ -84,9 +98,13 @@ use opensp.Options.Options
 use opensp.Options.LongOpt
 use opensp.EntityManager.EmConfig
 use opensp.Message.MessageType
+use opensp.Message.MessageFragment
 use opensp.Message.MessageArg
 use opensp.Message.MessageFormatter
 use opensp.CmdLineAppMessages.CmdLineAppMessages
+use opensp.CodingSystemKit.CodingSystemKit
+use opensp.CodingSystemKit.OutputEncoder
+use opensp.EntityAppMessages.EntityAppMessages
 use opensp.ParserAppMessages.ParserAppMessages
 use opensp.NsgmlsMessages.NsgmlsMessages
 use opensp.PosixStorageMessages.PosixStorageMessages
@@ -526,7 +544,7 @@ function read_stdin_to_string() returns String
 ; argument onto the -t value). Returns -1 when the RAST file cannot be
 ; created — the reference exit(1)s from the handler constructor, aborting
 ; even a batch run.
-function process_document(doc_args: pointer[pointer[char]], n_args: int, prog_name: String, out_utf8: bool, is_fixed: bool, active_links: pointer[Array[String]], opts: pointer[ParserOptions], error_limit: u32, reporter_options: u32, output_flags: u32, msg_fd: int, prolog_only: bool, suppress: bool, have_rast: bool, rast_path: String, em_cfg: pointer[EmConfig]) returns int
+function process_document(doc_args: pointer[pointer[char]], n_args: int, prog_name: String, out_utf8: bool, out_enc: pointer[OutputEncoder], is_fixed: bool, active_links: pointer[Array[String]], opts: pointer[ParserOptions], error_limit: u32, reporter_options: u32, output_flags: u32, msg_fd: int, prolog_only: bool, suppress: bool, have_rast: bool, rast_path: String, em_cfg: pointer[EmConfig]) returns int
 {
     ; -p wins over -t (makeEventHandler checks prologOnly_ first): no RAST
     ; file is even created.
@@ -607,7 +625,7 @@ function process_document(doc_args: pointer[pointer[char]], n_args: int, prog_na
     ; bucket, and Page.get on an oversized object masks to a bogus page header.
     let host Page.get(path.get_buffer() as pointer[void])
     var conforming false
-    let esis Parser.parse_to_esis(host, contents, base_dir, doc_name, prog_name, out_utf8, is_fixed, active_links, opts, error_limit, reporter_options, output_flags, msg_fd, prolog_only, use_rast, em_cfg, specs_ptr, &conforming)
+    let esis Parser.parse_to_esis(host, contents, base_dir, doc_name, prog_name, out_utf8, out_enc, is_fixed, active_links, opts, error_limit, reporter_options, output_flags, msg_fd, prolog_only, use_rast, em_cfg, specs_ptr, &conforming)
     ; -t: the returned text is the RAST file's content (stdout stays empty —
     ; the RAST handler replaces the ESIS one; -s is irrelevant here).
     if use_rast
@@ -617,12 +635,189 @@ function process_document(doc_args: pointer[pointer[char]], n_args: int, prog_na
         close(rast_fd as int)
     }
     ; -s (MessageEventHandler) and -p (PrologMessageEventHandler) print no
-    ; ESIS at all — not even the conformance marker.
+    ; ESIS at all — not even the conformance marker. Write the whole byte run
+    ; (NOT to_c_string): a -b system such as UCS-2/UTF-16/UNICODE embeds NUL
+    ; bytes that a C-string print would truncate at.
     else if (suppress = false) and (prolog_only = false)
-        Console.print(esis.to_c_string())
+    {
+        if esis.get_length() > (0 as size_t)
+            Io.write_all(1 as i32, esis.get_buffer() as pointer[void], esis.get_length())
+    }
     if conforming
         return 0
     1
+}
+
+; ---- -h / --help usage text (CmdLineApp::usage) ----------------------------
+; A single help row: the reference builds the left column from the option
+; registry (short char, optional long name, optional argument name) then pads
+; every left column to the widest + 3 and appends the formatted help text.
+define UsageRow (key: u32, has_name: bool, name: StringC, has_arg: bool, arg: StringC, help: StringC)
+
+; append every Char of a StringC to the render buffer.
+function usage_put_stringc(bp: pointer[u32], cap: size_t, pos: size_t, s: StringC) returns size_t
+{
+    var p pos
+    var i: size_t 0
+    while i < s.get_size()
+    {
+        set p: ParserState.put_char(bp, cap, p, s.get(i))
+        set i: i + 1
+    }
+    p
+}
+
+; register one row (help/arg names sourced from the message catalog, so the
+; text stays byte-identical to what real onsgmls prints).
+function add_usage_row(rows: pointer[Array[UsageRow]], key: u32, has_name: bool, name: StringC, has_arg: bool, argf: MessageFragment, help: MessageType)
+{
+    var arg StringC()
+    if has_arg
+        set arg: argf.text
+    rows.add(UsageRow(key, has_name, name, has_arg, arg, help.get_text()))
+}
+
+; CmdLineApp::usage's left-column builder: "  -X"[, --name[=ARG] | ARG].
+function usage_emit_left(bp: pointer[u32], cap: size_t, row: UsageRow) returns size_t
+{
+    var p: size_t 0
+    set p: ParserState.put_char(bp, cap, p, 0x20 as u32)
+    set p: ParserState.put_char(bp, cap, p, 0x20 as u32)
+    set p: ParserState.put_char(bp, cap, p, 0x2D as u32)
+    set p: ParserState.put_char(bp, cap, p, row.key)
+    if row.has_name
+    {
+        set p: ParserState.put_char(bp, cap, p, 0x2C as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x20 as u32)
+    }
+    else if row.has_arg
+        set p: ParserState.put_char(bp, cap, p, 0x20 as u32)
+    if row.has_name
+    {
+        set p: ParserState.put_char(bp, cap, p, 0x2D as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x2D as u32)
+        set p: usage_put_stringc(bp, cap, p, row.name)
+        if row.has_arg
+            set p: ParserState.put_char(bp, cap, p, 0x3D as u32)
+    }
+    if row.has_arg
+        set p: usage_put_stringc(bp, cap, p, row.arg)
+    p
+}
+
+; format one message template (single %1 = arg) as a whole line to stdout.
+; The help message uses the environment default coding system (utf8), NOT the
+; -b output coding system — CmdLineApp::usage says so explicitly.
+function usage_emit_msg(template: StringC, arg: StringC, utf8: bool)
+{
+    var buf u32[2048]
+    let bp buf as pointer[u32]
+    let cap 2048 as size_t
+    var args Vector[MessageArg](1 as size_t)
+    set *(args.get(0 as size_t)): MessageArg.Str(arg)
+    let fmt MessageFormatter()
+    var p fmt.format(template, args, bp, cap, true)
+    set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
+    ParserState.write_stderr(bp, p, utf8, 1)
+}
+
+; Print the full usage text to stdout and return (the caller exits 0). The row
+; registry mirrors the reference registration order (CmdLineApp, EntityApp,
+; ParserApp, NsgmlsApp); -A is advertised for byte-identical output even though
+; its ArcEngine axis is not yet ported (an actual -A still reports invalid).
+function print_usage(prog: String, utf8: bool, is_fixed: bool)
+{
+    let progc StringC(prog.to_c_string())
+
+    ; "Usage: <prog> [OPTION] SYSID..." — defaultUsage wrapped in usage.
+    var b1 u32[2048]
+    let bp1 b1 as pointer[u32]
+    let cap1 2048 as size_t
+    var a1 Vector[MessageArg](1 as size_t)
+    set *(a1.get(0 as size_t)): MessageArg.Str(progc)
+    let fmt1 MessageFormatter()
+    let inner_len fmt1.format(CmdLineAppMessages.defaultUsage().get_text(), a1, bp1, cap1, true)
+    let inner StringC(bp1, inner_len)
+    usage_emit_msg(CmdLineAppMessages.usage().get_text(), inner, utf8)
+
+    ; the usageStart pre-info line.
+    usage_emit_msg(CmdLineAppMessages.usageStart().get_text(), progc, utf8)
+
+    let rows Array[UsageRow]()
+    if is_fixed
+        add_usage_row(&rows, 0x62 as u32, true, StringC("encoding"), true, CmdLineAppMessages.name(), CmdLineAppMessages.eHelp())
+    else
+        add_usage_row(&rows, 0x62 as u32, true, StringC("bctf"), true, CmdLineAppMessages.name(), CmdLineAppMessages.bHelp())
+    add_usage_row(&rows, 0x66 as u32, true, StringC("error-file"), true, CmdLineAppMessages.file(), CmdLineAppMessages.fHelp())
+    add_usage_row(&rows, 0x76 as u32, true, StringC("version"), false, MessageFragment(), CmdLineAppMessages.vHelp())
+    add_usage_row(&rows, 0x68 as u32, true, StringC("help"), false, MessageFragment(), CmdLineAppMessages.hHelp())
+    add_usage_row(&rows, 0x63 as u32, true, StringC("catalog"), true, EntityAppMessages.sysid(), EntityAppMessages.cHelp())
+    add_usage_row(&rows, 0x43 as u32, true, StringC("catalogs"), false, MessageFragment(), EntityAppMessages.CHelp())
+    add_usage_row(&rows, 0x44 as u32, true, StringC("directory"), true, EntityAppMessages.directory(), EntityAppMessages.DHelp())
+    add_usage_row(&rows, 0x52 as u32, true, StringC("restricted"), false, MessageFragment(), EntityAppMessages.RHelp())
+    add_usage_row(&rows, 0x61 as u32, true, StringC("activate"), true, ParserAppMessages.name(), ParserAppMessages.aHelp())
+    add_usage_row(&rows, 0x41 as u32, true, StringC("architecture"), true, ParserAppMessages.name(), ParserAppMessages.AHelp())
+    add_usage_row(&rows, 0x45 as u32, true, StringC("max-errors"), true, ParserAppMessages.number(), ParserAppMessages.EHelp())
+    add_usage_row(&rows, 0x65 as u32, true, StringC("open-entities"), false, MessageFragment(), ParserAppMessages.eHelp())
+    add_usage_row(&rows, 0x67 as u32, true, StringC("open-elements"), false, MessageFragment(), ParserAppMessages.gHelp())
+    add_usage_row(&rows, 0x6E as u32, true, StringC("error-numbers"), false, MessageFragment(), ParserAppMessages.nHelp())
+    add_usage_row(&rows, 0x78 as u32, true, StringC("references"), false, MessageFragment(), ParserAppMessages.xHelp())
+    add_usage_row(&rows, 0x69 as u32, true, StringC("include"), true, ParserAppMessages.name(), ParserAppMessages.iHelp())
+    add_usage_row(&rows, 0x77 as u32, true, StringC("warning"), true, ParserAppMessages.type(), ParserAppMessages.wHelp())
+    add_usage_row(&rows, 0x42 as u32, true, StringC("batch-mode"), false, MessageFragment(), NsgmlsMessages.BHelp())
+    add_usage_row(&rows, 0x6F as u32, true, StringC("option"), true, NsgmlsMessages.option(), NsgmlsMessages.oHelp())
+    add_usage_row(&rows, 0x70 as u32, true, StringC("only-prolog"), false, MessageFragment(), NsgmlsMessages.pHelp())
+    add_usage_row(&rows, 0x73 as u32, true, StringC("no-output"), false, MessageFragment(), NsgmlsMessages.sHelp())
+    add_usage_row(&rows, 0x74 as u32, true, StringC("rast-file"), true, NsgmlsMessages.file(), NsgmlsMessages.tHelp())
+    add_usage_row(&rows, 0x64 as u32, false, StringC(), false, MessageFragment(), NsgmlsMessages.dHelp())
+    add_usage_row(&rows, 0x6C as u32, false, StringC(), false, MessageFragment(), NsgmlsMessages.lHelp())
+    add_usage_row(&rows, 0x6D as u32, false, StringC(), true, NsgmlsMessages.sysid(), NsgmlsMessages.mHelp())
+    add_usage_row(&rows, 0x72 as u32, false, StringC(), false, MessageFragment(), NsgmlsMessages.rHelp())
+    add_usage_row(&rows, 0x75 as u32, false, StringC(), false, MessageFragment(), NsgmlsMessages.uHelp())
+
+    ; widest left column across every row (CmdLineApp::usage's leftSize).
+    var maxw: size_t 0
+    var scratch u32[256]
+    let sp scratch as pointer[u32]
+    var i: size_t 0
+    while i < rows.get_length()
+    {
+        let l usage_emit_left(sp, 256 as size_t, *(rows.get_buffer() + i))
+        if l > maxw
+            set maxw: l
+        set i: i + 1
+    }
+
+    set i: 0 as size_t
+    while i < rows.get_length()
+    {
+        let row *(rows.get_buffer() + i)
+        var lb u32[2048]
+        let lbp lb as pointer[u32]
+        let lcap 2048 as size_t
+        var p usage_emit_left(lbp, lcap, row)
+        ; pad the left column to maxw + 3 (leftSize = maxw + 2, then <=).
+        while p <= (maxw + (2 as size_t))
+            set p: ParserState.put_char(lbp, lcap, p, 0x20 as u32)
+        var ah Vector[MessageArg](1 as size_t)
+        set *(ah.get(0 as size_t)): MessageArg.Str(row.arg)
+        let hf MessageFormatter()
+        let added hf.format(row.help, ah, lbp + p, lcap - p, true)
+        set p: p + added
+        set p: ParserState.put_char(lbp, lcap, p, 0x0A as u32)
+        ParserState.write_stderr(lbp, p, utf8, 1)
+        set i: i + 1
+    }
+
+    ; the trailing description paragraph (info1..info8; %1 = prog in 1 and 6).
+    usage_emit_msg(NsgmlsMessages.info1().get_text(), progc, utf8)
+    usage_emit_msg(NsgmlsMessages.info2().get_text(), progc, utf8)
+    usage_emit_msg(NsgmlsMessages.info3().get_text(), progc, utf8)
+    usage_emit_msg(NsgmlsMessages.info4().get_text(), progc, utf8)
+    usage_emit_msg(NsgmlsMessages.info5().get_text(), progc, utf8)
+    usage_emit_msg(NsgmlsMessages.info6().get_text(), progc, utf8)
+    usage_emit_msg(NsgmlsMessages.info7().get_text(), progc, utf8)
+    usage_emit_msg(NsgmlsMessages.info8().get_text(), progc, utf8)
 }
 
 function main(argc: int, argv: pointer[pointer[char]]) returns int
@@ -640,8 +835,16 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
     ;      EntityApp, ParserApp, NsgmlsApp) — implemented options only; see
     ;      the header comment for the axes still to come. ----
     let reg Array[LongOpt]^arg_host()
+    ; -b is CmdLineApp's FIRST registration; its long name is mode-dependent
+    ; (initCodingSystem runs in the constructor before registerOption):
+    ; --bctf without SP_CHARSET_FIXED, --encoding with it.
+    if is_fixed
+        reg.add(LongOpt(String("encoding"), 0x62 as u32, true))
+    else
+        reg.add(LongOpt(String("bctf"), 0x62 as u32, true))
     reg.add(LongOpt(String("error-file"), 0x66 as u32, true))
     reg.add(LongOpt(String("version"), 0x76 as u32, false))
+    reg.add(LongOpt(String("help"), 0x68 as u32, false))
     reg.add(LongOpt(String("catalog"), 0x63 as u32, true))
     reg.add(LongOpt(String("catalogs"), 0x43 as u32, false))
     reg.add(LongOpt(String("directory"), 0x44 as u32, true))
@@ -680,9 +883,22 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
     var output_flags: u32 0
     var prolog_only false
     var suppress false
+    var want_usage false
     var batch false
     var error_file: pointer[char] null
     var rast_file: pointer[char] null
+
+    ; -b: outputCodingSystem_. Filled by a valid -b during the loop; when no
+    ; -b (or only invalid ones — processOption resets the pointer to 0 on a
+    ; failed lookup) the environment default applies after the loop.
+    ; -b: outputCodingSystem_. Filled by a valid -b during the loop; when no
+    ; -b (or only invalid ones — processOption resets the pointer to 0 on a
+    ; failed lookup) the environment default applies after the loop. The
+    ; record is page-allocated inside the opensp package (a cross-package
+    ; sizeof of an opensp type in this driver miscompiles).
+    let out_enc CodingSystemKit.new_encoder(arg_host)
+    var have_b false
+    let is_bctf is_fixed = false
 
     let os Options.make(arg_host, argc, argv, &reg)
     var c: u32 0
@@ -731,6 +947,29 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
             app_msg1(prog_name, out_utf8, (reporter_options & ONS_REP_MESSAGE_NUMBERS) <> (0 as u32), emt, oname)
             app_msg0(prog_name, out_utf8, (reporter_options & ONS_REP_MESSAGE_NUMBERS) <> (0 as u32), CmdLineAppMessages.tryHelpOptionForInfo())
             return 1
+        }
+        else if c = (0x62 as u32)
+        {
+            ; processOption 'b': outputCodingSystem_ = lookupCodingSystem(arg).
+            ; An unknown name reports unknownBctf/unknownEncoding (quoted arg,
+            ; exit unaffected, parse continues) and leaves the pointer 0 — the
+            ; env default reapplies even after an earlier VALID -b.
+            var bkind 0
+            var bwhich 0
+            let barg String(os.get_arg() as pointer[const_char])
+            if CodingSystemKit.lookup(barg, is_bctf, &bkind, &bwhich)
+            {
+                CodingSystemKit.make_encoder(arg_host, bkind, bwhich, out_enc)
+                set have_b: true
+            }
+            else
+            {
+                set have_b: false
+                var emt CmdLineAppMessages.unknownBctf()
+                if is_fixed
+                    set emt: CmdLineAppMessages.unknownEncoding()
+                app_msg1(prog_name, out_utf8, (reporter_options & ONS_REP_MESSAGE_NUMBERS) <> (0 as u32), emt, StringC(os.get_arg() as pointer[const_char]))
+            }
         }
         else if c = (0x61 as u32)
             active_links.add(String(os.get_arg() as pointer[const_char]))
@@ -817,8 +1056,19 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
             set prolog_only: true
         else if c = (0x73 as u32)
             set suppress: true
+        else if c = (0x68 as u32)
+            ; -h: like the reference, only SET the flag — the option loop runs
+            ; to the end (so a -b after -h still applies) and usage prints after
+            ; the -f error-file open below.
+            set want_usage: true
         set scanning: os.get(&c)
     }
+
+    ; processOptions epilogue: `if (!outputCodingSystem_) outputCodingSystem_
+    ; = codingSystem()` — the environment pair (UTF-8 under SP_CHARSET_FIXED
+    ; + SP_ENCODING=XML/UTF-8 or SP_BCTF=UTF-8, else identity).
+    if have_b = false
+        CodingSystemKit.make_default(arg_host, out_utf8, out_enc)
 
     ; -f: opened AFTER the option loop (processOptions does), so option-time
     ; messages always reach the real stderr; open failure aborts with the
@@ -836,6 +1086,14 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
             return 1
         }
         set msg_fd: fd as int
+    }
+
+    ; -h/--help: CmdLineApp::run prints the usage AFTER processOptions (so a bad
+    ; -f still aborts first) and returns 0 without touching the document.
+    if want_usage
+    {
+        print_usage(prog_name, out_utf8, is_fixed)
+        return 0
     }
 
     ; the entity-manager config (EntityApp::entityManager): the command-line
@@ -879,7 +1137,7 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
                 append_lit(&racc, (*(argv + ai)) as pointer[const_char])
                 set rp: String(racc.get_buffer() as pointer[const_char], racc.get_length())
             }
-            let r process_document(argv + ai, 1, prog_name, out_utf8, is_fixed, &active_links, opts, error_limit, reporter_options, output_flags, msg_fd, prolog_only, suppress, rast_file <> null, rp, &em_cfg)
+            let r process_document(argv + ai, 1, prog_name, out_utf8, out_enc, is_fixed, &active_links, opts, error_limit, reporter_options, output_flags, msg_fd, prolog_only, suppress, rast_file <> null, rp, &em_cfg)
             if r < 0
                 return 1
             if r > ret
@@ -893,7 +1151,7 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
     var rp2 String()
     if rast_file <> null
         set rp2: String(rast_file as pointer[const_char])
-    let rmain process_document(argv + first_arg, argc - first_arg, prog_name, out_utf8, is_fixed, &active_links, opts, error_limit, reporter_options, output_flags, msg_fd, prolog_only, suppress, rast_file <> null, rp2, &em_cfg)
+    let rmain process_document(argv + first_arg, argc - first_arg, prog_name, out_utf8, out_enc, is_fixed, &active_links, opts, error_limit, reporter_options, output_flags, msg_fd, prolog_only, suppress, rast_file <> null, rp2, &em_cfg)
     if rmain < 0
         return 1
     rmain
