@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# dazzle unit suite — the style-engine layer self-tests for the dazzle port
+# (Stage 6a, ROADMAP-dazzle.md).
+#
+#   tests/dazzle/run.sh [scalyc-binary]   (default: scalyc/build/scalyc)
+#
+# dazzle.test() chains every module's self-test (ELObj, …) and returns 0 on
+# success. Mirrors tests/opensp/run.sh: compile the packages AHEAD-OF-TIME
+# into real archives and link + run unit.scaly against them — never --jit
+# (undefined externals would become 0-returning stubs and the suite would
+# false-pass; memory opensp-harness-falsepass).
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+BIN="${1:-$ROOT/scalyc/build/scalyc}"
+cd "$ROOT"
+
+# shellcheck disable=SC1091
+source tools/llvm-env.sh >/dev/null 2>&1
+set -u
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# --- 1. AOT-compile the dazzle and opensp packages into archives -----------
+for PKG in dazzle opensp; do
+  if ! "$BIN" -S --no-prelude -o "$TMP/$PKG.ll" "packages/$PKG/0.1.0/$PKG.scaly" > "$TMP/$PKG-emit.log" 2>&1; then
+    echo "dazzle: FAIL ($PKG emit)"; tail -8 "$TMP/$PKG-emit.log"; exit 1
+  fi
+  sed 's/^define linkonce_odr /define weak_odr /' "$TMP/$PKG.ll" > "$TMP/${PKG}_weak.ll"
+  if ! "$LLC" -relocation-model=pic -O2 -filetype=obj "$TMP/${PKG}_weak.ll" -o "$TMP/$PKG.o" > "$TMP/$PKG-llc.log" 2>&1; then
+    echo "dazzle: FAIL ($PKG llc)"; tail -8 "$TMP/$PKG-llc.log"; exit 1
+  fi
+  ar rcs "$TMP/lib$PKG.a" "$TMP/$PKG.o"
+done
+
+# --- 2. Ensure the scaly runtime archive the program links against exists --
+if [ ! -f /tmp/libscaly.a ]; then
+  "$BIN" -S --no-prelude --no-tests -o /tmp/libscaly.ll packages/scaly/0.1.0/scaly.scaly > "$TMP/rt.log" 2>&1 || { echo "dazzle: FAIL (runtime emit)"; tail -8 "$TMP/rt.log"; exit 1; }
+  sed 's/^define linkonce_odr /define weak_odr /' /tmp/libscaly.ll > /tmp/libscaly_weak.ll
+  "$OPT" -O2 /tmp/libscaly_weak.ll -o /tmp/libscaly_opt.bc >> "$TMP/rt.log" 2>&1 || { echo "dazzle: FAIL (runtime opt)"; tail -8 "$TMP/rt.log"; exit 1; }
+  "$LLC" -relocation-model=pic -O2 -filetype=obj /tmp/libscaly_opt.bc -o /tmp/libscaly.o >> "$TMP/rt.log" 2>&1 || { echo "dazzle: FAIL (runtime llc)"; tail -8 "$TMP/rt.log"; exit 1; }
+  tools/fcontext.sh /tmp/fcontext.o >> "$TMP/rt.log" 2>&1
+  tools/eio.sh /tmp/eio.o >> "$TMP/rt.log" 2>&1
+  ar rcs /tmp/libscaly.a /tmp/libscaly.o /tmp/fcontext.o /tmp/eio.o
+fi
+
+# --- 3. Link + run the unit harness ---------------------------------------
+if ! "$BIN" -o "$TMP/unit" "$HERE/unit.scaly" "$TMP/libdazzle.a" "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
+  echo "dazzle: FAIL (link)"; tail -8 "$TMP/link.log"; exit 1
+fi
+
+out="$("$TMP/unit" 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "PASS" ]; then
+  echo "dazzle: PASS"
+  exit 0
+fi
+echo "dazzle: FAIL (rc=$rc) out='$out'"
+exit 1

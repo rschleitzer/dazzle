@@ -1,0 +1,1337 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+
+; ELObj — the expression-language value model (Style/ELObj.cs, upstream
+; ELObj.cxx). The C++ single-inheritance hierarchy (~40 subclasses under
+; ELObj) is flattened into ONE union per the established opensp pattern
+; (Entity, CodingSystem): arms are standalone records, dispatch is `choose`,
+; never casts. Virtual-method dispatch becomes union functions.
+;
+; Inc-1 scope: the core objects (singletons, symbol, keyword, pair, vector,
+; char, string, integer, real, length, quantity), the printer, equal?/eqv?.
+; NodeListObj and SosofoObj sub-hierarchies join the union in later
+; increments (they need the grove / the style machinery); FunctionObj joins
+; with Insn/VM. The interning tables (SymbolObj/KeywordObj identity) live in
+; the Interpreter (Inc 3) — Identifier here is the minimal seed it extends.
+;
+; Reference semantics preserved deliberately:
+; - eqv? on strings falls back to content-equality (C# ELObj.isEquiv default
+;   delegates to isEqual and StringObj does not override) — NOT R4RS
+;   identity; the reference decides.
+; - PairObj is_equal/is_equiv recurse (C# carries the same FIXME).
+; - StringObj.is_equal accepts a char (stringData), CharObj.is_equal only a
+;   char — the asymmetry is the reference's.
+; - CharObj print is the raw "#\<char>" (the C# FIXME: no character names).
+
+; libm — fixed-prototype, non-variadic C calls: direct externs per the
+; containment rule (no shim needed).
+function log10(x: double) returns double extern
+function pow(x: double, y: double) returns double extern
+function floor(x: double) returns double extern
+
+; ELObj.QuantityType
+define QT_NONE: int 0
+define QT_LONG: int 1
+define QT_DOUBLE: int 2
+
+; quantityValue's three out-params as a small struct (built EXACTLY ONCE per
+; return path — emitter constraint on small-struct helpers).
+define QuantityValue (qtype: int, lval: int, dval: double, dim: int)
+{
+    init(qtype: int, lval: int, dval: double, dim: int)
+    {
+        set this.qtype: qtype
+        set this.lval: lval
+        set this.dval: dval
+        set this.dim: dim
+    }
+}
+
+; OutputCharStream — Inc-1 minimal: the Str arm only (StrOutputCharStream
+; semantics: accumulate Chars in memory). The file/encoding sinks arrive
+; with the FOTBuilder increment and write through opensp's CodingSystemKit.
+define OutputCharStream (buf: pointer[Array[u32]])
+{
+    function make(host: pointer[Page]) returns pointer[OutputCharStream]
+    {
+        let os host.allocate(sizeof OutputCharStream, alignof OutputCharStream) as pointer[OutputCharStream]
+        set os.buf: Array[u32]^host()
+        os
+    }
+
+    function put(this: pointer[OutputCharStream], ch: u32)
+        this.buf.add(ch)
+
+    function write(this: pointer[OutputCharStream], data: pointer[u32], n: size_t)
+    {
+        var i: size_t 0
+        while i < n
+        {
+            this.buf.add(*(data + i))
+            set i: i + 1
+        }
+    }
+
+    ; Widen an ASCII literal into the sink (print's fixed text).
+    function put_ascii(this: pointer[OutputCharStream], s: pointer[const_char])
+    {
+        var p s as pointer[u8]
+        while (*p) <> (0 as u8)
+        {
+            this.buf.add((*p) as u32)
+            set p: p + 1
+        }
+    }
+
+    function size(this: pointer[OutputCharStream]) returns size_t
+        this.buf.get_length()
+
+    ; Content comparison against an ASCII literal (test harness).
+    function is_ascii(this: pointer[OutputCharStream], s: pointer[const_char]) returns bool
+    {
+        var p s as pointer[u8]
+        var i: size_t 0
+        let n this.buf.get_length()
+        while (*p) <> (0 as u8)
+        {
+            if i >= n
+                return false
+
+            if (*(this.buf.get_buffer() + i)) <> ((*p) as u32)
+                return false
+
+            set p: p + 1
+            set i: i + 1
+        }
+        i = n
+    }
+
+    function to_string_c(this: pointer[OutputCharStream], host: pointer[Page]) returns StringC
+        StringC^host(this.buf.get_buffer(), this.buf.get_length())
+}
+
+; Identifier — minimal seed (name only). Interpreter.cs's Identifier carries
+; value/expression/insn/inheritedC/flowObj slots; those land with Inc 3. The
+; KeywordObj arm points here, and keyword equality is Identifier POINTER
+; equality (the interning table guarantees one Identifier per name).
+define Identifier (name: StringC)
+{
+    function make(host: pointer[Page], name: StringC) returns pointer[Identifier]
+    {
+        let ident host.allocate(sizeof Identifier, alignof Identifier) as pointer[Identifier]
+        set ident.name: StringC^host(name.data_ptr(), name.get_size())
+        ident
+    }
+
+    function get_name(this: Identifier) returns StringC
+        name
+}
+
+; --- arm records -----------------------------------------------------------
+; The five data-less singletons. The Interpreter (Inc 3) allocates exactly
+; one of each per run; eqv? on them is pointer identity for free.
+define ErrorObj ()
+define UnspecifiedObj ()
+define NilObj ()
+define TrueObj ()
+define FalseObj ()
+
+define SymbolObj (name: StringC, c_value: int)
+{
+    init(name: StringC)
+    {
+        set this.name: name
+        set this.c_value: 0
+    }
+}
+
+define KeywordObj (ident: pointer[Identifier])
+{
+    init(ident: pointer[Identifier])
+        set this.ident: ident
+}
+
+define PairObj (car: pointer[ELObj], cdr: pointer[ELObj])
+{
+    init(car: pointer[ELObj], cdr: pointer[ELObj])
+    {
+        set this.car: car
+        set this.cdr: cdr
+    }
+}
+
+; C++ VectorObj is a raw ELObj** + size; ported as a page-hosted buffer.
+; Scheme vectors are fixed-size after creation, element-settable.
+define VectorObj (elems: pointer[pointer[ELObj]], n: size_t)
+{
+    init(elems: pointer[pointer[ELObj]], n: size_t)
+    {
+        set this.elems: elems
+        set this.n: n
+    }
+}
+
+define CharObj (ch: u32)
+{
+    init(ch: u32)
+        set this.ch: ch
+}
+
+define StringObj (str: StringC)
+{
+    init(str: StringC)
+        set this.str: str
+}
+
+define IntegerObj (n: int)
+{
+    init(n: int)
+        set this.n: n
+}
+
+define RealObj (n: double)
+{
+    init(n: double)
+        set this.n: n
+}
+
+; A length in internal units (unitsPerInch per run, Interpreter state).
+define LengthObj (n: int)
+{
+    init(n: int)
+        set this.n: n
+}
+
+; A dimensioned inexact quantity (val * length^dim).
+define QuantityObj (val: double, dim: int)
+{
+    init(val: double, dim: int)
+    {
+        set this.val: val
+        set this.dim: dim
+    }
+}
+
+; --- the union -------------------------------------------------------------
+define ELObj union
+(
+    Error: ErrorObj
+    Unspecified: UnspecifiedObj
+    Nil: NilObj
+    True: TrueObj
+    False: FalseObj
+    Symbol: SymbolObj
+    Keyword: KeywordObj
+    Pair: PairObj
+    Vec: VectorObj
+    Chr: CharObj
+    Str: StringObj
+    Int: IntegerObj
+    Real: RealObj
+    Length: LengthObj
+    Quantity: QuantityObj
+)
+{
+    ; --- constructors (Collector::allocateObject seam: run-page make) ------
+    function make_error(host: pointer[Page]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Error(ErrorObj())
+        p
+    }
+
+    function make_unspecified(host: pointer[Page]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Unspecified(UnspecifiedObj())
+        p
+    }
+
+    function make_nil(host: pointer[Page]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Nil(NilObj())
+        p
+    }
+
+    function make_true(host: pointer[Page]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.True(TrueObj())
+        p
+    }
+
+    function make_false(host: pointer[Page]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.False(FalseObj())
+        p
+    }
+
+    ; Deep-copies the name onto the host page (transient-buffer trap).
+    function make_symbol(host: pointer[Page], name: StringC) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Symbol(SymbolObj(StringC^host(name.data_ptr(), name.get_size())))
+        p
+    }
+
+    function make_keyword(host: pointer[Page], ident: pointer[Identifier]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Keyword(KeywordObj(ident))
+        p
+    }
+
+    function make_pair(host: pointer[Page], car: pointer[ELObj], cdr: pointer[ELObj]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Pair(PairObj(car, cdr))
+        p
+    }
+
+    ; make-vector: n slots, all `fill` (may be null while under construction).
+    function make_vector(host: pointer[Page], n: size_t, fill: pointer[ELObj]) returns pointer[ELObj]
+    {
+        var elems: pointer[pointer[ELObj]] null
+        if n > (0 as size_t)
+        {
+            set elems: host.allocate(n * (sizeof pointer[ELObj]), alignof pointer[ELObj]) as pointer[pointer[ELObj]]
+            var i: size_t 0
+            while i < n
+            {
+                set *(elems + i): fill
+                set i: i + 1
+            }
+        }
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Vec(VectorObj(elems, n))
+        p
+    }
+
+    function make_char(host: pointer[Page], ch: u32) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Chr(CharObj(ch))
+        p
+    }
+
+    ; Deep-copies the text onto the host page (C# StringObj(StringC) makes a
+    ; copy for the same reason: the parser reuses its buffer).
+    function make_string(host: pointer[Page], str: StringC) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Str(StringObj(StringC^host(str.data_ptr(), str.get_size())))
+        p
+    }
+
+    function make_integer(host: pointer[Page], n: int) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Int(IntegerObj(n))
+        p
+    }
+
+    function make_real(host: pointer[Page], n: double) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Real(RealObj(n))
+        p
+    }
+
+    function make_length(host: pointer[Page], n: int) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Length(LengthObj(n))
+        p
+    }
+
+    function make_quantity(host: pointer[Page], val: double, dim: int) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Quantity(QuantityObj(val, dim))
+        p
+    }
+
+    ; --- predicates --------------------------------------------------------
+    function is_nil(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when n: Nil
+                return true
+            else
+                return false
+        false
+    }
+
+    ; NilObj: true; PairObj: walks the cdr chain; everything else: false.
+    function is_list(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when n: Nil
+                return true
+            when pr: Pair
+            {
+                var p pr.cdr
+                while p <> null
+                {
+                    choose *p
+                        when n2: Nil
+                            return true
+                        when p2: Pair
+                            set p: p2.cdr
+                        else
+                            return false
+                }
+                return true
+            }
+            else
+                return false
+        false
+    }
+
+    ; Everything is true except #f.
+    function is_true(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when f: False
+                return false
+            else
+                return true
+        true
+    }
+
+    ; --- accessors (NULL-sentinel, the opensp lookup convention) -----------
+    function get_car(this: pointer[ELObj]) returns pointer[ELObj]
+    {
+        choose *this
+            when pr: Pair
+                return pr.car
+            else
+                return null
+        null
+    }
+
+    function get_cdr(this: pointer[ELObj]) returns pointer[ELObj]
+    {
+        choose *this
+            when pr: Pair
+                return pr.cdr
+            else
+                return null
+        null
+    }
+
+    ; Arm rebuild in place — the union address (eq?-identity) is unchanged.
+    function set_car(this: pointer[ELObj], v: pointer[ELObj])
+    {
+        choose *this
+            when pr: Pair
+                set *this: ELObj.Pair(PairObj(v, pr.cdr))
+    }
+
+    function set_cdr(this: pointer[ELObj], v: pointer[ELObj])
+    {
+        choose *this
+            when pr: Pair
+                set *this: ELObj.Pair(PairObj(pr.car, v))
+    }
+
+    ; charValue: the codepoint, or -1 (no codepoint is negative).
+    function char_value(this: pointer[ELObj]) returns int
+    {
+        choose *this
+            when c: Chr
+                return c.ch as int
+            else
+                return 0 - 1
+        0 - 1
+    }
+
+    ; stringData: chars and strings have it (a char is a 1-char string).
+    function has_string_data(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when c: Chr
+                return true
+            when s: Str
+                return true
+            else
+                return false
+        false
+    }
+
+    ; The string data as a StringC (Chr allocates its 1-char buffer on host;
+    ; Str returns a shallow view of its page-resident buffer).
+    function string_data(this: pointer[ELObj], host: pointer[Page]) returns StringC
+    {
+        choose *this
+            when c: Chr
+            {
+                var buf u32[1]
+                set *(buf as pointer[u32]): c.ch
+                return StringC^host(buf as pointer[u32], 1 as size_t)
+            }
+            when s: Str
+                return s.str
+            else
+                return StringC()
+        StringC()
+    }
+
+    function is_exact_integer(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when i: Int
+                return true
+            else
+                return false
+        false
+    }
+
+    function exact_integer_value(this: pointer[ELObj]) returns int
+    {
+        choose *this
+            when i: Int
+                return i.n
+            else
+                return 0
+        0
+    }
+
+    ; realValue: integers and reals; quantities only when dimensionless.
+    function is_real(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when i: Int
+                return true
+            when r: Real
+                return true
+            when q: Quantity
+                return q.dim = 0
+            else
+                return false
+        false
+    }
+
+    function real_value(this: pointer[ELObj]) returns double
+    {
+        choose *this
+            when i: Int
+                return i.n as double
+            when r: Real
+                return r.n
+            when q: Quantity
+                return q.val
+            else
+                return 0.0
+        0.0
+    }
+
+    ; inexactRealValue: reals and dimensionless quantities, NOT integers.
+    function is_inexact_real(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when r: Real
+                return true
+            when q: Quantity
+                return q.dim = 0
+            else
+                return false
+        false
+    }
+
+    function is_length(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when l: Length
+                return true
+            else
+                return false
+        false
+    }
+
+    function length_value(this: pointer[ELObj]) returns int
+    {
+        choose *this
+            when l: Length
+                return l.n
+            else
+                return 0
+        0
+    }
+
+    ; quantityValue — Int: long dim 0; Real: double dim 0; Length: long
+    ; dim 1; Quantity: double with its dim; everything else noQuantity.
+    function quantity_value(this: pointer[ELObj]) returns QuantityValue
+    {
+        var qtype QT_NONE
+        var lval 0
+        var dval 0.0
+        var dim 0
+        choose *this
+            when i: Int
+            {
+                set qtype: QT_LONG
+                set lval: i.n
+            }
+            when r: Real
+            {
+                set qtype: QT_DOUBLE
+                set dval: r.n
+            }
+            when l: Length
+            {
+                set qtype: QT_LONG
+                set lval: l.n
+                set dim: 1
+            }
+            when q: Quantity
+            {
+                set qtype: QT_DOUBLE
+                set dval: q.val
+                set dim: q.dim
+            }
+        QuantityValue(qtype, lval, dval, dim)
+    }
+
+    ; convertToString: strings themselves, symbols their name, chars their
+    ; 1-char string; null otherwise.
+    function convert_to_string(this: pointer[ELObj], host: pointer[Page]) returns pointer[ELObj]
+    {
+        choose *this
+            when s: Str
+                return this
+            when sym: Symbol
+                return ELObj.make_string(host, sym.name)
+            when c: Chr
+            {
+                var buf u32[1]
+                set *(buf as pointer[u32]): c.ch
+                let s StringC^host(buf as pointer[u32], 1 as size_t)
+                return ELObj.make_string(host, s)
+            }
+            else
+                return null
+        null
+    }
+
+    ; --- printer -----------------------------------------------------------
+    ; ELObj::print(Interpreter&, OutputCharStream&). Of the Interpreter the
+    ; printer only consults unitsPerInch() (Length/Quantity); it is threaded
+    ; as a scalar until Inc 3 lands the Interpreter record.
+    function print(this: pointer[ELObj], os: pointer[OutputCharStream], units_per_inch: int)
+    {
+        choose *this
+            when e: Error
+                os.put_ascii("#<error>")
+            when u: Unspecified
+                os.put_ascii("#v")
+            when n: Nil
+                os.put_ascii("()")
+            when t: True
+                os.put_ascii("#t")
+            when f: False
+                os.put_ascii("#f")
+            when sym: Symbol
+                os.write(sym.name.data_ptr(), sym.name.get_size())
+            when k: Keyword
+            {
+                let name k.ident.get_name()
+                os.write(name.data_ptr(), name.get_size())
+                os.put_ascii(":")
+            }
+            when pr: Pair
+            {
+                os.put_ascii("(")
+                if pr.car <> null
+                    pr.car.print(os, units_per_inch)
+                var p pr.cdr
+                var done false
+                while done = false
+                {
+                    if p = null
+                    {
+                        os.put_ascii(")")
+                        set done: true
+                    }
+                    else
+                    {
+                        choose *p
+                            when n2: Nil
+                            {
+                                os.put_ascii(")")
+                                set done: true
+                            }
+                            when p2: Pair
+                            {
+                                os.put_ascii(" ")
+                                if p2.car <> null
+                                    p2.car.print(os, units_per_inch)
+                                set p: p2.cdr
+                            }
+                            else
+                            {
+                                os.put_ascii(" . ")
+                                p.print(os, units_per_inch)
+                                os.put_ascii(")")
+                                set done: true
+                            }
+                    }
+                }
+            }
+            when v: Vec
+            {
+                ; the reference's cycle guard: null the slot while printing
+                ; it, restore after; a null slot prints #<cycle>.
+                os.put_ascii("#(")
+                var i: size_t 0
+                while i < v.n
+                {
+                    if i > (0 as size_t)
+                        os.put_ascii(" ")
+                    let e *(v.elems + i)
+                    if e = null
+                        os.put_ascii("#<cycle>")
+                    if e <> null
+                    {
+                        set *(v.elems + i): null
+                        e.print(os, units_per_inch)
+                        set *(v.elems + i): e
+                    }
+                    set i: i + 1
+                }
+                os.put_ascii(")")
+            }
+            when c: Chr
+            {
+                os.put_ascii("#\\")
+                os.put(c.ch)
+            }
+            when s: Str
+            {
+                os.put_ascii("\"")
+                var i: size_t 0
+                let n s.str.get_size()
+                while i < n
+                {
+                    let ch s.str.get(i)
+                    if ch = (0x5C as u32)
+                        os.put_ascii("\\")
+                    if ch = (0x22 as u32)
+                        os.put_ascii("\\")
+                    os.put(ch)
+                    set i: i + 1
+                }
+                os.put_ascii("\"")
+            }
+            when i2: Int
+                ELObj.print_integer(os, i2.n, 10 as u32)
+            when r: Real
+                ELObj.print_double(os, r.n)
+            when l: Length
+            {
+                ELObj.print_double(os, (l.n as double) * 72.0 / (units_per_inch as double))
+                os.put_ascii("pt")
+            }
+            when q: Quantity
+            {
+                ELObj.print_double(os, q.val * pow(72.0 / (units_per_inch as double), q.dim as double))
+                os.put_ascii("pt")
+                ELObj.print_integer(os, q.dim, 10 as u32)
+            }
+    }
+
+    ; print(interp, os, radix) — only integers honor the radix.
+    function print_radix(this: pointer[ELObj], os: pointer[OutputCharStream], radix: u32, units_per_inch: int)
+    {
+        choose *this
+            when i: Int
+                ELObj.print_integer(os, i.n, radix)
+            else
+                this.print(os, units_per_inch)
+    }
+
+    ; IntegerObj::print — magnitude via unsigned wrap (covers INT64_MIN).
+    function print_integer(os: pointer[OutputCharStream], n: int, radix: u32)
+    {
+        if n = 0
+        {
+            os.put_ascii("0")
+            return
+        }
+        var m: size_t 0
+        if n < 0
+        {
+            os.put_ascii("-")
+            set m: (0 as size_t) - (n as size_t)
+        }
+        if n > 0
+            set m: n as size_t
+        var buf u8[64]
+        var i 0
+        let r radix as size_t
+        while m <> (0 as size_t)
+        {
+            let d (m % r) as int
+            var c 0x30 + d
+            if d >= 10
+                set c: 0x61 + d - 10
+            set *((buf as pointer[u8]) + i): c as u8
+            set i: i + 1
+            set m: m / r
+        }
+        while i > 0
+        {
+            set i: i - 1
+            os.put((*((buf as pointer[u8]) + i)) as u32)
+        }
+    }
+
+    ; RealObj::print is C's %g (precision 6, trailing zeros stripped,
+    ; scientific when exp < -4 or >= 6). Reimplemented here; the corpus
+    ; differential gate validates byte-fidelity against the reference.
+    function print_double(os: pointer[OutputCharStream], x_in: double)
+    {
+        var x x_in
+        if x < 0.0
+        {
+            os.put_ascii("-")
+            set x: 0.0 - x
+        }
+        if x = 0.0
+        {
+            os.put_ascii("0")
+            return
+        }
+        ; 6 significant digits: m in [100000, 999999] and decimal exponent e
+        var e (floor(log10(x))) as int
+        var m (floor((x / pow(10.0, (e - 5) as double)) + 0.5)) as int
+        if m >= 1000000
+        {
+            set m: m / 10
+            set e: e + 1
+        }
+        ; the six digits, most significant first
+        var digits u8[6]
+        var i 6
+        while i > 0
+        {
+            set i: i - 1
+            set *((digits as pointer[u8]) + i): (0x30 + (m % 10)) as u8
+            set m: m / 10
+        }
+        ; strip trailing zeros -> k significant digits (k >= 1)
+        var k 6
+        while k > 1
+        {
+            if (*((digits as pointer[u8]) + (k - 1))) <> (0x30 as u8)
+                break
+            set k: k - 1
+        }
+        var use_sci false
+        if e < (0 - 4)
+            set use_sci: true
+        if e >= 6
+            set use_sci: true
+        if use_sci
+        {
+            os.put((*(digits as pointer[u8])) as u32)
+            if k > 1
+            {
+                os.put_ascii(".")
+                var j 1
+                while j < k
+                {
+                    os.put((*((digits as pointer[u8]) + j)) as u32)
+                    set j: j + 1
+                }
+            }
+            os.put_ascii("e")
+            var ea e
+            if ea < 0
+            {
+                os.put_ascii("-")
+                set ea: 0 - ea
+            }
+            if ea >= 0
+            {
+                if e >= 0
+                    os.put_ascii("+")
+            }
+            if ea < 10
+                os.put_ascii("0")
+            ELObj.print_integer(os, ea, 10 as u32)
+            return
+        }
+        if e >= 0
+        {
+            ; point after e+1 digits; zero-pad when all digits are integral
+            var j 0
+            while j <= e
+            {
+                if j < k
+                    os.put((*((digits as pointer[u8]) + j)) as u32)
+                if j >= k
+                    os.put_ascii("0")
+                set j: j + 1
+            }
+            if k > (e + 1)
+            {
+                os.put_ascii(".")
+                while j < k
+                {
+                    os.put((*((digits as pointer[u8]) + j)) as u32)
+                    set j: j + 1
+                }
+            }
+            return
+        }
+        ; e < 0: 0.<zeros><digits>
+        os.put_ascii("0.")
+        var z 0 - e - 1
+        while z > 0
+        {
+            os.put_ascii("0")
+            set z: z - 1
+        }
+        var j2 0
+        while j2 < k
+        {
+            os.put((*((digits as pointer[u8]) + j2)) as u32)
+            set j2: j2 + 1
+        }
+    }
+
+    ; --- equality ----------------------------------------------------------
+    ; ELObj::equal — pointer identity, then structural isEqual.
+    function equal(a: pointer[ELObj], b: pointer[ELObj]) returns bool
+    {
+        if a = b
+            return true
+
+        ELObj.is_equal(a, b)
+    }
+
+    ; ELObj::eqv — pointer identity, then isEquiv (default: isEqual; Pair
+    ; recurses with eqv, Vec is never equivalent).
+    function eqv(a: pointer[ELObj], b: pointer[ELObj]) returns bool
+    {
+        if a = b
+            return true
+
+        choose *a
+            when pr: Pair
+            {
+                choose *b
+                    when pb: Pair
+                    {
+                        if ELObj.eqv(pr.car, pb.car)
+                            return ELObj.eqv(pr.cdr, pb.cdr)
+                        return false
+                    }
+                    else
+                        return false
+                return false
+            }
+            when v: Vec
+                return false
+            else
+                return ELObj.is_equal(a, b)
+        false
+    }
+
+    function is_equal(a: pointer[ELObj], b: pointer[ELObj]) returns bool
+    {
+        choose *a
+            when k: Keyword
+            {
+                choose *b
+                    when kb: Keyword
+                        return k.ident = kb.ident
+                    else
+                        return false
+                return false
+            }
+            when pr: Pair
+            {
+                ; the reference's recursive FIXME, ported as-is
+                choose *b
+                    when pb: Pair
+                    {
+                        if ELObj.equal(pr.car, pb.car)
+                            return ELObj.equal(pr.cdr, pb.cdr)
+                        return false
+                    }
+                    else
+                        return false
+                return false
+            }
+            when v: Vec
+            {
+                choose *b
+                    when vb: Vec
+                    {
+                        if v.n <> vb.n
+                            return false
+                        var i: size_t 0
+                        while i < v.n
+                        {
+                            if ELObj.equal(*(v.elems + i), *(vb.elems + i)) = false
+                                return false
+                            set i: i + 1
+                        }
+                        return true
+                    }
+                    else
+                        return false
+                return false
+            }
+            when c: Chr
+            {
+                choose *b
+                    when cb: Chr
+                        return c.ch = cb.ch
+                    else
+                        return false
+                return false
+            }
+            when s: Str
+            {
+                ; accepts anything with stringData (char or string)
+                if b.has_string_data() = false
+                    return false
+                choose *b
+                    when sb: Str
+                        return s.str.equals(sb.str)
+                    when cb: Chr
+                    {
+                        if s.str.get_size() <> (1 as size_t)
+                            return false
+                        return s.str.get(0 as size_t) = cb.ch
+                    }
+                    else
+                        return false
+                return false
+            }
+            when i: Int
+            {
+                choose *b
+                    when ib: Int
+                        return i.n = ib.n
+                    else
+                        return false
+                return false
+            }
+            when r: Real
+            {
+                ; RealObj: other.inexactRealValue == n_
+                if b.is_inexact_real() = false
+                    return false
+                return b.real_value() = r.n
+            }
+            when l: Length
+            {
+                let qv b.quantity_value()
+                if qv.qtype = QT_LONG
+                {
+                    if qv.dim = 1
+                        return qv.lval = l.n
+                    return false
+                }
+                if qv.qtype = QT_DOUBLE
+                {
+                    if qv.dim = 1
+                        return qv.dval = (l.n as double)
+                    return false
+                }
+                return false
+            }
+            when q: Quantity
+            {
+                let qv b.quantity_value()
+                if qv.qtype = QT_LONG
+                {
+                    if qv.dim = q.dim
+                        return (qv.lval as double) = q.val
+                    return false
+                }
+                if qv.qtype = QT_DOUBLE
+                {
+                    if qv.dim = q.dim
+                        return qv.dval = q.val
+                    return false
+                }
+                return false
+            }
+            else
+                return false
+        false
+    }
+
+    ; --- self-test ---------------------------------------------------------
+    function test() returns int
+    {
+        ; bootstrap the run region (the established test idiom)
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+
+        ; singletons print
+        let nil ELObj.make_nil(host)
+        var os OutputCharStream.make(host)
+        nil.print(os, 72000)
+        if os.is_ascii("()") = false
+            return -1
+
+        let t ELObj.make_true(host)
+        set os: OutputCharStream.make(host)
+        t.print(os, 72000)
+        if os.is_ascii("#t") = false
+            return -2
+
+        let f ELObj.make_false(host)
+        set os: OutputCharStream.make(host)
+        f.print(os, 72000)
+        if os.is_ascii("#f") = false
+            return -3
+
+        if f.is_true()
+            return -4
+
+        if t.is_true() = false
+            return -5
+
+        let unspec ELObj.make_unspecified(host)
+        set os: OutputCharStream.make(host)
+        unspec.print(os, 72000)
+        if os.is_ascii("#v") = false
+            return -6
+
+        ; integers
+        let i42 ELObj.make_integer(host, 42)
+        set os: OutputCharStream.make(host)
+        i42.print(os, 72000)
+        if os.is_ascii("42") = false
+            return -7
+
+        let neg ELObj.make_integer(host, 0 - 7)
+        set os: OutputCharStream.make(host)
+        neg.print(os, 72000)
+        if os.is_ascii("-7") = false
+            return -8
+
+        set os: OutputCharStream.make(host)
+        let i255 ELObj.make_integer(host, 255)
+        i255.print_radix(os, 16 as u32, 72000)
+        if os.is_ascii("ff") = false
+            return -9
+
+        ; char
+        let ca ELObj.make_char(host, 0x41 as u32)
+        set os: OutputCharStream.make(host)
+        ca.print(os, 72000)
+        if os.is_ascii("#\\A") = false
+            return -10
+
+        if ca.char_value() <> 0x41
+            return -11
+
+        if i42.char_value() <> (0 - 1)
+            return -12
+
+        ; string with escapes: a"b prints as "a\"b"
+        var sbuf u32[3]
+        set *(sbuf as pointer[u32]): (0x61 as u32)
+        set *((sbuf as pointer[u32]) + (1 as size_t)): (0x22 as u32)
+        set *((sbuf as pointer[u32]) + (2 as size_t)): (0x62 as u32)
+        let sc StringC(sbuf as pointer[u32], 3 as size_t)
+        let str ELObj.make_string(host, sc)
+        set os: OutputCharStream.make(host)
+        str.print(os, 72000)
+        if os.is_ascii("\"a\\\"b\"") = false
+            return -13
+
+        ; symbol + keyword
+        let sym ELObj.make_symbol(host, StringC("foo"))
+        set os: OutputCharStream.make(host)
+        sym.print(os, 72000)
+        if os.is_ascii("foo") = false
+            return -14
+
+        let ident Identifier.make(host, StringC("use"))
+        let kw ELObj.make_keyword(host, ident)
+        set os: OutputCharStream.make(host)
+        kw.print(os, 72000)
+        if os.is_ascii("use:") = false
+            return -15
+
+        ; pairs: (1 2), (1 . 2), improper tail
+        let one ELObj.make_integer(host, 1)
+        let two ELObj.make_integer(host, 2)
+        let l2 ELObj.make_pair(host, two, nil)
+        let l12 ELObj.make_pair(host, one, l2)
+        set os: OutputCharStream.make(host)
+        l12.print(os, 72000)
+        if os.is_ascii("(1 2)") = false
+            return -16
+
+        let dotted ELObj.make_pair(host, one, two)
+        set os: OutputCharStream.make(host)
+        dotted.print(os, 72000)
+        if os.is_ascii("(1 . 2)") = false
+            return -17
+
+        if l12.is_list() = false
+            return -18
+
+        if dotted.is_list()
+            return -19
+
+        if nil.is_list() = false
+            return -20
+
+        ; car/cdr + set_car (eq-stable arm rebuild)
+        if l12.get_car() <> one
+            return -21
+
+        if l12.get_cdr() <> l2
+            return -22
+
+        let l12b l12
+        l12.set_car(two)
+        if l12 <> l12b
+            return -23
+
+        if l12.get_car() <> two
+            return -24
+
+        l12.set_car(one)
+
+        ; vector print + cycle guard
+        let vec ELObj.make_vector(host, 2 as size_t, nil)
+        set os: OutputCharStream.make(host)
+        vec.print(os, 72000)
+        if os.is_ascii("#(() ())") = false
+            return -25
+
+        ; equal? / eqv?
+        ; the tail shares the ONE nil — the reference relies on singleton
+        ; identity (NilObj has no isEqual; Interpreter.makeNil is unique)
+        let l12c ELObj.make_pair(host, one, ELObj.make_pair(host, two, nil))
+        if ELObj.equal(l12, l12c) = false
+            return -26
+
+        if ELObj.equal(l12, dotted)
+            return -27
+
+        if ELObj.eqv(l12, l12) = false
+            return -28
+
+        ; reference semantics: PairObj.isEquiv recurses, so structurally
+        ; equal pairs of eqv leaves ARE eqv
+        if ELObj.eqv(l12, l12c) = false
+            return -29
+
+        ; strings: equal? by content, and the char/string asymmetry
+        let strb ELObj.make_string(host, sc)
+        if ELObj.equal(str, strb) = false
+            return -30
+
+        var abuf u32[1]
+        set *(abuf as pointer[u32]): (0x41 as u32)
+        let sa ELObj.make_string(host, StringC(abuf as pointer[u32], 1 as size_t))
+        if ELObj.equal(sa, ca) = false
+            return -31
+
+        if ELObj.equal(ca, sa)
+            return -32
+
+        ; numbers: 2 = 2.0 across is_equal? IntegerObj.isEqual demands Int
+        let r2 ELObj.make_real(host, 2.0)
+        if ELObj.equal(two, r2)
+            return -33
+
+        ; RealObj.isEqual: inexactRealValue of b — integer b has none
+        if ELObj.equal(r2, two)
+            return -34
+
+        ; reals print (%g)
+        set os: OutputCharStream.make(host)
+        let r25 ELObj.make_real(host, 2.5)
+        r25.print(os, 72000)
+        if os.is_ascii("2.5") = false
+            return -35
+
+        set os: OutputCharStream.make(host)
+        let r3 ELObj.make_real(host, 3.0)
+        r3.print(os, 72000)
+        if os.is_ascii("3") = false
+            return -36
+
+        set os: OutputCharStream.make(host)
+        let rml ELObj.make_real(host, 0.001)
+        rml.print(os, 72000)
+        if os.is_ascii("0.001") = false
+            return -37
+
+        set os: OutputCharStream.make(host)
+        let rbig ELObj.make_real(host, 10000000000.0)
+        rbig.print(os, 72000)
+        if os.is_ascii("1e+10") = false
+            return -38
+
+        set os: OutputCharStream.make(host)
+        let rn ELObj.make_real(host, 0.0 - 123456789.0)
+        rn.print(os, 72000)
+        if os.is_ascii("-1.23457e+08") = false
+            return -39
+
+        ; lengths and quantities: 144000 units at 72000/inch = 144pt
+        let len ELObj.make_length(host, 144000)
+        set os: OutputCharStream.make(host)
+        len.print(os, 72000)
+        if os.is_ascii("144pt") = false
+            return -40
+
+        let q ELObj.make_quantity(host, 2.0, 2)
+        set os: OutputCharStream.make(host)
+        q.print(os, 72000)
+        if os.is_ascii("2e-06pt2") = false
+            return -41
+
+        ; length equality via quantityValue
+        let len2 ELObj.make_length(host, 144000)
+        let qvd len.quantity_value()
+        if qvd.qtype <> QT_LONG
+            return -60
+        if qvd.lval <> 144000
+            return -62
+        if qvd.dim <> 1
+            return -61
+        if ELObj.equal(len, len2) = false
+            return -42
+
+        if ELObj.equal(len, two)
+            return -43
+
+        ; convertToString
+        let cs sym.convert_to_string(host)
+        if cs = null
+            return -44
+
+        set os: OutputCharStream.make(host)
+        cs.print(os, 72000)
+        if os.is_ascii("\"foo\"") = false
+            return -45
+
+        let cs2 str.convert_to_string(host)
+        if cs2 <> str
+            return -46
+
+        if sym.has_string_data()
+            return -47
+
+        0
+    }
+}
