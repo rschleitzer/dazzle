@@ -24,6 +24,29 @@ use opensp.StringC.StringC
 ; the column field entirely.
 define COL_OMITTED: u32 0xFFFFFFFF
 
+; DocSegment — one storage object of a multi-file document entity
+; (EntityManagerImpl::mergeSystemIds: every file argument becomes one storage
+; object of ONE entity; ExternalInfoImpl keeps the per-object boundaries).
+; `start` is the segment's first index in the shared normalized buffer
+; (== the previous segment's end, ExternalInfoImpl::position_[i-1].endOffset);
+; `starts_with_rs` mirrors startsWithRS — the record-normalization RS pending
+; at the previous file's end flushed as this segment's first char, so line
+; counting subtracts it (the segment's text then starts on ITS line 1);
+; `name` is the per-object actualStorageId a diagnostic in this segment
+; displays; `base_dir` is the found file's directory — the base a relative
+; system id in a declaration WITHIN this segment resolves against
+; (FSIParser's defLoc storage object).
+define DocSegment (start: size_t, starts_with_rs: bool, name: StringC, base_dir: String)
+{
+    init()
+    {
+        set start: 0
+        set starts_with_rs: false
+        set name: StringC()
+        set base_dir: String()
+    }
+}
+
 define Location (origin: pointer[Origin](null), index: u32(0))
 {
     init()
@@ -92,7 +115,9 @@ define Location (origin: pointer[Origin](null), index: u32(0))
 ; reference location's index when resolving a location up through this origin, so
 ; a diagnostic from inside the entity prints the position JUST PAST the reference
 ; in the enclosing source. Zero for a real backing source (no reference).
-define Origin (ref_location: Location, entity_decl: pointer[void](null), file_name: StringC, contents: pointer[u32](null), length: size_t(0), ref_length: size_t(0), pushed_rs: pointer[Array[size_t]](null))
+; segments — the multi-file document entity's storage-object table (null for
+; every single-file source, which keeps the historical line_col path exactly).
+define Origin (ref_location: Location, entity_decl: pointer[void](null), file_name: StringC, contents: pointer[u32](null), length: size_t(0), ref_length: size_t(0), pushed_rs: pointer[Array[size_t]](null), segments: pointer[Array[DocSegment]](null))
 {
     init()
     {
@@ -103,6 +128,7 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set length: 0
         set ref_length: 0
         set pushed_rs: null
+        set segments: null
     }
 
     init(ref_location: Location)
@@ -114,6 +140,7 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set length: 0
         set ref_length: 0
         set pushed_rs: null
+        set segments: null
     }
 
     init(ref_location: Location, entity_decl: pointer[void])
@@ -125,6 +152,7 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set length: 0
         set ref_length: 0
         set pushed_rs: null
+        set segments: null
     }
 
     ; EntityOrigin::make(entity, refLocation, refLength, markup): an entity origin
@@ -138,6 +166,7 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set length: 0
         set this.ref_length: ref_length
         set pushed_rs: null
+        set segments: null
     }
 
     ; Origin.parent() == InputSourceOriginImpl.parent() => refLocation_.
@@ -177,6 +206,74 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
     {
         set this.contents: contents
         set this.length: length
+    }
+
+    ; ---- the multi-file storage-object table (mergeSystemIds) --------------
+    function set_segments(this: pointer[Origin], segs: pointer[Array[DocSegment]])
+        set this.segments: segs
+
+    function has_segments(this: Origin) returns bool
+        segments <> null
+
+    ; the storage object `index` sits in: the LAST segment whose start is
+    ; <= index — an empty segment (equal starts) is never selected, exactly
+    ; like ExternalInfoImpl::convertOffset's `off >= endOffset` skip.
+    function segment_index_at(this: Origin, index: size_t) returns size_t
+    {
+        var best: size_t 0
+        if segments = null
+            return best
+        let n segments.get_length()
+        var k: size_t 0
+        while k < n
+        {
+            let sg *(segments.get_buffer() + k)
+            if sg.start <= index
+                set best: k
+            set k: k + 1
+        }
+        best
+    }
+
+    ; the actualStorageId a diagnostic at `index` displays — the segment's
+    ; found path for a multi-file document, the origin's single storage id
+    ; otherwise.
+    function file_name_at(this: Origin, index: size_t) returns StringC
+    {
+        if segments = null
+            return file_name
+        if segments.get_length() = (0 as size_t)
+            return file_name
+        let sg *(segments.get_buffer() + this.segment_index_at(index))
+        sg.name
+    }
+
+    ; the directory a relative system id in a declaration at `index` resolves
+    ; against (the defLoc storage object's base). Empty when unsegmented —
+    ; the caller falls back to its stored base.
+    function base_dir_at(this: Origin, index: size_t) returns String
+    {
+        if segments = null
+            return String()
+        if segments.get_length() = (0 as size_t)
+            return String()
+        let sg *(segments.get_buffer() + this.segment_index_at(index))
+        sg.base_dir
+    }
+
+    ; the multi-file analogue of the buffer-index-0 rule: the position sits ON
+    ; a segment's leading INSERTED RS — line 1, columnNumber 0 of its storage
+    ; object, so printLocation omits the column.
+    function on_segment_leading_rs(this: Origin, index: size_t) returns bool
+    {
+        if segments = null
+            return false
+        if segments.get_length() = (0 as size_t)
+            return false
+        let sg *(segments.get_buffer() + this.segment_index_at(index))
+        if sg.starts_with_rs = false
+            return false
+        index = sg.start
     }
 
     ; line/col of the char at `index` in this origin's normalized buffer — the
@@ -235,9 +332,32 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
             set *out_col: 0 as u32
             return
         }
+        ; multi-file document entity: line/col restart per storage object
+        ; (ExternalInfoImpl::convertOffset — `lineNumber = j - line1RS + 1 -
+        ; startsWithRS`, colStart clamped to the object's start offset). The
+        ; single-file source is the degenerate one-segment case: its leading
+        ; inserted RS (present whenever the buffer is non-empty) is the
+        ; swr=1 the historical `line = <RS count>` convention subtracted
+        ; implicitly, so the segmentless path stays byte-identical.
+        var seg_start: size_t 0
+        var swr: u32 0
+        if segments <> null
+        {
+            if segments.get_length() > (0 as size_t)
+            {
+                let sg *(segments.get_buffer() + this.segment_index_at(index))
+                set seg_start: sg.start
+                if sg.starts_with_rs
+                    set swr: 1 as u32
+            }
+            else if length > (0 as size_t)
+                set swr: 1 as u32
+        }
+        else if length > (0 as size_t)
+            set swr: 1 as u32
         var line: u32 0
-        var last_rs: size_t 0
-        var i: size_t 0
+        var last_rs: size_t seg_start
+        var i: size_t seg_start
         var n index
         if n > length
             set n: length
@@ -259,12 +379,13 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
             {
                 if this.is_pushed_rs(index) = false
                 {
-                    set *out_line: line + (1 as u32)
+                    set *out_line: (line + (2 as u32)) - swr
                     set *out_col: COL_OMITTED
                     return
                 }
             }
         }
+        set line: (line + (1 as u32)) - swr
         if line = (0 as u32)
             set line: 1 as u32
         set *out_line: line
@@ -300,6 +421,12 @@ define InputSource (origin: pointer[Origin](null), contents: pointer[u32](null),
 
     function get_origin(this: InputSource) returns pointer[Origin]
         origin
+
+    ; the scan cursor's absolute buffer index — how far reading has advanced
+    ; (the multi-file document's pending-open flush compares boundaries
+    ; against the BOTTOM input's cursor).
+    function get_cur_index(this: InputSource) returns size_t
+        cur_index
 
     function get_contents(this: InputSource) returns pointer[u32]
         contents

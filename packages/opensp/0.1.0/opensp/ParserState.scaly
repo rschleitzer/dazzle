@@ -34,6 +34,7 @@ use opensp.Message.MessageArg
 use opensp.Message.MessageFormatter
 use opensp.ParserAppMessages.ParserAppMessages
 use opensp.ParserMessages.ParserMessages
+use opensp.PosixStorageMessages.PosixStorageMessages
 use opensp.Event.Event
 use opensp.Lpd.Lpd
 use opensp.Lpd.LinkSet
@@ -144,6 +145,27 @@ define OeInfo
 ; Message also carries the MessageArg vector + auxiliary/open-element info; the
 ; parser stage fills those. Defined in this module (rather than Message.scaly)
 ; because it needs Location, whose module is declared after Message.
+; PendingOpen — a storage object of the multi-file document entity
+; (mergeSystemIds) that failed to open. The reference opens storage objects
+; LAZILY (ExternalInputSource::fill) and reports the failure when reading
+; first needs the object's data; the port pre-reads, so the failure is queued
+; here with `boundary` = the merged-buffer offset where the object's content
+; would have started, and flushed to stderr once the document scan crosses it
+; (or unconditionally at parse end). is_find selects the message shape:
+; cannotFind(spec, tried-list) after a search-dir walk, openSystemCall(spec,
+; strerror text) for the single-candidate open. Both argument StringCs are
+; widened and pinned at queue time.
+define PendingOpen (boundary: size_t, is_find: bool, spec: StringC, detail: StringC)
+{
+    init()
+    {
+        set boundary: 0
+        set is_find: false
+        set spec: StringC()
+        set detail: StringC()
+    }
+}
+
 define Message (type: MessageType, loc: Location)
 {
     init(type: MessageType, loc: Location)
@@ -449,6 +471,12 @@ define ParserState
     lp_name: pointer[StringC]
     lp_open: Array[LpOpen]
     lp_depth: size_t
+    ; --- deferred open failures of the multi-file document entity (see
+    ;     PendingOpen): flushed by scan position at every stderr emission,
+    ;     unconditionally at parse end. ---
+    pending_opens: pointer[Array[PendingOpen]]
+    pending_open_next: size_t
+    in_pending_flush: bool
 )
 {
     function make(host: pointer[Page], entity_manager: pointer[EntityManager], subdoc_level: u32, final_phase: int) returns pointer[ParserState]
@@ -558,6 +586,9 @@ define ParserState
         set ps.lp_name: null
         set ps.lp_open: Array[LpOpen]^host()
         set ps.lp_depth: 0
+        set ps.pending_opens: null
+        set ps.pending_open_next: 0
+        set ps.in_pending_flush: false
         ps
     }
 
@@ -619,7 +650,52 @@ define ParserState
         set this.decl_base_dir: bd
 
     function get_decl_base_dir(this: ParserState) returns String
+    {
+        ; multi-file document (mergeSystemIds): a relative system id in a
+        ; declaration resolves against the storage object the declaration
+        ; sits in (the reference's FSIParser defLoc — probed: `<!ENTITY e
+        ; SYSTEM "ent.txt">` in the second file resolves against ITS
+        ; directory). Walk the current scan position to its backing origin
+        ; (the resolve_location walk minus the line/col work); only the
+        ; document origin ever carries segments — while the external DTD
+        ; subset is parsed the resolved origin is the subset's own, so the
+        ; stored override keeps winning exactly as before.
+        let cl this.current_location()
+        var index cl.get_index()
+        var org cl.get_origin()
+        var resolved: pointer[Origin] null
+        var walking true
+        while walking
+        {
+            if org = null
+                set walking: false
+            else if org.get_contents() <> null
+            {
+                set resolved: org
+                set walking: false
+            }
+            else
+            {
+                let par org.parent()
+                if par.get_origin() = null
+                    set walking: false
+                else
+                {
+                    if org.get_entity_decl() <> null
+                        set index: par.get_index() + (org.get_ref_length() as u32)
+                    else
+                        set index: index + par.get_index()
+                    set org: par.get_origin()
+                }
+            }
+        }
+        if resolved <> null
+        {
+            if resolved.has_segments()
+                return resolved.base_dir_at(index as size_t)
+        }
         decl_base_dir
+    }
 
     ; ---- composition accessors -------------------------------------------
     function get_content_state(this: ParserState) returns pointer[ContentState]
@@ -2333,6 +2409,103 @@ define ParserState
         this.dispatch_message(msg)
     }
 
+    ; ---- deferred multi-file open failures (see PendingOpen) ---------------
+    ; Queue one failed storage-object open of the document entity. spec and
+    ; detail must already be widened AND pinned on the parser's page.
+    function queue_pending_open(this: pointer[ParserState], boundary: size_t, is_find: bool, spec: StringC, detail: StringC)
+    {
+        if this.pending_opens = null
+        {
+            let hp this.host
+            set this.pending_opens: Array[PendingOpen]^hp()
+        }
+        var po PendingOpen()
+        set po.boundary: boundary
+        set po.is_find: is_find
+        set po.spec: spec
+        set po.detail: detail
+        this.pending_opens.add(po)
+    }
+
+    function has_pending_opens(this: ParserState) returns bool
+    {
+        if pending_opens = null
+            return false
+        pending_open_next < pending_opens.get_length()
+    }
+
+    ; Flush every queued open failure whose boundary the document scan has
+    ; crossed (force = all of them — the parse-end sweep). The reference
+    ; reports the failure from fill() the moment reading needs the missing
+    ; object's data; the observable effect is its position in the stderr
+    ; stream, so flushing right before the next emitted message (and at
+    ; parse end) reproduces the byte stream. Reads the BOTTOM input's scan
+    ; cursor — the document entity's own read position, which pauses at a
+    ; reference site while pushed entities parse, exactly like the
+    ; reference's per-storage-object read.
+    function flush_pending_opens(this: pointer[ParserState], force: bool)
+    {
+        if this.in_pending_flush
+            return
+        if this.has_pending_opens() = false
+            return
+        var pos: size_t 0
+        if force = false
+        {
+            if this.input_level < (1 as u32)
+            {
+                ; the document input has already been popped (its final Ee) —
+                ; reading finished, every boundary was crossed. Pendings are
+                ; only ever queued right before the document is pushed, so a
+                ; pre-push message can't land here with an empty stack.
+                set pos: 0xFFFFFFFFFFFFFFFF as size_t
+            }
+            else
+            {
+                let bot *(this.input_stack.get_buffer())
+                set pos: bot.get_cur_index()
+            }
+        }
+        set this.in_pending_flush: true
+        let n this.pending_opens.get_length()
+        var k this.pending_open_next
+        var advancing true
+        while advancing
+        {
+            if k >= n
+                set advancing: false
+            else
+            {
+                let po *(this.pending_opens.get_buffer() + k)
+                var due force
+                if due = false
+                {
+                    if po.boundary <= pos
+                        set due: true
+                }
+                if due
+                {
+                    var args Vector[MessageArg](2 as size_t)
+                    set *(args.get(0 as size_t)): MessageArg.Str(po.spec)
+                    set *(args.get(1 as size_t)): MessageArg.Raw(po.detail)
+                    if po.is_find
+                        this.report_noloc(PosixStorageMessages.cannotFind(), args)
+                    else
+                        this.report_noloc(PosixStorageMessages.openSystemCall(), args)
+                    ; -g: the reference's dispatchMessage appends the open-
+                    ; elements trailer to this message too (fired in-instance
+                    ; through the parser messenger, location-less shape).
+                    this.emit_oe_noloc(this.capture_oe_info())
+                    set k: k + 1
+                }
+                else
+                    set advancing: false
+            }
+        }
+        set this.pending_open_next: k
+        set this.in_pending_flush: false
+    }
+
     ; report at an EXPLICIT location (a construct's captured start location, e.g. a
     ; start tag's) rather than the current scan cursor — Messenger::setNextLocation.
     function report_at(this: pointer[ParserState], type: MessageType, args: Vector[MessageArg], loc: Location)
@@ -2763,7 +2936,10 @@ define ParserState
     ; `rs_next_line` — how an index resolving ONTO an inserted RS renders
     ; (MAIN message: previous line + col; AUX line: next line, col omitted);
     ; see Origin.line_col.
-    function resolve_location(this: ParserState, loc: Location, rs_next_line: bool, out_line: pointer[u32], out_col: pointer[u32]) returns pointer[Origin]
+    ; out_index receives the index WITHIN the resolved origin's buffer — the
+    ; caller needs it to pick the storage-object name of a multi-file
+    ; document origin (Origin.file_name_at).
+    function resolve_location(this: ParserState, loc: Location, rs_next_line: bool, out_line: pointer[u32], out_col: pointer[u32], out_index: pointer[size_t]) returns pointer[Origin]
     {
         var index loc.get_index()
         var org loc.get_origin()
@@ -2793,6 +2969,7 @@ define ParserState
                 }
             }
         }
+        set *out_index: index as size_t
         if resolved <> null
         {
             resolved.line_col(index as size_t, rs_next_line, out_line, out_col)
@@ -2813,7 +2990,7 @@ define ParserState
     ; length, unlike the message walk), and an index sitting ON an inserted
     ; RS resolves to the line the RS STARTS (probed: a `&#RS;B`-shortref
     ; replacement anchors on the NEW line; keeprsre RS data chunks likewise).
-    function resolve_location_sos(this: ParserState, loc: Location, out_line: pointer[u32], out_col: pointer[u32]) returns pointer[Origin]
+    function resolve_location_sos(this: ParserState, loc: Location, out_line: pointer[u32], out_col: pointer[u32], out_index: pointer[size_t]) returns pointer[Origin]
     {
         var index loc.get_index()
         var org loc.get_origin()
@@ -2840,6 +3017,7 @@ define ParserState
                 }
             }
         }
+        set *out_index: index as size_t
         if resolved <> null
         {
             resolved.line_col(index as size_t, true, out_line, out_col)
@@ -2861,7 +3039,7 @@ define ParserState
     ; Text::charLocation) at the literal's source. emit_headers=false is the
     ; follow-on-line variant (clauses/open-elements reuse the main line's
     ; resolved position without reprinting headers).
-    function resolve_location_open(this: pointer[ParserState], loc: Location, rs_next_line: bool, emit_headers: bool, out_line: pointer[u32], out_col: pointer[u32]) returns pointer[Origin]
+    function resolve_location_open(this: pointer[ParserState], loc: Location, rs_next_line: bool, emit_headers: bool, out_line: pointer[u32], out_col: pointer[u32], out_index: pointer[size_t]) returns pointer[Origin]
     {
         var index loc.get_index()
         var org loc.get_origin()
@@ -2953,6 +3131,7 @@ define ParserState
                 }
             }
         }
+        set *out_index: index as size_t
         if resolved <> null
         {
             resolved.line_col(index as size_t, rs_next_line, out_line, out_col)
@@ -2974,11 +3153,12 @@ define ParserState
     {
         var pline: u32 0
         var pcol: u32 0
-        let presolved this.resolve_location_open(parent_loc, false, true, &pline, &pcol)
+        var pridx: size_t 0
+        let presolved this.resolve_location_open(parent_loc, false, true, &pline, &pcol, &pridx)
         if presolved = null
             return
         var pfname StringC()
-        set pfname: presolved.get_file_name()
+        set pfname: presolved.file_name_at(pridx)
 
         var buf u32[2048]
         let bp buf as pointer[u32]
@@ -3020,6 +3200,8 @@ define ParserState
             if presolved.get_buf_length() > (0 as size_t)
                 set omit: true
         }
+        if presolved.on_segment_leading_rs(pridx)
+            set omit: true
         if pcol = COL_OMITTED
             set omit: true
         if omit = false
@@ -3115,20 +3297,27 @@ define ParserState
             return
         var line: u32 0
         var col: u32 0
+        var ridx: size_t 0
         var resolved: pointer[Origin] null
         if this.reporter_option(REP_OPEN_ENTITIES)
-            set resolved: this.resolve_location_open(loc, false, false, &line, &col)
+            set resolved: this.resolve_location_open(loc, false, false, &line, &col, &ridx)
         else
-            set resolved: this.resolve_location(loc, false, &line, &col)
+            set resolved: this.resolve_location(loc, false, &line, &col, &ridx)
         var fname StringC()
         if resolved <> null
-            set fname: resolved.get_file_name()
+            set fname: resolved.file_name_at(ridx)
 
-        ; formatOpenElements (MessageFormatter.cxx:38): ` gi` per element;
-        ; a non-included element after the first appends `[n]` with the
-        ; PREVIOUS element's match index; at each included boundary (and at
-        ; the end) the previous element's last match renders as
-        ; ` (type[index])`.
+        let payload this.build_oe_payload(oe)
+        this.emit_ref_line(resolved, fname, line, col, loc.get_index(), ridx, StringC("open elements:"), payload)
+    }
+
+    ; formatOpenElements (MessageFormatter.cxx:38): ` gi` per element;
+    ; a non-included element after the first appends `[n]` with the
+    ; PREVIOUS element's match index; at each included boundary (and at
+    ; the end) the previous element's last match renders as
+    ; ` (type[index])`.
+    function build_oe_payload(this: pointer[ParserState], oe: pointer[Array[OeInfo]]) returns StringC
+    {
         var pay u32[1024]
         let pp pay as pointer[u32]
         let pcap 1024 as size_t
@@ -3200,8 +3389,46 @@ define ParserState
             }
         }
         let hp this.host
-        let payload StringC^hp(pp, p)
-        this.emit_ref_line(resolved, fname, line, col, loc.get_index(), StringC("open elements:"), payload)
+        StringC^hp(pp, p)
+    }
+
+    ; the -g trailer under a LOCATION-LESS message (a deferred multi-file
+    ; open failure fired mid-instance): `<prog>:open elements: <payload>` —
+    ; no location segment, no space after the program colon (probed).
+    function emit_oe_noloc(this: pointer[ParserState], oe: pointer[Array[OeInfo]])
+    {
+        if oe = null
+            return
+        if oe.get_length() = (0 as size_t)
+            return
+        let payload this.build_oe_payload(oe)
+        var buf u32[2048]
+        let bp buf as pointer[u32]
+        let cap 2048 as size_t
+        var p: size_t 0
+        let pn this.prog_name
+        var pi: size_t 0
+        while pi < pn.get_length()
+        {
+            set p: ParserState.put_char(bp, cap, p, (*(pn.get_buffer() + pi)) as u32)
+            set pi: pi + 1
+        }
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+        let lbl StringC("open elements:")
+        var li: size_t 0
+        while li < lbl.get_size()
+        {
+            set p: ParserState.put_char(bp, cap, p, lbl.get(li))
+            set li: li + 1
+        }
+        var yi: size_t 0
+        while yi < payload.get_size()
+        {
+            set p: ParserState.put_char(bp, cap, p, payload.get(yi))
+            set yi: yi + 1
+        }
+        set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
+        ParserState.write_stderr(bp, p, this.out_utf8, this.msg_fd)
     }
 
     ; emit_message — one diagnostic line to stderr, byte-identical to onsgmls's
@@ -3212,6 +3439,9 @@ define ParserState
     ; resolving an entity-internal location up the origin chain to its reference.
     function emit_message(this: pointer[ParserState], msg: pointer[Message], args: Vector[MessageArg])
     {
+        ; a queued multi-file open failure whose boundary the scan has crossed
+        ; prints BEFORE this message (the reference reported it from fill()).
+        this.flush_pending_opens(false)
         let loc msg.get_loc()
         var line: u32 0
         var col: u32 0
@@ -3219,13 +3449,14 @@ define ParserState
         ; header lines and anchors inside the entity's definition instead of
         ; resolving up to the reference.
         var resolved: pointer[Origin] null
+        var ridx: size_t 0
         if this.reporter_option(REP_OPEN_ENTITIES)
-            set resolved: this.resolve_location_open(loc, false, true, &line, &col)
+            set resolved: this.resolve_location_open(loc, false, true, &line, &col, &ridx)
         else
-            set resolved: this.resolve_location(loc, false, &line, &col)
+            set resolved: this.resolve_location(loc, false, &line, &col, &ridx)
         var fname StringC()
         if resolved <> null
-            set fname: resolved.get_file_name()
+            set fname: resolved.file_name_at(ridx)
 
         var buf u32[2048]
         let bp buf as pointer[u32]
@@ -3287,6 +3518,10 @@ define ParserState
                 if resolved.get_buf_length() > (0 as size_t)
                     set omit_col: true
             }
+            ; a later storage object's leading RS is the same rule (its
+            ; columnNumber is 0 in the reference formula).
+            if resolved.on_segment_leading_rs(ridx)
+                set omit_col: true
             if col = COL_OMITTED
                 set omit_col: true
             if omit_col = false
@@ -3338,7 +3573,7 @@ define ParserState
             ; two spaces: the relevantClauses fragment text ends in ": " and
             ; the reference appends `" " << clauses` after it.
             if cls.get_size() > (0 as size_t)
-                this.emit_ref_line(resolved, fname, line, col, loc.get_index(), StringC("relevant clauses:  "), cls)
+                this.emit_ref_line(resolved, fname, line, col, loc.get_index(), ridx, StringC("relevant clauses:  "), cls)
         }
     }
 
@@ -3346,7 +3581,7 @@ define ParserState
     ; <label><payload>` at the MAIN message's already-resolved location (no
     ; fresh origin walk — the reference prints these with the main line's
     ; externalInfo/off pair, so -e headers are not repeated).
-    function emit_ref_line(this: pointer[ParserState], resolved: pointer[Origin], fname: StringC, line: u32, col: u32, loc_index: u32, lbl: StringC, payload: StringC)
+    function emit_ref_line(this: pointer[ParserState], resolved: pointer[Origin], fname: StringC, line: u32, col: u32, loc_index: u32, ridx: size_t, lbl: StringC, payload: StringC)
     {
         var buf u32[2048]
         let bp buf as pointer[u32]
@@ -3378,6 +3613,8 @@ define ParserState
                 if resolved.get_buf_length() > (0 as size_t)
                     set omit_col: true
             }
+            if resolved.on_segment_leading_rs(ridx)
+                set omit_col: true
             if col = COL_OMITTED
                 set omit_col: true
             if omit_col = false
@@ -3416,13 +3653,14 @@ define ParserState
         ; -e: the aux location gets its own locationHeader call in the
         ; reference — so its "In entity ..." header lines print here too.
         var resolved: pointer[Origin] null
+        var ridx: size_t 0
         if this.reporter_option(REP_OPEN_ENTITIES)
-            set resolved: this.resolve_location_open(loc, true, true, &line, &col)
+            set resolved: this.resolve_location_open(loc, true, true, &line, &col, &ridx)
         else
-            set resolved: this.resolve_location(loc, true, &line, &col)
+            set resolved: this.resolve_location(loc, true, &line, &col, &ridx)
         var fname StringC()
         if resolved <> null
-            set fname: resolved.get_file_name()
+            set fname: resolved.file_name_at(ridx)
 
         var buf u32[2048]
         let bp buf as pointer[u32]
@@ -3471,6 +3709,9 @@ define ParserState
     ; has a null origin.
     function emit_message_noloc(this: pointer[ParserState], text: StringC, args: Vector[MessageArg], sev_char: u32, number: u32)
     {
+        ; same crossing rule as emit_message (the in_pending_flush guard keeps
+        ; the flush's own report_noloc lines out of here).
+        this.flush_pending_opens(false)
         var buf u32[2048]
         let bp buf as pointer[u32]
         let cap 2048 as size_t
