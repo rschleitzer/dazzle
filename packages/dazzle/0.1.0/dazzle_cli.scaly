@@ -1,0 +1,161 @@
+; dazzle — the DSSSL transform CLI (the `jade -t sgml|xml -d spec.dsl doc`
+; drop-in). Wires the full Stage-6a pipeline end to end: SGML/XML document ->
+; opensp parse -> Grove; DSSSL stylesheet -> Interpreter; ProcessContext drives
+; the grove through the construction rules into the transform FOTBuilder; the
+; top-level output stream goes to stdout (or -o FILE), while entity/directory
+; flow objects write their own files (the codegen use case).
+;
+; This is a program, not part of the `define dazzle` package module — it is
+; compiled standalone and linked against libdazzle.a + libopensp.a (see
+; tests/dazzle/build-cli.sh), exactly as onsgmls.scaly is for opensp.
+;
+; MVP flag set (mirrors the reference subset needed to run + corpus-diff):
+;   -d <stylesheet.dsl>   the DSSSL spec (required)
+;   -t sgml | xml         output flavour (default sgml; xml adds the decl +
+;                         self-closing empty elements)
+;   -o <file>             write the top-level stream to FILE instead of stdout
+;   <document>            the SGML/XML instance (one positional arg, required)
+; Deferred to later slices (reference has them): -G debug, -V var=value, -2
+; dsssl2, -s strict, the getopt-style combined/long options, stderr message
+; fidelity + exit codes over the corpus.
+
+package scaly 0.1.0
+package opensp 0.1.0
+package dazzle 0.1.0
+
+use opensp.Parser.Parser
+use opensp.ParserState.ParserState
+use opensp.Location.InputSource
+use dazzle.Grove.GroveNode
+use dazzle.Grove.GroveBuilder
+use dazzle.Interpreter.Interpreter
+use dazzle.SchemeParser.SchemeParser
+use dazzle.TransformFOTBuilder.TransformFOTBuilder
+use dazzle.ProcessContext.ProcessContext
+use scaly.memory.Page
+use scaly.containers.String
+use scaly.containers.Array
+use scaly.io.File
+use scaly.io.Console
+use scaly.fiber.Io
+
+; Normalize file bytes into a u32 record buffer: LF and CRLF collapse to a
+; single RE (0x0D) — the OpenSP record convention the SchemeParser lexer
+; expects (skip_comment ends a `;` comment at RE, never at LF; a raw LF file
+; would otherwise swallow the rest of the stylesheet after the first comment).
+; Bytes map 1:1 to codepoints (ASCII/Latin-1; a UTF-8 decode for non-ASCII
+; stylesheets is a later refinement).
+function normalize_records(host: pointer[Page], src: String) returns pointer[InputSource]
+{
+    let out Array[u32]^host()
+    let n src.get_length()
+    var i: size_t 0
+    while i < n
+    {
+        let b src.get(i)
+        if b = (0x0D as u8)
+        {
+            out.add(0x0D as u32)
+            ; CRLF -> single RE: swallow a following LF.
+            if (i + (1 as size_t)) < n
+            {
+                if src.get(i + (1 as size_t)) = (0x0A as u8)
+                    set i: i + 1
+            }
+        }
+        else if b = (0x0A as u8)
+            out.add(0x0D as u32)
+        else
+            out.add(b as u32)
+        set i: i + 1
+    }
+    InputSource.make(host, null, out.get_buffer(), out.get_length())
+}
+
+function main(argc: int, argv: pointer[pointer[char]]) returns int
+{
+    let prog_name String(*argv)
+    ; bootstrap the run region (one arena page for the whole run).
+    let anchor0 String("x")
+    let host Page.get(anchor0.get_buffer() as pointer[void])
+
+    var xml false
+    var dsl_path String("")
+    var doc_path String("")
+    var out_path String("")
+    var have_dsl false
+    var have_doc false
+
+    var i 1
+    while i < argc
+    {
+        let arg String(*(argv + i))
+        if arg.equals("-t")
+        {
+            set i: i + 1
+            if i < argc
+            {
+                let tp String(*(argv + i))
+                if tp.equals("xml")
+                    set xml: true
+            }
+        }
+        else if arg.equals("-d")
+        {
+            set i: i + 1
+            if i < argc
+            {
+                set dsl_path: String(*(argv + i))
+                set have_dsl: true
+            }
+        }
+        else if arg.equals("-o")
+        {
+            set i: i + 1
+            if i < argc
+                set out_path: String(*(argv + i))
+        }
+        else
+        {
+            set doc_path: arg
+            set have_doc: true
+        }
+        set i: i + 1
+    }
+
+    if (have_doc = false) or (have_dsl = false)
+    {
+        Console.println("usage: dazzle -d <stylesheet.dsl> [-t sgml|xml] [-o <out>] <document>")
+        return 1
+    }
+
+    ; --- document -> grove ---------------------------------------------------
+    let ps Parser.parse_simple(host, doc_path, prog_name)
+    if ps = null
+    {
+        Console.println("dazzle: cannot parse document")
+        return 1
+    }
+    let root GroveBuilder.build(host, ps)
+
+    ; --- stylesheet -> interpreter (parse + compile the construction rules) --
+    let dsl_src File.read_to_string(dsl_path)
+    let src_in normalize_records(host, dsl_src)
+    let interp Interpreter.make(host, 1440, false, false, false)
+    let sp SchemeParser.make(host, interp, src_in)
+    sp.parse()
+    interp.compile()
+
+    ; --- drive the grove through the style engine into the transform sink ----
+    let fotb TransformFOTBuilder.make(host, xml)
+    let pc ProcessContext.make(host, interp, fotb)
+    pc.process(root)
+
+    ; --- emit the top-level stream (entity/directory FOs wrote their own files)
+    let outp fotb.root_to_utf8()
+    if out_path.get_length() > (0 as size_t)
+        File.write_from_string(out_path, outp)
+    else
+        Io.write_all(1 as i32, outp.get_buffer() as pointer[void], outp.get_length())
+    0
+}
