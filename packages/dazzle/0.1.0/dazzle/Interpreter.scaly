@@ -1,0 +1,1030 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.Vector
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.XcharMap.XcharMap
+use opensp.Message.MessageType
+use opensp.Message.MessageArg
+use opensp.Message.MessageFormatter
+use opensp.ParserState.ParserState
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
+use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.CharNames.CharNames
+use dazzle.Sdata.Sdata
+
+; Interpreter — the style-language interpreter (style/Interpreter.cxx).
+; Inc-2 scope: the READER seam the SchemeParser datum reader needs — the
+; lexical-category table, symbol/keyword/identifier interning, number
+; conversion (convertNumber family incl. quantities and units), character
+; names (charNames.h table + U-XXXX), sdata entity mapping, and the
+; standard-chars / add-name-chars / add-separator-chars / map-sdata-entity
+; declaration hooks. The evaluation half (syntactic keys, primitives,
+; processing modes, Insn/VM) lands with Inc 3 per DESIGN.md.
+;
+; Messages: text/severity sourced from the generated InterpreterMessages
+; table (InterpreterMessages.msg). Rendering here is the package-level seam
+; (`dazzle:<severity>: <text>` on stderr + error count); the full
+; file:line:col MessageReporter prefix is the CLI driver's job and lands
+; with Inc 7 (DssslApp/CmdLineApp port), like the reference where the app
+; object IS the Messenger.
+
+; Interpreter::LexCategory
+define LEX_LETTER: int 0            ; a-z A-Z
+define LEX_OTHER_NAME_START: int 1  ; !$%&*/<=>?~_^:
+define LEX_ADD_NAME_START: int 2
+define LEX_DIGIT: int 3             ; 0-9
+define LEX_OTHER_NUMBER_START: int 4 ; -+.
+define LEX_OTHER: int 5
+define LEX_DELIMITER: int 6         ; ();"
+define LEX_WHITESPACE: int 7
+define LEX_ADD_WHITESPACE: int 8
+
+; the printer's replacement char for unknown character names
+define DEFAULT_CHAR: int 0xFFFD
+
+; Unit::computed_ states
+define UNIT_NOT_COMPUTED: int 0
+define UNIT_BEING_COMPUTED: int 1
+define UNIT_COMPUTED_EXACT: int 2
+define UNIT_COMPUTED_INEXACT: int 3
+define UNIT_COMPUTED_ERROR: int 4
+
+; strtod(3) — fixed-prototype, non-variadic, errno-free use: direct extern
+; per the containment rule.
+function strtod(s: pointer[const_char], endp: pointer[pointer[u8]]) returns double extern
+
+; A named-character-table entry (Interpreter::CharPart): the char plus the
+; index of the defining part (unsigned(-1) = predefined).
+define CharPart (name: StringC, c: u32, def_part: u32)
+{
+    init(name: StringC, c: u32, def_part: u32)
+    {
+        set this.name: name
+        set this.c: c
+        set this.def_part: def_part
+    }
+}
+
+; Unit — a named measurement unit (Interpreter.h class Unit : Named).
+; Inc-2 carries the computed-value half (builtin units get their value from
+; unitsPerInch in installUnits; setValue marks them computedExact/Inexact).
+; The define-unit expression path (def_/insn_, tryCompute's VM evaluation)
+; lands with Inc 3 — until then computed_ stays notComputed for user units
+; and resolveQuantity returns null (exactly the reference's "can't be done
+; yet" answer for an uncomputed unit without force).
+define Unit (name: StringC, computed: int, exact: int, inexact: double, dim: int, def_part: u32)
+{
+    function make(host: pointer[Page], name: StringC) returns pointer[Unit]
+    {
+        let u host.allocate(sizeof Unit, alignof Unit) as pointer[Unit]
+        set u.name: StringC^host(name.data_ptr(), name.get_size())
+        set u.computed: UNIT_NOT_COMPUTED
+        set u.exact: 0
+        set u.inexact: 0.0
+        set u.dim: 0
+        set u.def_part: 0xFFFFFFFF as u32
+        u
+    }
+
+    function get_name(this: Unit) returns StringC
+        name
+
+    ; void setValue(long)
+    function set_value_long(this: pointer[Unit], n: int)
+    {
+        set this.computed: UNIT_COMPUTED_EXACT
+        set this.exact: n
+        set this.dim: 1
+        set this.def_part: 0xFFFFFFFF as u32
+    }
+
+    ; void setValue(double)
+    function set_value_double(this: pointer[Unit], n: double)
+    {
+        set this.computed: UNIT_COMPUTED_INEXACT
+        set this.inexact: n
+        set this.dim: 1
+        set this.def_part: 0xFFFFFFFF as u32
+    }
+
+    ; bool defined(unsigned &part, Location &loc) — Inc-2 subset: no def_
+    ; expression yet, so defined <=> a computed value exists (the out-params
+    ; feed doDefineUnit's duplicate diagnostics, Inc 3).
+    function is_defined(this: Unit) returns bool
+        computed <> UNIT_NOT_COMPUTED
+
+    ; static bool scale(long val, int valExp, long factor, long &result):
+    ; result = val * 10^valExp * factor, 0 on overflow.
+    function scale(val: int, val_exp_in: int, factor_in: int, result: pointer[int]) returns bool
+    {
+        var val_exp val_exp_in
+        var factor factor_in
+        let long_max 0x7FFFFFFFFFFFFFFF
+        if factor <= 0
+            return false
+        while val_exp > 0
+        {
+            if factor > long_max / 10
+                return false
+            set val_exp: val_exp - 1
+            set factor: factor * 10
+        }
+        if val >= 0
+        {
+            if val > long_max / factor
+                return false
+        }
+        else
+        {
+            ; -(unsigned long)val > -(unsigned long)LONG_MIN/factor
+            let neg_val (0 as u64) - (val as u64)
+            let neg_min (long_max as u64) + (1 as u64)
+            if neg_val > neg_min / (factor as u64)
+                return false
+        }
+        var r val * factor
+        while val_exp < 0
+        {
+            set r: r / 10
+            set val_exp: val_exp + 1
+        }
+        set *result: r
+        true
+    }
+
+    ; ELObj *resolveQuantity(bool force, Interpreter &, long val, int valExp)
+    ; (val * 10^valExp of this unit; the unit's own exponent is 1).
+    function resolve_quantity_long(this: pointer[Unit], force: bool, interp: pointer[Interpreter], val: int, val_exp_in: int) returns pointer[ELObj]
+    {
+        this.try_compute(force, interp)
+        if this.computed = UNIT_COMPUTED_EXACT
+        {
+            var result 0
+            if Unit.scale(val, val_exp_in, this.exact, &result)
+                return ELObj.make_length(interp.host, result)
+        }
+        var val_exp val_exp_in
+        var x val as double
+        while val_exp > 0
+        {
+            set x: x * 10.0
+            set val_exp: val_exp - 1
+        }
+        while val_exp < 0
+        {
+            set x: x / 10.0
+            set val_exp: val_exp + 1
+        }
+        this.resolve_quantity_double(force, interp, x, 1)
+    }
+
+    ; ELObj *resolveQuantity(bool force, Interpreter &, double val, int unitExp)
+    function resolve_quantity_double(this: pointer[Unit], force: bool, interp: pointer[Interpreter], val: double, unit_exp_in: int) returns pointer[ELObj]
+    {
+        this.try_compute(force, interp)
+        var factor 0.0
+        if this.computed = UNIT_COMPUTED_EXACT
+            set factor: this.exact as double
+        else if this.computed = UNIT_COMPUTED_INEXACT
+            set factor: this.inexact
+        else if this.computed = UNIT_COMPUTED_ERROR
+            return interp.make_error()
+        else
+            return null
+        var unit_exp unit_exp_in
+        var result_dim 0
+        var result_val val
+        while unit_exp > 0
+        {
+            set result_dim: result_dim + this.dim
+            set result_val: result_val * factor
+            set unit_exp: unit_exp - 1
+        }
+        while unit_exp < 0
+        {
+            set result_dim: result_dim - this.dim
+            set result_val: result_val / factor
+            set unit_exp: unit_exp + 1
+        }
+        if result_dim = 0
+            return ELObj.make_real(interp.host, result_val)
+        ELObj.make_quantity(interp.host, result_val, result_dim)
+    }
+
+    ; void tryCompute(bool force, Interpreter &): Inc-2 subset — a unit
+    ; without a computed value has no definition expression yet (define-unit
+    ; parsing is Inc 3), so notComputed simply stays notComputed; the
+    ; beingComputed/unitLoop and VM-evaluation branches land with Inc 3.
+    function try_compute(this: pointer[Unit], force: bool, interp: pointer[Interpreter])
+    {
+    }
+}
+
+define Interpreter
+(
+    host: pointer[Page]
+    units_per_inch: int
+    debug_mode: bool
+    dsssl2: bool
+    strict_mode: bool
+    part_index: u32
+    d_part_index: u32
+    ; the permanent singletons (one per run; eqv? = identity)
+    nil_obj: pointer[ELObj]
+    true_obj: pointer[ELObj]
+    false_obj: pointer[ELObj]
+    error_obj: pointer[ELObj]
+    unspecified_obj: pointer[ELObj]
+    ; interning tables (NamedTable port shape: linear Array, insertion order)
+    symbol_table: pointer[Array[pointer[ELObj]]]
+    ident_table: pointer[Array[pointer[Identifier]]]
+    unit_table: pointer[Array[pointer[Unit]]]
+    named_char_table: pointer[Array[pointer[CharPart]]]
+    sdata_entity_name_table: pointer[Array[pointer[CharPart]]]
+    sdata_entity_text_table: pointer[Array[pointer[CharPart]]]
+    lex_category_table: pointer[XcharMap]
+    ; Messenger seam (see header note): counts + prints; the driver owns
+    ; the full location-prefixed rendering (Inc 7).
+    error_count: int
+    next_loc: Location
+)
+{
+    function make(host: pointer[Page], units_per_inch: int, debug_mode: bool, dsssl2: bool, strict_mode: bool) returns pointer[Interpreter]
+    {
+        let interp host.allocate(sizeof Interpreter, alignof Interpreter) as pointer[Interpreter]
+        set interp.host: host
+        set interp.units_per_inch: units_per_inch
+        set interp.debug_mode: debug_mode
+        set interp.dsssl2: dsssl2
+        set interp.strict_mode: strict_mode
+        set interp.part_index: 0 as u32
+        set interp.d_part_index: 1 as u32
+        set interp.nil_obj: ELObj.make_nil(host)
+        set interp.true_obj: ELObj.make_true(host)
+        set interp.false_obj: ELObj.make_false(host)
+        set interp.error_obj: ELObj.make_error(host)
+        set interp.unspecified_obj: ELObj.make_unspecified(host)
+        set interp.symbol_table: Array[pointer[ELObj]]^host()
+        set interp.ident_table: Array[pointer[Identifier]]^host()
+        set interp.unit_table: Array[pointer[Unit]]^host()
+        set interp.named_char_table: Array[pointer[CharPart]]^host()
+        set interp.sdata_entity_name_table: Array[pointer[CharPart]]^host()
+        set interp.sdata_entity_text_table: Array[pointer[CharPart]]^host()
+        set interp.error_count: 0
+        set interp.next_loc: Location()
+
+        interp.install_units()
+        if strict_mode = false
+        {
+            CharNames.install(interp)
+            Sdata.install(interp)
+        }
+
+        ; the lexical-category table (constructor tail, Interpreter.cxx:107)
+        let lex XcharMap.make(host, LEX_OTHER as u8)
+        set interp.lex_category_table: lex
+        lex.set_ee(LEX_DELIMITER as u8)
+        Interpreter.set_lex_ascii(lex, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", LEX_LETTER as u8)
+        Interpreter.set_lex_ascii(lex, "!$%&*/<=>?~_^:", LEX_OTHER_NAME_START as u8)
+        Interpreter.set_lex_ascii(lex, "0123456789", LEX_DIGIT as u8)
+        Interpreter.set_lex_ascii(lex, "-+.", LEX_OTHER_NUMBER_START as u8)
+        Interpreter.set_lex_ascii(lex, "();\"", LEX_DELIMITER as u8)
+        Interpreter.set_lex_ascii(lex, " \t\r\n", LEX_WHITESPACE as u8)
+        lex.set_char(0x0C as u32, LEX_WHITESPACE as u8)  ; \f
+        ; #',@[\]`{|} stay lexOther: not allowed in names. Chars >= 127 are
+        ; name-start in the non-strict repertoire (XcharMap's dense range
+        ; covers the BMP; higher planes clamp to the default — the XcharMap
+        ; port's documented scope).
+        if strict_mode = false
+            lex.set_range(127 as u32, 0xFFFF as u32, LEX_ADD_NAME_START as u8)
+
+        interp
+    }
+
+    function set_lex_ascii(lex: pointer[XcharMap], s: pointer[const_char], cat: u8)
+    {
+        var p s as pointer[u8]
+        while (*p) <> (0 as u8)
+        {
+            lex.set_char((*p) as u32, cat)
+            set p: p + 1
+        }
+    }
+
+    ; LexCategory lexCategory(Xchar c)
+    function lex_category(this: Interpreter, c: i32) returns int
+        lex_category_table.get(c) as int
+
+    ; the run arena page (Collector seam) — cross-module allocation sites
+    ; reach it through this accessor.
+    function get_host(this: Interpreter) returns pointer[Page]
+        host
+
+    function is_dsssl2(this: Interpreter) returns bool
+        dsssl2
+
+    ; --- singletons --------------------------------------------------------
+    function make_nil(this: Interpreter) returns pointer[ELObj]
+        nil_obj
+
+    function make_true(this: Interpreter) returns pointer[ELObj]
+        true_obj
+
+    function make_false(this: Interpreter) returns pointer[ELObj]
+        false_obj
+
+    function make_error(this: Interpreter) returns pointer[ELObj]
+        error_obj
+
+    function make_unspecified(this: Interpreter) returns pointer[ELObj]
+        unspecified_obj
+
+    function is_error(this: Interpreter, obj: pointer[ELObj]) returns bool
+        obj = error_obj
+
+    ; --- interning ---------------------------------------------------------
+    ; Identifier *lookup(const StringC &): one Identifier per name.
+    function lookup(this: pointer[Interpreter], str: StringC) returns pointer[Identifier]
+    {
+        let n this.ident_table.get_length()
+        let buf this.ident_table.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let p *(buf + i)
+            if p.get_name().equals(str)
+                return p
+            set i: i + 1
+        }
+        let ident Identifier.make(this.host, str)
+        this.ident_table.add(ident)
+        ident
+    }
+
+    ; SymbolObj *makeSymbol(const StringC &): one SymbolObj per name.
+    function make_symbol(this: pointer[Interpreter], str: StringC) returns pointer[ELObj]
+    {
+        let n this.symbol_table.get_length()
+        let buf this.symbol_table.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let p *(buf + i)
+            let sn p.symbol_name()
+            if sn.equals(str)
+                return p
+            set i: i + 1
+        }
+        let host this.host
+        let name StringC^host(str.data_ptr(), str.get_size())
+        let sym ELObj.make_symbol(host, name)
+        this.symbol_table.add(sym)
+        sym
+    }
+
+    ; KeywordObj *makeKeyword(const StringC &): a fresh KeywordObj whose
+    ; identity is the interned Identifier.
+    function make_keyword(this: pointer[Interpreter], str: StringC) returns pointer[ELObj]
+    {
+        let ident this.lookup(str)
+        ELObj.make_keyword(this.host, ident)
+    }
+
+    ; --- units -------------------------------------------------------------
+    ; Unit *lookupUnit(const StringC &): create on demand.
+    function lookup_unit(this: pointer[Interpreter], name: StringC) returns pointer[Unit]
+    {
+        let n this.unit_table.get_length()
+        let buf this.unit_table.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let p *(buf + i)
+            if p.get_name().equals(name)
+                return p
+            set i: i + 1
+        }
+        let u Unit.make(this.host, name)
+        this.unit_table.add(u)
+        u
+    }
+
+    ; void installUnits(): builtin units valued from unitsPerInch; "pc" is
+    ; the DSSSL2 addition.
+    function install_units(this: pointer[Interpreter])
+    {
+        this.install_unit("m", 5000, 127)
+        this.install_unit("cm", 50, 127)
+        this.install_unit("mm", 5, 127)
+        this.install_unit("in", 1, 1)
+        this.install_unit("pt", 1, 72)
+        this.install_unit("pica", 1, 6)
+        if this.dsssl2
+            this.install_unit("pc", 1, 6)
+    }
+
+    function install_unit(this: pointer[Interpreter], name: pointer[const_char], numer: int, denom: int)
+    {
+        let u this.lookup_unit(StringC(name))
+        let n this.units_per_inch * numer
+        if n % denom = 0
+            u.set_value_long(n / denom)
+        else
+            u.set_value_double((n as double) / (denom as double))
+    }
+
+    ; --- named characters --------------------------------------------------
+    function lookup_char_entry(t: pointer[Array[pointer[CharPart]]], name: StringC) returns pointer[CharPart]
+    {
+        let n t.get_length()
+        let buf t.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let p *(buf + i)
+            if p.name.equals(name)
+                return p
+            set i: i + 1
+        }
+        null
+    }
+
+    function insert_char_entry(this: pointer[Interpreter], t: pointer[Array[pointer[CharPart]]], name: StringC, c: u32, def_part: u32)
+    {
+        let existing Interpreter.lookup_char_entry(t, name)
+        if existing <> null
+        {
+            set existing.c: c
+            set existing.def_part: def_part
+            return
+        }
+        let host this.host
+        let e host.allocate(sizeof CharPart, alignof CharPart) as pointer[CharPart]
+        set e.name: StringC^host(name.data_ptr(), name.get_size())
+        set e.c: c
+        set e.def_part: def_part
+        t.add(e)
+    }
+
+    ; the generated CharNames/Sdata tables install through these (defPart -1)
+    function def_char(this: pointer[Interpreter], name: pointer[const_char], c: u32)
+        this.insert_char_entry(this.named_char_table, StringC(name), c, 0xFFFFFFFF as u32)
+
+    function def_sdata_char(this: pointer[Interpreter], name: pointer[const_char], c: u32)
+        this.insert_char_entry(this.sdata_entity_name_table, StringC(name), c, 0xFFFFFFFF as u32)
+
+    ; bool convertCharName(const StringC &str, Char &c)
+    function convert_char_name(this: Interpreter, str: StringC, c: pointer[u32]) returns bool
+    {
+        let cp Interpreter.lookup_char_entry(named_char_table, str)
+        if cp <> null
+        {
+            set *c: cp.c
+            return true
+        }
+        Interpreter.convert_unicode_char_name(str, c)
+    }
+
+    ; static bool convertUnicodeCharName(const StringC &str, Char &c): U-XXXX
+    function convert_unicode_char_name(str: StringC, c: pointer[u32]) returns bool
+    {
+        if str.get_size() <> (6 as size_t)
+            return false
+        if str.get(0 as size_t) <> (0x55 as u32)
+            return false
+        if str.get(1 as size_t) <> (0x2D as u32)
+            return false
+        var value: u32 0
+        var i: size_t 2
+        while i < (6 as size_t)
+        {
+            let ch str.get(i)
+            set value: value << (4 as u32)
+            if (ch >= (0x30 as u32)) and (ch <= (0x39 as u32))
+                set value: value | (ch - (0x30 as u32))
+            else if (ch >= (0x41 as u32)) and (ch <= (0x46 as u32))
+                set value: value | ((10 as u32) + (ch - (0x41 as u32)))
+            else
+                return false
+            set i: i + 1
+        }
+        set *c: value
+        true
+    }
+
+    ; --- declaration hooks (style-specification declaration elements) ------
+    ; void setCharRepertoire(const StringC &pubid)
+    function set_char_repertoire(this: pointer[Interpreter], pubid: StringC)
+    {
+        if pubid.equals(StringC("UNREGISTERED::OpenJade//Character Repertoire::OpenJade"))
+        {
+            if this.strict_mode
+            {
+                CharNames.install(this)
+                Sdata.install(this)
+                this.lex_category_table.set_range(127 as u32, 0xFFFF as u32, LEX_ADD_NAME_START as u8)
+                set this.strict_mode: false
+            }
+        }
+        else
+            this.message1(InterpreterMessages.unsupportedCharRepertoire(), pubid)
+    }
+
+    ; void addStandardChar(const StringC &name, const StringC &num)
+    function add_standard_char(this: pointer[Interpreter], name: StringC, num: StringC)
+    {
+        var n 0
+        var i: size_t 0
+        if Interpreter.scan_sign_digits(num, &i, &n) = false
+        {
+            this.message1(InterpreterMessages.invalidCharNumber(), num)
+            return
+        }
+        let def Interpreter.lookup_char_entry(this.named_char_table, name)
+        if def <> null
+        {
+            if this.d_part_index < def.def_part
+                this.insert_char_entry(this.named_char_table, name, n as u32, this.d_part_index)
+            else if (def.def_part = this.d_part_index) and (def.c <> (n as u32))
+                this.message1(InterpreterMessages.duplicateCharName(), name)
+        }
+        else
+            this.insert_char_entry(this.named_char_table, name, n as u32, this.d_part_index)
+    }
+
+    ; void addNameChar(const StringC &name)
+    function add_name_char(this: pointer[Interpreter], name: StringC)
+    {
+        let cp Interpreter.lookup_char_entry(this.named_char_table, name)
+        if cp = null
+        {
+            this.message1(InterpreterMessages.badCharName(), name)
+            return
+        }
+        if (this.lex_category_table.get(cp.c as i32) as int) <> LEX_OTHER
+        {
+            this.message0(InterpreterMessages.badDeclaration())
+            return
+        }
+        this.lex_category_table.set_char(cp.c, LEX_ADD_NAME_START as u8)
+    }
+
+    ; void addSeparatorChar(const StringC &name)
+    function add_separator_char(this: pointer[Interpreter], name: StringC)
+    {
+        let cp Interpreter.lookup_char_entry(this.named_char_table, name)
+        if cp = null
+        {
+            this.message1(InterpreterMessages.badCharName(), name)
+            return
+        }
+        if (this.lex_category_table.get(cp.c as i32) as int) <> LEX_OTHER
+        {
+            this.message0(InterpreterMessages.badDeclaration())
+            return
+        }
+        this.lex_category_table.set_char(cp.c, LEX_ADD_WHITESPACE as u8)
+    }
+
+    ; void addSdataEntity(const StringC &ename, const StringC &etext, const StringC &name)
+    function add_sdata_entity(this: pointer[Interpreter], ename: StringC, etext: StringC, name: StringC)
+    {
+        let cp Interpreter.lookup_char_entry(this.named_char_table, name)
+        if cp = null
+        {
+            this.message1(InterpreterMessages.badCharName(), name)
+            return
+        }
+        if ename.get_size() > (0 as size_t)
+        {
+            let def Interpreter.lookup_char_entry(this.sdata_entity_name_table, ename)
+            if def <> null
+            {
+                if this.d_part_index < def.def_part
+                    this.insert_char_entry(this.sdata_entity_name_table, ename, cp.c, this.d_part_index)
+                else if (def.def_part = this.d_part_index) and (def.c <> cp.c)
+                    this.message1(InterpreterMessages.duplicateSdataEntityName(), ename)
+            }
+            else
+                this.insert_char_entry(this.sdata_entity_name_table, ename, cp.c, this.d_part_index)
+        }
+        if etext.get_size() > (0 as size_t)
+        {
+            let def Interpreter.lookup_char_entry(this.sdata_entity_text_table, etext)
+            if def <> null
+            {
+                if this.d_part_index < def.def_part
+                    this.insert_char_entry(this.sdata_entity_text_table, etext, cp.c, this.d_part_index)
+                else if (def.def_part = this.d_part_index) and (def.c <> cp.c)
+                    this.message1(InterpreterMessages.duplicateSdataEntityText(), etext)
+            }
+            else
+                this.insert_char_entry(this.sdata_entity_text_table, etext, cp.c, this.d_part_index)
+        }
+    }
+
+    ; --- number conversion -------------------------------------------------
+    ; static bool scanSignDigits(const StringC &, size_t &i, int &n)
+    function scan_sign_digits(str: StringC, i: pointer[size_t], n: pointer[int]) returns bool
+    {
+        var negative false
+        if *i < str.get_size()
+        {
+            if str.get(*i) = (0x2D as u32)
+            {
+                set *i: *i + (1 as size_t)
+                set negative: true
+            }
+            else if str.get(*i) = (0x2B as u32)
+                set *i: *i + (1 as size_t)
+        }
+        let j *i
+        var v 0
+        while *i < str.get_size()
+        {
+            let ch str.get(*i)
+            if (ch < (0x30 as u32)) or (ch > (0x39 as u32))
+                break
+            if negative
+                set v: v * 10 - ((ch - (0x30 as u32)) as int)
+            else
+                set v: v * 10 + ((ch - (0x30 as u32)) as int)
+            set *i: *i + (1 as size_t)
+        }
+        set *n: v
+        *i <> j
+    }
+
+    ; ELObj *convertNumber(const StringC &str, int radix = 10)
+    function convert_number(this: pointer[Interpreter], str: StringC) returns pointer[ELObj]
+        this.convert_number_radix(str, 10)
+
+    function convert_number_radix(this: pointer[Interpreter], str: StringC, radix_in: int) returns pointer[ELObj]
+    {
+        var radix radix_in
+        if str.get_size() = (0 as size_t)
+            return null
+        var i: size_t 0
+        if str.get(0 as size_t) = (0x23 as u32)
+        {
+            ; '#' radix prefix: #d #x #o #b
+            if str.get_size() < (2 as size_t)
+                return null
+            let r str.get(1 as size_t)
+            if r = (0x64 as u32)
+                set radix: 10
+            else if r = (0x78 as u32)
+                set radix: 16
+            else if r = (0x6F as u32)
+                set radix: 8
+            else if r = (0x62 as u32)
+                set radix: 2
+            else
+                return null
+            set i: i + (2 as size_t)
+        }
+        if i >= str.get_size()
+            return null
+        var negative false
+        if str.get(i) = (0x2D as u32)
+        {
+            set negative: true
+            set i: i + (1 as size_t)
+        }
+        else
+        {
+            if str.get(i) = (0x2B as u32)
+                set i: i + (1 as size_t)
+        }
+        var had_decimal_point false
+        var had_digit false
+        var n 0
+        var exp 0
+        let long_max 0x7FFFFFFFFFFFFFFF
+        while i < str.get_size()
+        {
+            let c str.get(i)
+            var weight 0 - 1
+            if (c >= (0x30 as u32)) and (c <= (0x39 as u32))
+                set weight: (c - (0x30 as u32)) as int
+            else if (c >= (0x61 as u32)) and (c <= (0x66 as u32))
+                set weight: ((c - (0x61 as u32)) as int) + 10
+            if (weight >= 0) and (weight < radix)
+            {
+                set had_digit: true
+                if negative
+                {
+                    ; -(unsigned long)n > (-(unsigned long)LONG_MIN - weight)/radix
+                    let neg_n (0 as u64) - (n as u64)
+                    let neg_min (long_max as u64) + (1 as u64)
+                    if neg_n > (neg_min - (weight as u64)) / (radix as u64)
+                    {
+                        if radix <> 10
+                            return null
+                        return this.convert_number_float(str)
+                    }
+                    set n: n * radix - weight
+                }
+                else
+                {
+                    if n > (long_max - weight) / radix
+                    {
+                        if radix <> 10
+                            return null
+                        return this.convert_number_float(str)
+                    }
+                    set n: n * radix + weight
+                }
+                if had_decimal_point
+                    set exp: exp - 1
+            }
+            else if (c = (0x2E as u32)) and (radix = 10)
+            {
+                if had_decimal_point
+                    return null
+                set had_decimal_point: true
+            }
+            else
+                break
+            set i: i + (1 as size_t)
+        }
+        if had_digit = false
+            return null
+        if (radix <> 10) and (i < str.get_size())
+            return null
+        if (i + (1 as size_t)) < str.get_size()
+        {
+            if str.get(i) = (0x65 as u32)
+            {
+                ; 'e' exponent — but not when a letter follows ("1em" is a
+                ; quantity in the em unit)
+                if (this.lex_category_table.get(str.get(i + (1 as size_t)) as i32) as int) <> LEX_LETTER
+                {
+                    set had_decimal_point: true
+                    set i: i + (1 as size_t)
+                    var e 0
+                    if Interpreter.scan_sign_digits(str, &i, &e) = false
+                        return null
+                    set exp: exp + e
+                }
+            }
+        }
+        if i < str.get_size()
+        {
+            var unit_exp 0
+            let unit this.scan_unit(str, i, &unit_exp)
+            if unit = null
+                return null
+            if unit_exp = 1
+                return ELObj.make_unresolved_length(this.host, n, exp, unit)
+            return this.convert_number_float(str)
+        }
+        if had_decimal_point
+            return this.convert_number_float(str)
+        ELObj.make_integer(this.host, n)
+    }
+
+    ; ELObj *convertNumberFloat(const StringC &str)
+    function convert_number_float(this: pointer[Interpreter], str: StringC) returns pointer[ELObj]
+    {
+        ; omit an optional #d radix prefix
+        var i0: size_t 0
+        if str.get_size() > (1 as size_t)
+        {
+            if (str.get(0 as size_t) = (0x23 as u32)) and (str.get(1 as size_t) = (0x64 as u32))
+                set i0: 2
+        }
+        let host this.host
+        let cap (str.get_size() + (1 as size_t)) - i0
+        let buf host.allocate(cap, 1 as size_t) as pointer[u8]
+        var w: size_t 0
+        var i i0
+        while i < str.get_size()
+        {
+            let c str.get(i)
+            if (c > (127 as u32)) or (c = (0 as u32))
+                return null
+            ; 'E' is a valid exponent marker for C but not for us
+            if c = (0x45 as u32)
+                break
+            set *(buf + w): c as u8
+            set w: w + (1 as size_t)
+            set i: i + 1
+        }
+        set *(buf + w): 0 as u8
+        var endp: pointer[u8] null
+        let val strtod(buf as pointer[const_char], &endp)
+        let consumed (endp as size_t) - (buf as size_t)
+        if consumed = (str.get_size() - i0)
+            return ELObj.make_real(host, val)
+        if consumed = (0 as size_t)
+            return null
+        var unit_exp 0
+        let unit this.scan_unit(str, consumed + i0, &unit_exp)
+        if unit = null
+            return null
+        ELObj.make_unresolved_quantity(host, val, unit, unit_exp)
+    }
+
+    ; Unit *scanUnit(const StringC &str, size_t i, int &unitExp) — null on error.
+    function scan_unit(this: pointer[Interpreter], str: StringC, i_in: size_t, unit_exp: pointer[int]) returns pointer[Unit]
+    {
+        let host this.host
+        var i i_in
+        let name_chars Array[u32]^host()
+        while i < str.get_size()
+        {
+            let c str.get(i)
+            if (c = (0x2D as u32)) or (c = (0x2B as u32)) or ((c >= (0x30 as u32)) and (c <= (0x39 as u32)))
+                break
+            name_chars.add(c)
+            set i: i + 1
+        }
+        if i >= str.get_size()
+            set *unit_exp: 1
+        else
+        {
+            var e 0
+            var neg false
+            if (str.get(i) = (0x2D as u32)) or (str.get(i) = (0x2B as u32))
+            {
+                if str.get(i) = (0x2D as u32)
+                    set neg: true
+                set i: i + 1
+                if i >= str.get_size()
+                    return null
+            }
+            while i < str.get_size()
+            {
+                let c str.get(i)
+                if (c < (0x30 as u32)) or (c > (0x39 as u32))
+                    return null
+                set e: e * 10
+                if neg
+                    set e: e - ((c - (0x30 as u32)) as int)
+                else
+                    set e: e + ((c - (0x30 as u32)) as int)
+                set i: i + 1
+            }
+            set *unit_exp: e
+        }
+        let unit_name StringC^host(name_chars.get_buffer(), name_chars.get_length())
+        this.lookup_unit(unit_name)
+    }
+
+    ; --- Messenger seam ----------------------------------------------------
+    function set_next_location(this: pointer[Interpreter], loc: Location)
+        set this.next_loc: loc
+
+    function get_error_count(this: Interpreter) returns int
+        error_count
+
+    function message0(this: pointer[Interpreter], mt: MessageType)
+    {
+        let args Vector[MessageArg]()
+        this.emit(mt, args)
+    }
+
+    function message1(this: pointer[Interpreter], mt: MessageType, a1: StringC)
+    {
+        var args Vector[MessageArg](1 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Str(a1)
+        this.emit(mt, args)
+    }
+
+    ; --- self-test ---------------------------------------------------------
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+        ; jade's default: twips (20*72 units per inch)
+        let interp Interpreter.make(host, 1440, false, false, false)
+
+        ; integer conversion incl. radix prefixes
+        let a interp.convert_number(StringC("42"))
+        if a = null
+            return 1
+        if a.exact_integer_value() <> 42
+            return 2
+        let b interp.convert_number(StringC("-17"))
+        if b.exact_integer_value() <> (0 - 17)
+            return 3
+        let c interp.convert_number(StringC("#x1a"))
+        if c.exact_integer_value() <> 26
+            return 4
+        let d interp.convert_number(StringC("#b101"))
+        if d.exact_integer_value() <> 5
+            return 5
+        let e interp.convert_number(StringC("#o17"))
+        if e.exact_integer_value() <> 15
+            return 6
+        let f interp.convert_number(StringC("+5"))
+        if f.exact_integer_value() <> 5
+            return 7
+
+        ; reals
+        let g interp.convert_number(StringC("1.5"))
+        if g.is_inexact_real() = false
+            return 8
+        if g.real_value() <> 1.5
+            return 9
+        let h interp.convert_number(StringC("1.5e2"))
+        if h.real_value() <> 150.0
+            return 10
+
+        ; malformed
+        if interp.convert_number(StringC("1.2.3")) <> null
+            return 11
+        if interp.convert_number(StringC("#xg")) <> null
+            return 12
+
+        ; quantities: builtin units are precomputed from unitsPerInch, so
+        ; resolve_quantities completes without the VM
+        let q interp.convert_number(StringC("2in"))
+        if q = null
+            return 13
+        let rq q.resolve_quantities(false, interp, Location())
+        if rq.is_length() = false
+            return 14
+        if rq.length_value() <> 2880
+            return 15
+        let q2 interp.convert_number(StringC("3pt"))
+        let rq2 q2.resolve_quantities(false, interp, Location())
+        if rq2.length_value() <> 60
+            return 16
+
+        ; char names: the generated table + U-XXXX
+        var ch: u32 0
+        if interp.convert_char_name(StringC("space"), &ch) = false
+            return 17
+        if ch <> (0x20 as u32)
+            return 18
+        if interp.convert_char_name(StringC("U-0041"), &ch) = false
+            return 19
+        if ch <> (0x41 as u32)
+            return 20
+        if interp.convert_char_name(StringC("no-such-name"), &ch)
+            return 21
+
+        ; interning: one Identifier / SymbolObj per name; keywords are fresh
+        ; objects equal through their interned Identifier
+        let i1 interp.lookup(StringC("foo"))
+        let i2 interp.lookup(StringC("foo"))
+        if i1 <> i2
+            return 22
+        let s1 interp.make_symbol(StringC("bar"))
+        let s2 interp.make_symbol(StringC("bar"))
+        if s1 <> s2
+            return 23
+        let k1 interp.make_keyword(StringC("baz"))
+        let k2 interp.make_keyword(StringC("baz"))
+        if k1 = k2
+            return 24
+        if ELObj.equal(k1, k2) = false
+            return 25
+
+        ; lexical categories
+        if interp.lex_category(0x41) <> LEX_LETTER
+            return 26
+        if interp.lex_category(0x28) <> LEX_DELIMITER
+            return 27
+        if interp.lex_category(0 - 1) <> LEX_DELIMITER
+            return 28
+        if interp.lex_category(0x2B) <> LEX_OTHER_NUMBER_START
+            return 29
+
+        if interp.get_error_count() <> 0
+            return 30
+
+        0
+    }
+
+    ; render `dazzle:<severity>: <text with %N substituted>` to stderr and
+    ; count errors (the driver's location-prefixed reporting is Inc 7).
+    function emit(this: pointer[Interpreter], mt: MessageType, args: Vector[MessageArg])
+    {
+        var buf u32[2048]
+        let bp buf as pointer[u32]
+        let cap 2048 as size_t
+        var p: size_t 0
+        set p: ParserState.put_char(bp, cap, p, 0x64 as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x61 as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x7A as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x7A as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x6C as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x65 as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+        set p: ParserState.put_char(bp, cap, p, mt.severity_char())
+        set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+        set p: ParserState.put_char(bp, cap, p, 0x20 as u32)
+        let fmt MessageFormatter()
+        let added fmt.format(mt.get_text(), args, bp + p, cap - p, false)
+        set p: p + added
+        set p: ParserState.put_char(bp, cap, p, 0x0A as u32)
+        ParserState.write_stderr(bp, p, true, 2)
+        if mt.is_error()
+            set this.error_count: this.error_count + 1
+    }
+}

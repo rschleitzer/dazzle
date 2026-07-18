@@ -1,0 +1,994 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.Location.InputSource
+use opensp.Message.MessageType
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.OutputCharStream
+use dazzle.Interpreter.Interpreter
+use dazzle.Interpreter.Unit
+use dazzle.InterpreterMessages.InterpreterMessages
+
+; SchemeParser — the DSSSL expression-language reader
+; (style/SchemeParser.cxx; the C# mirror's lexer DIVERGES from the C++ —
+; lexCategory-driven scanning, #b/#o/#x/#d radix tokens, #A glyph ids,
+; keyword tokens with the colon already stripped — the C++ is the oracle).
+;
+; Inc-2 scope: the lexer (getToken and friends over the opensp InputSource
+; token cursor) and the DATUM reader (parseDatum / parseSelfEvaluating /
+; parseAbbreviation) plus the declaration-content parsers
+; (parseStandardChars / parseNameChars / parseSeparatorChars /
+; parseMapSdataEntity). The EXPRESSION half (parse()/parseTopLevel and the
+; parse<Form> family building Expression trees) lands with Inc 3 — it
+; shares this lexer unchanged.
+;
+; Line ends: SchemeParser reads OpenSP-normalized text (records end in RE =
+; 0x0D); skipComment therefore stops at '\r', exactly like the reference.
+
+; token-allow bits (SchemeParser.h; octal in the reference)
+define ALLOW_END_OF_ENTITY: int 0x1
+define ALLOW_FALSE: int 0x2
+define ALLOW_KEYWORD: int 0x4
+define ALLOW_OPEN_PAREN: int 0x8
+define ALLOW_CLOSE_PAREN: int 0x10
+define ALLOW_IDENTIFIER: int 0x20
+define ALLOW_PERIOD: int 0x40
+define ALLOW_OTHER_EXPR: int 0x80
+define ALLOW_EXPRESSION_KEY: int 0x100
+define ALLOW_KEY_DEFINE: int 0x200
+define ALLOW_KEY_ELSE: int 0x400
+define ALLOW_KEY_ARROW: int 0x800
+define ALLOW_STRING: int 0x1000
+define ALLOW_HASH_OPTIONAL: int 0x2000
+define ALLOW_HASH_KEY: int 0x4000
+define ALLOW_HASH_REST: int 0x8000
+define ALLOW_UNQUOTE: int 0x10000
+define ALLOW_UNQUOTE_SPLICING: int 0x20000
+define ALLOW_QUASIQUOTE_KEY: int 0x40000
+define ALLOW_VECTOR: int 0x80000
+define ALLOW_HASH_CONTENTS: int 0x100000
+; allowExpr = False|Keyword|OpenParen|Identifier|String|HashOptional
+;           | HashKey|HashRest|OtherExpr
+define ALLOW_EXPR: int 0xF0AE
+
+; tokens (SchemeParser.h enum Token)
+define TOKEN_END_OF_ENTITY: int 0
+define TOKEN_TRUE: int 1
+define TOKEN_FALSE: int 2
+define TOKEN_STRING: int 3
+define TOKEN_IDENTIFIER: int 4
+define TOKEN_KEYWORD: int 5
+define TOKEN_CHAR: int 6
+define TOKEN_NUMBER: int 7
+define TOKEN_GLYPH_ID: int 8
+define TOKEN_OPEN_PAREN: int 9
+define TOKEN_CLOSE_PAREN: int 10
+define TOKEN_PERIOD: int 11
+define TOKEN_VECTOR: int 12
+define TOKEN_QUOTE: int 13
+define TOKEN_QUASIQUOTE: int 14
+define TOKEN_UNQUOTE: int 15
+define TOKEN_UNQUOTE_SPLICING: int 16
+define TOKEN_HASH_REST: int 17
+define TOKEN_HASH_OPTIONAL: int 18
+define TOKEN_HASH_KEY: int 19
+define TOKEN_HASH_CONTENTS: int 20
+define TOKEN_VOID: int 21
+
+define SchemeParser
+(
+    host: pointer[Page]
+    interp: pointer[Interpreter]
+    input: pointer[InputSource]
+    current_token: StringC
+    dsssl2: bool
+)
+{
+    function make(host: pointer[Page], interp: pointer[Interpreter], input: pointer[InputSource]) returns pointer[SchemeParser]
+    {
+        let p host.allocate(sizeof SchemeParser, alignof SchemeParser) as pointer[SchemeParser]
+        set p.host: host
+        set p.interp: interp
+        set p.input: input
+        set p.current_token: StringC()
+        set p.dsssl2: interp.is_dsssl2()
+        p
+    }
+
+    ; --- helpers -----------------------------------------------------------
+    ; currentToken_.assign(in->currentTokenStart() + from, len): a fresh copy
+    ; on the run page (each token keeps its own buffer, so a StringObj built
+    ; from a token survives later tokens — arena semantics).
+    function set_token_slice(this: pointer[SchemeParser], from: size_t, len: size_t)
+    {
+        let host this.host
+        let start this.input.current_token_start_index()
+        let contents this.input.get_contents()
+        set this.current_token: StringC^host(contents + (start + from), len)
+    }
+
+    function set_token_char(this: pointer[SchemeParser], c: u32)
+    {
+        let host this.host
+        var buf u32[1]
+        set *(buf as pointer[u32]): c
+        set this.current_token: StringC^host(buf as pointer[u32], 1 as size_t)
+    }
+
+    function lex_cat(this: pointer[SchemeParser], c: i32) returns int
+        this.interp.lex_category(c)
+
+    ; the reference's initMessage: messages carry the current input location.
+    function message0(this: pointer[SchemeParser], mt: MessageType)
+    {
+        this.interp.set_next_location(this.input.here_location())
+        this.interp.message0(mt)
+    }
+
+    function message1(this: pointer[SchemeParser], mt: MessageType, a1: StringC)
+    {
+        this.interp.set_next_location(this.input.here_location())
+        this.interp.message1(mt, a1)
+    }
+
+    ; --- the lexer ---------------------------------------------------------
+    ; void extendToken(): extend to a delimiter.
+    function extend_token(this: pointer[SchemeParser])
+    {
+        var length this.input.current_token_length()
+        repeat
+        {
+            let c this.input.token_char()
+            if this.lex_cat(c) > LEX_OTHER
+                break
+            set length: length + 1
+        }
+        this.input.end_token(length)
+    }
+
+    ; bool tokenRecover(unsigned allowed, Token &tok)
+    function token_recover(this: pointer[SchemeParser], allowed: int, tok: pointer[int]) returns bool
+    {
+        if allowed = ALLOW_CLOSE_PAREN
+        {
+            this.input.unget_token()
+            set *tok: TOKEN_CLOSE_PAREN
+            this.message0(InterpreterMessages.missingCloseParen())
+            return true
+        }
+        let tlen this.input.current_token_length()
+        if tlen = (0 as size_t)
+            this.message0(InterpreterMessages.unexpectedEof())
+        else
+        {
+            this.set_token_slice(0 as size_t, tlen)
+            this.message1(InterpreterMessages.unexpectedToken(), this.current_token)
+        }
+        false
+    }
+
+    ; bool handleNumber(unsigned allowed, Token &tok)
+    function handle_number(this: pointer[SchemeParser], allowed: int, tok: pointer[int]) returns bool
+    {
+        if (allowed & ALLOW_OTHER_EXPR) = 0
+            return this.token_recover(allowed, tok)
+        set *tok: TOKEN_NUMBER
+        let tlen this.input.current_token_length()
+        this.set_token_slice(0 as size_t, tlen)
+        true
+    }
+
+    ; bool handleIdentifier(unsigned allowed, Token &tok)
+    function handle_identifier(this: pointer[SchemeParser], allowed: int, tok: pointer[int]) returns bool
+    {
+        if (allowed & ALLOW_IDENTIFIER) = 0
+            return this.token_recover(allowed, tok)
+        let tlen this.input.current_token_length()
+        this.set_token_slice(0 as size_t, tlen)
+        set *tok: TOKEN_IDENTIFIER
+        true
+    }
+
+    ; void skipComment(): to end of entity or RE.
+    function skip_comment(this: pointer[SchemeParser])
+    {
+        repeat
+        {
+            let c this.input.token_char()
+            if (c < 0) or (c = 0x0D)
+                break
+        }
+    }
+
+    ; bool scanString(unsigned allowed, Token &tok)
+    function scan_string(this: pointer[SchemeParser], allowed: int, tok: pointer[int]) returns bool
+    {
+        let host this.host
+        let chars Array[u32]^host()
+        repeat
+        {
+            var c this.input.token_char()
+            if c < 0
+            {
+                this.message0(InterpreterMessages.unterminatedString())
+                this.input.end_token(1 as size_t)
+                return false
+            }
+            else if c = 0x22
+            {
+                set this.current_token: StringC^host(chars.get_buffer(), chars.get_length())
+                set *tok: TOKEN_STRING
+                return true
+            }
+            else if c = 0x5C
+            {
+                set c: this.input.token_char()
+                if (c = 0x5C) or (c = 0x22)
+                    chars.add(c as u32)
+                else if c < 0
+                {
+                    ; end of entity mid-escape: the next iteration reports
+                    ; the unterminated string
+                }
+                else
+                {
+                    ; named character escape \name; (terminator other than
+                    ; ';' is pushed back)
+                    let name_chars Array[u32]^host()
+                    name_chars.add(c as u32)
+                    var nc this.input.token_char()
+                    while this.lex_cat(nc) < LEX_OTHER
+                    {
+                        name_chars.add(nc as u32)
+                        set nc: this.input.token_char()
+                    }
+                    if nc <> 0x3B
+                    {
+                        let cur_len this.input.current_token_length()
+                        this.input.end_token(cur_len - (1 as size_t))
+                    }
+                    let name StringC^host(name_chars.get_buffer(), name_chars.get_length())
+                    var ch: u32 0
+                    if (*this.interp).convert_char_name(name, &ch)
+                        chars.add(ch)
+                    else
+                        this.message1(InterpreterMessages.unknownCharName(), name)
+                }
+            }
+            else
+                chars.add(c as u32)
+        }
+        false
+    }
+
+    ; bool getToken(unsigned allowed, Token &tok)
+    function get_token(this: pointer[SchemeParser], allowed: int, tok: pointer[int]) returns bool
+    {
+        repeat
+        {
+            this.input.start_token()
+            var c this.input.token_char()
+            if c < 0
+            {
+                if (allowed & ALLOW_END_OF_ENTITY) = 0
+                    return this.token_recover(allowed, tok)
+                set *tok: TOKEN_END_OF_ENTITY
+                return true
+            }
+            else if c = 0x28
+            {
+                if (allowed & ALLOW_OPEN_PAREN) = 0
+                    return this.token_recover(allowed, tok)
+                set *tok: TOKEN_OPEN_PAREN
+                return true
+            }
+            else if c = 0x29
+            {
+                if (allowed & ALLOW_CLOSE_PAREN) = 0
+                    return this.token_recover(allowed, tok)
+                set *tok: TOKEN_CLOSE_PAREN
+                return true
+            }
+            else if c = 0x27
+            {
+                if (allowed & ALLOW_OTHER_EXPR) = 0
+                    return this.token_recover(allowed, tok)
+                set *tok: TOKEN_QUOTE
+                return true
+            }
+            else if c = 0x60
+            {
+                if (allowed & ALLOW_OTHER_EXPR) = 0
+                    return this.token_recover(allowed, tok)
+                set *tok: TOKEN_QUASIQUOTE
+                return true
+            }
+            else if c = 0x2C
+            {
+                set c: this.input.token_char()
+                if c = 0x40
+                {
+                    if (allowed & ALLOW_UNQUOTE_SPLICING) = 0
+                        return this.token_recover(allowed, tok)
+                    set *tok: TOKEN_UNQUOTE_SPLICING
+                }
+                else
+                {
+                    if (allowed & ALLOW_UNQUOTE) = 0
+                        return this.token_recover(allowed, tok)
+                    set *tok: TOKEN_UNQUOTE
+                    this.input.end_token(1 as size_t)
+                }
+                return true
+            }
+            else if (c = 0x20) or (c = 0x0D) or (c = 0x0A) or (c = 0x09) or (c = 0x0C)
+            {
+                ; whitespace
+            }
+            else if c = 0x23
+            {
+                ; '#'
+                set c: this.input.token_char()
+                if (c = 0x74)
+                {
+                    ; #t
+                    if (allowed & ALLOW_OTHER_EXPR) = 0
+                        return this.token_recover(allowed, tok)
+                    set *tok: TOKEN_TRUE
+                    return true
+                }
+                else if c = 0x66
+                {
+                    ; #f
+                    if (allowed & ALLOW_FALSE) = 0
+                        return this.token_recover(allowed, tok)
+                    set *tok: TOKEN_FALSE
+                    return true
+                }
+                else if c = 0x5C
+                {
+                    ; #\ character literal
+                    set c: this.input.token_char()
+                    if c < 0
+                    {
+                        this.message0(InterpreterMessages.unexpectedEof())
+                        if (allowed & ALLOW_END_OF_ENTITY) <> 0
+                        {
+                            set *tok: TOKEN_END_OF_ENTITY
+                            return true
+                        }
+                        return false
+                    }
+                    if (allowed & ALLOW_OTHER_EXPR) = 0
+                    {
+                        this.extend_token()
+                        return this.token_recover(allowed, tok)
+                    }
+                    this.input.discard_initial()
+                    this.extend_token()
+                    set *tok: TOKEN_CHAR
+                    if this.input.current_token_length() = (1 as size_t)
+                        this.set_token_slice(0 as size_t, 1 as size_t)
+                    else
+                    {
+                        let host this.host
+                        let start this.input.current_token_start_index()
+                        let contents this.input.get_contents()
+                        let tlen this.input.current_token_length()
+                        let name StringC^host(contents + start, tlen)
+                        var ch: u32 DEFAULT_CHAR as u32
+                        if (*this.interp).convert_char_name(name, &ch) = false
+                        {
+                            this.message1(InterpreterMessages.unknownCharName(), name)
+                            set ch: DEFAULT_CHAR as u32
+                        }
+                        this.set_token_char(ch)
+                    }
+                    return true
+                }
+                else if c = 0x21
+                {
+                    ; #!named-constant
+                    this.extend_token()
+                    let host this.host
+                    let start this.input.current_token_start_index()
+                    let contents this.input.get_contents()
+                    let tlen this.input.current_token_length()
+                    let tem StringC^host(contents + (start + (2 as size_t)), tlen - (2 as size_t))
+                    if tem.equals(StringC("optional"))
+                    {
+                        if (allowed & ALLOW_HASH_OPTIONAL) = 0
+                            return this.token_recover(allowed, tok)
+                        set *tok: TOKEN_HASH_OPTIONAL
+                        return true
+                    }
+                    if tem.equals(StringC("key"))
+                    {
+                        if (allowed & ALLOW_HASH_KEY) = 0
+                            return this.token_recover(allowed, tok)
+                        set *tok: TOKEN_HASH_KEY
+                        return true
+                    }
+                    if tem.equals(StringC("rest"))
+                    {
+                        if (allowed & ALLOW_HASH_REST) = 0
+                            return this.token_recover(allowed, tok)
+                        set *tok: TOKEN_HASH_REST
+                        return true
+                    }
+                    if tem.equals(StringC("contents"))
+                    {
+                        if (allowed & ALLOW_HASH_CONTENTS) = 0
+                            return this.token_recover(allowed, tok)
+                        set *tok: TOKEN_HASH_CONTENTS
+                        return true
+                    }
+                    this.message1(InterpreterMessages.unknownNamedConstant(), tem)
+                }
+                else if (c = 0x62) or (c = 0x6F) or (c = 0x78) or (c = 0x64)
+                {
+                    ; #b #o #x #d radix-prefixed number
+                    this.extend_token()
+                    if (allowed & ALLOW_OTHER_EXPR) = 0
+                        return this.token_recover(allowed, tok)
+                    set *tok: TOKEN_NUMBER
+                    this.set_token_slice(0 as size_t, this.input.current_token_length())
+                    return true
+                }
+                else if c = 0x41
+                {
+                    ; #A glyph id
+                    this.extend_token()
+                    if (allowed & ALLOW_OTHER_EXPR) = 0
+                        return this.token_recover(allowed, tok)
+                    set *tok: TOKEN_GLYPH_ID
+                    this.set_token_slice(2 as size_t, this.input.current_token_length() - (2 as size_t))
+                    return true
+                }
+                else if c < 0
+                {
+                    this.message0(InterpreterMessages.unexpectedEof())
+                    if (allowed & ALLOW_END_OF_ENTITY) <> 0
+                    {
+                        set *tok: TOKEN_END_OF_ENTITY
+                        return true
+                    }
+                    return false
+                }
+                else if (c = 0x76) and this.dsssl2
+                {
+                    ; #v (dsssl2)
+                    if (allowed & ALLOW_OTHER_EXPR) = 0
+                        return this.token_recover(allowed, tok)
+                    set *tok: TOKEN_VOID
+                    return true
+                }
+                else if (c = 0x28) and this.dsssl2
+                {
+                    ; #( vector (dsssl2)
+                    if (allowed & ALLOW_VECTOR) = 0
+                        return this.token_recover(allowed, tok)
+                    set *tok: TOKEN_VECTOR
+                    return true
+                }
+                else
+                    this.message0(InterpreterMessages.unknownHash())
+            }
+            else if c = 0x22
+            {
+                if (allowed & ALLOW_STRING) = 0
+                    return this.token_recover(allowed, tok)
+                return this.scan_string(allowed, tok)
+            }
+            else if c = 0x3B
+                this.skip_comment()
+            else if c = 0x2E
+            {
+                ; '.' — period, "..." identifier, or number
+                this.extend_token()
+                let len this.input.current_token_length()
+                if len = (1 as size_t)
+                {
+                    if (allowed & ALLOW_PERIOD) = 0
+                        return this.token_recover(allowed, tok)
+                    set *tok: TOKEN_PERIOD
+                    return true
+                }
+                if len = (3 as size_t)
+                {
+                    let start this.input.current_token_start_index()
+                    let contents this.input.get_contents()
+                    if (*(contents + (start + (1 as size_t))) = (0x2E as u32)) and (*(contents + (start + (2 as size_t))) = (0x2E as u32))
+                        return this.handle_identifier(allowed, tok)
+                }
+                return this.handle_number(allowed, tok)
+            }
+            else
+            {
+                let cat this.lex_cat(c)
+                if cat = LEX_ADD_WHITESPACE
+                {
+                    ; declared separator char: whitespace
+                }
+                else if cat = LEX_OTHER_NUMBER_START
+                {
+                    this.extend_token()
+                    ; a lone + or - is an identifier
+                    if this.input.current_token_length() = (1 as size_t)
+                        return this.handle_identifier(allowed, tok)
+                    return this.handle_number(allowed, tok)
+                }
+                else if cat = LEX_DIGIT
+                {
+                    this.extend_token()
+                    return this.handle_number(allowed, tok)
+                }
+                else
+                {
+                    var invalid false
+                    var do_name true
+                    if cat = LEX_OTHER
+                    {
+                        if c < 0x20
+                        {
+                            ; ignore control characters
+                            this.message0(InterpreterMessages.invalidChar())
+                            set do_name: false
+                        }
+                        else
+                            this.input.unget_token()
+                    }
+                    if do_name
+                    {
+                        ; name scan (letters, other name starts, declared
+                        ; name chars; lexOther chars join with a diagnostic)
+                        var length this.input.current_token_length()
+                        repeat
+                        {
+                            let nc this.input.token_char()
+                            let lc this.lex_cat(nc)
+                            if lc > LEX_OTHER
+                                break
+                            if lc = LEX_OTHER
+                                set invalid: true
+                            set length: length + 1
+                        }
+                        this.input.end_token(length)
+
+                        let tlen this.input.current_token_length()
+                        let start this.input.current_token_start_index()
+                        let contents this.input.get_contents()
+                        var is_keyword false
+                        if tlen > (1 as size_t)
+                        {
+                            if *(contents + ((start + tlen) - (1 as size_t))) = (0x3A as u32)
+                                set is_keyword: true
+                        }
+                        if is_keyword
+                        {
+                            if (allowed & ALLOW_KEYWORD) = 0
+                                return this.token_recover(allowed, tok)
+                            this.set_token_slice(0 as size_t, tlen - (1 as size_t))
+                            set *tok: TOKEN_KEYWORD
+                            var double_colon false
+                            if this.current_token.get_size() > (1 as size_t)
+                            {
+                                if this.current_token.get(this.current_token.get_size() - (1 as size_t)) = (0x3A as u32)
+                                    set double_colon: true
+                            }
+                            if invalid or double_colon
+                                this.message1(InterpreterMessages.invalidIdentifier(), this.current_token)
+                            return true
+                        }
+                        if invalid
+                        {
+                            this.set_token_slice(0 as size_t, tlen)
+                            this.message1(InterpreterMessages.invalidIdentifier(), this.current_token)
+                        }
+                        return this.handle_identifier(allowed, tok)
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    ; --- the datum reader --------------------------------------------------
+    ; ELObj *convertAfiiGlyphId(const StringC &): #Annnn -> GlyphIdObj (null
+    ; on a malformed suffix, exactly the reference).
+    function convert_afii_glyph_id(this: pointer[SchemeParser], str: StringC) returns pointer[ELObj]
+    {
+        var n 0
+        var i: size_t 0
+        while i < str.get_size()
+        {
+            let c str.get(i)
+            if (c < (0x30 as u32)) or (c > (0x39 as u32))
+            {
+                set n: 0
+                break
+            }
+            set n: n * 10 + ((c - (0x30 as u32)) as int)
+            set i: i + 1
+        }
+        if n = 0
+        {
+            this.message1(InterpreterMessages.invalidAfiiGlyphId(), str)
+            return null
+        }
+        let interp this.interp
+        ELObj.make_glyph_id(interp.get_host(), StringC("ISO/IEC 10036/RA//Glyphs"), n)
+    }
+
+    ; bool parseSelfEvaluating(unsigned otherAllowed, ELObj *&result, Token &tok)
+    function parse_self_evaluating(this: pointer[SchemeParser], other_allowed: int, result: pointer[pointer[ELObj]], tok: pointer[int]) returns bool
+    {
+        set *result: null
+        if this.get_token(ALLOW_EXPR | other_allowed, tok) = false
+            return false
+        let interp this.interp
+        let t *tok
+        if t = TOKEN_TRUE
+            set *result: interp.make_true()
+        else if t = TOKEN_FALSE
+            set *result: interp.make_false()
+        else if t = TOKEN_VOID
+            set *result: interp.make_unspecified()
+        else if t = TOKEN_STRING
+            set *result: ELObj.make_string(interp.get_host(), this.current_token)
+        else if t = TOKEN_KEYWORD
+            set *result: interp.make_keyword(this.current_token)
+        else if t = TOKEN_CHAR
+            set *result: ELObj.make_char(interp.get_host(), this.current_token.get(0 as size_t))
+        else if t = TOKEN_NUMBER
+        {
+            let v interp.convert_number(this.current_token)
+            if v = null
+            {
+                this.message1(InterpreterMessages.invalidNumber(), this.current_token)
+                set *result: interp.make_error()
+            }
+            else
+                set *result: v
+        }
+        else if t = TOKEN_GLYPH_ID
+            set *result: this.convert_afii_glyph_id(this.current_token)
+        true
+    }
+
+    ; bool parseAbbreviation(const char *sym, ELObj *&result): 'x -> (quote x)
+    function parse_abbreviation(this: pointer[SchemeParser], sym: pointer[const_char], result: pointer[pointer[ELObj]]) returns bool
+    {
+        let interp this.interp
+        let quote_sym interp.make_symbol(StringC(sym))
+        var obj: pointer[ELObj] null
+        var ignore_loc Location()
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_datum(0, &obj, &ignore_loc, &tok) = false
+            return false
+        let hostp interp.get_host()
+        let tail ELObj.make_pair(hostp, obj, interp.make_nil())
+        set *result: ELObj.make_pair(hostp, quote_sym, tail)
+        true
+    }
+
+    ; bool parseDatum(unsigned otherAllowed, ELObj *&result, Location &loc, Token &tok)
+    function parse_datum(this: pointer[SchemeParser], other_allowed: int, result: pointer[pointer[ELObj]], loc: pointer[Location], tok: pointer[int]) returns bool
+    {
+        if this.parse_self_evaluating(other_allowed | ALLOW_VECTOR | ALLOW_UNQUOTE | ALLOW_UNQUOTE_SPLICING, result, tok) = false
+            return false
+        let loc_org this.input.get_origin()
+        let loc_idx this.input.get_cur_index()
+        set *loc: Location(loc_org, loc_idx as u32)
+        if *result <> null
+            return true
+        let interp this.interp
+        let t *tok
+        if t = TOKEN_IDENTIFIER
+            set *result: interp.make_symbol(this.current_token)
+        else if t = TOKEN_QUOTE
+            return this.parse_abbreviation("quote", result)
+        else if t = TOKEN_QUASIQUOTE
+            return this.parse_abbreviation("quasiquote", result)
+        else if t = TOKEN_UNQUOTE
+            return this.parse_abbreviation("unquote", result)
+        else if t = TOKEN_UNQUOTE_SPLICING
+            return this.parse_abbreviation("unquote-splicing", result)
+        else if t = TOKEN_OPEN_PAREN
+        {
+            var tem: pointer[ELObj] null
+            var ignore_loc Location()
+            if this.parse_datum(ALLOW_CLOSE_PAREN, &tem, &ignore_loc, tok) = false
+                return false
+            if tem = null
+                set *result: interp.make_nil()
+            else
+            {
+                let hostp interp.get_host()
+                let list ELObj.make_pair(hostp, tem, null)
+                var last list
+                var done false
+                while done = false
+                {
+                    if this.parse_datum(ALLOW_CLOSE_PAREN | ALLOW_PERIOD, &tem, &ignore_loc, tok) = false
+                        return false
+                    if tem = null
+                    {
+                        if *tok = TOKEN_CLOSE_PAREN
+                        {
+                            last.set_cdr(interp.make_nil())
+                            set done: true
+                        }
+                        else
+                        {
+                            ; improper list: '.' cdr ')'
+                            if this.parse_datum(0, &tem, &ignore_loc, tok) = false
+                                return false
+                            last.set_cdr(tem)
+                            if this.get_token(ALLOW_CLOSE_PAREN, tok) = false
+                                return false
+                            set done: true
+                        }
+                    }
+                    else
+                    {
+                        let p ELObj.make_pair(hostp, tem, null)
+                        last.set_cdr(p)
+                        set last: p
+                    }
+                }
+                set *result: list
+            }
+        }
+        else if t = TOKEN_VECTOR
+        {
+            let hostv this.host
+            let elems Array[pointer[ELObj]]^hostv()
+            var ignore_loc Location()
+            var done false
+            while done = false
+            {
+                var tem: pointer[ELObj] null
+                if this.parse_datum(ALLOW_CLOSE_PAREN, &tem, &ignore_loc, tok) = false
+                    return false
+                if tem = null
+                    set done: true
+                else
+                    elems.add(tem)
+            }
+            set *result: ELObj.make_vector_of(interp.get_host(), elems.get_buffer(), elems.get_length())
+        }
+        true
+    }
+
+    ; --- declaration-content parsers (style-specification declarations) ----
+    ; void parseStandardChars()
+    function parse_standard_chars(this: pointer[SchemeParser])
+    {
+        repeat
+        {
+            var tok TOKEN_END_OF_ENTITY
+            if this.get_token(ALLOW_IDENTIFIER | ALLOW_END_OF_ENTITY, &tok) = false
+                break
+            if tok = TOKEN_END_OF_ENTITY
+                break
+
+            let name this.current_token
+
+            if this.get_token(ALLOW_OTHER_EXPR, &tok) = false
+            {
+                this.message0(InterpreterMessages.badDeclaration())
+                break
+            }
+            if tok <> TOKEN_NUMBER
+            {
+                this.message0(InterpreterMessages.badDeclaration())
+                break
+            }
+
+            ; the name must be letters (digits, '-', '.' after the first)
+            var i: size_t 0
+            var ok true
+            while i < name.get_size()
+            {
+                let cat this.lex_cat(name.get(i) as i32)
+                if cat <> LEX_LETTER
+                {
+                    var tail_ok false
+                    if i > (0 as size_t)
+                    {
+                        if (cat = LEX_DIGIT) or (name.get(i) = (0x2D as u32)) or (name.get(i) = (0x2E as u32))
+                            set tail_ok: true
+                    }
+                    if tail_ok = false
+                    {
+                        set ok: false
+                        break
+                    }
+                }
+                set i: i + 1
+            }
+            if (ok = false) or (name.get_size() = (1 as size_t))
+            {
+                this.message1(InterpreterMessages.invalidCharName(), name)
+                continue
+            }
+
+            ; the number must be all digits
+            var j: size_t 0
+            var num_ok true
+            while j < this.current_token.get_size()
+            {
+                if this.lex_cat(this.current_token.get(j) as i32) <> LEX_DIGIT
+                {
+                    set num_ok: false
+                    break
+                }
+                set j: j + 1
+            }
+            if num_ok = false
+            {
+                this.message1(InterpreterMessages.invalidCharNumber(), this.current_token)
+                continue
+            }
+
+            this.interp.add_standard_char(name, this.current_token)
+        }
+    }
+
+    ; void parseNameChars()
+    function parse_name_chars(this: pointer[SchemeParser])
+    {
+        repeat
+        {
+            var tok TOKEN_END_OF_ENTITY
+            if this.get_token(ALLOW_IDENTIFIER | ALLOW_END_OF_ENTITY, &tok) = false
+                break
+            if tok = TOKEN_END_OF_ENTITY
+                break
+            this.interp.add_name_char(this.current_token)
+        }
+    }
+
+    ; void parseSeparatorChars()
+    function parse_separator_chars(this: pointer[SchemeParser])
+    {
+        repeat
+        {
+            var tok TOKEN_END_OF_ENTITY
+            if this.get_token(ALLOW_IDENTIFIER | ALLOW_END_OF_ENTITY, &tok) = false
+                break
+            if tok = TOKEN_END_OF_ENTITY
+                break
+            this.interp.add_separator_char(this.current_token)
+        }
+    }
+
+    ; void parseMapSdataEntity(const StringC &ename, const StringC &etext)
+    function parse_map_sdata_entity(this: pointer[SchemeParser], ename: StringC, etext: StringC)
+    {
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER | ALLOW_END_OF_ENTITY, &tok) = false
+        {
+            this.message0(InterpreterMessages.badDeclaration())
+            return
+        }
+        if tok = TOKEN_END_OF_ENTITY
+        {
+            this.message0(InterpreterMessages.badDeclaration())
+            return
+        }
+        this.interp.add_sdata_entity(ename, etext, this.current_token)
+    }
+
+    ; --- self-test ---------------------------------------------------------
+    ; parse one datum from an ASCII snippet and print it; empty result means
+    ; parse failure. (Line ends in snippets are RE = \r, the OpenSP record
+    ; convention this reader lives on.)
+    function dump_one(this: pointer[SchemeParser], os: pointer[OutputCharStream]) returns bool
+    {
+        var datum: pointer[ELObj] null
+        var loc Location()
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_datum(ALLOW_END_OF_ENTITY, &datum, &loc, &tok) = false
+            return false
+        if datum = null
+            return false
+        let interp this.interp
+        let resolved datum.resolve_quantities(false, interp, loc)
+        resolved.print(os, 1440)
+        true
+    }
+
+    function check(host: pointer[Page], interp: pointer[Interpreter], src: pointer[const_char], expect: pointer[const_char]) returns bool
+    {
+        let text StringC(src)
+        let src_in InputSource.make(host, null, text.data_ptr(), text.get_size())
+        let sp SchemeParser.make(host, interp, src_in)
+        let os OutputCharStream.make(host)
+        if sp.dump_one(os) = false
+            return false
+        os.is_ascii(expect)
+    }
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+        let interp Interpreter.make(host, 1440, false, false, false)
+
+        ; atoms
+        if SchemeParser.check(host, interp, "42", "42") = false
+            return 1
+        if SchemeParser.check(host, interp, "-17", "-17") = false
+            return 2
+        if SchemeParser.check(host, interp, "#x1a", "26") = false
+            return 3
+        if SchemeParser.check(host, interp, "1.5", "1.5") = false
+            return 4
+        if SchemeParser.check(host, interp, ".5", "0.5") = false
+            return 5
+        if SchemeParser.check(host, interp, "#t", "#t") = false
+            return 6
+        if SchemeParser.check(host, interp, "#f", "#f") = false
+            return 7
+        if SchemeParser.check(host, interp, "foo", "foo") = false
+            return 8
+        if SchemeParser.check(host, interp, "list->string", "list->string") = false
+            return 9
+        if SchemeParser.check(host, interp, "...", "...") = false
+            return 10
+        if SchemeParser.check(host, interp, "-", "-") = false
+            return 11
+        if SchemeParser.check(host, interp, "foo:", "foo:") = false
+            return 12
+
+        ; strings (named character escapes, not C escapes)
+        if SchemeParser.check(host, interp, "\"hi\"", "\"hi\"") = false
+            return 13
+        if SchemeParser.check(host, interp, "\"a\\U-0041;b\"", "\"aAb\"") = false
+            return 14
+        if SchemeParser.check(host, interp, "\"q\\\"w\"", "\"q\\\"w\"") = false
+            return 15
+
+        ; characters
+        if SchemeParser.check(host, interp, "#\\a", "#\\a") = false
+            return 16
+        if SchemeParser.check(host, interp, "#\\space", "#\\ ") = false
+            return 17
+
+        ; quantities resolve through the builtin units
+        if SchemeParser.check(host, interp, "2in", "144pt") = false
+            return 18
+
+        ; lists
+        if SchemeParser.check(host, interp, "()", "()") = false
+            return 19
+        if SchemeParser.check(host, interp, "(a b c)", "(a b c)") = false
+            return 20
+        if SchemeParser.check(host, interp, "(a . b)", "(a . b)") = false
+            return 21
+        if SchemeParser.check(host, interp, "(a (b c) d)", "(a (b c) d)") = false
+            return 22
+
+        ; abbreviations
+        if SchemeParser.check(host, interp, "'foo", "(quote foo)") = false
+            return 23
+        if SchemeParser.check(host, interp, "\`(a ,b ,@c)", "(quasiquote (a (unquote b) (unquote-splicing c)))") = false
+            return 24
+
+        ; comments end at RE (\r), the OpenSP record convention
+        if SchemeParser.check(host, interp, "; note\r42", "42") = false
+            return 25
+
+        ; vectors are dsssl2-gated
+        if SchemeParser.check(host, interp, "#(1 2)", "#(1 2)")
+            return 26
+        let interp2 Interpreter.make(host, 1440, false, true, false)
+        if SchemeParser.check(host, interp2, "#(1 2)", "#(1 2)") = false
+            return 27
+
+        0
+    }
+}

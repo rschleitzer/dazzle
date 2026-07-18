@@ -50,11 +50,15 @@ if ! "$BIN" -o "$TMP/unit" "$HERE/unit.scaly" "$TMP/libdazzle.a" "$TMP/libopensp
   echo "dazzle: FAIL (link)"; tail -8 "$TMP/link.log"; exit 1
 fi
 
-out="$("$TMP/unit" 2>&1)"
+# Expected stderr: the SchemeParser vector-gating check provokes exactly one
+# reference diagnostic (#( outside dsssl2 -> unknownHash).
+out="$("$TMP/unit" 2>"$TMP/err")"
 rc=$?
-if [ "$rc" -eq 0 ] && [ "$out" = "PASS" ]; then
+err="$(cat "$TMP/err")"
+experr="dazzle:E: invalid character after '#'"
+if [ "$rc" -eq 0 ] && [ "$out" = "PASS" ] && [ "$err" = "$experr" ]; then
   echo "dazzle: PASS"
   exit 0
 fi
-echo "dazzle: FAIL (rc=$rc) out='$out'"
+echo "dazzle: FAIL (rc=$rc) out='$out' err='$err'"
 exit 1
