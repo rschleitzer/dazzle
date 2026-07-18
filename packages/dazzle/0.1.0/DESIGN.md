@@ -34,11 +34,14 @@ add one service-codegen run (the roadmap exit names both stylesheet families).
 
 Reference-behavior findings the port must reproduce:
 
-- **The directory flow object does NOT create directories.** A missing output
-  directory yields `dazzle:E: cannot open output file "..."` on stderr, the
-  content falls through to stdout, and rc STAYS 0. (dazzle-net DIVERGES here —
-  its C# `startDirectory` calls `Directory.CreateDirectory`; the C++ binary is
-  the oracle, so: no mkdir.)
+- **The directory flow object mkdir's (0755).** SUPERSEDED note (2026-07-18):
+  the earlier measured baseline read "no mkdir" while the C++ dazzle extension
+  sources were not checked out. They now are (`~/repos/dazzle/jade/
+  TransformFOTBuilder.cxx:600` calls `mkdir(dirName, 0755)` unconditionally) and
+  the C# mirror agrees (`Directory.CreateDirectory`); per rule zero the port
+  follows the located C++/C# source, so `startDirectory` creates the directory.
+  (Decision Ralf 2026-07-18. If a future re-measurement of the reference binary
+  shows no-mkdir, revisit — the two oracles disagreed here.)
 - `-t sgml` selects the **TransformFOTBuilder** (JadeApp backend switch), not
   SgmlFOTBuilder (that one renders an FOT dump).
 
@@ -48,9 +51,10 @@ The `directory` flow object is NOT in openjade-net (upstream openjade's
 `TransformFOTBuilder.cxx` has no trace); its portable mirror is
 `dazzle-net/src/lib/TransformFOTBuilder.cs` (`DirectoryFlowObj`, pubid
 `UNREGISTERED::Dazzle//Flow Object Class::directory`, a `directoryStack_`
-prefixing entity filenames). **OPEN: the C++ dazzle extension sources are not
-checked out locally** — until located, the reference binary is the behavioral
-oracle and dazzle-net the structural mirror for this one flow object.
+prefixing entity filenames). **RESOLVED 2026-07-18: the C++ dazzle extension
+sources ARE checked out** — `~/repos/dazzle/jade/TransformFOTBuilder.{cxx,h}`
+(with the `DirectoryFlowObj` + `startDirectory`/`startEntity`); this is now the
+ground-truth oracle for the sink, dazzle-net the structural mirror.
 
 ## RBMM mapping
 
