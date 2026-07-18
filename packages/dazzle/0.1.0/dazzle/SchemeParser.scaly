@@ -5,7 +5,13 @@ use opensp.Location.Location
 use opensp.Location.InputSource
 use opensp.Message.MessageType
 use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
 use dazzle.ELObj.OutputCharStream
+use dazzle.Expression.Expression
+use dazzle.Expression.Environment
+use dazzle.Insn.Insn
+use dazzle.Insn.Signature
+use dazzle.VM.VM
 use dazzle.Interpreter.Interpreter
 use dazzle.Interpreter.Unit
 use dazzle.InterpreterMessages.InterpreterMessages
@@ -75,6 +81,15 @@ define TOKEN_HASH_OPTIONAL: int 18
 define TOKEN_HASH_KEY: int 19
 define TOKEN_HASH_CONTENTS: int 20
 define TOKEN_VOID: int 21
+
+; every allow bit set (recovery / skipForm).
+define ALLOW_ALL: int 0x1FFFFF
+
+; parseFormals argument kinds.
+define FORMAL_REQUIRED: int 0
+define FORMAL_OPTIONAL: int 1
+define FORMAL_REST: int 2
+define FORMAL_KEY: int 3
 
 define SchemeParser
 (
@@ -882,6 +897,867 @@ define SchemeParser
         this.interp.add_sdata_entity(ename, etext, this.current_token)
     }
 
+    ; ======================================================================
+    ; Inc 3 — the EXPRESSION reader (SchemeParser.cxx parseExpression family).
+    ; Builds Expression trees the Interpreter compiles + runs. Shares the Inc-2
+    ; lexer unchanged. make / style / with-mode / the query forms (there-exists?
+    ; ...) and quasiquote route to later increments; the pure-eval forms are
+    ; here (if/cond/case/and/or/let/let*/letrec/lambda/begin/set!/quote + define).
+    ; ======================================================================
+
+    function cur_loc(this: SchemeParser) returns Location
+        Location(this.input.get_origin(), this.input.get_cur_index() as u32)
+
+    function expect_close_paren(this: pointer[SchemeParser]) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        this.get_token(ALLOW_CLOSE_PAREN, &tok)
+    }
+
+    ; bool parseExpression(out expr) — the public entry.
+    function parse_expression(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        var key SK_NOTKEY
+        var tok TOKEN_END_OF_ENTITY
+        this.parse_expr_full(ALLOW_EXPR, result, &key, &tok)
+    }
+
+    ; bool parseExpression(allowed, out expr, out key, out tok).
+    function parse_expr_full(this: pointer[SchemeParser], allowed: int, result: pointer[pointer[Expression]], key: pointer[int], tok: pointer[int]) returns bool
+    {
+        set *result: null
+        set *key: SK_NOTKEY
+        set *tok: TOKEN_END_OF_ENTITY
+        if this.get_token(allowed, tok) = false
+            return false
+        let interp this.interp
+        let hp this.host
+        let t *tok
+        if t = TOKEN_IDENTIFIER
+        {
+            let ident interp.lookup(this.current_token)
+            set *key: ident.syntactic_key()
+            set *result: Expression.make_variable(hp, ident, this.cur_loc())
+            return true
+        }
+        if t = TOKEN_NUMBER
+        {
+            let val interp.convert_number(this.current_token)
+            if val = null
+            {
+                this.message1(InterpreterMessages.invalidNumber(), this.current_token)
+                return false
+            }
+            set *result: Expression.make_constant(hp, val, this.cur_loc())
+            return true
+        }
+        if t = TOKEN_STRING
+        {
+            set *result: Expression.make_constant(hp, ELObj.make_string(interp.get_host(), this.current_token), this.cur_loc())
+            return true
+        }
+        if t = TOKEN_TRUE
+        {
+            set *result: Expression.make_constant(hp, interp.make_true(), this.cur_loc())
+            return true
+        }
+        if t = TOKEN_FALSE
+        {
+            set *result: Expression.make_constant(hp, interp.make_false(), this.cur_loc())
+            return true
+        }
+        if t = TOKEN_OPEN_PAREN
+            return this.parse_call(result)
+        if t = TOKEN_QUOTE
+            return this.parse_quoted_datum(result)
+        if t = TOKEN_CHAR
+        {
+            var ch: u32 0
+            if this.current_token.get_size() > (0 as size_t)
+                set ch: this.current_token.get(0 as size_t)
+            set *result: Expression.make_constant(hp, ELObj.make_char(interp.get_host(), ch), this.cur_loc())
+            return true
+        }
+        ; CloseParen / Keyword: expr stays null, tok carries the signal.
+        if t = TOKEN_CLOSE_PAREN
+            return true
+        if t = TOKEN_KEYWORD
+            return true
+        false
+    }
+
+    ; bool parseCall(out expr) — the open paren has been consumed.
+    function parse_call(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let interp this.interp
+        let hp this.host
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER | ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+            return false
+        if tok = TOKEN_CLOSE_PAREN
+        {
+            set *result: Expression.make_constant(hp, interp.make_nil(), this.cur_loc())
+            return true
+        }
+        if tok = TOKEN_IDENTIFIER
+        {
+            let ident interp.lookup(this.current_token)
+            let sk ident.syntactic_key()
+            if sk = SK_QUOTE
+                return this.parse_quote(result)
+            if sk = SK_IF
+                return this.parse_if(result)
+            if sk = SK_COND
+                return this.parse_cond(result)
+            if sk = SK_CASE
+                return this.parse_case(result)
+            if sk = SK_AND
+                return this.parse_and(result)
+            if sk = SK_OR
+                return this.parse_or(result)
+            if sk = SK_LET
+                return this.parse_let(result)
+            if sk = SK_LET_STAR
+                return this.parse_let_star(result)
+            if sk = SK_LETREC
+                return this.parse_letrec(result)
+            if sk = SK_LAMBDA
+                return this.parse_lambda(result)
+            if sk = SK_BEGIN
+                return this.parse_begin(result)
+            if sk = SK_SET
+                return this.parse_set(result)
+            ; make / style / with-mode / query forms are later increments; for
+            ; now they resolve as an ordinary call on the identifier.
+            return this.parse_regular_call(ident, result)
+        }
+        ; operator is itself a parenthesized call: (( ... ) args...)
+        var func_expr: pointer[Expression] null
+        if this.parse_call(&func_expr) = false
+            return false
+        this.parse_call_args(func_expr, result)
+    }
+
+    function parse_regular_call(this: pointer[SchemeParser], func: pointer[Identifier], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let loc this.cur_loc()
+        let args Array[pointer[Expression]]^hp()
+        repeat
+        {
+            var key SK_NOTKEY
+            var tok TOKEN_END_OF_ENTITY
+            var arg: pointer[Expression] null
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &arg, &key, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if arg <> null
+                args.add(arg)
+        }
+        let op Expression.make_variable(hp, func, loc)
+        set *result: Expression.make_call(hp, op, args, loc)
+        true
+    }
+
+    function parse_call_args(this: pointer[SchemeParser], func: pointer[Expression], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        if func = null
+            return false
+        let hp this.host
+        let loc this.cur_loc()
+        let args Array[pointer[Expression]]^hp()
+        repeat
+        {
+            var key SK_NOTKEY
+            var tok TOKEN_END_OF_ENTITY
+            var arg: pointer[Expression] null
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &arg, &key, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if arg <> null
+                args.add(arg)
+        }
+        set *result: Expression.make_call(hp, func, args, loc)
+        true
+    }
+
+    function parse_if(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let loc this.cur_loc()
+        var test_e: pointer[Expression] null
+        var conseq: pointer[Expression] null
+        var alt: pointer[Expression] null
+        var key SK_NOTKEY
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_expr_full(ALLOW_EXPR, &test_e, &key, &tok) = false
+            return false
+        if this.parse_expr_full(ALLOW_EXPR, &conseq, &key, &tok) = false
+            return false
+        this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &alt, &key, &tok)
+        if tok <> TOKEN_CLOSE_PAREN
+        {
+            if this.expect_close_paren() = false
+                return false
+        }
+        set *result: Expression.make_if(hp, test_e, conseq, alt, loc)
+        true
+    }
+
+    ; collect a body's expressions until the close paren (parseBegin).
+    function parse_begin(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let loc this.cur_loc()
+        let exprs Array[pointer[Expression]]^hp()
+        repeat
+        {
+            var key SK_NOTKEY
+            var tok TOKEN_END_OF_ENTITY
+            var e: pointer[Expression] null
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &e, &key, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if e <> null
+                exprs.add(e)
+        }
+        set *result: this.collapse_body(exprs, loc)
+        true
+    }
+
+    ; an expression sequence -> unspecified / the single expr / a Sequence.
+    function collapse_body(this: pointer[SchemeParser], exprs: pointer[Array[pointer[Expression]]], loc: Location) returns pointer[Expression]
+    {
+        let hp this.host
+        let n exprs.get_length() as int
+        if n = 0
+            return Expression.make_constant(hp, this.interp.make_unspecified(), loc)
+        if n = 1
+            return *(exprs.get_buffer())
+        Expression.make_sequence(hp, exprs, loc)
+    }
+
+    function parse_and(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let loc this.cur_loc()
+        let exprs Array[pointer[Expression]]^hp()
+        repeat
+        {
+            var key SK_NOTKEY
+            var tok TOKEN_END_OF_ENTITY
+            var e: pointer[Expression] null
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &e, &key, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if e <> null
+                exprs.add(e)
+        }
+        let n exprs.get_length() as int
+        if n = 0
+            set *result: Expression.make_constant(hp, this.interp.make_true(), loc)
+        else if n = 1
+            set *result: *(exprs.get_buffer())
+        else
+        {
+            let b exprs.get_buffer()
+            var acc *(b + (n - 1))
+            var i n - 2
+            while i >= 0
+            {
+                set acc: Expression.make_and(hp, *(b + i), acc, loc)
+                set i: i - 1
+            }
+            set *result: acc
+        }
+        true
+    }
+
+    function parse_or(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let loc this.cur_loc()
+        let exprs Array[pointer[Expression]]^hp()
+        repeat
+        {
+            var key SK_NOTKEY
+            var tok TOKEN_END_OF_ENTITY
+            var e: pointer[Expression] null
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &e, &key, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if e <> null
+                exprs.add(e)
+        }
+        let n exprs.get_length() as int
+        if n = 0
+            set *result: Expression.make_constant(hp, this.interp.make_false(), loc)
+        else if n = 1
+            set *result: *(exprs.get_buffer())
+        else
+        {
+            let b exprs.get_buffer()
+            var acc *(b + (n - 1))
+            var i n - 2
+            while i >= 0
+            {
+                set acc: Expression.make_or(hp, *(b + i), acc, loc)
+                set i: i - 1
+            }
+            set *result: acc
+        }
+        true
+    }
+
+    function parse_set(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let var_ident this.interp.lookup(this.current_token)
+        var value: pointer[Expression] null
+        var key SK_NOTKEY
+        if this.parse_expr_full(ALLOW_EXPR, &value, &key, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        set *result: Expression.make_assignment(hp, var_ident, value, loc)
+        true
+    }
+
+    function parse_quote(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        var datum: pointer[ELObj] null
+        var loc Location()
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_datum(ALLOW_EXPR, &datum, &loc, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        set *result: Expression.make_constant(this.host, datum, loc)
+        true
+    }
+
+    function parse_quoted_datum(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        var datum: pointer[ELObj] null
+        var loc Location()
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_datum(ALLOW_EXPR, &datum, &loc, &tok) = false
+            return false
+        set *result: Expression.make_constant(this.host, datum, loc)
+        true
+    }
+
+    ; (cond (test expr...) ... (else expr...)) -> nested ifs.
+    function parse_cond(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let loc this.cur_loc()
+        let tests Array[pointer[Expression]]^hp()
+        let results Array[pointer[Expression]]^hp()
+        let is_else_arr Array[bool]^hp()
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            var test_e: pointer[Expression] null
+            var key SK_NOTKEY
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_KEY_ELSE, &test_e, &key, &tok) = false
+                return false
+            var is_else false
+            if key = SK_ELSE
+                set is_else: true
+            let res_exprs Array[pointer[Expression]]^hp()
+            repeat
+            {
+                var r: pointer[Expression] null
+                if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &r, &key, &tok) = false
+                    return false
+                if tok = TOKEN_CLOSE_PAREN
+                    break
+                if r <> null
+                    res_exprs.add(r)
+            }
+            var conseq: pointer[Expression] null
+            if (res_exprs.get_length() as int) = 0
+                set conseq: test_e
+            else
+                set conseq: this.collapse_body(res_exprs, loc)
+            tests.add(test_e)
+            results.add(conseq)
+            is_else_arr.add(is_else)
+            if is_else
+                break
+        }
+        var alternate Expression.make_cond_fail(hp, loc)
+        let n tests.get_length() as int
+        let tb tests.get_buffer()
+        let rb results.get_buffer()
+        let eb is_else_arr.get_buffer()
+        var i n - 1
+        while i >= 0
+        {
+            if *(eb + i)
+                set alternate: *(rb + i)
+            else
+                set alternate: Expression.make_if(hp, *(tb + i), *(rb + i), alternate, loc)
+            set i: i - 1
+        }
+        set *result: alternate
+        true
+    }
+
+    ; (case key ((d...) expr...) ... (else expr...)).
+    function parse_case(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let loc this.cur_loc()
+        var key_expr: pointer[Expression] null
+        var key SK_NOTKEY
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_expr_full(ALLOW_EXPR, &key_expr, &key, &tok) = false
+            return false
+        let datums Array[pointer[ELObj]]^hp()
+        let case_starts Array[int]^hp()
+        let results Array[pointer[Expression]]^hp()
+        var else_expr: pointer[Expression] null
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_IDENTIFIER, &tok) = false
+                return false
+            if tok = TOKEN_IDENTIFIER
+            {
+                let ident this.interp.lookup(this.current_token)
+                if ident.syntactic_key() = SK_ELSE
+                {
+                    if this.parse_begin(&else_expr) = false
+                        return false
+                    continue
+                }
+                return false
+            }
+            ; datum list
+            case_starts.add(datums.get_length() as int)
+            repeat
+            {
+                var d: pointer[ELObj] null
+                var dloc Location()
+                if this.parse_datum(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &d, &dloc, &tok) = false
+                    return false
+                if tok = TOKEN_CLOSE_PAREN
+                    break
+                datums.add(d)
+            }
+            var res: pointer[Expression] null
+            if this.parse_begin(&res) = false
+                return false
+            results.add(res)
+        }
+        set *result: Expression.make_case(hp, key_expr, datums, case_starts, results, else_expr, loc)
+        true
+    }
+
+    ; --- let family --------------------------------------------------------
+    ; parse `(var init) ...)` — the bindings-list open paren already consumed.
+    function parse_bindings(this: pointer[SchemeParser], vars: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]]) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+                return false
+            vars.add(this.interp.lookup(this.current_token))
+            var init_e: pointer[Expression] null
+            var key SK_NOTKEY
+            if this.parse_expr_full(ALLOW_EXPR, &init_e, &key, &tok) = false
+                return false
+            inits.add(init_e)
+            if this.expect_close_paren() = false
+                return false
+        }
+        true
+    }
+
+    function parse_let(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let loc this.cur_loc()
+        let vars Array[pointer[Identifier]]^hp()
+        let inits Array[pointer[Expression]]^hp()
+        var body: pointer[Expression] null
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_OPEN_PAREN | ALLOW_IDENTIFIER, &tok) = false
+            return false
+        var name: pointer[Identifier] null
+        if tok = TOKEN_IDENTIFIER
+        {
+            set name: this.interp.lookup(this.current_token)
+            ; the bindings list open paren follows.
+            if this.get_token(ALLOW_OPEN_PAREN, &tok) = false
+                return false
+            if this.parse_bindings(vars, inits) = false
+                return false
+            if this.parse_begin(&body) = false
+                return false
+        }
+        else
+        {
+            ; regular let — the bindings-list open paren is the tok we just read.
+            if this.parse_bindings(vars, inits) = false
+                return false
+            if this.parse_begin(&body) = false
+                return false
+        }
+        if name <> null
+        {
+            ; named let -> ((letrec ((name (lambda (vars) body))) name) inits...)
+            let loop_formal Array[pointer[Identifier]]^hp()
+            loop_formal.add(name)
+            let empty_inits Array[pointer[Expression]]^hp()
+            let lam_sig Signature((vars.get_length() as int), 0, false, 0, null)
+            let lambda Expression.make_lambda(hp, vars, empty_inits, lam_sig, body, loc)
+            let loop_init Array[pointer[Expression]]^hp()
+            loop_init.add(lambda)
+            let loop_ref Expression.make_variable(hp, name, loc)
+            let letrec Expression.make_letrec(hp, loop_formal, loop_init, loop_ref, loc)
+            set *result: Expression.make_call(hp, letrec, inits, loc)
+        }
+        else
+            set *result: Expression.make_let(hp, vars, inits, body, loc)
+        true
+    }
+
+    function parse_let_star(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let loc this.cur_loc()
+        let vars Array[pointer[Identifier]]^hp()
+        let inits Array[pointer[Expression]]^hp()
+        var body: pointer[Expression] null
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_OPEN_PAREN, &tok) = false
+            return false
+        if this.parse_bindings(vars, inits) = false
+            return false
+        if this.parse_begin(&body) = false
+            return false
+        set *result: Expression.make_let_star(hp, vars, inits, body, loc)
+        true
+    }
+
+    function parse_letrec(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let loc this.cur_loc()
+        let vars Array[pointer[Identifier]]^hp()
+        let inits Array[pointer[Expression]]^hp()
+        var body: pointer[Expression] null
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_OPEN_PAREN, &tok) = false
+            return false
+        if this.parse_bindings(vars, inits) = false
+            return false
+        if this.parse_begin(&body) = false
+            return false
+        set *result: Expression.make_letrec(hp, vars, inits, body, loc)
+        true
+    }
+
+    function parse_lambda(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let loc this.cur_loc()
+        let formals Array[pointer[Identifier]]^hp()
+        let defaults Array[pointer[Expression]]^hp()
+        var n_required 0
+        var has_rest false
+        var n_key 0
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_OPEN_PAREN | ALLOW_IDENTIFIER, &tok) = false
+            return false
+        if tok = TOKEN_IDENTIFIER
+        {
+            ; (lambda x body) — a single rest parameter.
+            formals.add(this.interp.lookup(this.current_token))
+            set has_rest: true
+        }
+        else
+        {
+            if this.parse_formals(formals, defaults, &n_required, &has_rest, &n_key) = false
+                return false
+        }
+        var body: pointer[Expression] null
+        if this.parse_begin(&body) = false
+            return false
+        var rest_slot 0
+        if has_rest
+            set rest_slot: 1
+        let n_optional (formals.get_length() as int) - n_required - n_key - rest_slot
+        let sig this.build_signature(formals, n_required, n_optional, has_rest, n_key)
+        set *result: Expression.make_lambda(hp, formals, defaults, sig, body, loc)
+        true
+    }
+
+    ; assemble a Signature, materializing the keyword-arg identifier table.
+    function build_signature(this: pointer[SchemeParser], formals: pointer[Array[pointer[Identifier]]], n_required: int, n_optional: int, has_rest: bool, n_key: int) returns Signature
+    {
+        var keys: pointer[pointer[Identifier]] null
+        if n_key > 0
+        {
+            let hp this.host
+            set keys: hp.allocate((n_key as size_t) * sizeof pointer[Identifier], alignof pointer[Identifier]) as pointer[pointer[Identifier]]
+            let fb formals.get_buffer()
+            let base (formals.get_length() as int) - n_key
+            var i 0
+            while i < n_key
+            {
+                set *(keys + i): *(fb + (base + i))
+                set i: i + 1
+            }
+        }
+        Signature(n_required, n_optional, has_rest, n_key, keys)
+    }
+
+    ; bool parseFormals(formals, inits, out nRequired, out hasRest, out nKey).
+    function parse_formals(this: pointer[SchemeParser], formals: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], n_required: pointer[int], has_rest: pointer[bool], n_key: pointer[int]) returns bool
+    {
+        set *n_required: 0
+        set *has_rest: false
+        set *n_key: 0
+        var kind FORMAL_REQUIRED
+        var allowed ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER | ALLOW_HASH_OPTIONAL | ALLOW_HASH_REST | ALLOW_HASH_KEY
+        var c_req 0
+        var c_opt 0
+        var c_rest 0
+        var c_key 0
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(allowed, &tok) = false
+                return false
+            if tok = TOKEN_HASH_OPTIONAL
+            {
+                set allowed: ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER | ALLOW_HASH_REST | ALLOW_HASH_KEY
+                set kind: FORMAL_OPTIONAL
+            }
+            else if tok = TOKEN_HASH_REST
+            {
+                set allowed: ALLOW_IDENTIFIER
+                set kind: FORMAL_REST
+            }
+            else if tok = TOKEN_HASH_KEY
+            {
+                set allowed: ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER
+                set kind: FORMAL_KEY
+            }
+            else if tok = TOKEN_OPEN_PAREN
+            {
+                if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+                    return false
+                formals.add(this.interp.lookup(this.current_token))
+                if kind = FORMAL_OPTIONAL
+                    set c_opt: c_opt + 1
+                else
+                    set c_key: c_key + 1
+                var init_e: pointer[Expression] null
+                var key SK_NOTKEY
+                if this.parse_expr_full(ALLOW_EXPR, &init_e, &key, &tok) = false
+                    return false
+                this.pad_inits(inits, c_opt + c_key)
+                set *(inits.get_buffer() + ((c_opt + c_key) - 1)): init_e
+                if this.get_token(ALLOW_CLOSE_PAREN, &tok) = false
+                    return false
+            }
+            else if tok = TOKEN_IDENTIFIER
+            {
+                formals.add(this.interp.lookup(this.current_token))
+                if kind = FORMAL_REQUIRED
+                    set c_req: c_req + 1
+                else if kind = FORMAL_OPTIONAL
+                {
+                    set c_opt: c_opt + 1
+                    this.pad_inits(inits, c_opt + c_key)
+                }
+                else if kind = FORMAL_REST
+                {
+                    set c_rest: c_rest + 1
+                    set allowed: ALLOW_HASH_KEY | ALLOW_CLOSE_PAREN
+                }
+                else
+                {
+                    set c_key: c_key + 1
+                    this.pad_inits(inits, c_opt + c_key)
+                }
+            }
+            else if tok = TOKEN_CLOSE_PAREN
+                break
+            else
+                return false
+        }
+        set *n_required: c_req
+        set *n_key: c_key
+        if c_rest > 0
+            set *has_rest: true
+        this.pad_inits(inits, c_opt + c_key)
+        true
+    }
+
+    ; grow inits with null defaults up to n entries.
+    function pad_inits(this: pointer[SchemeParser], inits: pointer[Array[pointer[Expression]]], n: int)
+    {
+        while (inits.get_length() as int) < n
+            inits.add(null)
+    }
+
+    ; --- top level ---------------------------------------------------------
+    ; the reader loop (SchemeParser::parse) — one top-level form per iteration.
+    function parse(this: pointer[SchemeParser])
+    {
+        var recovering false
+        repeat
+        {
+            var allowed ALLOW_OPEN_PAREN | ALLOW_END_OF_ENTITY
+            if recovering
+                set allowed: ALLOW_ALL
+            var tok TOKEN_END_OF_ENTITY
+            if this.get_token(allowed, &tok) = false
+            {
+                set recovering: true
+                continue
+            }
+            if tok = TOKEN_END_OF_ENTITY
+                break
+            if tok <> TOKEN_OPEN_PAREN
+            {
+                set recovering: true
+                continue
+            }
+            let success this.parse_top_level()
+            if success = false
+                this.skip_form()
+            set recovering: success = false
+        }
+    }
+
+    function parse_top_level(this: pointer[SchemeParser]) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER | ALLOW_KEY_DEFINE, &tok) = false
+            return false
+        if tok = TOKEN_IDENTIFIER
+        {
+            let ident this.interp.lookup(this.current_token)
+            if ident.syntactic_key() = SK_DEFINE
+                return this.do_define()
+            ; element / root / mode / declare-* etc. are style/grove increments;
+            ; skip them cleanly for the eval core.
+            return this.skip_form()
+        }
+        this.skip_form()
+    }
+
+    function do_define(this: pointer[SchemeParser]) returns bool
+    {
+        let hp this.host
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER | ALLOW_OPEN_PAREN, &tok) = false
+            return false
+        if tok = TOKEN_IDENTIFIER
+        {
+            ; (define var expr)
+            let ident this.interp.lookup(this.current_token)
+            var expr: pointer[Expression] null
+            var key SK_NOTKEY
+            if this.parse_expr_full(ALLOW_EXPR, &expr, &key, &tok) = false
+                return false
+            if this.expect_close_paren() = false
+                return false
+            ident.set_expression(expr, 0 as u32, this.cur_loc())
+            return true
+        }
+        ; (define (name formals) body)
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let name this.interp.lookup(this.current_token)
+        let formals Array[pointer[Identifier]]^hp()
+        let defaults Array[pointer[Expression]]^hp()
+        var n_required 0
+        var has_rest false
+        var n_key 0
+        if this.parse_formals(formals, defaults, &n_required, &has_rest, &n_key) = false
+            return false
+        var body: pointer[Expression] null
+        if this.parse_begin(&body) = false
+            return false
+        let loc this.cur_loc()
+        var rest_slot 0
+        if has_rest
+            set rest_slot: 1
+        let n_optional (formals.get_length() as int) - n_required - n_key - rest_slot
+        let sig this.build_signature(formals, n_required, n_optional, has_rest, n_key)
+        let lambda Expression.make_lambda(hp, formals, defaults, sig, body, loc)
+        name.set_expression(lambda, 0 as u32, loc)
+        true
+    }
+
+    ; skip a form to its matching close paren (recovery / unhandled forms).
+    function skip_form(this: pointer[SchemeParser]) returns bool
+    {
+        var depth 1
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(ALLOW_ALL, &tok) = false
+                return true
+            if tok = TOKEN_END_OF_ENTITY
+                return true
+            if (tok = TOKEN_OPEN_PAREN) or (tok = TOKEN_VECTOR)
+                set depth: depth + 1
+            else if tok = TOKEN_CLOSE_PAREN
+            {
+                set depth: depth - 1
+                if depth = 0
+                    break
+            }
+        }
+        true
+    }
+
     ; --- self-test ---------------------------------------------------------
     ; parse one datum from an ASCII snippet and print it; empty result means
     ; parse failure. (Line ends in snippets are RE = \r, the OpenSP record
@@ -989,6 +1865,115 @@ define SchemeParser
         if SchemeParser.check(host, interp2, "#(1 2)", "#(1 2)") = false
             return 27
 
+        ; ================= Inc 3: the evaluator =============================
+        let ei Interpreter.make(host, 1440, false, false, false)
+
+        ; arithmetic + comparison
+        if SchemeParser.eval_int(host, ei, "(+ 1 2)") <> 3
+            return 30
+        if SchemeParser.eval_int(host, ei, "(* 6 7)") <> 42
+            return 31
+        if SchemeParser.eval_int(host, ei, "(- 10 3 2)") <> 5
+            return 32
+        if SchemeParser.eval_int(host, ei, "(+ 1 (* 2 3) (- 8 4))") <> 11
+            return 33
+        if SchemeParser.eval_bool(host, ei, "(< 1 2 3)") = false
+            return 34
+        if SchemeParser.eval_bool(host, ei, "(= 5 5)") = false
+            return 35
+
+        ; if / and / or / begin
+        if SchemeParser.eval_int(host, ei, "(if #t 11 22)") <> 11
+            return 36
+        if SchemeParser.eval_int(host, ei, "(if #f 11 22)") <> 22
+            return 37
+        if SchemeParser.eval_int(host, ei, "(begin 1 2 3)") <> 3
+            return 38
+
+        ; lambda application + closures
+        if SchemeParser.eval_int(host, ei, "((lambda (x) (* x x)) 5)") <> 25
+            return 39
+        if SchemeParser.eval_int(host, ei, "((lambda (x y) (+ x y)) 3 4)") <> 7
+            return 40
+
+        ; let / let* / letrec
+        if SchemeParser.eval_int(host, ei, "(let ((a 3) (b 4)) (+ a b))") <> 7
+            return 41
+        if SchemeParser.eval_int(host, ei, "(let* ((a 3) (b (* a 2))) (+ a b))") <> 9
+            return 42
+
+        ; named let — TCO: 100k tail calls must not grow the stack
+        if SchemeParser.eval_int(host, ei, "(let loop ((i 0) (s 0)) (if (= i 100000) s (loop (+ i 1) (+ s i))))") <> 4999950000
+            return 43
+
+        ; list ops
+        if SchemeParser.eval_int(host, ei, "(car (cdr (list 1 2 3)))") <> 2
+            return 44
+        if SchemeParser.eval_int(host, ei, "(length (list 1 2 3 4))") <> 4
+            return 45
+
+        ; cond
+        if SchemeParser.eval_int(host, ei, "(cond (#f 1) (#t 2) (else 3))") <> 2
+            return 46
+
+        ; top-level define + non-tail recursion (control stack)
+        SchemeParser.run_program(host, ei, "(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))")
+        if SchemeParser.eval_int(host, ei, "(fact 5)") <> 120
+            return 47
+
+        ; top-level mutual recursion via lazy top-level refs
+        SchemeParser.run_program(host, ei, "(define (my-even? n) (if (= n 0) #t (my-odd? (- n 1))))")
+        SchemeParser.run_program(host, ei, "(define (my-odd? n) (if (= n 0) #f (my-even? (- n 1))))")
+        if SchemeParser.eval_bool(host, ei, "(my-even? 10)") = false
+            return 48
+        if SchemeParser.eval_bool(host, ei, "(my-even? 7)")
+            return 49
+
         0
+    }
+
+    ; --- eval-test helpers -------------------------------------------------
+    ; parse ONE expression from src, compile it, run it on a fresh VM.
+    function eval_str(host: pointer[Page], interp: pointer[Interpreter], src: pointer[const_char]) returns pointer[ELObj]
+    {
+        let text StringC(src)
+        let src_in InputSource.make(host, null, text.data_ptr(), text.get_size())
+        let sp SchemeParser.make(host, interp, src_in)
+        var expr: pointer[Expression] null
+        if sp.parse_expression(&expr) = false
+            return interp.make_error()
+        if expr = null
+            return interp.make_error()
+        let env Environment.make(host)
+        let insn Expression.optimize_compile(expr, interp, env, 0, null)
+        let vm VM.make(host, interp)
+        vm.eval(insn, null, null)
+    }
+
+    ; run a whole program (its top-level defines register on interp).
+    function run_program(host: pointer[Page], interp: pointer[Interpreter], src: pointer[const_char])
+    {
+        let text StringC(src)
+        let src_in InputSource.make(host, null, text.data_ptr(), text.get_size())
+        let sp SchemeParser.make(host, interp, src_in)
+        sp.parse()
+    }
+
+    function eval_int(host: pointer[Page], interp: pointer[Interpreter], src: pointer[const_char]) returns int
+    {
+        let v SchemeParser.eval_str(host, interp, src)
+        if v = null
+            return 0 - 999999
+        if v.is_exact_integer() = false
+            return 0 - 999998
+        v.exact_integer_value()
+    }
+
+    function eval_bool(host: pointer[Page], interp: pointer[Interpreter], src: pointer[const_char]) returns bool
+    {
+        let v SchemeParser.eval_str(host, interp, src)
+        if v = null
+            return false
+        v.is_true()
     }
 }

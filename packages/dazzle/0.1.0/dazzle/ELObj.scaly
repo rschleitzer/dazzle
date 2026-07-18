@@ -5,6 +5,12 @@ use opensp.Location.Location
 use dazzle.Interpreter.Interpreter
 use dazzle.Interpreter.Unit
 use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.Expression.Expression
+use dazzle.Expression.Environment
+use dazzle.Insn.Insn
+use dazzle.Insn.Signature
+use dazzle.VM.VM
+use dazzle.Primitive.Primitive
 
 ; ELObj — the expression-language value model (Style/ELObj.cs, upstream
 ; ELObj.cxx). The C++ single-inheritance hierarchy (~40 subclasses under
@@ -50,6 +56,19 @@ define QuantityValue (qtype: int, lval: int, dval: double, dim: int)
         set this.dval: dval
         set this.dim: dim
     }
+
+    ; accessors (cross-module reads go through these, per the port field rule).
+    function get_qtype(this: QuantityValue) returns int
+        qtype
+
+    function get_lval(this: QuantityValue) returns int
+        lval
+
+    function get_dval(this: QuantityValue) returns double
+        dval
+
+    function get_dim(this: QuantityValue) returns int
+        dim
 }
 
 ; OutputCharStream — Inc-1 minimal: the Str arm only (StrOutputCharStream
@@ -119,17 +138,161 @@ define OutputCharStream (buf: pointer[Array[u32]])
 ; value/expression/insn/inheritedC/flowObj slots; those land with Inc 3. The
 ; KeywordObj arm points here, and keyword equality is Identifier POINTER
 ; equality (the interning table guarantees one Identifier per name).
-define Identifier (name: StringC)
+; Identifier::SyntacticKey (ELObj.cs enum) as int constants. notKey = 0.
+define SK_NOTKEY: int 0
+define SK_KEY_USE: int 1
+define SK_KEY_LABEL: int 2
+define SK_KEY_CONTENT_MAP: int 3
+define SK_DEFINE: int 4
+define SK_DEFINE_UNIT: int 5
+define SK_ELEMENT: int 6
+define SK_OR_ELEMENT: int 7
+define SK_DEFAULT: int 8
+define SK_ROOT: int 9
+define SK_ID: int 10
+define SK_MODE: int 11
+define SK_DECLARE_INITIAL_VALUE: int 12
+define SK_DECLARE_CHARACTERISTIC: int 13
+define SK_DECLARE_FLOW_OBJECT_CLASS: int 14
+define SK_DECLARE_DEFAULT_LANGUAGE: int 15
+define SK_DEFINE_LANGUAGE: int 16
+define SK_QUOTE: int 17
+define SK_QUASIQUOTE: int 18
+define SK_UNQUOTE: int 19
+define SK_UNQUOTE_SPLICING: int 20
+define SK_IF: int 21
+define SK_COND: int 22
+define SK_CASE: int 23
+define SK_AND: int 24
+define SK_OR: int 25
+define SK_LET: int 26
+define SK_LET_STAR: int 27
+define SK_LETREC: int 28
+define SK_LAMBDA: int 29
+define SK_BEGIN: int 30
+define SK_SET: int 31
+define SK_THERE_EXISTS: int 32
+define SK_FOR_ALL: int 33
+define SK_SELECT_EACH: int 34
+define SK_UNION_FOR_EACH: int 35
+define SK_MAKE: int 36
+define SK_STYLE: int 37
+define SK_WITH_MODE: int 38
+define SK_ELSE: int 39
+define SK_ARROW: int 40
+
+; Identifier — a top-level name cell (ELObj.cs class Identifier : Named). Inc-1
+; carried the bare name; Inc 3 adds the definition/lazy-eval machinery: a value
+; or an uncompiled Expression that computeValue compiles-and-runs on demand,
+; plus the syntactic-key tag. The inheritedC / flowObj slots are later
+; increments and are not carried yet.
+define Identifier
+(
+    name: StringC
+    value: pointer[ELObj]
+    expr: pointer[Expression]
+    insn: pointer[Insn]
+    def_part: u32
+    def_loc: Location
+    is_defined: bool
+    evaluated_flag: bool
+    being_computed: bool
+    syn_key: int
+)
 {
     function make(host: pointer[Page], name: StringC) returns pointer[Identifier]
     {
         let ident host.allocate(sizeof Identifier, alignof Identifier) as pointer[Identifier]
         set ident.name: StringC^host(name.data_ptr(), name.get_size())
+        set ident.value: null
+        set ident.expr: null
+        set ident.insn: null
+        set ident.def_part: 0 as u32
+        set ident.def_loc: Location()
+        set ident.is_defined: false
+        set ident.evaluated_flag: false
+        set ident.being_computed: false
+        set ident.syn_key: SK_NOTKEY
         ident
     }
 
     function get_name(this: Identifier) returns StringC
         name
+
+    function set_syntactic_key(this: pointer[Identifier], key: int)
+        set this.syn_key: key
+
+    ; syntacticKey(out key) returns synKey != notKey; callers read syn_key().
+    function syntactic_key(this: Identifier) returns int
+        syn_key
+
+    function is_syntactic_key(this: Identifier) returns bool
+        syn_key <> SK_NOTKEY
+
+    function is_def(this: Identifier) returns bool
+        is_defined
+
+    function evaluated(this: Identifier) returns bool
+        evaluated_flag
+
+    ; setDefinition(part, loc, value): a ready value (primitive/flow-obj install).
+    function set_definition(this: pointer[Identifier], part: u32, loc: Location, value: pointer[ELObj])
+    {
+        set this.def_part: part
+        set this.def_loc: loc
+        set this.value: value
+        set this.is_defined: true
+        set this.evaluated_flag: value <> null
+    }
+
+    ; setExpression(expr, part, loc): a top-level (define ...) — compiled lazily.
+    function set_expression(this: pointer[Identifier], expr: pointer[Expression], part: u32, loc: Location)
+    {
+        set this.def_part: part
+        set this.def_loc: loc
+        set this.expr: expr
+        set this.is_defined: true
+        set this.evaluated_flag: false
+    }
+
+    function get_expression(this: Identifier) returns pointer[Expression]
+        expr
+
+    ; computeValue(force): value if known; else compile the expression and, if
+    ; forced or compile-time-evaluable, run it on a fresh VM. beingComputed
+    ; guards a self-referential definition loop.
+    function compute_value(this: pointer[Identifier], force: bool, interp: pointer[Interpreter]) returns pointer[ELObj]
+    {
+        if this.is_defined = false
+            return null
+        if this.value <> null
+            return this.value
+        if this.expr = null
+            return null
+        if this.being_computed
+        {
+            if force
+            {
+                interp.set_next_location(this.def_loc)
+                set this.value: interp.make_error()
+            }
+            return this.value
+        }
+        set this.being_computed: true
+        let host interp.get_host()
+        if this.insn = null
+        {
+            let env Environment.make(host)
+            set this.insn: Expression.optimize_compile(this.expr, interp, env, 0, null)
+        }
+        if force or this.expr.can_eval(false)
+        {
+            let vm VM.make(host, interp)
+            set this.value: vm.eval(this.insn, null, null)
+        }
+        set this.being_computed: false
+        this.value
+    }
 }
 
 ; --- arm records -----------------------------------------------------------
@@ -252,6 +415,66 @@ define GlyphIdObj (pubid: StringC, suffix: int)
     }
 }
 
+; --- callable / mutable-cell arms (Inc 3: FunctionObj.cs) ------------------
+; A mutable cell (set!/letrec/shared-capture boxing). read_only guards the
+; letrec pre-init phase.
+define BoxObj (value: pointer[ELObj], read_only: bool)
+{
+    init(value: pointer[ELObj])
+    {
+        set this.value: value
+        set this.read_only: false
+    }
+}
+
+; A user closure: compiled body + captured display (may be null). The display
+; is a buffer of display_len+1 slots (C++ null-terminates for the Collector;
+; we keep the terminator for shape fidelity though the arena needs no trace).
+define ClosureObj (sig: Signature, code: pointer[Insn], display: pointer[pointer[ELObj]])
+{
+    init(sig: Signature, code: pointer[Insn], display: pointer[pointer[ELObj]])
+    {
+        set this.sig: sig
+        set this.code: code
+        set this.display: display
+    }
+}
+
+; A built-in: signature + a prim_id selecting the Primitive.dispatch arm.
+define PrimitiveObj (sig: Signature, prim_id: int, ident: pointer[Identifier])
+{
+    init(sig: Signature, prim_id: int)
+    {
+        set this.sig: sig
+        set this.prim_id: prim_id
+        set this.ident: null
+    }
+}
+
+; An escape-only continuation (call/cc). Zero corpus users; the variant
+; exists for shape fidelity, call semantics land when something needs it.
+define ContinuationObj (stack_size: int, control_stack_size: int)
+{
+    init()
+    {
+        set this.stack_size: 0
+        set this.control_stack_size: 0
+    }
+}
+
+; The fallback for an undefined external procedure: accepts anything, returns
+; its first argument (identity) or #f (FunctionObj.cs NoOpProcedureObj).
+define NoOpProcObj (name: StringC)
+{
+    init(name: StringC)
+        set this.name: name
+}
+
+; apply and call-with-current-continuation are FunctionObj subclasses with
+; custom call/tailCall (not PrimitiveObj); dataless arms here.
+define ApplyFnObj ()
+define CallCCFnObj ()
+
 ; --- the union -------------------------------------------------------------
 define ELObj union
 (
@@ -273,6 +496,13 @@ define ELObj union
     UnresolvedLength: UnresolvedLengthObj
     UnresolvedQuantity: UnresolvedQuantityObj
     GlyphId: GlyphIdObj
+    Box: BoxObj
+    Closure: ClosureObj
+    Primitive: PrimitiveObj
+    Continuation: ContinuationObj
+    NoOpProc: NoOpProcObj
+    ApplyFn: ApplyFnObj
+    CallCCFn: CallCCFnObj
 )
 {
     ; --- constructors (Collector::allocateObject seam: run-page make) ------
@@ -448,10 +678,408 @@ define ELObj union
         StringC()
     }
 
+    ; --- callable / box constructors (Inc 3) -------------------------------
+    function make_box(host: pointer[Page], value: pointer[ELObj]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Box(BoxObj(value))
+        p
+    }
+
+    function make_closure(host: pointer[Page], sig: Signature, code: pointer[Insn], display: pointer[pointer[ELObj]]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Closure(ClosureObj(sig, code, display))
+        p
+    }
+
+    function make_primitive(host: pointer[Page], sig: Signature, prim_id: int) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Primitive(PrimitiveObj(sig, prim_id))
+        p
+    }
+
+    function make_noop_proc(host: pointer[Page], name: StringC) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.NoOpProc(NoOpProcObj(name))
+        p
+    }
+
+    function make_apply_fn(host: pointer[Page]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.ApplyFn(ApplyFnObj())
+        p
+    }
+
+    function make_callcc_fn(host: pointer[Page]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.CallCCFn(CallCCFnObj())
+        p
+    }
+
+    ; --- box accessors -----------------------------------------------------
+    function box_value(this: pointer[ELObj]) returns pointer[ELObj]
+    {
+        choose *this
+            when b: Box
+                return b.value
+            else
+                return null
+        null
+    }
+
+    function box_set_value(this: pointer[ELObj], v: pointer[ELObj])
+    {
+        choose *this
+            when b: Box
+                set *this: ELObj.Box(BoxObj(v, b.read_only))
+    }
+
+    function box_is_read_only(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when b: Box
+                return b.read_only
+            else
+                return false
+        false
+    }
+
+    ; --- function protocol -------------------------------------------------
+    ; asFunction != null: a Closure/Primitive/Continuation/NoOpProc/apply/cc.
+    function is_function(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when c: Closure
+                return true
+            when p: Primitive
+                return true
+            when k: Continuation
+                return true
+            when n: NoOpProc
+                return true
+            when a: ApplyFn
+                return true
+            when cc: CallCCFn
+                return true
+            else
+                return false
+        false
+    }
+
+    function signature_of(this: pointer[ELObj]) returns Signature
+    {
+        choose *this
+            when c: Closure
+                return c.sig
+            when p: Primitive
+                return p.sig
+            when k: Continuation
+                return Signature(1, 0, false)
+            when n: NoOpProc
+                return Signature(0, 0, true)
+            when a: ApplyFn
+                return Signature(2, 0, true)
+            when cc: CallCCFn
+                return Signature(1, 0, false)
+            else
+                return Signature(0, 0, false)
+        Signature(0, 0, false)
+    }
+
+    function n_required_args(this: pointer[ELObj]) returns int
+        this.signature_of().n_required
+
+    function n_optional_args(this: pointer[ELObj]) returns int
+        this.signature_of().n_optional
+
+    function n_key_args(this: pointer[ELObj]) returns int
+        this.signature_of().n_key
+
+    function has_rest_arg(this: pointer[ELObj]) returns bool
+        this.signature_of().rest_arg
+
+    function primitive_set_ident(this: pointer[ELObj], ident: pointer[Identifier])
+    {
+        choose *this
+            when p: Primitive
+                set *this: ELObj.Primitive(PrimitiveObj(p.sig, p.prim_id, ident))
+    }
+
+    ; makeCallInsn / makeTailCallInsn: primitives compile to a PrimitiveCallInsn
+    ; (direct dispatch), everything else to a FunctionCallInsn.
+    function make_call_insn(this: pointer[ELObj], n_args: int, interp: pointer[Interpreter], loc: Location, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host interp.get_host()
+        choose *this
+            when p: Primitive
+                return Insn.make_primitive_call(host, n_args, this, loc, next)
+            else
+                return Insn.make_function_call(host, n_args, this, loc, next)
+        null
+    }
+
+    function make_tail_call_insn(this: pointer[ELObj], n_args: int, interp: pointer[Interpreter], loc: Location, n_caller_args: int) returns pointer[Insn]
+        Insn.make_function_tail_call(interp.get_host(), n_args, this, loc, n_caller_args)
+
+    ; primitiveCall dispatch for the Primitive / NoOpProc arms.
+    function prim_call(this: pointer[ELObj], n_args: int, args: pointer[pointer[ELObj]], ctx: pointer[VM], interp: pointer[Interpreter], loc: Location) returns pointer[ELObj]
+    {
+        choose *this
+            when p: Primitive
+                return Primitive.dispatch(p.prim_id, n_args, args, ctx, interp, loc)
+            when n: NoOpProc
+            {
+                if n_args > 0
+                    return *args
+                return interp.make_false()
+            }
+            else
+                return interp.make_error()
+        interp.make_error()
+    }
+
+    ; FunctionObj::call — dispatch a call to this callable (VM.cs/FunctionObj.cs).
+    function call(this: pointer[ELObj], vm: pointer[VM], loc: Location, next: pointer[Insn]) returns pointer[Insn]
+    {
+        choose *this
+            when c: Closure
+            {
+                vm.need_stack(1)
+                let naa vm.get_n_actual_args()
+                vm.push_frame(next, naa)
+                vm.set_frame_start(vm.get_sp() - naa)
+                vm.set_closure(c.display)
+                vm.set_protect_closure(this)
+                vm.set_closure_loc(loc)
+                return c.code
+            }
+            when p: Primitive
+                return this.prim_call_return(vm, loc, next)
+            when n: NoOpProc
+                return this.prim_call_return(vm, loc, next)
+            when a: ApplyFn
+                return this.apply_call(vm, loc, next, false, 0)
+            else
+            {
+                vm.set_sp(0 - 1)
+                return null
+            }
+        null
+    }
+
+    function tail_call(this: pointer[ELObj], vm: pointer[VM], loc: Location, n_caller_args: int) returns pointer[Insn]
+    {
+        choose *this
+            when c: Closure
+            {
+                vm.need_stack(1)
+                let n_args vm.get_n_actual_args()
+                if n_caller_args > 0
+                {
+                    let old_frame vm.get_sp() - n_args
+                    let new_frame old_frame - n_caller_args
+                    var i 0
+                    while i < n_args
+                    {
+                        vm.stack_set(new_frame + i, vm.stack_ref(old_frame + i))
+                        set i: i + 1
+                    }
+                    vm.set_frame_start(new_frame)
+                    vm.set_sp(new_frame + n_args)
+                }
+                else
+                    vm.set_frame_start(vm.get_sp() - n_args)
+                vm.set_closure(c.display)
+                vm.set_protect_closure(this)
+                vm.set_closure_loc(loc)
+                return c.code
+            }
+            when p: Primitive
+                return this.prim_tail_call(vm, loc, n_caller_args)
+            when n: NoOpProc
+                return this.prim_tail_call(vm, loc, n_caller_args)
+            when a: ApplyFn
+                return this.apply_call(vm, loc, null, true, n_caller_args)
+            else
+            {
+                vm.set_sp(0 - 1)
+                return null
+            }
+        null
+    }
+
+    ; PrimitiveObj::call — gather args, dispatch, push result.
+    function prim_call_return(this: pointer[ELObj], vm: pointer[VM], loc: Location, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let naa vm.get_n_actual_args()
+        if naa = 0
+            vm.need_stack(1)
+        let argp vm.get_sp() - naa
+        let result this.prim_call(naa, vm.sbase_at(argp), vm, vm.get_interp(), loc)
+        vm.stack_set(argp, result)
+        vm.set_sp(argp + 1)
+        if vm.get_interp().is_error(result)
+        {
+            vm.set_sp(0 - 1)
+            return null
+        }
+        next
+    }
+
+    ; PrimitiveObj::tailCall — dispatch, pop frame, push result.
+    function prim_tail_call(this: pointer[ELObj], vm: pointer[VM], loc: Location, n_caller_args: int) returns pointer[Insn]
+    {
+        let naa vm.get_n_actual_args()
+        let argp vm.get_sp() - naa
+        let result this.prim_call(naa, vm.sbase_at(argp), vm, vm.get_interp(), loc)
+        if vm.get_interp().is_error(result)
+        {
+            vm.set_sp(0 - 1)
+            return null
+        }
+        vm.set_sp(argp - n_caller_args)
+        let nxt vm.pop_frame()
+        vm.need_stack(1)
+        vm.stack_set(vm.get_sp(), result)
+        vm.set_sp(vm.get_sp() + 1)
+        nxt
+    }
+
+    ; ApplyPrimitiveObj::call/tailCall — shuffle the arg list onto the stack,
+    ; then run an (Tail)Apply against the extracted function.
+    function apply_call(this: pointer[ELObj], vm: pointer[VM], loc: Location, next: pointer[Insn], tail: bool, n_caller_args: int) returns pointer[Insn]
+    {
+        if vm.apply_shuffle(loc) = false
+            return null
+        if tail
+            return Insn.exec_tail_apply(vm, n_caller_args, vm.get_n_actual_args(), loc)
+        Insn.exec_apply(vm, vm.get_n_actual_args(), loc, next)
+    }
+
     function is_nil(this: pointer[ELObj]) returns bool
     {
         choose *this
             when n: Nil
+                return true
+            else
+                return false
+        false
+    }
+
+    function is_pair(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when p: Pair
+                return true
+            else
+                return false
+        false
+    }
+
+    ; KeywordObj::identifier() — the interned Identifier, or null if not a keyword.
+    function keyword_ident(this: pointer[ELObj]) returns pointer[Identifier]
+    {
+        choose *this
+            when k: Keyword
+                return k.ident
+            else
+                return null
+        null
+    }
+
+    ; --- type predicates (Primitive.cs) ------------------------------------
+    function is_number(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when i: Int
+                return true
+            when r: Real
+                return true
+            when l: Length
+                return true
+            when q: Quantity
+                return true
+            when ul: UnresolvedLength
+                return true
+            when uq: UnresolvedQuantity
+                return true
+            else
+                return false
+        false
+    }
+
+    function is_integer_p(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when i: Int
+                return true
+            else
+                return false
+        false
+    }
+
+    function is_string_p(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when s: Str
+                return true
+            else
+                return false
+        false
+    }
+
+    function is_symbol_p(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when s: Symbol
+                return true
+            else
+                return false
+        false
+    }
+
+    function is_char_p(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when c: Chr
+                return true
+            else
+                return false
+        false
+    }
+
+    function is_keyword_p(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when k: Keyword
+                return true
+            else
+                return false
+        false
+    }
+
+    function is_vector_p(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when v: Vec
+                return true
+            else
+                return false
+        false
+    }
+
+    ; #t and #f are the only booleans.
+    function is_boolean_p(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when t: True
+                return true
+            when f: False
                 return true
             else
                 return false

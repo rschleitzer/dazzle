@@ -1,0 +1,1333 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.Location.Location
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
+use dazzle.Insn.Insn
+use dazzle.Insn.Signature
+use dazzle.Interpreter.Interpreter
+
+; Expression — the compiled-form AST (Style/Expression.cxx). Each Expression
+; compiles to an Insn chain against a compilation Environment that resolves
+; lexical variables to frame / closure-display slots and tracks which need
+; boxing (assigned or captured-and-is_shared). The C++ optimize() constant-folding
+; pass is a pure performance/IR transform — the interpreter yields *values*,
+; so folding never changes a result; it is a no-op here and joins later if
+; byte-identical IR is ever needed. markBoundVars (the box/unbox analysis) and
+; compile are ported faithfully — they are correctness-bearing. Style / make /
+; with-mode expressions join with the FOT machinery in a later increment.
+
+; BoundVar flags (Expression.cs BoundVar).
+define BV_USED: u32 0x1
+define BV_ASSIGNED: u32 0x2
+define BV_UNINIT: u32 0x4
+define BV_SHARED: u32 0x8
+define BV_NOT_USED_MASK: u32 0xFFFFFFFE
+
+define BoundVar (ident: pointer[Identifier], flags: u32, rebound_count: u32)
+{
+    init(ident: pointer[Identifier], flags: u32)
+    {
+        set this.ident: ident
+        set this.flags: flags
+        set this.rebound_count: 0 as u32
+    }
+
+    function boxed(this: BoundVar) returns bool
+        BoundVar.flags_boxed(flags)
+
+    function flags_boxed(flags: u32) returns bool
+        (flags & (BV_ASSIGNED | BV_SHARED)) <> (0 as u32)
+}
+
+; A growable BoundVar list (Expression.cs BoundVarList) with the compile-time
+; mutation ops (mark/rebind/unbind/removeUnused/resize).
+define BoundVarList (host: pointer[Page], buf: pointer[BoundVar], n: int, cap: int)
+{
+    function make(host: pointer[Page]) returns pointer[BoundVarList]
+    {
+        let l host.allocate(sizeof BoundVarList, alignof BoundVarList) as pointer[BoundVarList]
+        set l.host: host
+        set l.buf: null
+        set l.n: 0
+        set l.cap: 0
+        l
+    }
+
+    function make_from_idents(host: pointer[Page], idents: pointer[Array[pointer[Identifier]]]) returns pointer[BoundVarList]
+    {
+        let l BoundVarList.make(host)
+        let m idents.get_length() as int
+        let ib idents.get_buffer()
+        var i 0
+        while i < m
+        {
+            l.append(*(ib + i), 0 as u32)
+            set i: i + 1
+        }
+        l
+    }
+
+    ; BoundVarList(idents, n, flags): first n idents, flags & ~usedFlag.
+    function make_from_idents_n(host: pointer[Page], idents: pointer[Array[pointer[Identifier]]], n: int, flags: u32) returns pointer[BoundVarList]
+    {
+        let l BoundVarList.make(host)
+        let m idents.get_length() as int
+        let ib idents.get_buffer()
+        var i 0
+        while (i < n) and (i < m)
+        {
+            l.append(*(ib + i), flags & BV_NOT_USED_MASK)
+            set i: i + 1
+        }
+        l
+    }
+
+    function copy(host: pointer[Page], other: pointer[BoundVarList]) returns pointer[BoundVarList]
+    {
+        let l BoundVarList.make(host)
+        var i 0
+        while i < other.n
+        {
+            let bv other.at(i)
+            l.append_raw(bv.ident, bv.flags, bv.rebound_count)
+            set i: i + 1
+        }
+        l
+    }
+
+    function count(this: BoundVarList) returns int
+        n
+
+    function get_host(this: BoundVarList) returns pointer[Page]
+        host
+
+    function at(this: BoundVarList, i: int) returns pointer[BoundVar]
+        buf + i
+
+    function ensure_cap(this: pointer[BoundVarList], need: int)
+    {
+        if need <= this.cap
+            return
+        var nc this.cap
+        if nc < 4
+            set nc: 4
+        while nc < need
+            set nc: nc * 2
+        let nb this.host.allocate((nc as size_t) * sizeof BoundVar, alignof BoundVar) as pointer[BoundVar]
+        var i 0
+        while i < this.n
+        {
+            set *(nb + i): *(this.buf + i)
+            set i: i + 1
+        }
+        set this.buf: nb
+        set this.cap: nc
+    }
+
+    function append(this: pointer[BoundVarList], ident: pointer[Identifier], flags: u32)
+    {
+        this.ensure_cap(this.n + 1)
+        set *(this.buf + this.n): BoundVar(ident, flags & BV_NOT_USED_MASK)
+        set this.n: this.n + 1
+    }
+
+    function append_raw(this: pointer[BoundVarList], ident: pointer[Identifier], flags: u32, rebound: u32)
+    {
+        this.ensure_cap(this.n + 1)
+        set *(this.buf + this.n): BoundVar(ident, flags, rebound)
+        set this.n: this.n + 1
+    }
+
+    function resize(this: pointer[BoundVarList], m: int)
+    {
+        if m < this.n
+            set this.n: m
+        else
+        {
+            while this.n < m
+                this.append_raw(null, 0 as u32, 0 as u32)
+        }
+    }
+
+    function find_index(this: BoundVarList, ident: pointer[Identifier]) returns int
+    {
+        var i 0
+        while i < n
+        {
+            if (buf + i).ident = ident
+                return i
+            set i: i + 1
+        }
+        0 - 1
+    }
+
+    function find(this: BoundVarList, ident: pointer[Identifier]) returns pointer[BoundVar]
+    {
+        let idx this.find_index(ident)
+        if idx < 0
+            return null
+        buf + idx
+    }
+
+    function mark(this: pointer[BoundVarList], ident: pointer[Identifier], flags: u32)
+    {
+        let idx this.find_index(ident)
+        if idx >= 0
+        {
+            let bv this.buf + idx
+            if bv.rebound_count = (0 as u32)
+                set bv.flags: bv.flags | flags
+        }
+    }
+
+    function rebind(this: pointer[BoundVarList], idents: pointer[Array[pointer[Identifier]]])
+    {
+        let m idents.get_length() as int
+        let ib idents.get_buffer()
+        var i 0
+        while i < m
+        {
+            let idx this.find_index(*(ib + i))
+            if idx >= 0
+            {
+                let bv this.buf + idx
+                set bv.rebound_count: bv.rebound_count + (1 as u32)
+            }
+            set i: i + 1
+        }
+    }
+
+    function unbind(this: pointer[BoundVarList], idents: pointer[Array[pointer[Identifier]]])
+    {
+        let m idents.get_length() as int
+        let ib idents.get_buffer()
+        var i 0
+        while i < m
+        {
+            let idx this.find_index(*(ib + i))
+            if idx >= 0
+            {
+                let bv this.buf + idx
+                set bv.rebound_count: bv.rebound_count - (1 as u32)
+            }
+            set i: i + 1
+        }
+    }
+
+    function remove_unused(this: pointer[BoundVarList])
+    {
+        var j 0
+        var i 0
+        while i < this.n
+        {
+            if ((this.buf + i).flags & BV_USED) <> (0 as u32)
+            {
+                if j <> i
+                    set *(this.buf + j): *(this.buf + i)
+                set j: j + 1
+            }
+            set i: i + 1
+        }
+        set this.n: j
+    }
+}
+
+define FrameVarList (vars: pointer[BoundVarList], stack_pos: int, next: pointer[FrameVarList])
+
+; Compilation environment (Expression.cs Environment): a chain of frame-var
+; scopes plus the enclosing closure's captured vars.
+define Environment (closure_vars: pointer[BoundVarList], frame_var_list: pointer[FrameVarList])
+{
+    function make(host: pointer[Page]) returns pointer[Environment]
+    {
+        let e host.allocate(sizeof Environment, alignof Environment) as pointer[Environment]
+        set e.closure_vars: null
+        set e.frame_var_list: null
+        e
+    }
+
+    function copy(host: pointer[Page], other: pointer[Environment]) returns pointer[Environment]
+    {
+        let e host.allocate(sizeof Environment, alignof Environment) as pointer[Environment]
+        set e.closure_vars: other.closure_vars
+        set e.frame_var_list: other.frame_var_list
+        e
+    }
+
+    function make_with(host: pointer[Page], frame_vars: pointer[BoundVarList], closure_vars: pointer[BoundVarList]) returns pointer[Environment]
+    {
+        let e host.allocate(sizeof Environment, alignof Environment) as pointer[Environment]
+        set e.closure_vars: closure_vars
+        let f host.allocate(sizeof FrameVarList, alignof FrameVarList) as pointer[FrameVarList]
+        set f.vars: frame_vars
+        set f.stack_pos: 0
+        set f.next: null
+        set e.frame_var_list: f
+        e
+    }
+
+    function lookup(this: Environment, ident: pointer[Identifier], is_frame: pointer[bool], index: pointer[int], flags: pointer[u32]) returns bool
+    {
+        var p frame_var_list
+        while p <> null
+        {
+            if p.vars <> null
+            {
+                let idx p.vars.find_index(ident)
+                if idx >= 0
+                {
+                    set *is_frame: true
+                    set *index: idx + p.stack_pos
+                    set *flags: (p.vars.at(idx)).flags
+                    return true
+                }
+            }
+            set p: p.next
+        }
+        if closure_vars <> null
+        {
+            let idx closure_vars.find_index(ident)
+            if idx >= 0
+            {
+                set *is_frame: false
+                set *index: idx
+                set *flags: (closure_vars.at(idx)).flags
+                return true
+            }
+        }
+        false
+    }
+
+    function bound_vars(this: Environment, result: pointer[BoundVarList])
+    {
+        if closure_vars <> null
+        {
+            var i 0
+            while i < closure_vars.count()
+            {
+                let bv closure_vars.at(i)
+                result.append(bv.ident, bv.flags)
+                set i: i + 1
+            }
+        }
+        var f frame_var_list
+        while f <> null
+        {
+            if f.vars <> null
+            {
+                var i 0
+                while i < f.vars.count()
+                {
+                    let bv f.vars.at(i)
+                    result.append(bv.ident, bv.flags)
+                    set i: i + 1
+                }
+            }
+            set f: f.next
+        }
+    }
+
+    function augment_frame(this: pointer[Environment], host: pointer[Page], vars: pointer[BoundVarList], stack_pos: int)
+    {
+        let f host.allocate(sizeof FrameVarList, alignof FrameVarList) as pointer[FrameVarList]
+        set f.vars: vars
+        set f.stack_pos: stack_pos
+        set f.next: this.frame_var_list
+        set this.frame_var_list: f
+    }
+}
+
+; --- expression arm records ------------------------------------------------
+define ConstantExpr (obj: pointer[ELObj], loc: Location)
+define ResolvedConstantExpr (obj: pointer[ELObj], loc: Location)
+define VariableExpr (ident: pointer[Identifier], loc: Location)
+define IfExpr (test: pointer[Expression], consequent: pointer[Expression], alternate: pointer[Expression], loc: Location)
+define OrExpr (test1: pointer[Expression], test2: pointer[Expression], loc: Location)
+define AndExpr (test1: pointer[Expression], test2: pointer[Expression], loc: Location)
+define CallExpr (op: pointer[Expression], args: pointer[Array[pointer[Expression]]], loc: Location)
+define SequenceExpr (seq: pointer[Array[pointer[Expression]]], loc: Location)
+define LetExpr (vars: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], body: pointer[Expression], loc: Location)
+define LetStarExpr (vars: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], body: pointer[Expression], loc: Location)
+define LetrecExpr (vars: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], body: pointer[Expression], loc: Location)
+define CondFailExpr (loc: Location)
+; datums / results are parallel arrays; each case's datums begin at
+; case_starts[i] and run to case_starts[i+1] in the flat datums array.
+define CaseExpr (key: pointer[Expression], datums: pointer[Array[pointer[ELObj]]], case_starts: pointer[Array[int]], results: pointer[Array[pointer[Expression]]], else_expr: pointer[Expression], loc: Location)
+define QuasiquoteExpr (members: pointer[Array[pointer[Expression]]], spliced: pointer[Array[bool]], qq_type: int, loc: Location)
+define AssignmentExpr (var_ident: pointer[Identifier], value: pointer[Expression], loc: Location)
+define LambdaExpr (formals: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], sig: Signature, loc: Location, body: pointer[Expression])
+
+; QuasiquoteExpression.Type
+define QQ_LIST: int 0
+define QQ_IMPROPER: int 1
+define QQ_VECTOR: int 2
+
+define Expression union
+(
+    Constant: ConstantExpr
+    ResolvedConstant: ResolvedConstantExpr
+    Variable: VariableExpr
+    If: IfExpr
+    Or: OrExpr
+    And: AndExpr
+    Call: CallExpr
+    Sequence: SequenceExpr
+    Let: LetExpr
+    LetStar: LetStarExpr
+    Letrec: LetrecExpr
+    CondFail: CondFailExpr
+    Case: CaseExpr
+    Quasiquote: QuasiquoteExpr
+    Assignment: AssignmentExpr
+    Lambda: LambdaExpr
+)
+{
+    ; --- constructors ------------------------------------------------------
+    function alloc(host: pointer[Page]) returns pointer[Expression]
+        host.allocate(sizeof Expression, alignof Expression) as pointer[Expression]
+
+    function make_constant(host: pointer[Page], obj: pointer[ELObj], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.Constant(ConstantExpr(obj, loc))
+        p
+    }
+
+    function make_variable(host: pointer[Page], ident: pointer[Identifier], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.Variable(VariableExpr(ident, loc))
+        p
+    }
+
+    function make_if(host: pointer[Page], test: pointer[Expression], consequent: pointer[Expression], alternate: pointer[Expression], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.If(IfExpr(test, consequent, alternate, loc))
+        p
+    }
+
+    function make_or(host: pointer[Page], test1: pointer[Expression], test2: pointer[Expression], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.Or(OrExpr(test1, test2, loc))
+        p
+    }
+
+    function make_and(host: pointer[Page], test1: pointer[Expression], test2: pointer[Expression], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.And(AndExpr(test1, test2, loc))
+        p
+    }
+
+    function make_call(host: pointer[Page], op: pointer[Expression], args: pointer[Array[pointer[Expression]]], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.Call(CallExpr(op, args, loc))
+        p
+    }
+
+    function make_sequence(host: pointer[Page], seq: pointer[Array[pointer[Expression]]], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.Sequence(SequenceExpr(seq, loc))
+        p
+    }
+
+    function make_let(host: pointer[Page], vars: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], body: pointer[Expression], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.Let(LetExpr(vars, inits, body, loc))
+        p
+    }
+
+    function make_let_star(host: pointer[Page], vars: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], body: pointer[Expression], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.LetStar(LetStarExpr(vars, inits, body, loc))
+        p
+    }
+
+    function make_letrec(host: pointer[Page], vars: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], body: pointer[Expression], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.Letrec(LetrecExpr(vars, inits, body, loc))
+        p
+    }
+
+    function make_cond_fail(host: pointer[Page], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.CondFail(CondFailExpr(loc))
+        p
+    }
+
+    function make_case(host: pointer[Page], key: pointer[Expression], datums: pointer[Array[pointer[ELObj]]], case_starts: pointer[Array[int]], results: pointer[Array[pointer[Expression]]], else_expr: pointer[Expression], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.Case(CaseExpr(key, datums, case_starts, results, else_expr, loc))
+        p
+    }
+
+    function make_quasiquote(host: pointer[Page], members: pointer[Array[pointer[Expression]]], spliced: pointer[Array[bool]], qq_type: int, loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.Quasiquote(QuasiquoteExpr(members, spliced, qq_type, loc))
+        p
+    }
+
+    function make_assignment(host: pointer[Page], var_ident: pointer[Identifier], value: pointer[Expression], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.Assignment(AssignmentExpr(var_ident, value, loc))
+        p
+    }
+
+    function make_lambda(host: pointer[Page], formals: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], sig: Signature, body: pointer[Expression], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.Lambda(LambdaExpr(formals, inits, sig, loc, body))
+        p
+    }
+
+    ; --- location ----------------------------------------------------------
+    function location(this: pointer[Expression]) returns Location
+    {
+        choose *this
+            when e: Constant
+                return e.loc
+            when e: ResolvedConstant
+                return e.loc
+            when e: Variable
+                return e.loc
+            when e: If
+                return e.loc
+            when e: Or
+                return e.loc
+            when e: And
+                return e.loc
+            when e: Call
+                return e.loc
+            when e: Sequence
+                return e.loc
+            when e: Let
+                return e.loc
+            when e: LetStar
+                return e.loc
+            when e: Letrec
+                return e.loc
+            when e: CondFail
+                return e.loc
+            when e: Case
+                return e.loc
+            when e: Quasiquote
+                return e.loc
+            when e: Assignment
+                return e.loc
+            when e: Lambda
+                return e.loc
+            else
+                return Location()
+        Location()
+    }
+
+    ; --- constantValue (minimal; only resolved constants report a value) ---
+    function constant_value(this: pointer[Expression]) returns pointer[ELObj]
+    {
+        choose *this
+            when e: ResolvedConstant
+                return e.obj
+            else
+                return null
+        null
+    }
+
+    ; --- canEval (conservative: only literals are compile-time evaluable) --
+    function can_eval(this: pointer[Expression], maybe_call: bool) returns bool
+    {
+        choose *this
+            when e: ResolvedConstant
+                return true
+            else
+                return false
+        false
+    }
+
+    ; keyword(): the keyword identifier of a constant keyword (make/style).
+    function keyword(this: pointer[Expression]) returns pointer[Identifier]
+    {
+        choose *this
+            when e: Constant
+                return e.obj.keyword_ident()
+            else
+                return null
+        null
+    }
+
+    ; optimize(): the constant-folding pass — a no-op here (see header).
+    function optimize(this: pointer[Expression], interp: pointer[Interpreter], env: pointer[Environment]) returns pointer[Expression]
+        this
+
+    ; optimizeCompile: optimize then compile (Expression.cs).
+    function optimize_compile(expr: pointer[Expression], interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        if expr = null
+            return next
+        let e expr.optimize(interp, env)
+        e.compile(interp, env, stack_pos, next)
+    }
+
+    ; compilePushVars: push captured vars (frame/closure refs) for a closure's
+    ; display, recursively.
+    function compile_push_vars(interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, vars: pointer[BoundVarList], var_index: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        if var_index >= vars.count()
+            return next
+        let host interp.get_host()
+        var is_frame false
+        var index 0
+        var flags: u32 0
+        let found env.lookup((vars.at(var_index)).ident, &is_frame, &index, &flags)
+        let rest Expression.compile_push_vars(interp, env, stack_pos + 1, vars, var_index + 1, next)
+        if is_frame
+            return Insn.make_frame_ref(host, index, rest)
+        Insn.make_closure_ref(host, index, rest)
+    }
+
+    ; --- markBoundVars -----------------------------------------------------
+    function mark_bound_vars(this: pointer[Expression], vars: pointer[BoundVarList], is_shared: bool)
+    {
+        choose *this
+            when e: Variable
+            {
+                var f BV_USED
+                if is_shared
+                    set f: f | BV_SHARED
+                vars.mark(e.ident, f)
+            }
+            when e: If
+            {
+                e.test.mark_bound_vars(vars, is_shared)
+                e.consequent.mark_bound_vars(vars, is_shared)
+                if e.alternate <> null
+                    e.alternate.mark_bound_vars(vars, is_shared)
+            }
+            when e: Or
+            {
+                e.test1.mark_bound_vars(vars, is_shared)
+                e.test2.mark_bound_vars(vars, is_shared)
+            }
+            when e: And
+            {
+                e.test1.mark_bound_vars(vars, is_shared)
+                e.test2.mark_bound_vars(vars, is_shared)
+            }
+            when e: Call
+            {
+                e.op.mark_bound_vars(vars, is_shared)
+                let n e.args.get_length() as int
+                let b e.args.get_buffer()
+                var i 0
+                while i < n
+                {
+                    (*(b + i)).mark_bound_vars(vars, is_shared)
+                    set i: i + 1
+                }
+            }
+            when e: Sequence
+            {
+                let n e.seq.get_length() as int
+                let b e.seq.get_buffer()
+                var i 0
+                while i < n
+                {
+                    (*(b + i)).mark_bound_vars(vars, is_shared)
+                    set i: i + 1
+                }
+            }
+            when e: Let
+            {
+                Expression.mark_list(e.inits, vars, is_shared)
+                vars.rebind(e.vars)
+                e.body.mark_bound_vars(vars, is_shared)
+                vars.unbind(e.vars)
+            }
+            when e: LetStar
+            {
+                Expression.mark_list(e.inits, vars, is_shared)
+                vars.rebind(e.vars)
+                e.body.mark_bound_vars(vars, is_shared)
+                vars.unbind(e.vars)
+            }
+            when e: Letrec
+            {
+                vars.rebind(e.vars)
+                Expression.mark_list(e.inits, vars, is_shared)
+                e.body.mark_bound_vars(vars, is_shared)
+                vars.unbind(e.vars)
+            }
+            when e: Case
+            {
+                e.key.mark_bound_vars(vars, is_shared)
+                Expression.mark_list(e.results, vars, is_shared)
+                if e.else_expr <> null
+                    e.else_expr.mark_bound_vars(vars, is_shared)
+            }
+            when e: Quasiquote
+                Expression.mark_list(e.members, vars, is_shared)
+            when e: Assignment
+            {
+                var f BV_USED | BV_ASSIGNED
+                if is_shared
+                    set f: f | BV_SHARED
+                vars.mark(e.var_ident, f)
+                e.value.mark_bound_vars(vars, is_shared)
+            }
+            when e: Lambda
+            {
+                ; optional/key inits (rebound over their preceding formals)
+                let sig e.sig
+                let n_init sig.n_optional + sig.n_key
+                let ib e.inits.get_buffer()
+                var i 0
+                while i < n_init
+                {
+                    let init_e *(ib + i)
+                    if init_e <> null
+                    {
+                        let sub Expression.ident_prefix(e.formals, interp_host_of(vars), sig.n_required + i)
+                        vars.rebind(sub)
+                        init_e.mark_bound_vars(vars, true)
+                        vars.unbind(sub)
+                    }
+                    set i: i + 1
+                }
+                vars.rebind(e.formals)
+                e.body.mark_bound_vars(vars, true)
+                vars.unbind(e.formals)
+            }
+            else
+            {
+            }
+    }
+
+    function mark_list(list: pointer[Array[pointer[Expression]]], vars: pointer[BoundVarList], is_shared: bool)
+    {
+        let n list.get_length() as int
+        let b list.get_buffer()
+        var i 0
+        while i < n
+        {
+            let e *(b + i)
+            if e <> null
+                e.mark_bound_vars(vars, is_shared)
+            set i: i + 1
+        }
+    }
+
+    ; a fresh Array of the first n idents (Lambda.markBoundVars sub-lists).
+    function ident_prefix(idents: pointer[Array[pointer[Identifier]]], host: pointer[Page], n: int) returns pointer[Array[pointer[Identifier]]]
+    {
+        let a Array[pointer[Identifier]]^host()
+        let b idents.get_buffer()
+        var i 0
+        while i < n
+        {
+            a.add(*(b + i))
+            set i: i + 1
+        }
+        a
+    }
+
+    ; --- compile -----------------------------------------------------------
+    function compile(this: pointer[Expression], interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host interp.get_host()
+        choose *this
+            when e: Constant
+                return Insn.make_constant(host, e.obj, Insn.make_resolve_quantities(host, e.loc, next))
+            when e: ResolvedConstant
+                return Insn.make_constant(host, e.obj, next)
+            when e: Variable
+                return this.compile_variable(e.ident, e.loc, interp, env, stack_pos, next)
+            when e: If
+            {
+                if e.alternate <> null
+                    return e.test.compile(interp, env, stack_pos,
+                        Insn.make_test(host, Expression.optimize_compile(e.consequent, interp, env, stack_pos, next),
+                            e.alternate.compile(interp, env, stack_pos, next)))
+                return e.test.compile(interp, env, stack_pos,
+                    Insn.make_and(host, Expression.optimize_compile(e.consequent, interp, env, stack_pos, next), next))
+            }
+            when e: Or
+                return e.test1.compile(interp, env, stack_pos,
+                    Insn.make_or(host, Expression.optimize_compile(e.test2, interp, env, stack_pos, next), next))
+            when e: And
+                return e.test1.compile(interp, env, stack_pos,
+                    Insn.make_and(host, Expression.optimize_compile(e.test2, interp, env, stack_pos, next), next))
+            when e: Call
+                return this.compile_call(interp, env, stack_pos, next)
+            when e: Sequence
+            {
+                let n e.seq.get_length() as int
+                let b e.seq.get_buffer()
+                let last *(b + (n - 1))
+                var result last.compile(interp, env, stack_pos, next)
+                var i n - 2
+                while i >= 0
+                {
+                    let se *(b + i)
+                    set result: se.compile(interp, env, stack_pos, Insn.make_pop(host, result))
+                    set i: i - 1
+                }
+                return result
+            }
+            when e: Let
+                return this.compile_let(e.vars, e.inits, e.body, interp, env, stack_pos, next)
+            when e: LetStar
+                return this.compile_let_star(e.vars, e.inits, e.body, interp, env, stack_pos, next)
+            when e: Letrec
+                return this.compile_letrec(e.vars, e.inits, e.body, interp, env, stack_pos, next)
+            when e: CondFail
+                return Insn.make_cond_fail(host, e.loc)
+            when e: Case
+                return this.compile_case(interp, env, stack_pos, next)
+            when e: Quasiquote
+                return this.compile_quasiquote(interp, env, stack_pos, next)
+            when e: Assignment
+                return this.compile_assignment(e.var_ident, e.value, e.loc, interp, env, stack_pos, next)
+            when e: Lambda
+                return this.compile_lambda(interp, env, stack_pos, next)
+            else
+                return next
+        next
+    }
+
+    ; VariableExpression::compile.
+    function compile_variable(this: pointer[Expression], ident: pointer[Identifier], loc: Location, interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host interp.get_host()
+        var is_frame false
+        var index 0
+        var flags: u32 0
+        let found env.lookup(ident, &is_frame, &index, &flags)
+        if found
+        {
+            let boxed BoundVar.flags_boxed(flags)
+            ; peephole: a boxed/plain ref that is the sole binding being popped.
+            if is_frame and (next <> null) and next.is_pop_bindings()
+            {
+                if (next.pop_bindings_n() = 1) and ((index - stack_pos) = (0 - 1))
+                {
+                    let nn next.pop_bindings_next()
+                    var tem nn
+                    if (flags & BV_UNINIT) <> (0 as u32)
+                        set tem: Insn.make_check_init(host, ident, loc, nn)
+                    if boxed
+                        return Insn.make_unbox(host, tem)
+                    return tem
+                }
+            }
+            var tem next
+            if (flags & BV_UNINIT) <> (0 as u32)
+                set tem: Insn.make_check_init(host, ident, loc, next)
+            if boxed
+                set tem: Insn.make_unbox(host, tem)
+            if is_frame
+                return Insn.make_stack_ref(host, index - stack_pos, index, tem)
+            return Insn.make_closure_ref(host, index, tem)
+        }
+        ; top-level reference
+        if ident.is_def() = false
+        {
+            interp.set_next_location(loc)
+            return Insn.make_constant(host, ELObj.make_noop_proc(host, ident.get_name()), next)
+        }
+        let val ident.compute_value(false, interp)
+        if val = null
+            return Insn.make_top_ref(host, ident, next)
+        if interp.is_error(val)
+            return Insn.make_constant(host, ELObj.make_noop_proc(host, ident.get_name()), next)
+        Insn.make_constant(host, val, next)
+    }
+
+    ; CallExpression::compile.
+    function compile_call(this: pointer[Expression], interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host interp.get_host()
+        choose *this
+            when e: Call
+            {
+                let op e.op
+                let args e.args
+                let n args.get_length() as int
+                let value op.constant_value()
+                var result: pointer[Insn] null
+                if value <> null
+                {
+                    var caller_args 0
+                    if (next <> null) and next.is_return()
+                    {
+                        set caller_args: next.return_n()
+                        set result: value.make_tail_call_insn(n, interp, e.loc, caller_args)
+                    }
+                    else
+                        set result: value.make_call_insn(n, interp, e.loc, next)
+                }
+                else
+                {
+                    var caller_args 0
+                    if (next <> null) and next.is_return()
+                    {
+                        set caller_args: next.return_n()
+                        set result: Insn.make_tail_apply(host, caller_args, n, e.loc)
+                    }
+                    else
+                        set result: Insn.make_apply(host, n, e.loc, next)
+                    set result: op.compile(interp, env, stack_pos + n, result)
+                }
+                let b args.get_buffer()
+                var i n - 1
+                while i >= 0
+                {
+                    set result: Expression.optimize_compile(*(b + i), interp, env, stack_pos + i, result)
+                    set i: i - 1
+                }
+                return result
+            }
+            else
+                return next
+        next
+    }
+
+    ; LetExpression::compile.
+    function compile_let(this: pointer[Expression], var_names: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], body: pointer[Expression], interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host interp.get_host()
+        let n_vars var_names.get_length() as int
+        let body_env Environment.copy(host, env)
+        let bound_vars BoundVarList.make_from_idents(host, var_names)
+        body.mark_bound_vars(bound_vars, false)
+        body_env.augment_frame(host, bound_vars, stack_pos)
+        let body_code Expression.optimize_compile(body, interp, body_env, stack_pos + n_vars, Insn.make_pop_bindings(host, n_vars, next))
+        Expression.compile_let_inits(interp, env, inits, bound_vars, 0, stack_pos, body_code)
+    }
+
+    function compile_let_inits(interp: pointer[Interpreter], env: pointer[Environment], inits: pointer[Array[pointer[Expression]]], init_vars: pointer[BoundVarList], init_index: int, stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let n inits.get_length() as int
+        if init_index >= n
+            return next
+        let host interp.get_host()
+        var tem Expression.compile_let_inits(interp, env, inits, init_vars, init_index + 1, stack_pos + 1, next)
+        if (init_vars.at(init_index)).boxed()
+            set tem: Insn.make_box(host, tem)
+        Expression.optimize_compile(*(inits.get_buffer() + init_index), interp, env, stack_pos, tem)
+    }
+
+    ; LetStarExpression::compile.
+    function compile_let_star(this: pointer[Expression], var_names: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], body: pointer[Expression], interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host interp.get_host()
+        let n_vars var_names.get_length() as int
+        let body_env Environment.copy(host, env)
+        let vars BoundVarList.make(host)
+        let vb var_names.get_buffer()
+        var i 0
+        while i < n_vars
+        {
+            if i > 0
+                (*(inits.get_buffer() + i)).mark_bound_vars(vars, false)
+            vars.append(*(vb + i), 0 as u32)
+            set i: i + 1
+        }
+        body.mark_bound_vars(vars, false)
+        body_env.augment_frame(host, vars, stack_pos)
+        let body_code Expression.optimize_compile(body, interp, body_env, stack_pos + n_vars, Insn.make_pop_bindings(host, n_vars, next))
+        Expression.compile_let_star_inits(interp, env, inits, vars, 0, stack_pos, body_code)
+    }
+
+    function compile_let_star_inits(interp: pointer[Interpreter], env: pointer[Environment], inits: pointer[Array[pointer[Expression]]], init_vars: pointer[BoundVarList], init_index: int, stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let n inits.get_length() as int
+        if init_index >= n
+            return next
+        let host interp.get_host()
+        let next_env Environment.copy(host, env)
+        let vars BoundVarList.make(host)
+        let iv init_vars.at(init_index)
+        vars.append(iv.ident, iv.flags)
+        next_env.augment_frame(host, vars, stack_pos)
+        var tem Expression.compile_let_star_inits(interp, next_env, inits, init_vars, init_index + 1, stack_pos + 1, next)
+        if iv.boxed()
+            set tem: Insn.make_box(host, tem)
+        Expression.optimize_compile(*(inits.get_buffer() + init_index), interp, env, stack_pos, tem)
+    }
+
+    ; LetrecExpression::compile.
+    function compile_letrec(this: pointer[Expression], var_names: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], body: pointer[Expression], interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host interp.get_host()
+        let n_vars var_names.get_length() as int
+        let vars BoundVarList.make_from_idents_n(host, var_names, n_vars, BV_ASSIGNED)
+        let body_env Environment.copy(host, env)
+        Expression.mark_list(inits, vars, false)
+        body.mark_bound_vars(vars, false)
+        body_env.augment_frame(host, vars, stack_pos)
+        var tem Expression.optimize_compile(body, interp, body_env, stack_pos + n_vars, Insn.make_pop_bindings(host, n_vars, next))
+        var i 0
+        while i < n_vars
+        {
+            let bv vars.at(i)
+            set bv.flags: bv.flags | BV_UNINIT
+            set i: i + 1
+        }
+        set i: 0
+        while i < n_vars
+        {
+            if (vars.at(i)).boxed()
+                set tem: Insn.make_set_box(host, n_vars, tem)
+            else
+                set tem: Insn.make_set_immediate(host, n_vars, tem)
+            set i: i + 1
+        }
+        set tem: Expression.compile_letrec_inits(interp, body_env, inits, 0, stack_pos + n_vars, tem)
+        set i: n_vars - 1
+        while i >= 0
+        {
+            if (vars.at(i)).boxed()
+                set tem: Insn.make_box(host, tem)
+            set tem: Insn.make_constant(host, null, tem)
+            set i: i - 1
+        }
+        tem
+    }
+
+    function compile_letrec_inits(interp: pointer[Interpreter], env: pointer[Environment], inits: pointer[Array[pointer[Expression]]], init_index: int, stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let n inits.get_length() as int
+        if init_index >= n
+            return next
+        Expression.optimize_compile(*(inits.get_buffer() + init_index), interp, env, stack_pos,
+            Expression.compile_letrec_inits(interp, env, inits, init_index + 1, stack_pos + 1, next))
+    }
+
+    ; CaseExpression::compile — datums are resolved inline (the optimize pass'
+    ; job in the reference; done here so no optimize is needed).
+    function compile_case(this: pointer[Expression], interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host interp.get_host()
+        choose *this
+            when e: Case
+            {
+                var finish: pointer[Insn] null
+                if e.else_expr <> null
+                    set finish: Insn.make_pop(host, e.else_expr.compile(interp, env, stack_pos, next))
+                else
+                    set finish: Insn.make_case_fail(host, e.loc)
+                let n_cases e.results.get_length() as int
+                let rb e.results.get_buffer()
+                let db e.datums.get_buffer()
+                let sb e.case_starts.get_buffer()
+                let total_datums e.datums.get_length() as int
+                var i 0
+                while i < n_cases
+                {
+                    let match_code (*(rb + i)).compile(interp, env, stack_pos, next)
+                    let start *(sb + i)
+                    var stop total_datums
+                    if (i + 1) < n_cases
+                        set stop: *(sb + (i + 1))
+                    var j start
+                    while j < stop
+                    {
+                        let datum (*(db + j)).resolve_quantities(false, interp, e.loc)
+                        if datum <> null
+                            set finish: Insn.make_case(host, datum, match_code, finish)
+                        set j: j + 1
+                    }
+                    set i: i + 1
+                }
+                return e.key.compile(interp, env, stack_pos, finish)
+            }
+            else
+                return next
+        next
+    }
+
+    ; QuasiquoteExpression::compile.
+    function compile_quasiquote(this: pointer[Expression], interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host interp.get_host()
+        choose *this
+            when e: Quasiquote
+            {
+                let members e.members
+                let spliced e.spliced
+                let mb members.get_buffer()
+                let sp2 spliced.get_buffer()
+                var tem next
+                var n members.get_length() as int
+                if e.qq_type = QQ_VECTOR
+                {
+                    var splicy false
+                    var i 0
+                    while i < n
+                    {
+                        if *(sp2 + i)
+                            set splicy: true
+                        set i: i + 1
+                    }
+                    if splicy = false
+                    {
+                        set tem: Insn.make_vector(host, n, tem)
+                        var k n
+                        while k > 0
+                        {
+                            set tem: (*(mb + (k - 1))).compile(interp, env, stack_pos + (k - 1), tem)
+                            set k: k - 1
+                        }
+                        return tem
+                    }
+                    set tem: Insn.make_list_to_vector(host, tem)
+                }
+                else if e.qq_type = QQ_IMPROPER
+                    set n: n - 1
+                var i 0
+                while i < n
+                {
+                    if *(sp2 + i)
+                        set tem: Insn.make_append(host, e.loc, tem)
+                    else
+                        set tem: Insn.make_cons(host, tem)
+                    set tem: (*(mb + i)).compile(interp, env, stack_pos + 1, tem)
+                    set i: i + 1
+                }
+                if e.qq_type = QQ_IMPROPER
+                    set tem: (*(mb + (members.get_length() as int - 1))).compile(interp, env, stack_pos, tem)
+                else
+                    set tem: Insn.make_constant(host, interp.make_nil(), tem)
+                return tem
+            }
+            else
+                return next
+        next
+    }
+
+    ; AssignmentExpression::compile.
+    function compile_assignment(this: pointer[Expression], var_ident: pointer[Identifier], value: pointer[Expression], loc: Location, interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host interp.get_host()
+        var is_frame false
+        var index 0
+        var flags: u32 0
+        let found env.lookup(var_ident, &is_frame, &index, &flags)
+        if found = false
+        {
+            interp.set_next_location(loc)
+            return Insn.make_error(host)
+        }
+        var result next
+        if (flags & BV_UNINIT) <> (0 as u32)
+            set result: Insn.make_check_init(host, var_ident, loc, next)
+        if is_frame
+        {
+            if BoundVar.flags_boxed(flags)
+                set result: Insn.make_stack_set_box(host, index - (stack_pos + 1), index, loc, result)
+            else
+                set result: Insn.make_stack_set(host, index - (stack_pos + 1), index, result)
+        }
+        else
+            set result: Insn.make_closure_set_box(host, index, loc, result)
+        Expression.optimize_compile(value, interp, env, stack_pos, result)
+    }
+
+    ; LambdaExpression::compile — the closure builder with the optional/rest/key
+    ; varargs entry-point machinery (Expression.cs).
+    function compile_lambda(this: pointer[Expression], interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host interp.get_host()
+        choose *this
+            when e: Lambda
+            {
+                let sig e.sig
+                let formals e.formals
+                let inits e.inits
+                let n_formals formals.get_length() as int
+                let fb formals.get_buffer()
+                let n_inits inits.get_length() as int
+
+                let bound_vars BoundVarList.make(host)
+                env.bound_vars(bound_vars)
+                this.mark_bound_vars(bound_vars, false)
+                bound_vars.remove_unused()
+
+                let formal_vars BoundVarList.make_from_idents_n(host, formals, sig.n_required, 0 as u32)
+                var i 0
+                while i < sig.n_optional + sig.n_key
+                {
+                    if i < n_inits
+                    {
+                        let init_e *(inits.get_buffer() + i)
+                        if init_e <> null
+                            init_e.mark_bound_vars(formal_vars, false)
+                    }
+                    formal_vars.append(*(fb + (sig.n_required + i)), 0 as u32)
+                    set i: i + 1
+                }
+                if sig.rest_arg
+                    formal_vars.append(*(fb + (n_formals - 1)), 0 as u32)
+                e.body.mark_bound_vars(formal_vars, false)
+
+                let lambda_env Environment.make_with(host, formal_vars, bound_vars)
+                var code Expression.optimize_compile(e.body, interp, lambda_env, n_formals, Insn.make_return(host, n_formals))
+
+                if (sig.n_optional > 0) or sig.rest_arg or (sig.n_key > 0)
+                    set code: Expression.compile_lambda_varargs(interp, sig, formals, inits, formal_vars, bound_vars, code, host)
+
+                set i: 0
+                while i < sig.n_required
+                {
+                    if (formal_vars.at(i)).boxed()
+                        set code: Insn.make_box_arg(host, i, code)
+                    set i: i + 1
+                }
+                return Expression.compile_push_vars(interp, env, stack_pos, bound_vars, 0,
+                    Insn.make_closure_insn(host, sig, code, bound_vars.count(), next))
+            }
+            else
+                return next
+        next
+    }
+
+    ; the optional/rest/key entry-point construction (LambdaExpression.compile).
+    function compile_lambda_varargs(interp: pointer[Interpreter], sig: Signature, formals: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], formal_vars: pointer[BoundVarList], bound_vars: pointer[BoundVarList], code: pointer[Insn], host: pointer[Page]) returns pointer[Insn]
+    {
+        var extra 0
+        if sig.rest_arg or (sig.n_key > 0)
+            set extra: 1
+        let ep_count sig.n_optional + extra + 1
+        let entry host.allocate((ep_count as size_t) * sizeof pointer[Insn], alignof pointer[Insn]) as pointer[pointer[Insn]]
+        var z 0
+        while z < ep_count
+        {
+            set *(entry + z): null
+            set z: z + 1
+        }
+        let n_formals formals.get_length() as int
+        let fb formals.get_buffer()
+        let n_inits inits.get_length() as int
+        let ib inits.get_buffer()
+
+        ; last entry point: all optional args supplied
+        set *(entry + (ep_count - 1)): code
+        if sig.rest_arg and (formal_vars.at(formal_vars.count() - 1)).boxed()
+            set *(entry + (ep_count - 1)): Insn.make_box_stack(host, (0 - 1) - sig.n_key, *(entry + (ep_count - 1)))
+
+        if sig.n_key > 0
+        {
+            var i sig.n_optional + sig.n_key - 1
+            while i >= sig.n_optional
+            {
+                let offset i - (sig.n_optional + sig.n_key)
+                var set_insn Insn.make_set_key_arg(host, offset, *(entry + (ep_count - 1)))
+                if (formal_vars.at(sig.n_required + i)).boxed()
+                    set set_insn: Insn.make_box(host, set_insn)
+                if (i < n_inits) and (*(ib + i) <> null)
+                {
+                    let f BoundVarList.copy(host, formal_vars)
+                    f.resize(sig.n_required + i + extra)
+                    let ev Environment.make_with(host, f, bound_vars)
+                    set set_insn: Expression.optimize_compile(*(ib + i), interp, ev, n_formals, set_insn)
+                }
+                else
+                    set set_insn: Insn.make_constant(host, interp.make_false(), set_insn)
+                set *(entry + (ep_count - 1)): Insn.make_test_null(host, offset, set_insn, *(entry + (ep_count - 1)))
+                set i: i - 1
+            }
+        }
+
+        if sig.rest_arg or (sig.n_key > 0)
+        {
+            var code_no_rest code
+            var i sig.n_optional + sig.n_key - 1
+            while i >= sig.n_optional
+            {
+                if (formal_vars.at(sig.n_required + i)).boxed()
+                    set code_no_rest: Insn.make_box(host, code_no_rest)
+                if (i < n_inits) and (*(ib + i) <> null)
+                {
+                    let f BoundVarList.copy(host, formal_vars)
+                    f.resize(sig.n_required + i + extra)
+                    let ev Environment.make_with(host, f, bound_vars)
+                    set code_no_rest: Expression.optimize_compile(*(ib + i), interp, ev, f.count(), code_no_rest)
+                }
+                else
+                    set code_no_rest: Insn.make_constant(host, interp.make_false(), code_no_rest)
+                set i: i - 1
+            }
+            if sig.rest_arg
+            {
+                if (formal_vars.at(formal_vars.count() - 1)).boxed()
+                    set code_no_rest: Insn.make_box(host, code_no_rest)
+                set code_no_rest: Insn.make_constant(host, interp.make_nil(), code_no_rest)
+            }
+            set *(entry + sig.n_optional): code_no_rest
+        }
+
+        var i sig.n_optional - 1
+        while i >= 0
+        {
+            var tem *(entry + (i + 1))
+            if (formal_vars.at(sig.n_required + i)).boxed()
+                set tem: Insn.make_box(host, tem)
+            if (i < n_inits) and (*(ib + i) <> null)
+            {
+                let f BoundVarList.copy(host, formal_vars)
+                f.resize(sig.n_required + i)
+                let ev Environment.make_with(host, f, bound_vars)
+                set *(entry + i): Expression.optimize_compile(*(ib + i), interp, ev, f.count(), tem)
+            }
+            else
+                set *(entry + i): Insn.make_constant(host, interp.make_false(), tem)
+            set i: i - 1
+        }
+
+        set i: 0
+        while i < sig.n_optional
+        {
+            if (formal_vars.at(sig.n_required + i)).boxed()
+            {
+                var j i
+                while j < sig.n_optional
+                {
+                    set *(entry + (j + 1)): Insn.make_box_arg(host, i + sig.n_required, *(entry + (j + 1)))
+                    set j: j + 1
+                }
+                if (sig.n_key > 0) or sig.rest_arg
+                {
+                    var re 0
+                    if sig.rest_arg
+                        set re: 1
+                    set *(entry + (ep_count - 1)): Insn.make_box_stack(host, i - sig.n_key - re - sig.n_optional, *(entry + (ep_count - 1)))
+                }
+            }
+            set i: i + 1
+        }
+
+        Insn.make_varargs(host, sig, entry, ep_count, sig_loc_placeholder())
+    }
+}
+
+; a placeholder location for the Varargs insn (the reference uses the lambda's
+; location; a synthesized one suffices — Varargs never reports a diagnostic in
+; the eval core).
+function sig_loc_placeholder() returns Location
+    Location()
+
+; the host page reachable from a BoundVarList (used by markBoundVars' Lambda
+; sub-list construction).
+function interp_host_of(vars: pointer[BoundVarList]) returns pointer[Page]
+    vars.get_host()

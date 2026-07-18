@@ -1,0 +1,265 @@
+use scaly.memory.Page
+use opensp.Location.Location
+use dazzle.ELObj.ELObj
+use dazzle.Insn.Insn
+use dazzle.Interpreter.Interpreter
+
+; VM — the threaded-code virtual machine (Style/VM.cxx). The evaluation loop
+; is `while (insn) insn = insn->execute(this)`; each Insn advances the value
+; stack (sbase/sp) and returns its successor. Frames and closures live on the
+; control stack (csbase/csp). Error is signalled by driving sp negative (the
+; C++ sp==NULL; C# sp==-1). One arena page per run: the stacks grow by
+; allocating a fresh, larger buffer on the host and copying — never freed.
+;
+; Cross-module rule (port history S52): other modules reach VM state ONLY
+; through the accessors below, never by direct field access.
+
+; ControlStackEntry (VM.cs): a saved frame for popFrame to restore.
+define ControlStackEntry
+(
+    closure: pointer[pointer[ELObj]]
+    protect_closure: pointer[ELObj]
+    next: pointer[Insn]
+    frame_size: int
+    closure_loc: Location
+    continuation: pointer[ELObj]
+)
+{
+    init()
+    {
+        set this.closure: null
+        set this.protect_closure: null
+        set this.next: null
+        set this.frame_size: 0
+        set this.closure_loc: Location()
+        set this.continuation: null
+    }
+}
+
+define VM
+(
+    interp: pointer[Interpreter]
+    host: pointer[Page]
+    sbase: pointer[pointer[ELObj]]
+    sp: int
+    slim: int
+    frame_start: int
+    closure: pointer[pointer[ELObj]]
+    protect_closure: pointer[ELObj]
+    closure_loc: Location
+    csbase: pointer[ControlStackEntry]
+    csp: int
+    cslim: int
+    n_actual_args: int
+)
+{
+    function make(host: pointer[Page], interp: pointer[Interpreter]) returns pointer[VM]
+    {
+        let vm host.allocate(sizeof VM, alignof VM) as pointer[VM]
+        set vm.interp: interp
+        set vm.host: host
+        set vm.sbase: null
+        set vm.sp: 0
+        set vm.slim: 0
+        set vm.frame_start: 0
+        set vm.closure: null
+        set vm.protect_closure: null
+        set vm.closure_loc: Location()
+        set vm.csbase: null
+        set vm.csp: 0
+        set vm.cslim: 0
+        set vm.n_actual_args: 0
+        vm
+    }
+
+    ; --- accessors (cross-module surface) ----------------------------------
+    function get_sp(this: VM) returns int
+        sp
+
+    function set_sp(this: pointer[VM], n: int)
+        set this.sp: n
+
+    function get_interp(this: VM) returns pointer[Interpreter]
+        interp
+
+    function get_host(this: VM) returns pointer[Page]
+        host
+
+    function get_frame_start(this: VM) returns int
+        frame_start
+
+    function set_frame_start(this: pointer[VM], n: int)
+        set this.frame_start: n
+
+    function get_closure(this: VM) returns pointer[pointer[ELObj]]
+        closure
+
+    function set_closure(this: pointer[VM], d: pointer[pointer[ELObj]])
+        set this.closure: d
+
+    function set_protect_closure(this: pointer[VM], c: pointer[ELObj])
+        set this.protect_closure: c
+
+    function set_closure_loc(this: pointer[VM], loc: Location)
+        set this.closure_loc: loc
+
+    function get_n_actual_args(this: VM) returns int
+        n_actual_args
+
+    function set_n_actual_args(this: pointer[VM], n: int)
+        set this.n_actual_args: n
+
+    ; value-stack element access (sbase[i]).
+    function stack_ref(this: VM, i: int) returns pointer[ELObj]
+        *(sbase + i)
+
+    function stack_set(this: pointer[VM], i: int, v: pointer[ELObj])
+        set *(this.sbase + i): v
+
+    ; a raw pointer into the value stack at index i (arg slices for primitives).
+    function sbase_at(this: VM, i: int) returns pointer[pointer[ELObj]]
+        sbase + i
+
+    ; closure-display element (closure[i]).
+    function closure_ref(this: VM, i: int) returns pointer[ELObj]
+        *(closure + i)
+
+    ; --- stack growth ------------------------------------------------------
+    function need_stack(this: pointer[VM], n: int)
+    {
+        if this.sp + n > this.slim
+            this.grow_stack(n)
+    }
+
+    function grow_stack(this: pointer[VM], n: int)
+    {
+        var new_size this.sp
+        if n > new_size
+            set new_size: new_size + (((n + 15) / 16) * 16)
+        else
+            set new_size: new_size + new_size
+        if new_size < 64
+            set new_size: 64
+        let buf this.host.allocate((new_size as size_t) * sizeof pointer[ELObj], alignof pointer[ELObj]) as pointer[pointer[ELObj]]
+        var i 0
+        while i < this.sp
+        {
+            set *(buf + i): *(this.sbase + i)
+            set i: i + 1
+        }
+        set this.slim: new_size
+        set this.sbase: buf
+        set this.closure: this.closure
+    }
+
+    ; --- control stack -----------------------------------------------------
+    function push_frame(this: pointer[VM], next: pointer[Insn], args_pushed: int)
+    {
+        if this.csp >= this.cslim
+        {
+            var new_size 8
+            if this.cslim > 0
+                set new_size: this.cslim * 2
+            let nb this.host.allocate((new_size as size_t) * sizeof ControlStackEntry, alignof ControlStackEntry) as pointer[ControlStackEntry]
+            var i 0
+            while i < this.csp
+            {
+                set *(nb + i): *(this.csbase + i)
+                set i: i + 1
+            }
+            set this.cslim: new_size
+            set this.csbase: nb
+        }
+        let e this.csbase + this.csp
+        set e.closure: this.closure
+        set e.protect_closure: this.protect_closure
+        set e.next: next
+        set e.frame_size: this.sp - this.frame_start - args_pushed
+        set e.closure_loc: this.closure_loc
+        set e.continuation: null
+        set this.csp: this.csp + 1
+    }
+
+    function pop_frame(this: pointer[VM]) returns pointer[Insn]
+    {
+        set this.csp: this.csp - 1
+        let e this.csbase + this.csp
+        set this.closure: e.closure
+        set this.protect_closure: e.protect_closure
+        set this.frame_start: this.sp - e.frame_size
+        set this.closure_loc: e.closure_loc
+        e.next
+    }
+
+    function init_stack(this: pointer[VM])
+    {
+        set this.sp: 0
+        set this.frame_start: 0
+        set this.csp: 0
+    }
+
+    ; --- eval loop (VM::eval) ----------------------------------------------
+    function eval(this: pointer[VM], insn_in: pointer[Insn], display: pointer[pointer[ELObj]], arg: pointer[ELObj]) returns pointer[ELObj]
+    {
+        this.init_stack()
+        if arg <> null
+        {
+            this.need_stack(1)
+            set *(this.sbase + this.sp): arg
+            set this.sp: this.sp + 1
+        }
+        set this.closure: display
+        set this.protect_closure: null
+        set this.closure_loc: Location()
+
+        var insn insn_in
+        while insn <> null
+        {
+            set insn: insn.execute(this)
+            if this.sp < 0
+                break
+        }
+
+        if this.sp >= 0
+        {
+            set this.sp: this.sp - 1
+            return *(this.sbase + this.sp)
+        }
+        this.interp.make_error()
+    }
+
+    ; ApplyPrimitiveObj::shuffle — the (apply f a b list) argument reshuffle:
+    ; drop f from under the args, splice the trailing list, push f on top.
+    function apply_shuffle(this: pointer[VM], loc: Location) returns bool
+    {
+        let n_args this.n_actual_args
+        let func *(this.sbase + (this.sp - n_args))
+        var i n_args - 2
+        while i > 0
+        {
+            set *(this.sbase + (this.sp - i - 2)): *(this.sbase + (this.sp - i - 1))
+            set i: i - 1
+        }
+        set this.n_actual_args: n_args - 2
+        var list *(this.sbase + (this.sp - 1))
+        set this.sp: this.sp - 2
+        while (list <> null) and (list.is_nil() = false)
+        {
+            if list.is_pair() = false
+            {
+                this.interp.set_next_location(loc)
+                set this.sp: 0 - 1
+                return false
+            }
+            this.need_stack(1)
+            set this.n_actual_args: this.n_actual_args + 1
+            set *(this.sbase + this.sp): list.get_car()
+            set this.sp: this.sp + 1
+            set list: list.get_cdr()
+        }
+        this.need_stack(1)
+        set *(this.sbase + this.sp): func
+        set this.sp: this.sp + 1
+        true
+    }
+}
