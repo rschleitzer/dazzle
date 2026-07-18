@@ -52,13 +52,29 @@ fi
 
 # Expected stderr: the SchemeParser vector-gating check provokes exactly one
 # reference diagnostic (#( outside dsssl2 -> unknownHash).
+experr="dazzle:E: invalid character after '#'"
 out="$("$TMP/unit" 2>"$TMP/err")"
 rc=$?
 err="$(cat "$TMP/err")"
-experr="dazzle:E: invalid character after '#'"
-if [ "$rc" -eq 0 ] && [ "$out" = "PASS" ] && [ "$err" = "$experr" ]; then
-  echo "dazzle: PASS"
-  exit 0
+if [ "$rc" -ne 0 ] || [ "$out" != "PASS" ] || [ "$err" != "$experr" ]; then
+  echo "dazzle: FAIL (rc=$rc) out='$out' err='$err'"
+  exit 1
 fi
-echo "dazzle: FAIL (rc=$rc) out='$out' err='$err'"
-exit 1
+
+# --- 4. Same harness through the in-process JIT (cross-package dependency ---
+# linking). --jit AOT-compiles the opensp + dazzle dependency packages to
+# objects and links them into the ORC JITDylib (Emitter.jit_run /
+# cli.compile_jit_dependencies), so the whole engine runs JIT-compiled. This
+# is the DSSSL jitter's foundation; it also guards the regression where the
+# retired jit_dep_bodies planner path mis-planned large dependency bodies into
+# corrupt plans and crashed the emitter.
+jout="$("$BIN" --jit "$HERE/unit.scaly" 2>"$TMP/jerr")"
+jrc=$?
+jerr="$(cat "$TMP/jerr")"
+if [ "$jrc" -ne 0 ] || [ "$jout" != "PASS" ] || [ "$jerr" != "$experr" ]; then
+  echo "dazzle: FAIL (--jit rc=$jrc) out='$jout' err='$jerr'"
+  exit 1
+fi
+
+echo "dazzle: PASS"
+exit 0
