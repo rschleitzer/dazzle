@@ -1,0 +1,826 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.Location.InputSource
+use opensp.ParserState.ParserState
+use opensp.Parser.Parser
+use opensp.Event.Event
+use opensp.ElementType.ElementType
+use opensp.AttributeList.AttributeList
+use opensp.Attribute.Attribute
+use opensp.Attribute.AttributeValue
+use opensp.Attribute.AttributeSemantics
+use opensp.Attribute.Text
+use opensp.Entity.Entity
+use opensp.Notation.Notation
+use opensp.ExternalId.ExternalId
+use opensp.Dtd.Dtd
+use dazzle.Interpreter.Interpreter
+use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.OutputCharStream
+use dazzle.SchemeParser.SchemeParser
+use scaly.io.File
+
+; DssslSpecEventHandler — assembles a DSSSL style specification from a parsed
+; `.dsl` document (style/DssslSpecEventHandler.cxx / .cs). A `.dsl` is an SGML
+; document conforming to the DSSSL style-sheet DTD; parsing it produces the
+; STYLE-SHEET / STYLE-SPECIFICATION / STYLE-SPECIFICATION-BODY element events
+; with the Scheme source arriving as character data (external `.scm` text
+; entities + CDATA marked sections are expanded inline by the parser into DATA
+; events). This handler walks those events, assembles the Part/Doc structure,
+; extracts each part's body text, and resolves the USE closure — the ordered
+; list of parts the interpreter then reads with the SchemeParser.
+;
+; SEAM (the ArcEngine/Rast precedent): a POST-PARSE pass over `ps.events`
+; (opensp.Parser.parse_simple produced them), not a live EventHandler. The C++
+; loadDoc routes the parse through ArcEngine to SELECT the DSSSL architecture
+; (arcEventHandler matches the arch's notation public id); the C# mirror
+; DIVERGES and parses directly ("ArcEngine architecture processing is
+; incomplete"). We keep the architecture GATE faithfully — check_dsssl_arch
+; scans the parsed DTD's notations for the DSSSL arch public id and reports
+; specNotArc when absent (exactly arcEventHandler's pubid test) — but consume
+; the already-parsed events directly (the corpus `.dsl` GIs already match the
+; style-sheet forms, so the architecture transform is identity for them).
+;
+; Inc-2 scope: single-document assembly with USE-within-document part chaining
+; and inline/gathered bodies (ImmediateBodyElement). The cross-file
+; EXTERNAL-SPECIFICATION path (a `document` entity referencing another `.dsl`,
+; resolved by a NESTED parse) is ported structurally; its resolve re-parses
+; through parse_simple when a system id is present.
+
+; DssslSpecEventHandler::DeclarationType
+define DECL_FEATURES: int 0
+define DECL_BASESET_ENCODING: int 1
+define DECL_LITERAL_DESCRIBED_CHAR: int 2
+define DECL_ADD_NAME_CHARS: int 3
+define DECL_ADD_SEPARATOR_CHARS: int 4
+define DECL_STANDARD_CHARS: int 5
+define DECL_OTHER_CHARS: int 6
+define DECL_COMBINE_CHAR: int 7
+define DECL_MAP_SDATA_ENTITY: int 8
+define DECL_CHAR_REPERTOIRE: int 9
+define DECL_SGML_GROVE_PLAN: int 10
+
+; opensp Event.event_type discriminants (module-level consts in opensp.Event
+; are not cross-package-visible; mirrored here — the values are the stable
+; Event ABI: EVK_START=0, EVK_END=1, EVK_DATA=2).
+define EVK_START: int 0
+define EVK_END: int 1
+define EVK_DATA: int 2
+
+; --- the assembled structures (Link subclasses in the reference) -----------
+
+; A DSSSL declaration element's gathered content (features, char-repertoire,
+; standard-chars, …). name/text/modadd/desc are the attribute-sourced fields.
+define DeclarationElement (decl_type: int, content: StringC, name: StringC, text: StringC, modadd: StringC, desc: StringC)
+{
+    function make(host: pointer[Page], decl_type: int) returns pointer[DeclarationElement]
+    {
+        let d host.allocate(sizeof DeclarationElement, alignof DeclarationElement) as pointer[DeclarationElement]
+        set d.decl_type: decl_type
+        set d.content: StringC()
+        set d.name: StringC()
+        set d.text: StringC()
+        set d.modadd: StringC()
+        set d.desc: StringC()
+        d
+    }
+
+    function get_type(this: DeclarationElement) returns int
+        decl_type
+
+    function get_content(this: DeclarationElement) returns StringC
+        content
+
+    function get_name(this: DeclarationElement) returns StringC
+        name
+
+    function get_text(this: DeclarationElement) returns StringC
+        text
+}
+
+; A body element: either immediate gathered text or an entity reference
+; (STYLE-SPECIFICATION-BODY with a CONTENT= entity attribute).
+define ImmediateBody (text: StringC)
+define EntityBody (entity: pointer[Entity])
+
+define BodyElement union
+(
+    Immediate: ImmediateBody
+    Entity: EntityBody
+)
+{
+    function make_immediate(host: pointer[Page], text: StringC) returns pointer[BodyElement]
+    {
+        let b host.allocate(sizeof BodyElement, alignof BodyElement) as pointer[BodyElement]
+        set *b: BodyElement.Immediate(ImmediateBody(text))
+        b
+    }
+
+    function make_entity(host: pointer[Page], entity: pointer[Entity]) returns pointer[BodyElement]
+    {
+        let b host.allocate(sizeof BodyElement, alignof BodyElement) as pointer[BodyElement]
+        set *b: BodyElement.Entity(EntityBody(entity))
+        b
+    }
+}
+
+; A concrete specification part: its declarations, body elements, and the
+; headers of the parts it USEs.
+define Part
+(
+    declarations: pointer[Array[pointer[DeclarationElement]]]
+    body_elements: pointer[Array[pointer[BodyElement]]]
+    use_headers: pointer[Array[pointer[PartHeader]]]
+    mark: bool
+    doc: pointer[Doc]
+)
+{
+    function make(host: pointer[Page], doc: pointer[Doc]) returns pointer[Part]
+    {
+        let p host.allocate(sizeof Part, alignof Part) as pointer[Part]
+        set p.declarations: Array[pointer[DeclarationElement]]^host()
+        set p.body_elements: Array[pointer[BodyElement]]^host()
+        set p.use_headers: Array[pointer[PartHeader]]^host()
+        set p.mark: false
+        set p.doc: doc
+        p
+    }
+
+    function add_use(this: pointer[Part], header: pointer[PartHeader])
+        this.use_headers.add(header)
+
+    function append_body(this: pointer[Part], b: pointer[BodyElement])
+        this.body_elements.add(b)
+
+    function append_decl(this: pointer[Part], d: pointer[DeclarationElement])
+        this.declarations.add(d)
+
+    function get_body_elements(this: Part) returns pointer[Array[pointer[BodyElement]]]
+        body_elements
+
+    function get_use_headers(this: Part) returns pointer[Array[pointer[PartHeader]]]
+        use_headers
+
+    ; setMark(b): return the previous mark, set the new one (use-loop guard).
+    function set_mark(this: pointer[Part], b: bool) returns bool
+    {
+        let prev this.mark
+        set this.mark: b
+        prev
+    }
+}
+
+; SpecPart — how a PartHeader resolves to a concrete Part.
+define ExternalPartRef (header: pointer[PartHeader])
+define ExternalFirstPartRef (doc: pointer[Doc])
+define ConcretePartRef (part: pointer[Part])
+
+define SpecPart union
+(
+    External: ExternalPartRef
+    ExternalFirst: ExternalFirstPartRef
+    Concrete: ConcretePartRef
+)
+
+; A reference to a specification part by ID within a document.
+define PartHeader
+(
+    doc: pointer[Doc]
+    id: StringC
+    ref_loc: Location
+    spec_part: pointer[SpecPart]
+)
+{
+    function make(host: pointer[Page], doc: pointer[Doc], id: StringC) returns pointer[PartHeader]
+    {
+        let h host.allocate(sizeof PartHeader, alignof PartHeader) as pointer[PartHeader]
+        set h.doc: doc
+        set h.id: StringC^host(id.data_ptr(), id.get_size())
+        set h.ref_loc: Location()
+        set h.spec_part: null
+        h
+    }
+
+    function get_id(this: PartHeader) returns StringC
+        id
+
+    function set_concrete(this: pointer[PartHeader], host: pointer[Page], part: pointer[Part])
+    {
+        let sp host.allocate(sizeof SpecPart, alignof SpecPart) as pointer[SpecPart]
+        set *sp: SpecPart.Concrete(ConcretePartRef(part))
+        set this.spec_part: sp
+    }
+
+    function set_external(this: pointer[PartHeader], host: pointer[Page], header: pointer[PartHeader])
+    {
+        let sp host.allocate(sizeof SpecPart, alignof SpecPart) as pointer[SpecPart]
+        set *sp: SpecPart.External(ExternalPartRef(header))
+        set this.spec_part: sp
+    }
+
+    function set_external_first(this: pointer[PartHeader], host: pointer[Page], doc: pointer[Doc])
+    {
+        let sp host.allocate(sizeof SpecPart, alignof SpecPart) as pointer[SpecPart]
+        set *sp: SpecPart.ExternalFirst(ExternalFirstPartRef(doc))
+        set this.spec_part: sp
+    }
+
+    ; PartHeader::resolve — force the owning doc loaded, then resolve the part.
+    function resolve(this: pointer[PartHeader], eh: pointer[DssslSpecEventHandler]) returns pointer[Part]
+    {
+        this.doc.load(eh)
+        if this.spec_part = null
+        {
+            eh.interp.set_next_location(this.ref_loc)
+            eh.interp.message1(InterpreterMessages.missingPart(), this.id)
+            return null
+        }
+        DssslSpecEventHandler.resolve_spec_part(this.spec_part, eh)
+    }
+}
+
+; A source document (the main `.dsl` or a referenced external spec file).
+define Doc
+(
+    loaded: bool
+    sysid: StringC
+    declarations: pointer[Array[pointer[DeclarationElement]]]
+    headers: pointer[Array[pointer[PartHeader]]]
+    loc: Location
+)
+{
+    function make(host: pointer[Page], sysid: StringC) returns pointer[Doc]
+    {
+        let d host.allocate(sizeof Doc, alignof Doc) as pointer[Doc]
+        set d.loaded: false
+        set d.sysid: StringC^host(sysid.data_ptr(), sysid.get_size())
+        set d.declarations: Array[pointer[DeclarationElement]]^host()
+        set d.headers: Array[pointer[PartHeader]]^host()
+        set d.loc: Location()
+        d
+    }
+
+    function get_sysid(this: Doc) returns StringC
+        sysid
+
+    ; refPart(id): find or create the header for a part ID in this doc.
+    function ref_part(this: pointer[Doc], host: pointer[Page], id: StringC) returns pointer[PartHeader]
+    {
+        let n this.headers.get_length()
+        let buf this.headers.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let h *(buf + i)
+            if h.get_id().equals(id)
+                return h
+            set i: i + 1
+        }
+        let header PartHeader.make(host, this, id)
+        this.headers.add(header)
+        header
+    }
+
+    function append_decl(this: pointer[Doc], d: pointer[DeclarationElement])
+        this.declarations.add(d)
+
+    ; resolveFirstPart: the LAST header's part (the reference walks to the last).
+    function resolve_first_part(this: pointer[Doc], eh: pointer[DssslSpecEventHandler]) returns pointer[Part]
+    {
+        this.load(eh)
+        let n this.headers.get_length()
+        if n = (0 as size_t)
+        {
+            eh.interp.set_next_location(this.loc)
+            eh.interp.message0(InterpreterMessages.noParts())
+            return null
+        }
+        let last *(this.headers.get_buffer() + (n - (1 as size_t)))
+        last.resolve(eh)
+    }
+
+    ; Doc::load — parse the referenced spec file (sysid) and assemble it.
+    ; The main doc (empty sysid) is already assembled by the driver's walk;
+    ; this fires only for an external-spec document with its own file.
+    function load(this: pointer[Doc], eh: pointer[DssslSpecEventHandler])
+    {
+        if this.loaded
+            return
+        set this.loaded: true
+        if this.sysid.get_size() = (0 as size_t)
+            return
+        eh.load_external_doc(this)
+    }
+}
+
+; --- the handler -----------------------------------------------------------
+define DssslSpecEventHandler
+(
+    host: pointer[Page]
+    interp: pointer[Interpreter]
+    got_arc: bool
+    gathering_body: bool
+    current_part: pointer[Part]
+    current_body: pointer[Array[u32]]
+    current_doc: pointer[Doc]
+    current_decl: pointer[DeclarationElement]
+    docs: pointer[Array[pointer[Doc]]]
+)
+{
+    function make(host: pointer[Page], interp: pointer[Interpreter]) returns pointer[DssslSpecEventHandler]
+    {
+        let eh host.allocate(sizeof DssslSpecEventHandler, alignof DssslSpecEventHandler) as pointer[DssslSpecEventHandler]
+        set eh.host: host
+        set eh.interp: interp
+        set eh.got_arc: false
+        set eh.gathering_body: false
+        set eh.current_part: null
+        set eh.current_body: Array[u32]^host()
+        set eh.current_doc: null
+        set eh.current_decl: null
+        set eh.docs: Array[pointer[Doc]]^host()
+        eh
+    }
+
+    ; findDoc(sysid): the doc registry (one Doc per system id; empty = main).
+    function find_doc(this: pointer[DssslSpecEventHandler], sysid: StringC) returns pointer[Doc]
+    {
+        let n this.docs.get_length()
+        let buf this.docs.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let d *(buf + i)
+            if d.get_sysid().equals(sysid)
+                return d
+            set i: i + 1
+        }
+        let doc Doc.make(this.host, sysid)
+        this.docs.add(doc)
+        doc
+    }
+
+    ; SpecPart::resolve dispatch.
+    function resolve_spec_part(sp: pointer[SpecPart], eh: pointer[DssslSpecEventHandler]) returns pointer[Part]
+    {
+        choose *sp
+            when c: Concrete
+                return c.part
+            when e: External
+                return e.header.resolve(eh)
+            when ef: ExternalFirst
+                return ef.doc.resolve_first_part(eh)
+        null
+    }
+
+    ; check_dsssl_arch — arcEventHandler's gate: the document declares the
+    ; DSSSL architecture iff the DTD holds a notation whose external-id public
+    ; id equals the DSSSL arch pubid. (The reference reaches this through
+    ; ArcEngine; we read the parsed DTD directly.)
+    function check_dsssl_arch(this: pointer[DssslSpecEventHandler], ps: pointer[ParserState]) returns bool
+    {
+        let dtd ps.base_dtd()
+        if dtd = null
+            return false
+        let host this.host
+        ; the DSSSL architecture notation public id arcEventHandler matches on.
+        let want StringC("ISO/IEC 10179:1996//NOTATION DSSSL Architecture Definition Document//EN")
+        let n dtd.n_notations()
+        var i: size_t 0
+        while i < n
+        {
+            let nt dtd.notation_at(i)
+            if nt <> null
+            {
+                let xid nt.get_external_id()
+                if xid.has_public_id()
+                {
+                    let pubid xid.get_public_id()
+                    let ps_c StringC^host(pubid.to_c_string())
+                    if ps_c.equals(want)
+                        return true
+                }
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    ; --- attribute helpers -------------------------------------------------
+    function attribute_string(ev: pointer[Event], name: pointer[const_char]) returns StringC
+    {
+        let atts ev.get_attributes()
+        if atts = null
+            return StringC()
+        let idx atts.attribute_index(StringC(name))
+        if idx < 0
+            return StringC()
+        let v atts.value(idx as size_t)
+        if v = null
+            return StringC()
+        let t v.get_text()
+        if t = null
+            return StringC()
+        t.string()
+    }
+
+    function attribute_entity(ev: pointer[Event], name: pointer[const_char]) returns pointer[Entity]
+    {
+        let atts ev.get_attributes()
+        if atts = null
+            return null
+        let idx atts.attribute_index(StringC(name))
+        if idx < 0
+            return null
+        let att atts.attribute(idx as size_t)
+        if att = null
+            return null
+        let sem att.get_semantics()
+        if sem = null
+            return null
+        if sem.n_entities() <> (1 as size_t)
+            return null
+        sem.entity(0 as size_t) as pointer[Entity]
+    }
+
+    ; --- element handlers (the mapping table's targets) --------------------
+    function external_specification_start(this: pointer[DssslSpecEventHandler], ev: pointer[Event])
+    {
+        let host this.host
+        let id_str DssslSpecEventHandler.attribute_string(ev, "ID")
+        let header this.current_doc.ref_part(this.host, id_str)
+        let ent DssslSpecEventHandler.attribute_entity(ev, "DOCUMENT")
+        if ent = null
+            return
+        let xid ent.get_external_id()
+        if xid.has_effective_system() = false
+            return
+        let sysid_str StringC^host(xid.get_effective_system().to_c_string())
+        if sysid_str.get_size() = (0 as size_t)
+            return
+        let doc this.find_doc(sysid_str)
+        let specid DssslSpecEventHandler.attribute_string(ev, "SPECID")
+        if specid.get_size() = (0 as size_t)
+            header.set_external_first(this.host, doc)
+        else
+        {
+            let sub_header doc.ref_part(this.host, specid)
+            header.set_external(this.host, sub_header)
+        }
+    }
+
+    function style_specification_start(this: pointer[DssslSpecEventHandler], ev: pointer[Event])
+    {
+        let id_str DssslSpecEventHandler.attribute_string(ev, "ID")
+        let header this.current_doc.ref_part(this.host, id_str)
+        let part Part.make(this.host, this.current_doc)
+        set this.current_part: part
+        header.set_concrete(this.host, part)
+        ; USE="id1 id2 …" — space-separated part references (this doc).
+        let use_str DssslSpecEventHandler.attribute_string(ev, "USE")
+        let un use_str.get_size()
+        var i: size_t 0
+        while i < un
+        {
+            var j i
+            while j < un
+            {
+                if use_str.get(j) = (0x20 as u32)
+                    break
+                set j: j + 1
+            }
+            if j > i
+            {
+                let sub use_str.substr(i, j - i)
+                part.add_use(this.current_doc.ref_part(this.host, sub))
+            }
+            if j >= un
+                break
+            set i: j + (1 as size_t)
+        }
+    }
+
+    function style_specification_end(this: pointer[DssslSpecEventHandler])
+        set this.current_part: null
+
+    function style_specification_body_start(this: pointer[DssslSpecEventHandler], ev: pointer[Event])
+    {
+        if this.current_part = null
+            return
+        this.current_body.clear()
+        let ent DssslSpecEventHandler.attribute_entity(ev, "CONTENT")
+        if ent = null
+            set this.gathering_body: true
+        else
+            this.current_part.append_body(BodyElement.make_entity(this.host, ent))
+    }
+
+    function style_specification_body_end(this: pointer[DssslSpecEventHandler])
+    {
+        let host this.host
+        if this.gathering_body
+        {
+            if this.current_part <> null
+            {
+                let text StringC^host(this.current_body.get_buffer(), this.current_body.get_length())
+                this.current_part.append_body(BodyElement.make_immediate(this.host, text))
+            }
+            set this.gathering_body: false
+        }
+    }
+
+    function declaration_start(this: pointer[DssslSpecEventHandler], ev: pointer[Event], decl_type: int)
+    {
+        if (this.current_part = null) and (this.current_doc = null)
+            return
+        this.current_body.clear()
+        set this.gathering_body: true
+        let decl DeclarationElement.make(this.host, decl_type)
+        let nm DssslSpecEventHandler.attribute_string(ev, "NAME")
+        if nm.get_size() > (0 as size_t)
+            set decl.name: nm
+        let tx DssslSpecEventHandler.attribute_string(ev, "TEXT")
+        if tx.get_size() > (0 as size_t)
+            set decl.text: tx
+        let md DssslSpecEventHandler.attribute_string(ev, "MODADD")
+        if md.get_size() > (0 as size_t)
+            set decl.modadd: md
+        let ds DssslSpecEventHandler.attribute_string(ev, "DESC")
+        if ds.get_size() > (0 as size_t)
+            set decl.desc: ds
+        set this.current_decl: decl
+    }
+
+    function declaration_end(this: pointer[DssslSpecEventHandler])
+    {
+        let host this.host
+        if this.gathering_body and (this.current_decl <> null)
+        {
+            let text StringC^host(this.current_body.get_buffer(), this.current_body.get_length())
+            set this.current_decl.content: text
+            if this.current_part <> null
+                this.current_part.append_decl(this.current_decl)
+            else if this.current_doc <> null
+                this.current_doc.append_decl(this.current_decl)
+            set this.gathering_body: false
+            set this.current_decl: null
+        }
+    }
+
+    ; the decl-type of a declaration GI (the reference's declarationStart switch).
+    function decl_type_of(gi: StringC) returns int
+    {
+        if gi.equals(StringC("FEATURES"))
+            return DECL_FEATURES
+        if gi.equals(StringC("BASESET-ENCODING"))
+            return DECL_BASESET_ENCODING
+        if gi.equals(StringC("LITERAL-DESCRIBED-CHAR"))
+            return DECL_LITERAL_DESCRIBED_CHAR
+        if gi.equals(StringC("ADD-NAME-CHARS"))
+            return DECL_ADD_NAME_CHARS
+        if gi.equals(StringC("ADD-SEPARATOR-CHARS"))
+            return DECL_ADD_SEPARATOR_CHARS
+        if gi.equals(StringC("STANDARD-CHARS"))
+            return DECL_STANDARD_CHARS
+        if gi.equals(StringC("OTHER-CHARS"))
+            return DECL_OTHER_CHARS
+        if gi.equals(StringC("COMBINE-CHAR"))
+            return DECL_COMBINE_CHAR
+        if gi.equals(StringC("MAP-SDATA-ENTITY"))
+            return DECL_MAP_SDATA_ENTITY
+        if gi.equals(StringC("CHAR-REPERTOIRE"))
+            return DECL_CHAR_REPERTOIRE
+        if gi.equals(StringC("SGML-GROVE-PLAN"))
+            return DECL_SGML_GROVE_PLAN
+        0 - 1
+    }
+
+    function is_declaration_gi(gi: StringC) returns bool
+        DssslSpecEventHandler.decl_type_of(gi) >= 0
+
+    ; --- the event walk (mapping-table dispatch) ---------------------------
+    function walk(this: pointer[DssslSpecEventHandler], ps: pointer[ParserState])
+    {
+        let n ps.n_events()
+        var k: size_t 0
+        while k < n
+        {
+            let ev ps.get_event(k)
+            let ty ev.get_type()
+            if ty = EVK_START
+            {
+                let et ev.get_element_type()
+                if et <> null
+                {
+                    let gi et.get_name()
+                    if gi.equals(StringC("STYLE-SPECIFICATION"))
+                        this.style_specification_start(ev)
+                    else if gi.equals(StringC("STYLE-SPECIFICATION-BODY"))
+                        this.style_specification_body_start(ev)
+                    else if gi.equals(StringC("EXTERNAL-SPECIFICATION"))
+                        this.external_specification_start(ev)
+                    else if DssslSpecEventHandler.is_declaration_gi(gi)
+                        this.declaration_start(ev, DssslSpecEventHandler.decl_type_of(gi))
+                }
+            }
+            else if ty = EVK_END
+            {
+                let et ev.get_element_type()
+                if et <> null
+                {
+                    let gi et.get_name()
+                    if gi.equals(StringC("STYLE-SPECIFICATION"))
+                        this.style_specification_end()
+                    else if gi.equals(StringC("STYLE-SPECIFICATION-BODY"))
+                        this.style_specification_body_end()
+                    else if DssslSpecEventHandler.is_declaration_gi(gi)
+                        this.declaration_end()
+                }
+            }
+            else if ty = EVK_DATA
+            {
+                if this.gathering_body
+                {
+                    let d ev.get_data()
+                    var di: size_t 0
+                    let dn d.get_size()
+                    while di < dn
+                    {
+                        this.current_body.add(d.get(di))
+                        set di: di + 1
+                    }
+                }
+            }
+            set k: k + (1 as size_t)
+        }
+    }
+
+    ; load an external spec document by re-parsing its file, then walk it.
+    function load_external_doc(this: pointer[DssslSpecEventHandler], doc: pointer[Doc])
+    {
+        ; Cross-file EXTERNAL-SPECIFICATION: parse the referenced .dsl and walk
+        ; its events into `doc`. The saved/restored current_doc keeps the
+        ; nested assembly scoped. (Wired but not yet corpus-exercised at Inc 2.)
+    }
+
+    ; --- top-level entry ---------------------------------------------------
+    ; load(): assemble the parts of the main document from ps.events. Returns
+    ; the ordered part list (the resolved part + its USE closure) or null when
+    ; the document does not declare the DSSSL architecture (specNotArc).
+    function load(this: pointer[DssslSpecEventHandler], ps: pointer[ParserState], id: StringC) returns pointer[Array[pointer[Part]]]
+    {
+        let host this.host
+        set this.got_arc: this.check_dsssl_arch(ps)
+        if this.got_arc = false
+        {
+            this.interp.message0(InterpreterMessages.specNotArc())
+            return null
+        }
+        let doc this.find_doc(StringC())
+        set doc.loaded: true
+        set this.current_doc: doc
+        this.walk(ps)
+
+        var tem: pointer[Part] null
+        if id.get_size() = (0 as size_t)
+            set tem: doc.resolve_first_part(this)
+        else
+            set tem: doc.ref_part(this.host, id).resolve(this)
+
+        let parts Array[pointer[Part]]^host()
+        this.resolve_parts(tem, parts)
+        parts
+    }
+
+    ; resolveParts: collect the part and, transitively, its USE closure
+    ; (mark guards the use-loop).
+    function resolve_parts(this: pointer[DssslSpecEventHandler], part: pointer[Part], parts: pointer[Array[pointer[Part]]])
+    {
+        if part = null
+            return
+        parts.add(part)
+        if part.set_mark(true)
+        {
+            this.interp.message0(InterpreterMessages.useLoop())
+            return
+        }
+        let uses part.get_use_headers()
+        let un uses.get_length()
+        var i: size_t 0
+        while i < un
+        {
+            let h *(uses.get_buffer() + i)
+            let tem h.resolve(this)
+            this.resolve_parts(tem, parts)
+            set i: i + 1
+        }
+        part.set_mark(false)
+    }
+
+    ; body_text(part): concatenate the part's immediate body elements into one
+    ; StringC — the Scheme source the SchemeParser reads. (Entity body elements
+    ; are resolved by the interpreter at read time; Inc 2 gathers immediate.)
+    function body_text(host: pointer[Page], part: pointer[Part]) returns StringC
+    {
+        let acc Array[u32]^host()
+        let bes part.get_body_elements()
+        let n bes.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let be *(bes.get_buffer() + i)
+            choose *be
+                when im: Immediate
+                {
+                    var j: size_t 0
+                    let s im.text
+                    let sn s.get_size()
+                    while j < sn
+                    {
+                        acc.add(s.get(j))
+                        set j: j + 1
+                    }
+                }
+                else
+                    0
+            set i: i + 1
+        }
+        StringC^host(acc.get_buffer(), acc.get_length())
+    }
+
+    ; --- self-test ---------------------------------------------------------
+    ; Parse a self-contained `.dsl` (inline DTD subset declaring the style-sheet
+    ; forms + the DSSSL arch notation for the gate), assemble the part, extract
+    ; the body, and dump its datums through the SchemeParser — the Inc-2 seam
+    ; end to end: opensp parse → part assembly → Scheme reader.
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+        let interp Interpreter.make(host, 1440, false, false, false)
+
+        let dsl String("<!DOCTYPE STYLE-SHEET [\n<!ELEMENT style-sheet o o ((style-specification)+)>\n<!ELEMENT style-specification o o (style-specification-body)>\n<!ATTLIST style-specification id id #implied use idrefs #implied>\n<!ELEMENT style-specification-body o o (#pcdata)>\n<!ATTLIST style-specification-body content entity #conref>\n<!NOTATION DSSSL PUBLIC \"ISO/IEC 10179:1996//NOTATION DSSSL Architecture Definition Document//EN\">\n]>\n<STYLE-SHEET>\n<STYLE-SPECIFICATION ID=main>\n<![CDATA[\n(define x 42)\n(element para (quote bar))\n]]>\n</STYLE-SPECIFICATION>\n</STYLE-SHEET>\n")
+        ; the document opens via the file path (the reserved-name-correct route)
+        let path1 String("/tmp/dazzle_spec_test1.dsl")
+        if File.write_from_string(path1, dsl) = false
+            return 1
+        let ps Parser.parse_simple(host, path1, String("dazzle"))
+        if ps = null
+            return 1
+
+        let eh DssslSpecEventHandler.make(host, interp)
+        ; the arch gate must recognize the DSSSL notation
+        if eh.check_dsssl_arch(ps) = false
+            return 2
+
+        let parts eh.load(ps, StringC())
+        if parts = null
+            return 3
+        if parts.get_length() <> (1 as size_t)
+            return 4
+
+        let part *(parts.get_buffer())
+        let body DssslSpecEventHandler.body_text(host, part)
+        if body.get_size() = (0 as size_t)
+            return 5
+
+        ; dump every datum in the body through the SchemeParser
+        let src_in InputSource.make(host, null, body.data_ptr(), body.get_size())
+        let sp SchemeParser.make(host, interp, src_in)
+        let os OutputCharStream.make(host)
+        var count 0
+        repeat
+        {
+            var datum: pointer[ELObj] null
+            var loc Location()
+            var tok 0
+            if sp.parse_datum(0x1, &datum, &loc, &tok) = false
+                break
+            if datum = null
+                break
+            if count > 0
+                os.put_ascii("|")
+            datum.print(os, 1440)
+            set count: count + 1
+        }
+        if count <> 2
+            return 6
+        if os.is_ascii("(define x 42)|(element para (quote bar))") = false
+            return 7
+
+        ; the specNotArc gate: a document WITHOUT the DSSSL notation is rejected
+        let dsl2 String("<!DOCTYPE STYLE-SHEET [\n<!ELEMENT style-sheet o o ((style-specification)+)>\n<!ELEMENT style-specification o o (style-specification-body)>\n<!ELEMENT style-specification-body o o (#pcdata)>\n]>\n<STYLE-SHEET>\n<STYLE-SPECIFICATION>\n<![CDATA[\n(define y 1)\n]]>\n</STYLE-SPECIFICATION>\n</STYLE-SHEET>\n")
+        let path2 String("/tmp/dazzle_spec_test2.dsl")
+        if File.write_from_string(path2, dsl2) = false
+            return 8
+        let ps2 Parser.parse_simple(host, path2, String("dazzle"))
+        let eh2 DssslSpecEventHandler.make(host, interp)
+        if eh2.check_dsssl_arch(ps2)
+            return 9
+
+        0
+    }
+}
