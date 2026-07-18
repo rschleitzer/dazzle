@@ -6,6 +6,7 @@ use opensp.Location.InputSource
 use opensp.Message.MessageType
 use dazzle.ELObj.ELObj
 use dazzle.ELObj.Identifier
+use dazzle.ELObj.FlowObj
 use dazzle.ELObj.OutputCharStream
 use dazzle.Expression.Expression
 use dazzle.Expression.Environment
@@ -20,7 +21,7 @@ use dazzle.Grove.GroveBuilder
 use dazzle.ProcessingMode.ProcessingMode
 use dazzle.Pattern.Pattern
 use dazzle.ProcessContext.ProcessContext
-use dazzle.ProcessContext.FOTBuilder
+use dazzle.TransformFOTBuilder.TransformFOTBuilder
 use opensp.Parser.Parser
 use scaly.io.File
 
@@ -1053,8 +1054,10 @@ define SchemeParser
                 return this.parse_set(result)
             if sk = SK_QUASIQUOTE
                 return this.parse_quasiquote(result)
-            ; make / style / with-mode / query forms are later increments; for
-            ; now they resolve as an ordinary call on the identifier.
+            if sk = SK_MAKE
+                return this.parse_make(result)
+            ; style / with-mode / query forms are later increments; for now they
+            ; resolve as an ordinary call on the identifier.
             return this.parse_regular_call(ident, result)
         }
         ; operator is itself a parenthesized call: (( ... ) args...)
@@ -1084,6 +1087,90 @@ define SchemeParser
         }
         let op Expression.make_variable(hp, func, loc)
         set *result: Expression.make_call(hp, op, args, loc)
+        true
+    }
+
+    ; resolve a flow-object-class identifier to its FOC_* kind: declare-flow-
+    ; object-class bound its VALUE to a FlowObjBox. FOC_SEQUENCE if unbound.
+    function foc_of_ident(this: pointer[SchemeParser], ident: pointer[Identifier]) returns int
+    {
+        let v ident.get_value_raw()
+        if v = null
+            return FOC_SEQUENCE
+        let fo: pointer[FlowObj] v.flowobj_box_ref()
+        if fo = null
+            return FOC_SEQUENCE
+        fo.get_foc()
+    }
+
+    ; parseMake (SchemeParser.cxx) — (make FOC key: val … content…). FOC is the
+    ; flow-object-class identifier (declare-flow-object-class bound it); keyword:
+    ; value pairs are characteristics; the rest are content. The MakeExpr carries
+    ; exprs = [characteristic values …, content …] with `keys` parallel to the
+    ; leading value slice. Characteristics must precede content (the DSSSL make
+    ; idiom); duplicate keys keep the first (C++ dedup).
+    function parse_make(this: pointer[SchemeParser], result: pointer[pointer[Expression]]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let interp this.interp
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let foc_ident interp.lookup(this.current_token)
+        let foc this.foc_of_ident(foc_ident)
+        let keys Array[pointer[Identifier]]^hp()
+        let exprs Array[pointer[Expression]]^hp()
+        repeat
+        {
+            var tem: pointer[Expression] null
+            var key SK_NOTKEY
+            var etok TOKEN_END_OF_ENTITY
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &tem, &key, &etok) = false
+                return false
+            if etok = TOKEN_CLOSE_PAREN
+                break
+            if etok = TOKEN_KEYWORD
+            {
+                ; a characteristic — only while no content has appeared yet.
+                if keys.get_length() = exprs.get_length()
+                {
+                    let k interp.lookup(this.current_token)
+                    var val: pointer[Expression] null
+                    var vkey SK_NOTKEY
+                    var vtok TOKEN_END_OF_ENTITY
+                    if this.parse_expr_full(ALLOW_EXPR, &val, &vkey, &vtok) = false
+                        return false
+                    ; dedup: first occurrence wins.
+                    var dup false
+                    var di 0
+                    while di < (keys.get_length() as int)
+                    {
+                        let kp keys.get(di as size_t)
+                        if kp <> null
+                        {
+                            let ke *kp
+                            let kn ke.get_name()
+                            let cn k.get_name()
+                            if kn.equals(cn)
+                                set dup: true
+                        }
+                        set di: di + 1
+                    }
+                    if dup = false
+                    {
+                        keys.add(k)
+                        exprs.add(val)
+                    }
+                    continue
+                }
+            }
+            if tem = null
+                break
+            exprs.add(tem)
+        }
+        set *result: Expression.make_make(hp, foc, keys, exprs, loc)
         true
     }
 
@@ -1945,7 +2032,9 @@ define SchemeParser
                 return this.do_root()
             if sk = SK_MODE
                 return this.do_mode()
-            ; id rules + declare-* forms are deferred slices; consume cleanly.
+            if sk = SK_DECLARE_FLOW_OBJECT_CLASS
+                return this.do_declare_flow_object_class()
+            ; id rules + other declare-* forms are deferred slices; consume cleanly.
             return this.skip_form()
         }
         this.skip_form()
@@ -2082,6 +2171,22 @@ define SchemeParser
         }
         set this.def_mode: this.interp.initial_processing_mode()
         true
+    }
+
+    ; doDeclareFlowObjectClass — (declare-flow-object-class NAME "public-id").
+    ; Binds NAME's value to a FlowObjBox for the transform flow-object class
+    ; (FOC_* resolved from the public id). The full inheritedC/duplicate-part
+    ; machinery is the print path; here it is a straight name -> value binding.
+    function do_declare_flow_object_class(this: pointer[SchemeParser]) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let ident this.interp.lookup(this.current_token)
+        if this.get_token(ALLOW_STRING, &tok) = false
+            return false
+        this.interp.install_extension_flow_object_class(ident, this.current_token)
+        this.expect_close_paren()
     }
 
     ; parseRuleBody: one expression + the closing paren. Inc 5a is
@@ -2563,7 +2668,8 @@ define SchemeParser
         ; gdoc (document > DOC > PARA[ALIGN=center] > "Hello" + EMPH > "world")
         ; and observe the collected characters.
         ; (1) process-children threads root->DOC->PARA->{data, EMPH}; EMPH wraps.
-        if SchemeParser.style_eq("(root (process-children)) (element DOC (process-children)) (element PARA (process-children)) (element EMPH (sosofo-append (literal \"<\") (process-children) (literal \">\")))", gdoc, "Hello<world>") = false
+        ; The transform FOTBuilder escapes the literal < > as character data.
+        if SchemeParser.style_eq("(root (process-children)) (element DOC (process-children)) (element PARA (process-children)) (element EMPH (sosofo-append (literal \"<\") (process-children) (literal \">\")))", gdoc, "Hello&lt;world&gt;") = false
             return 120
         ; (2) a default rule catches DOC + PARA; EMPH's literal replaces content.
         if SchemeParser.style_eq("(root (process-children)) (default (process-children)) (element EMPH (literal \"X\"))", gdoc, "HelloX") = false
@@ -2577,6 +2683,29 @@ define SchemeParser
         ; (5) select-elements + process-node-list: process only the EMPH child.
         if SchemeParser.style_eq("(root (process-children)) (element DOC (process-children)) (element PARA (process-node-list (select-elements (children (current-node)) \"EMPH\"))) (element EMPH (literal \"E\"))", gdoc, "E") = false
             return 124
+
+        ; --- Inc 5b slice B: the `make` special form -> flow objects --------
+        ; (6) an element flow object brackets its content with start/end tags.
+        if SchemeParser.style_eq("(declare-flow-object-class element \"UNREGISTERED::James Clark//Flow Object Class::element\") (root (make element gi: \"x\" (literal \"hi\")))", gdoc, "<x>hi</x>") = false
+            return 125
+        ; (7) attributes: characteristic -> a name/value pair list.
+        if SchemeParser.style_eq("(declare-flow-object-class element \"UNREGISTERED::James Clark//Flow Object Class::element\") (root (make element gi: \"a\" attributes: (list (list \"href\" \"u\")) (literal \"L\")))", gdoc, "<a href=\"u\">L</a>") = false
+            return 126
+        ; (8) an empty gi falls back to the current node's GI (ElementFlowObj).
+        if SchemeParser.style_eq("(declare-flow-object-class element \"UNREGISTERED::James Clark//Flow Object Class::element\") (root (process-children)) (element DOC (make element (process-children))) (default (process-children))", gdoc, "<DOC>Helloworld</DOC>") = false
+            return 127
+        ; (9) empty-element: atomic, no content (xml off -> no self-close).
+        if SchemeParser.style_eq("(declare-flow-object-class empty-element \"UNREGISTERED::James Clark//Flow Object Class::empty-element\") (root (make empty-element gi: \"br\"))", gdoc, "<br>") = false
+            return 128
+        ; (10) entity-ref: atomic reference syntax.
+        if SchemeParser.style_eq("(declare-flow-object-class entity-ref \"UNREGISTERED::James Clark//Flow Object Class::entity-ref\") (root (make entity-ref name: \"amp\"))", gdoc, "&amp;") = false
+            return 129
+        ; (11) processing-instruction: atomic.
+        if SchemeParser.style_eq("(declare-flow-object-class pi \"UNREGISTERED::James Clark//Flow Object Class::processing-instruction\") (root (make pi data: \"go\"))", gdoc, "<?go>") = false
+            return 130
+        ; (12) the built-in sequence flow object just processes content.
+        if SchemeParser.style_eq("(root (make sequence (literal \"S\")))", gdoc, "S") = false
+            return 131
 
         0
     }
@@ -2597,10 +2726,10 @@ define SchemeParser
         let sp SchemeParser.make(host, interp, src_in)
         sp.parse()
         interp.compile()
-        let fotb FOTBuilder.make(host)
+        let fotb TransformFOTBuilder.make(host, false)
         let pc ProcessContext.make(host, interp, fotb)
         pc.process(root)
-        let s fotb.to_stringc(host)
+        let s fotb.root_to_stringc(host)
         s.equals(StringC(expected))
     }
 
