@@ -453,12 +453,14 @@ define PrimitiveObj (sig: Signature, prim_id: int, ident: pointer[Identifier])
 
 ; An escape-only continuation (call/cc). Zero corpus users; the variant
 ; exists for shape fidelity, call semantics land when something needs it.
-define ContinuationObj (stack_size: int, control_stack_size: int)
+define ContinuationObj (stack_size: int, control_stack_size: int, live: bool, read_only: bool)
 {
     init()
     {
         set this.stack_size: 0
         set this.control_stack_size: 0
+        set this.live: true
+        set this.read_only: false
     }
 }
 
@@ -721,6 +723,82 @@ define ELObj union
         p
     }
 
+    function make_continuation(host: pointer[Page]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.Continuation(ContinuationObj())
+        p
+    }
+
+    ; --- continuation state (call/cc) --------------------------------------
+    ; ContinuationObj::set(stackSize, controlStackSize) — record the capture.
+    function continuation_set(this: pointer[ELObj], ss: int, css: int)
+    {
+        choose *this
+            when k: Continuation
+            {
+                var nk k
+                set nk.stack_size: ss
+                set nk.control_stack_size: css
+                set *this: ELObj.Continuation(nk)
+            }
+            else
+                return
+    }
+
+    function continuation_kill(this: pointer[ELObj])
+    {
+        choose *this
+            when k: Continuation
+            {
+                var nk k
+                set nk.live: false
+                set *this: ELObj.Continuation(nk)
+            }
+            else
+                return
+    }
+
+    function continuation_live(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when k: Continuation
+                return k.live
+            else
+                return false
+        false
+    }
+
+    function continuation_read_only(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when k: Continuation
+                return k.read_only
+            else
+                return false
+        false
+    }
+
+    function continuation_stack_size(this: pointer[ELObj]) returns int
+    {
+        choose *this
+            when k: Continuation
+                return k.stack_size
+            else
+                return 0
+        0
+    }
+
+    function continuation_control_stack_size(this: pointer[ELObj]) returns int
+    {
+        choose *this
+            when k: Continuation
+                return k.control_stack_size
+            else
+                return 0
+        0
+    }
+
     ; --- box accessors -----------------------------------------------------
     function box_value(this: pointer[ELObj]) returns pointer[ELObj]
     {
@@ -864,12 +942,71 @@ define ELObj union
                 return this.prim_call_return(vm, loc, next)
             when a: ApplyFn
                 return this.apply_call(vm, loc, next, false, 0)
+            when cc: CallCCFn
+                return this.callcc_call(vm, loc, next, false, 0)
+            when k: Continuation
+                return this.continuation_call(vm, loc)
             else
             {
                 vm.set_sp(0 - 1)
                 return null
             }
         null
+    }
+
+    ; CallWithCurrentContinuationPrimitiveObj::call/tailCall — replace the sole
+    ; argument (the receiver proc) with a fresh Continuation, invoke it, then
+    ; (for closures) record the continuation in its frame via setArgToCC.
+    function callcc_call(this: pointer[ELObj], vm: pointer[VM], loc: Location, next: pointer[Insn], tail: bool, n_caller_args: int) returns pointer[Insn]
+    {
+        let f vm.stack_ref(vm.get_sp() - 1)
+        if (f = null) or (f.is_function() = false)
+        {
+            vm.get_interp().set_next_location(loc)
+            vm.set_sp(0 - 1)
+            return null
+        }
+        let host vm.get_host()
+        let k ELObj.make_continuation(host)
+        vm.stack_set(vm.get_sp() - 1, k)
+        var insn: pointer[Insn] null
+        if tail
+            set insn: f.tail_call(vm, loc, n_caller_args)
+        else
+            set insn: f.call(vm, loc, next)
+        f.set_arg_to_cc(vm, k)
+        insn
+    }
+
+    ; FunctionObj::setArgToCC — only a Closure records the continuation.
+    function set_arg_to_cc(this: pointer[ELObj], vm: pointer[VM], k: pointer[ELObj])
+    {
+        choose *this
+            when c: Closure
+                vm.set_closure_arg_to_cc(k)
+            else
+                return
+    }
+
+    ; ContinuationObj::call — restore the captured stack + control stack and
+    ; resume with the supplied result (an escape-only, one-shot continuation).
+    function continuation_call(this: pointer[ELObj], vm: pointer[VM], loc: Location) returns pointer[Insn]
+    {
+        if (this.continuation_live() = false) or this.continuation_read_only()
+        {
+            vm.get_interp().set_next_location(loc)
+            vm.set_sp(0 - 1)
+            return null
+        }
+        let result vm.stack_ref(vm.get_sp() - 1)
+        vm.unwind_control_stack(this.continuation_control_stack_size())
+        vm.set_sp(this.continuation_stack_size() - 1)
+        let nxt vm.pop_frame()
+        vm.need_stack(1)
+        let sp2 vm.get_sp()
+        vm.stack_set(sp2, result)
+        vm.set_sp(sp2 + 1)
+        nxt
     }
 
     function tail_call(this: pointer[ELObj], vm: pointer[VM], loc: Location, n_caller_args: int) returns pointer[Insn]
@@ -905,6 +1042,10 @@ define ELObj union
                 return this.prim_tail_call(vm, loc, n_caller_args)
             when a: ApplyFn
                 return this.apply_call(vm, loc, null, true, n_caller_args)
+            when cc: CallCCFn
+                return this.callcc_call(vm, loc, null, true, n_caller_args)
+            when k: Continuation
+                return this.continuation_call(vm, loc)
             else
             {
                 vm.set_sp(0 - 1)
