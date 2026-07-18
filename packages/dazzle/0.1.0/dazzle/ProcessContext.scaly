@@ -1,0 +1,257 @@
+; ProcessContext — drives a grove through a mode's construction rules,
+; emitting a flow-object sequence into a FOTBuilder (Style/ProcessContext.cxx +
+; SosofoObj::process). process(root) walks the tree: each node is matched, its
+; rule evaluated to a sosofo, and the sosofo processed — process-children
+; recurses, literal emits characters, and so on.
+;
+; Inc 5a scope (Konstruktionsregeln-Kern): construction rules + a minimal
+; character-collecting FOTBuilder so a transform's output is observable.
+; Deferred (the print/connection machinery): style stacks, connections/ports,
+; tables, page types, flow objects (`make`) — Inc 6 (FOTBuilder) / Inc 9
+; (print path). process-children-trim approximates to plain process-children
+; (whitespace trimming lands with the trim rules).
+
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use dazzle.Grove.GroveNode
+use dazzle.ELObj.ELObj
+use dazzle.VM.VM
+use dazzle.Interpreter.Interpreter
+use dazzle.ProcessingMode.ProcessingMode
+use dazzle.ProcessingMode.Rule
+use dazzle.ProcessingMode.Specificity
+
+; A minimal FOTBuilder: the transform sink collapsed to a character collector.
+; The real FOTBuilder (formatting-instruction / entity / directory flow object)
+; arrives in Inc 6; the Style engine only needs `characters` to be observable.
+define FOTBuilder (chars: pointer[Array[u32]])
+{
+    function make(host: pointer[Page]) returns pointer[FOTBuilder]
+    {
+        let f host.allocate(sizeof FOTBuilder, alignof FOTBuilder) as pointer[FOTBuilder]
+        set f.chars: Array[u32]^host()
+        f
+    }
+
+    function characters(this: pointer[FOTBuilder], s: pointer[u32], n: size_t)
+    {
+        var i: size_t 0
+        while i < n
+        {
+            this.chars.add(*(s + i))
+            set i: i + 1
+        }
+    }
+
+    function characters_from_node(this: pointer[FOTBuilder], node: pointer[GroveNode], s: pointer[u32], n: size_t)
+        this.characters(s, n)
+
+    ; the collected output as a StringC (test observation point).
+    function to_stringc(this: pointer[FOTBuilder], host: pointer[Page]) returns StringC
+    {
+        let n this.chars.get_length()
+        StringC^host(this.chars.get_buffer(), n)
+    }
+}
+
+define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: pointer[FOTBuilder], match_spec: Specificity, mode: pointer[ProcessingMode])
+{
+    function make(host: pointer[Page], interp: pointer[Interpreter], fotb: pointer[FOTBuilder]) returns pointer[ProcessContext]
+    {
+        let pc host.allocate(sizeof ProcessContext, alignof ProcessContext) as pointer[ProcessContext]
+        set pc.vm: VM.make(host, interp)
+        set pc.interp: interp
+        set pc.fotb: fotb
+        set pc.match_spec: Specificity()
+        set pc.mode: null
+        pc
+    }
+
+    function get_fotb(this: ProcessContext) returns pointer[FOTBuilder]
+        fotb
+
+    ; process(root): the entry point (StyleEngine::process). No initial style in
+    ; Inc 5a; go straight to processNode in the initial mode.
+    function process(this: pointer[ProcessContext], node: pointer[GroveNode])
+    {
+        let m this.interp.initial_processing_mode()
+        this.process_node(node, m)
+    }
+
+    ; processNode: characters flow straight through; element/document nodes are
+    ; matched and their rule evaluated to a sosofo. currentNode + match cursor +
+    ; mode are saved and restored around the (possibly nested) eval.
+    function process_node(this: pointer[ProcessContext], node: pointer[GroveNode], mode: pointer[ProcessingMode])
+    {
+        if node = null
+            return
+        let cls node.get_class()
+        if cls = GN_DATA
+        {
+            let c node.get_chars()
+            this.fotb.characters_from_node(node, c.data_ptr(), c.get_size())
+            return
+        }
+        if cls = GN_PI
+            return
+        let host this.interp.get_host()
+        let save_node this.vm.get_current_node()
+        let save_spec this.match_spec
+        let save_mode this.mode
+        this.vm.set_current_node(node)
+        set this.match_spec: Specificity()
+        set this.mode: mode
+        let rule: pointer[Rule] mode.find_match(node, host, &this.match_spec)
+        if rule = null
+            this.process_children(mode)
+        else
+        {
+            let insn rule.get_rule_insn()
+            let obj this.vm.eval(insn, null, null)
+            if this.interp.is_error(obj)
+            {
+                ; initial (unnamed) mode falls back to processing children.
+                if mode.get_name().get_size() = (0 as size_t)
+                    this.process_children(mode)
+            }
+            else
+                this.process_sosofo(obj)
+        }
+        this.vm.set_current_node(save_node)
+        set this.match_spec: save_spec
+        set this.mode: save_mode
+    }
+
+    ; processChildren: process each child of the current node in `mode`. If the
+    ; current node has no children but is the grove root, descend to the
+    ; document element (mirrors getDocumentElement).
+    function process_children(this: pointer[ProcessContext], mode: pointer[ProcessingMode])
+    {
+        let node this.vm.get_current_node()
+        if node = null
+            return
+        let n node.child_count()
+        if n = 0
+        {
+            if node.get_class() = GN_DOCUMENT
+            {
+                var k 0
+                while k < node.child_count()
+                {
+                    this.process_node(node.child_at(k), mode)
+                    set k: k + 1
+                }
+            }
+            return
+        }
+        var i 0
+        while i < n
+        {
+            this.process_node(node.child_at(i), mode)
+            set i: i + 1
+        }
+    }
+
+    ; nextMatch: resume the current node's rule scan at the next lower rule.
+    function next_match(this: pointer[ProcessContext])
+    {
+        let host this.interp.get_host()
+        let node this.vm.get_current_node()
+        let save_spec this.match_spec
+        let rule: pointer[Rule] this.mode.find_match(node, host, &this.match_spec)
+        if rule = null
+            this.process_children(this.mode)
+        else
+        {
+            let obj this.vm.eval(rule.get_rule_insn(), null, null)
+            if this.interp.is_error(obj)
+                this.process_children(this.mode)
+            else
+                this.process_sosofo(obj)
+        }
+        set this.match_spec: save_spec
+    }
+
+    ; processNodeList: process every node of a node-list value (ProcessNodeList
+    ; SosofoObj::process). currentNode is saved/restored per node by processNode.
+    function process_node_list(this: pointer[ProcessContext], nl: pointer[ELObj])
+    {
+        if nl = null
+            return
+        if nl.is_node_list_p() = false
+            return
+        let n nl.node_list_count()
+        var i 0
+        while i < n
+        {
+            let node nl.node_list_node(i)
+            if node <> null
+                this.process_node(node, this.mode)
+            set i: i + 1
+        }
+    }
+
+    ; SosofoObj::process — the sosofo interpreter. Dispatches on kind.
+    function process_sosofo(this: pointer[ProcessContext], sosofo: pointer[ELObj])
+    {
+        if sosofo = null
+            return
+        if sosofo.is_sosofo_p() = false
+            return
+        let kind sosofo.sosofo_kind()
+        if kind = SOSO_APPEND
+        {
+            let parts sosofo.sosofo_parts()
+            if parts = null
+                return
+            let n parts.get_length()
+            let b parts.get_buffer()
+            var i: size_t 0
+            while i < n
+            {
+                this.process_sosofo(*(b + i))
+                set i: i + 1
+            }
+            return
+        }
+        if kind = SOSO_LITERAL
+        {
+            let str_obj sosofo.sosofo_aux()
+            if str_obj = null
+                return
+            let host this.interp.get_host()
+            let s str_obj.string_data(host)
+            this.fotb.characters(s.data_ptr(), s.get_size())
+            return
+        }
+        if kind = SOSO_PROCESS_CHILDREN
+        {
+            this.process_children(this.mode)
+            return
+        }
+        if kind = SOSO_PROCESS_CHILDREN_TRIM
+        {
+            this.process_children(this.mode)
+            return
+        }
+        if kind = SOSO_PROCESS_NODE_LIST
+        {
+            this.process_node_list(sosofo.sosofo_aux())
+            return
+        }
+        if kind = SOSO_PROCESS_NODE
+        {
+            let nl sosofo.sosofo_aux()
+            if nl <> null
+            {
+                let nd nl.node_list_node(0)
+                if nd <> null
+                    this.process_node(nd, this.mode)
+            }
+            return
+        }
+        if kind = SOSO_NEXT_MATCH
+            this.next_match()
+    }
+}
