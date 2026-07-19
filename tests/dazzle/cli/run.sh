@@ -31,4 +31,17 @@ if [ "$rc" -ne 0 ] || [ "$got" != "$want" ]; then
   exit 1
 fi
 
+# builtins.dsl prolog: map + node-list->list + apply + attribute-string. Guards
+# install_builtins() (the DSSSL Scheme prolog load) end to end. SCALY_HOME is
+# set so the prolog resolves regardless of cwd.
+got2="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/ids.dsl" "$HERE/suite.sgml")"
+rc2=$?
+want2="$(cat "$HERE/ids.expected")"
+if [ "$rc2" -ne 0 ] || [ "$got2" != "$want2" ]; then
+  echo "dazzle-cli: FAIL builtins (rc=$rc2)"
+  echo "  want: $(printf '%s' "$want2" | cat -v)"
+  echo "  got:  $(printf '%s' "$got2" | cat -v)"
+  exit 1
+fi
+
 echo "dazzle-cli: PASS"
