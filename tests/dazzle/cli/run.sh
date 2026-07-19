@@ -69,4 +69,16 @@ if [ "$rc4" -ne 0 ] || [ "$got4" != "$want4" ]; then
   exit 1
 fi
 
+# multiline character-data literal: the RE state machine must keep interior
+# record-ends as newlines (the bug dropped the first, emitted &#13; for the next).
+got5="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/re.dsl" "$HERE/suite.sgml")"
+rc5=$?
+want5="$(cat "$HERE/re.expected")"
+if [ "$rc5" -ne 0 ] || [ "$got5" != "$want5" ]; then
+  echo "dazzle-cli: FAIL re-statemachine (rc=$rc5)"
+  echo "  want: $(printf '%s' "$want5" | cat -v)"
+  echo "  got:  $(printf '%s' "$got5" | cat -v)"
+  exit 1
+fi
+
 echo "dazzle-cli: PASS"
