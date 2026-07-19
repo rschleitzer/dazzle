@@ -57,4 +57,16 @@ if [ "$rc3" -ne 0 ] || [ "$got3" != "$want3" ]; then
   exit 1
 fi
 
+# style-sheet DTD by PUBLIC id (no inline subset) -> forces catalog resolution
+# of the shipped dsssl/style-sheet.dtd (STYLE-SHEET forms + DSSSL arch notation).
+got4="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/public.dsl" "$HERE/suite.sgml")"
+rc4=$?
+want4="$(cat "$HERE/public.expected")"
+if [ "$rc4" -ne 0 ] || [ "$got4" != "$want4" ]; then
+  echo "dazzle-cli: FAIL public-dtd (rc=$rc4)"
+  echo "  want: $(printf '%s' "$want4" | cat -v)"
+  echo "  got:  $(printf '%s' "$got4" | cat -v)"
+  exit 1
+fi
+
 echo "dazzle-cli: PASS"
