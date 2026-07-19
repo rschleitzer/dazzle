@@ -63,6 +63,33 @@ ground-truth oracle for the sink, dazzle-net the structural mirror.
   the allocation seam (objects are `make`d on the run page). No GC in v1;
   the 6a-exit high-water measurement against the 95 MB reference decides
   whether the ladder's scratch-region or Collector rung is needed.
+
+  **6a-exit measurement (2026-07-19, `tests/dazzle/memhw.sh`).** Peak RSS over
+  the in-repo mkp DSSSL codegen corpus (the five `-G -t sgml -d` runs that
+  `tests/dazzle/codegen/run.sh` proves byte-identical):
+
+  | run | dazzle | openjade | ratio |
+  |---|---|---|---|
+  | scaly.dsl → parser/Syntax/grammar | 39.4 MB | 19.8 MB | 2.0× |
+  | test-expressions.dsl (69 tests) | 41.2 MB | 16.4 MB | 2.5× |
+  | test-definitions.dsl (15 tests) | 27.8 MB | 15.8 MB | 1.8× |
+  | test-choose.dsl (14 tests) | 28.6 MB | 15.6 MB | 1.8× |
+  | test-controlflow.dsl (28 tests) | 33.1 MB | 15.9 MB | 2.1× |
+
+  High-water **41.2 MB** (vs a ~9 MB fixed floor on a trivial doc). The 1.8–2.5×
+  overhead over openjade's mark-sweep GC is the expected arena-retention cost
+  and is negligible in absolute terms. Retention is **sub-linear in rule count**,
+  not the feared O(n²): per-test cost *falls* as the doc grows (1.40 MB/test at
+  14 tests → 0.47 MB/test at 69) — an O(n²) churn would make it rise.
+
+  **Verdict for risk-register item 1: arena-per-run is sufficient at this scale;
+  neither the scratch-region (rung ii) nor the Collector (rung iii) is needed.**
+  Caveat: this is the project's own literate/grammar corpus. The real-world
+  service-codegen family (the 3.6 M-output module behind the 95 MB openjade
+  reference above) uses named-let-over-node-list idioms more heavily and is not
+  in this checkout — re-run `memhw.sh` against it when those stylesheets are
+  available (Stage 4/9). Rung (iii) remains the bounded fallback, so this is a
+  cost risk, never an architectural one.
 - **`eq?` / identity-keyed tables rely on stable addresses** — sound as long
   as we do NOT copy objects between regions. Any future scratch-region
   copy-out must exempt identity-bearing objects (design-note item for that
