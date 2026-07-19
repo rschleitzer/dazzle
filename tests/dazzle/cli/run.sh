@@ -44,4 +44,17 @@ if [ "$rc2" -ne 0 ] || [ "$got2" != "$want2" ]; then
   exit 1
 fi
 
+# full DSSSL style-sheet SGML wrapper (<!DOCTYPE STYLE-SHEET> + <STYLE-SPECIFICATION>
+# + CDATA body) routed through DssslSpecEventHandler (the -d spec reader). Same
+# stylesheet body as ids.dsl, so same golden.
+got3="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/wrapped.dsl" "$HERE/suite.sgml")"
+rc3=$?
+want3="$(cat "$HERE/wrapped.expected")"
+if [ "$rc3" -ne 0 ] || [ "$got3" != "$want3" ]; then
+  echo "dazzle-cli: FAIL wrapped-spec (rc=$rc3)"
+  echo "  want: $(printf '%s' "$want3" | cat -v)"
+  echo "  got:  $(printf '%s' "$got3" | cat -v)"
+  exit 1
+fi
+
 echo "dazzle-cli: PASS"
