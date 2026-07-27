@@ -554,6 +554,21 @@ define ParserState
     ; pass-1 interleave marks: events.length at each pass-1 kept message, so
     ; the no-pass2 replay interprets buffered rast PIs in stream order.
     pass1_kept_marks: Array[size_t]
+    ; ---- streaming ESIS delivery (memory Front B) ----------------------
+    ; The reference STREAMS events through the handler and frees each; the
+    ; port's whole-run event queue retained every Event + its data copy on
+    ; the run arena (~600 MB on a 5 MB parse). When streaming is on, events
+    ; allocate on ev_scratch (an exclusive-page region of the run page) and
+    ; the parser drains queued events into the ESIS writer (stream_w, a
+    ; pointer[EsisW] — typed void: module Esis is planned after this one)
+    ; chunk-wise, then resets the scratch region. Queue entries below
+    ; `drained` are dangling and never read again. Streaming stays OFF for
+    ; RAST (-t), architectures (-A), link activation (-a, the pass-2
+    ; replay discards queued events) and -p — those need the full queue.
+    streaming: bool
+    stream_w: pointer[void]
+    ev_scratch: pointer[Page]
+    drained: size_t
 )
 {
     function make(host: pointer[Page], entity_manager: pointer[EntityManager], subdoc_level: u32, final_phase: int) returns pointer[ParserState]
@@ -679,7 +694,53 @@ define ParserState
         set ps.rast_had_doc_element: false
         set ps.rast_simple_names: null
         set ps.pass1_kept_marks: Array[size_t]^host()
+        set ps.streaming: false
+        set ps.stream_w: null
+        set ps.ev_scratch: null
+        set ps.drained: 0
         ps
+    }
+
+    ; ---- streaming ESIS delivery (memory Front B) --------------------------
+    function is_streaming(this: ParserState) returns bool
+        streaming
+
+    function get_stream_w(this: ParserState) returns pointer[void]
+        stream_w
+
+    function get_drained(this: ParserState) returns size_t
+        drained
+
+    function set_drained(this: pointer[ParserState], n: size_t)
+        set this.drained: n
+
+    ; the page events (and their payload copies) allocate on: the drainable
+    ; scratch region when streaming, the run page otherwise.
+    function event_host(this: ParserState) returns pointer[Page]
+    {
+        if ev_scratch <> null
+            return ev_scratch
+        host
+    }
+
+    function enable_streaming(this: pointer[ParserState], w: pointer[void])
+    {
+        set this.streaming: true
+        set this.stream_w: w
+        let hp this.host
+        set this.ev_scratch: hp.allocate_exclusive_page()
+    }
+
+    ; release every event allocated since the last drain and start a fresh
+    ; scratch region. Only sound right after the writer consumed the queue
+    ; up to its current length.
+    function reset_event_scratch(this: pointer[ParserState])
+    {
+        let hp this.host
+        let old this.ev_scratch
+        if old <> null
+            hp.deallocate_exclusive_page(old)
+        set this.ev_scratch: hp.allocate_exclusive_page()
     }
 
     ; ---- RAST (-t) --------------------------------------------------------
@@ -1262,7 +1323,8 @@ define ParserState
         set *bp: re
         let sc StringC(bp, 1 as size_t)
         let loc (*this).os_top_re_loc()
-        let ev Event.make_data(this.host, sc, loc)
+        let eh (*this).event_host()
+        let ev Event.make_data(eh, sc, loc)
         this.queue_event(ev)
     }
 
@@ -2390,7 +2452,7 @@ define ParserState
             {
                 if (this.output_flags & OF_ENTITY) <> (0 as u32)
                 {
-                    let hp this.host
+                    let hp (*this).event_host()
                     this.queue_event(Event.make_entity_defaulted(hp, entity, Location()))
                 }
             }
