@@ -309,6 +309,12 @@ define Identifier
             return this.value
         }
         set this.being_computed: true
+        ; makePermanent semantics: the computed value (and its insn) is cached
+        ; on the Identifier and read by every later eval — it must build on
+        ; the run page, never on the eval scratch region a TopRefInsn forcing
+        ; may be running under. Clear the region for the computation.
+        let saved_region interp.get_eval_region()
+        interp.set_eval_region(null)
         let host interp.get_host()
         if this.insn = null
         {
@@ -320,6 +326,7 @@ define Identifier
             let vm VM.make(host, interp)
             set this.value: vm.eval(this.insn, null, null)
         }
+        interp.set_eval_region(saved_region)
         set this.being_computed: false
         this.value
     }
@@ -379,6 +386,25 @@ define StringObj (str: StringC)
 {
     init(str: StringC)
         set this.str: str
+}
+
+; StrCatObj — a lazy string-concatenation node (rope). string-append over a
+; large total builds one of these (parts = the argument objects: Str/Chr/
+; nested StrCat) instead of materializing; the flat buffer is produced once
+; on first consumption (string_data) and the node is overwritten in place
+; with the Str arm (memoized — same union slot, no growth). This is an
+; allocation-seam deviation of the same kind as the RBMM arena itself: the
+; reference materializes every append and lets the GC reclaim the
+; intermediates; without a GC the nested appends of the generator corpus
+; retained O(depth × bytes) in the eval region. Value semantics identical
+; (strings are immutable; string-append returns a fresh object either way).
+define StrCatObj (parts: pointer[Array[pointer[ELObj]]], size: size_t)
+{
+    init(parts: pointer[Array[pointer[ELObj]]], size: size_t)
+    {
+        set this.parts: parts
+        set this.size: size
+    }
 }
 
 define IntegerObj (n: int)
@@ -641,6 +667,7 @@ define ELObj union
     Vec: VectorObj
     Chr: CharObj
     Str: StringObj
+    StrCat: StrCatObj
     Int: IntegerObj
     Real: RealObj
     Length: LengthObj
@@ -768,6 +795,14 @@ define ELObj union
     {
         let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
         set *p: ELObj.Str(StringObj(StringC^host(str.data_ptr(), str.get_size())))
+        p
+    }
+
+    ; a rope node over already-string-valued parts; `size` = total chars.
+    function make_strcat(host: pointer[Page], parts: pointer[Array[pointer[ELObj]]], size: size_t) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.StrCat(StrCatObj(parts, size))
         p
     }
 
@@ -1532,6 +1567,8 @@ define ELObj union
         choose *this
             when s: Str
                 return true
+            when sc: StrCat
+                return true
             else
                 return false
         false
@@ -1733,6 +1770,8 @@ define ELObj union
                 return true
             when s: Str
                 return true
+            when sc: StrCat
+                return true
             else
                 return false
         false
@@ -1751,9 +1790,101 @@ define ELObj union
             }
             when s: Str
                 return s.str
+            when sc: StrCat
+            {
+                ; flatten once and memoize in place. The scratch fill buffer
+                ; goes on the caller's host (transient); the final buffer on
+                ; the rope's OWN page — the memoized Str must live exactly as
+                ; long as the object itself, and callers pass shorter-lived
+                ; hosts (a deeper eval scratch region).
+                let n sc.size
+                if n = (0 as size_t)
+                {
+                    set *this: ELObj.Str(StringObj(StringC()))
+                    return StringC()
+                }
+                let tmp host.allocate(n * (sizeof u32), alignof u32) as pointer[u32]
+                this.strcat_fill(tmp, 0 as size_t)
+                let own Page.get(this as pointer[void])
+                let flat StringC^own(tmp, n)
+                set *this: ELObj.Str(StringObj(flat))
+                return flat
+            }
             else
                 return StringC()
         StringC()
+    }
+
+    ; stringData total WITHOUT flattening a rope (string-append/string-length
+    ; fast path). Negative when the object carries no string data.
+    function string_size(this: pointer[ELObj]) returns i64
+    {
+        choose *this
+            when c: Chr
+                return 1 as i64
+            when s: Str
+                return s.str.get_size() as i64
+            when sc: StrCat
+                return sc.size as i64
+            else
+                return (0 - 1) as i64
+        (0 - 1) as i64
+    }
+
+    ; flatten walk: write this object's string data at buf+off, return the
+    ; advanced offset.
+    function strcat_fill(this: pointer[ELObj], buf: pointer[u32], off: size_t) returns size_t
+    {
+        choose *this
+            when c: Chr
+            {
+                set *(buf + off): c.ch
+                return off + 1
+            }
+            when s: Str
+            {
+                let m s.str.get_size()
+                var k: size_t 0
+                while k < m
+                {
+                    set *(buf + off + k): s.str.get(k)
+                    set k: k + 1
+                }
+                return off + m
+            }
+            when sc: StrCat
+            {
+                let ps sc.parts
+                let n ps.get_length()
+                let b ps.get_buffer()
+                var o off
+                var i: size_t 0
+                while i < n
+                {
+                    let part *(b + i)
+                    if part <> null
+                        set o: part.strcat_fill(buf, o)
+                    set i: i + 1
+                }
+                return o
+            }
+            else
+                return off
+        off
+    }
+
+    ; collapse a rope in place (consumers that pattern-match the Str arm
+    ; directly — printer, is_equal — normalize first).
+    procedure normalize_string(this: pointer[ELObj])
+    {
+        choose *this
+            when sc: StrCat
+            {
+                let own Page.get(this as pointer[void])
+                this.string_data(own)
+            }
+            else
+                return
     }
 
     function is_exact_integer(this: pointer[ELObj]) returns bool
@@ -1912,6 +2043,8 @@ define ELObj union
         choose *this
             when s: Str
                 return this
+            when sc: StrCat
+                return this
             when sym: Symbol
                 return ELObj.make_string(host, sym.name)
             when c: Chr
@@ -1932,6 +2065,7 @@ define ELObj union
     ; as a scalar until Inc 3 lands the Interpreter record.
     function print(this: pointer[ELObj], os: pointer[OutputCharStream], units_per_inch: int)
     {
+        this.normalize_string()
         choose *this
             when e: Error
                 os.put_ascii("#<error>")
@@ -2261,6 +2395,8 @@ define ELObj union
 
     function is_equal(a: pointer[ELObj], b: pointer[ELObj]) returns bool
     {
+        a.normalize_string()
+        b.normalize_string()
         choose *a
             when k: Keyword
             {
