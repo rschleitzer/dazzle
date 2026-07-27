@@ -119,4 +119,18 @@ if [ "$rc8" -ne 0 ] || [ "$got8" != "FALLBACK" ] \
   exit 1
 fi
 
+# forward-declared flow-object class (declare-flow-object-class AFTER the make
+# that uses it — cql.dsl loads fodeclare.scm last; MakeExpression resolves at
+# compile) + node-property with keyword args (tree-root/grove-root/default:).
+# Golden validated against the reference dazzle.
+got9="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/focfwd.dsl" "$HERE/axis.sgml")"
+rc9=$?
+want9="$(cat "$HERE/focfwd.expected")"
+if [ "$rc9" -ne 0 ] || [ "$got9" != "$want9" ]; then
+  echo "dazzle-cli: FAIL foc-forward/node-property (rc=$rc9)"
+  echo "  want: $(printf '%s' "$want9" | cat -v)"
+  echo "  got:  $(printf '%s' "$got9" | cat -v)"
+  exit 1
+fi
+
 echo "dazzle-cli: PASS"
