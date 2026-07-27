@@ -23,8 +23,12 @@ use dazzle.ProcessingMode.ProcessingMode
 use dazzle.ProcessingMode.Rule
 use dazzle.ProcessingMode.Specificity
 use dazzle.TransformFOTBuilder.TransformFOTBuilder
+use dazzle.SgmlFOTBuilder.SgmlFOTBuilder
+use dazzle.Style.StyleStack
+use dazzle.Style.InheritedC
+use dazzle.Style.DisplayNIC
 
-define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: pointer[TransformFOTBuilder], match_spec: Specificity, mode: pointer[ProcessingMode])
+define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: pointer[TransformFOTBuilder], match_spec: Specificity, mode: pointer[ProcessingMode], sgml_fotb: pointer[void], style_stack: pointer[void])
 {
     function make(host: pointer[Page], interp: pointer[Interpreter], fotb: pointer[TransformFOTBuilder]) returns pointer[ProcessContext]
     {
@@ -34,11 +38,57 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
         set pc.fotb: fotb
         set pc.match_spec: Specificity()
         set pc.mode: null
+        set pc.sgml_fotb: null
+        set pc.style_stack: null
         pc
     }
 
     function get_fotb(this: ProcessContext) returns pointer[TransformFOTBuilder]
         fotb
+
+    ; the fot-backend constructor: the SgmlFOTBuilder sink + a style stack
+    ; (the transform path never pushes styles — its reference setters are
+    ; no-ops; see DESIGN.md Inc 8).
+    function make_fot(host: pointer[Page], interp: pointer[Interpreter], sgml: pointer[SgmlFOTBuilder]) returns pointer[ProcessContext]
+    {
+        let pc host.allocate(sizeof ProcessContext, alignof ProcessContext) as pointer[ProcessContext]
+        set pc.vm: VM.make(host, interp)
+        set pc.interp: interp
+        set pc.fotb: null
+        set pc.match_spec: Specificity()
+        set pc.mode: null
+        set pc.sgml_fotb: sgml as pointer[void]
+        set pc.style_stack: StyleStack.make(host) as pointer[void]
+        pc
+    }
+
+    function sgml_sink(this: ProcessContext) returns pointer[SgmlFOTBuilder]
+        sgml_fotb as pointer[SgmlFOTBuilder]
+
+    ; characters dispatch — the two sinks (exactly one is non-null).
+    function emit_characters(this: pointer[ProcessContext], s: pointer[u32], n: size_t)
+    {
+        let sg this.sgml_sink()
+        if sg <> null
+        {
+            sg.characters(s, n)
+            return
+        }
+        if this.fotb <> null
+            this.fotb.characters(s, n)
+    }
+
+    function emit_characters_node(this: pointer[ProcessContext], node: pointer[GroveNode], s: pointer[u32], n: size_t)
+    {
+        let sg this.sgml_sink()
+        if sg <> null
+        {
+            sg.characters_from_node(node, s, n)
+            return
+        }
+        if this.fotb <> null
+            this.fotb.characters_from_node(node, s, n)
+    }
 
     ; process(root): the entry point (StyleEngine::process). No initial style in
     ; Inc 5a; go straight to processNode in the initial mode.
@@ -59,7 +109,7 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
         if cls = GN_DATA
         {
             let c node.get_chars()
-            this.fotb.characters_from_node(node, c.data_ptr(), c.get_size())
+            this.emit_characters_node(node, c.data_ptr(), c.get_size())
             return
         }
         if cls = GN_PI
@@ -86,6 +136,10 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
         ; EvalContext.processingMode — the process-* primitives capture it,
         ; with-mode brackets rebind it during the eval.
         this.vm.set_processing_mode(mode as pointer[void])
+        ; fot: the pending-anchor bracket (ProcessContext.cxx startNode/endNode)
+        let sg0 this.sgml_sink()
+        if sg0 <> null
+            sg0.start_node(node, mode.get_name())
         let rule: pointer[Rule] mode.find_match(node, host, &this.match_spec)
         if rule = null
             this.process_children(mode)
@@ -102,6 +156,8 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
             else
                 this.process_sosofo(obj)
         }
+        if sg0 <> null
+            sg0.end_node()
         this.vm.set_current_node(save_node)
         set this.match_spec: save_spec
         set this.mode: save_mode
@@ -220,7 +276,7 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
                 return
             let host this.interp.get_host()
             let s str_obj.string_data(host)
-            this.fotb.characters(s.data_ptr(), s.get_size())
+            this.emit_characters(s.data_ptr(), s.get_size())
             return
         }
         if kind = SOSO_PROCESS_CHILDREN
@@ -285,6 +341,11 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
         if fo = null
             return
         let foc fo.get_foc()
+        if this.sgml_sink() <> null
+        {
+            this.process_flow_obj_fot(sosofo, fo, foc)
+            return
+        }
         if foc = FOC_ELEMENT
         {
             let gi this.element_gi(fo)
@@ -336,6 +397,110 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
             return
         }
         ; FOC_SEQUENCE (and any unknown class): just process the content.
+        this.process_flow_obj_content(sosofo)
+    }
+
+    ; --- the fot path (Inc 8) -------------------------------------------------
+    ; FlowObj::process — push the attached style (emitting set_ic for every
+    ; spec pushed at this level), emit the flow object, process content, pop.
+    function push_fo_style(this: pointer[ProcessContext], fo: pointer[FlowObj])
+    {
+        let ss this.style_stack as pointer[StyleStack]
+        let style fo.get_style()
+        if style = null
+        {
+            ss.push_empty()
+            return
+        }
+        let scratch this.interp.get_host()
+        ss.push_start(scratch)
+        ss.push_continue(style, scratch)
+        ; pushEnd: render the specs pushed at this level, in push order.
+        let sg this.sgml_sink()
+        let list ss.current_specs()
+        if list <> null
+        {
+            let n list.get_length()
+            var i: size_t 0
+            while i < n
+            {
+                let indp list.get(i)
+                if indp <> null
+                {
+                    let spec ss.spec_of(*indp)
+                    if spec <> null
+                        sg.set_ic(spec)
+                }
+                set i: i + (1 as size_t)
+            }
+        }
+    }
+
+    function pop_fo_style(this: pointer[ProcessContext], fo: pointer[FlowObj])
+    {
+        let ss this.style_stack as pointer[StyleStack]
+        if fo.get_style() = null
+        {
+            ss.pop_empty()
+            return
+        }
+        ss.pop()
+    }
+
+    ; the fot flow-object dispatch (SgmlFOTBuilder's slice: sequence,
+    ; paragraph, paragraph-break, display-group, line-field). Unknown classes
+    ; (incl. the transform extensions bound as FOC_UNKNOWN under -t fot) are
+    ; content-transparent; formatting-instruction is the base-class atomic
+    ; no-op.
+    function process_flow_obj_fot(this: pointer[ProcessContext], sosofo: pointer[ELObj], fo: pointer[FlowObj], foc: int)
+    {
+        let sg this.sgml_sink()
+        if foc = FOC_PARAGRAPH
+        {
+            this.push_fo_style(fo)
+            sg.start_paragraph(fo.get_dnic() as pointer[DisplayNIC])
+            this.process_flow_obj_content(sosofo)
+            sg.end_paragraph()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_PARAGRAPH_BREAK
+        {
+            this.push_fo_style(fo)
+            sg.paragraph_break(fo.get_dnic() as pointer[DisplayNIC])
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_DISPLAY_GROUP
+        {
+            this.push_fo_style(fo)
+            sg.start_display_group(fo.get_dnic() as pointer[DisplayNIC])
+            this.process_flow_obj_content(sosofo)
+            sg.end_display_group()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_LINE_FIELD
+        {
+            this.push_fo_style(fo)
+            sg.start_line_field()
+            this.process_flow_obj_content(sosofo)
+            sg.end_line_field()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_SEQUENCE
+        {
+            this.push_fo_style(fo)
+            sg.start_sequence()
+            this.process_flow_obj_content(sosofo)
+            sg.end_sequence()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_FORMATTING_INSTRUCTION
+            return
+        ; FOC_UNKNOWN and anything unported: content only.
         this.process_flow_obj_content(sosofo)
     }
 

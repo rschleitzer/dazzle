@@ -1,6 +1,7 @@
 use scaly.memory.Page
 use scaly.containers.Array
 use opensp.Location.Location
+use opensp.StringC.StringC
 use dazzle.ELObj.ELObj
 use dazzle.ELObj.Identifier
 use dazzle.ELObj.FlowObj
@@ -8,6 +9,8 @@ use dazzle.Insn.Insn
 use dazzle.Insn.Signature
 use dazzle.Interpreter.Interpreter
 use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.Style.InheritedC
+use dazzle.Style.Convert
 
 ; Expression — the compiled-form AST (Style/Expression.cxx). Each Expression
 ; compiles to an Insn chain against a compilation Environment that resolves
@@ -367,6 +370,7 @@ define LambdaExpr (formals: pointer[Array[pointer[Identifier]]], inits: pointer[
 ; declare-flow-object-class LATER in the part reaches back (cql.dsl loads
 ; fodeclare.scm last). Unknown class at compile = message + sequence fallback.
 define MakeExpr (foc_ident: pointer[Identifier], keys: pointer[Array[pointer[Identifier]]], exprs: pointer[Array[pointer[Expression]]], loc: Location)
+define StyleExpr (keys: pointer[Array[pointer[Identifier]]], exprs: pointer[Array[pointer[Expression]]], loc: Location)
 
 ; WithModeExpr — `(with-mode NAME expr)` (WithModeExpression): eval `content`
 ; with the VM's EvalContext processingMode switched to `mode` (a
@@ -398,6 +402,7 @@ define Expression union
     Assignment: AssignmentExpr
     Lambda: LambdaExpr
     Make: MakeExpr
+    StyleE: StyleExpr
     WithMode: WithModeExpr
 )
 {
@@ -517,6 +522,13 @@ define Expression union
         p
     }
 
+    function make_style_expr(host: pointer[Page], keys: pointer[Array[pointer[Identifier]]], exprs: pointer[Array[pointer[Expression]]], loc: Location) returns pointer[Expression]
+    {
+        let p Expression.alloc(host)
+        set *p: Expression.StyleE(StyleExpr(keys, exprs, loc))
+        p
+    }
+
     function make_with_mode(host: pointer[Page], mode: pointer[void], content: pointer[Expression], loc: Location) returns pointer[Expression]
     {
         let p Expression.alloc(host)
@@ -562,6 +574,8 @@ define Expression union
                 return e.loc
             when e: Make
                 return e.loc
+            when e: StyleE
+                return e.loc
             when e: WithMode
                 return e.loc
             else
@@ -573,6 +587,21 @@ define Expression union
     function constant_value(this: pointer[Expression]) returns pointer[ELObj]
     {
         choose *this
+            when e: ResolvedConstant
+                return e.obj
+            else
+                return null
+        null
+    }
+
+    ; the datum of either constant arm — the make-IC compile split uses it
+    ; (a parsed literal like 12pt or a quoted symbol is a Constant carrying
+    ; its ELObj; evaluation would be pure, so folding it here is safe).
+    function constant_datum(this: pointer[Expression]) returns pointer[ELObj]
+    {
+        choose *this
+            when e: Constant
+                return e.obj
             when e: ResolvedConstant
                 return e.obj
             else
@@ -755,6 +784,8 @@ define Expression union
                 ; closures over let* bindings in make content came up
                 ; "reference to undefined variable" or silently empty).
                 Expression.mark_list(e.exprs, vars, is_shared)
+            when e: StyleE
+                Expression.mark_list(e.exprs, vars, is_shared)
             when e: WithMode
                 e.content.mark_bound_vars(vars, is_shared)
             else
@@ -851,6 +882,8 @@ define Expression union
                 return this.compile_lambda(interp, env, stack_pos, next)
             when e: Make
                 return this.compile_make(e.foc_ident, e.keys, e.exprs, e.loc, interp, env, stack_pos, next)
+            when e: StyleE
+                return this.compile_style(e.keys, e.exprs, e.loc, interp, env, stack_pos, next)
             when e: WithMode
             {
                 ; WithModeExpression::compile — an undefined mode messages
@@ -896,7 +929,114 @@ define Expression union
             set n_key: keys.get_length() as int
         let total exprs.get_length() as int
         let n_content total - n_key
-        var result Insn.make_flow_obj(host, foc, keys, n_content, loc, next)
+        ; the styled classes (StyleExpression::compile split): classify each
+        ; keyword as NIC / IC (const or pending) / use: / ignored. Transform
+        ; classes keep the collapsed path (key_class stays null); FOC_UNKNOWN
+        ; swallows every keyword (UnknownFlowObj::hasNonInheritedC).
+        var key_class: pointer[Array[int]] null
+        var key_ic: pointer[Array[pointer[InheritedC]]] null
+        var styled false
+        if foc = FOC_SEQUENCE
+            set styled: true
+        if (foc >= FOC_PARAGRAPH) and (foc <= FOC_LINE_FIELD)
+            set styled: true
+        if styled and (n_key > 0)
+        {
+            set key_class: Array[int]^host()
+            set key_ic: Array[pointer[InheritedC]]^host()
+            var display_foc false
+            if foc = FOC_PARAGRAPH
+                set display_foc: true
+            if foc = FOC_PARAGRAPH_BREAK
+                set display_foc: true
+            if foc = FOC_DISPLAY_GROUP
+                set display_foc: true
+            var has_use false
+            let eb exprs.get_buffer()
+            var i 0
+            while i < n_key
+            {
+                var cls KEY_IGNORE
+                var icp: pointer[InheritedC] null
+                let kp keys.get(i as size_t)
+                if kp <> null
+                {
+                    let ident *kp
+                    let sk ident.syntactic_key()
+                    let ei *(eb + i)
+                    var handled false
+                    if display_foc and Convert.is_display_nic_key(sk)
+                    {
+                        set cls: KEY_NIC
+                        set handled: true
+                    }
+                    if handled = false
+                    {
+                        if (foc = FOC_DISPLAY_GROUP) and (sk = SK_COALESCE_ID)
+                        {
+                            set cls: KEY_NIC
+                            set handled: true
+                        }
+                    }
+                    if handled = false
+                    {
+                        ; line-field's InlineNIC priorities: accepted, never
+                        ; printed by the fot dump.
+                        if (foc = FOC_LINE_FIELD) and ((sk = SK_BREAK_BEFORE_PRIORITY) or (sk = SK_BREAK_AFTER_PRIORITY))
+                            set handled: true
+                    }
+                    if handled = false
+                    {
+                        if sk = SK_KEY_USE
+                        {
+                            if has_use = false
+                            {
+                                set cls: KEY_USE
+                                set has_use: true
+                            }
+                            set handled: true
+                        }
+                    }
+                    if handled = false
+                    {
+                        let icraw ident.get_inherited_c()
+                        if icraw <> null
+                        {
+                            let proto icraw as pointer[InheritedC]
+                            let cv ei.constant_datum()
+                            if cv <> null
+                            {
+                                let cic Convert.ic_from_value(host, proto, cv, ei.location(), interp)
+                                if cic <> null
+                                {
+                                    set cls: KEY_IC_CONST
+                                    set icp: cic
+                                }
+                            }
+                            else
+                            {
+                                set cls: KEY_IC_PENDING
+                                set icp: InheritedC.make_pending(host, proto, i, ei.location())
+                            }
+                            set handled: true
+                        }
+                    }
+                    if handled = false
+                    {
+                        ; MakeExpression::unknownStyleKeyword: label:/
+                        ; content-map: return silently (their machinery is a
+                        ; later slice); anything else messages at the MAKE's
+                        ; location with the class name.
+                        if (sk <> SK_KEY_LABEL) and (sk <> SK_KEY_CONTENT_MAP)
+                            this.unknown_make_keyword(ident, foc_ident, interp, loc)
+                    }
+                }
+                key_class.add(cls)
+                key_ic.add(icp)
+                set i: i + 1
+            }
+        }
+        var result Insn.make_flow_obj(host, foc, keys, key_class, key_ic as pointer[void], n_content, loc, next)
         let b exprs.get_buffer()
         var i total - 1
         while i >= 0
@@ -906,6 +1046,114 @@ define Expression union
             set i: i - 1
         }
         result
+    }
+
+    ; StyleExpression::compile — the pure style form `(style key: val …)`:
+    ; the same keyword split as the styled make, minus NICs and content.
+    function compile_style(this: pointer[Expression], keys: pointer[Array[pointer[Identifier]]], exprs: pointer[Array[pointer[Expression]]], loc: Location, interp: pointer[Interpreter], env: pointer[Environment], stack_pos: int, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host interp.get_host()
+        var n_key 0
+        if keys <> null
+            set n_key: keys.get_length() as int
+        let key_class Array[int]^host()
+        let key_ic Array[pointer[InheritedC]]^host()
+        var has_use false
+        let eb exprs.get_buffer()
+        var i 0
+        while i < n_key
+        {
+            var cls KEY_IGNORE
+            var icp: pointer[InheritedC] null
+            let kp keys.get(i as size_t)
+            if kp <> null
+            {
+                let ident *kp
+                let sk ident.syntactic_key()
+                let ei *(eb + i)
+                var handled false
+                if sk = SK_KEY_USE
+                {
+                    if has_use = false
+                    {
+                        set cls: KEY_USE
+                        set has_use: true
+                    }
+                    set handled: true
+                }
+                if handled = false
+                {
+                    let icraw ident.get_inherited_c()
+                    if icraw <> null
+                    {
+                        let proto icraw as pointer[InheritedC]
+                        let cv ei.constant_datum()
+                        if cv <> null
+                        {
+                            let cic Convert.ic_from_value(host, proto, cv, ei.location(), interp)
+                            if cic <> null
+                            {
+                                set cls: KEY_IC_CONST
+                                set icp: cic
+                            }
+                        }
+                        else
+                        {
+                            set cls: KEY_IC_PENDING
+                            set icp: InheritedC.make_pending(host, proto, i, ei.location())
+                        }
+                        set handled: true
+                    }
+                }
+                if handled = false
+                    this.unknown_style_keyword(ident, interp, loc)
+            }
+            key_class.add(cls)
+            key_ic.add(icp)
+            set i: i + 1
+        }
+        var result Insn.make_style_insn(host, keys, key_class, key_ic as pointer[void], loc, next)
+        var j n_key - 1
+        while j >= 0
+        {
+            let ej *(eb + j)
+            set result: Expression.optimize_compile(ej, interp, env, stack_pos + j, result)
+            set j: j - 1
+        }
+        result
+    }
+
+    ; StyleExpression::unknownStyleKeyword — "<name>:" is not a style keyword.
+    function unknown_style_keyword(this: pointer[Expression], ident: pointer[Identifier], interp: pointer[Interpreter], loc: Location)
+    {
+        let host interp.get_host()
+        interp.set_next_location(loc)
+        interp.message1(InterpreterMessages.invalidStyleKeyword(), Expression.keyword_arg(host, ident))
+    }
+
+    ; MakeExpression::unknownStyleKeyword — "<name>:" is not valid for this
+    ; flow object class.
+    function unknown_make_keyword(this: pointer[Expression], ident: pointer[Identifier], foc_ident: pointer[Identifier], interp: pointer[Interpreter], loc: Location)
+    {
+        let host interp.get_host()
+        interp.set_next_location(loc)
+        interp.message2(InterpreterMessages.invalidMakeKeyword(), Expression.keyword_arg(host, ident), foc_ident.get_name())
+    }
+
+    ; "<name>:" — the keyword-shaped message argument.
+    function keyword_arg(host: pointer[Page], ident: pointer[Identifier]) returns StringC
+    {
+        let nm ident.get_name()
+        let n nm.get_size()
+        let buf host.allocate((n + (1 as size_t)) * (4 as size_t), 4) as pointer[u32]
+        var i: size_t 0
+        while i < n
+        {
+            set *(buf + i): nm.get(i)
+            set i: i + (1 as size_t)
+        }
+        set *(buf + n): 0x3A as u32
+        StringC(buf, n + (1 as size_t))
     }
 
     ; VariableExpression::compile.

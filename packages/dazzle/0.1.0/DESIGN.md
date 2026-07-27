@@ -142,7 +142,79 @@ emission-neutral — `cycle.sh` IDENTICAL)
 
 ## Deliberate non-goals in 6a
 
-- No print path (`InheritedC`, RTF/TeX/MIF/HTML backends) — Stage 9.
 - No `call/cc` (loud unsupported error; zero corpus users).
 - No JIT — that is 6b, behind the `Expression` seam established here.
 - `LangObj`/`MacroFlowObj` etc. ported only if the demand list pulls them in.
+- ~~No print path (`InheritedC`, RTF/TeX/MIF/HTML backends) — Stage 9.~~
+  SUPERSEDED by the widened 6a exit (REPRODUCTION.md step 2, started
+  2026-07-27): the `-t fot` backend + the inherited-characteristics
+  foundation land in 6a; see Inc 8 below.
+
+## Inc 8 — `-t fot` backend (SgmlFOTBuilder) + inherited-characteristics foundation
+
+Reference: `jade/SgmlFOTBuilder.cxx` (2824 LOC) fed by the style engine's
+IC system (`style/Style.{h,cxx}`, `style/InheritedC.cxx`,
+`style/FlowObj.cxx`); backend selection `jade.cxx makeFOTBuilder` —
+`-t fot` writes to a FILE (default `<docbase>.fot`), unitsPerInch=72000
+(millipoints; JadeApp ctor `u`), NO extension flow objects, output through
+`RecordOutputCharStream(EncodeOutputCharStream(...))`.
+
+Slice 1 (this increment) — foundation, validated byte-identically against
+the reference binaries on toy stylesheets (`tests/dazzle/fot/`):
+
+- **`Style.scaly` (new module):** `InheritedC` as a kind-tagged record
+  (bool/length/length-spec/symbol/string/integer/public-id — the six
+  generic classes of `InheritedC.cxx`; specials Color/Border/Rule deferred),
+  conversion + `invalidCharacteristicValue` per the reference converters;
+  `StyleSpec`/`VarStyleObj` (ELObj arm `Style`, opaque spec pointer),
+  `StyleStack` with the `InheritedCInfo`/`PopList` level machinery
+  (`pushContinue` first-wins dedup per level, `pushEnd` emits the set*
+  calls in spec order; the `dependencies`/`actual-*` machinery and style
+  RULES are deferred with the `inherited-*`/`actual-*` primitives).
+- **Eager IC evaluation (deliberate collapse, recorded):** the reference
+  compiles non-constant IC value exprs into `VarInheritedC` code evaluated
+  lazily at style-push (needed for `actual-*`); DSSSL exprs are pure, so
+  slice 1 evaluates them EAGERLY in the make insn (the frame is live) and
+  stores constant ICs. Revisit when porting `inherited-*`/`actual-*`
+  (Family B) — those need true deferred evaluation + the display-vars
+  capture (`VarStyleInsn` boundVars) and `VarStyleObj.node`.
+- **`Identifier.inherited_c` slot** (the S62 struct-growth trap measured
+  GONE 2026-07-27: Identifier/FlowObj/ProcessContext growth probes all
+  green — suites + codegen byte-identical); FOT symbols installed with
+  their `c_value` codes (the full 120-entry FOTBuilder::Symbol enum;
+  faithful quirk: `symbolBevel`'s name is "join").
+- **IC registry:** `installInheritedCs` generic entries ported wholesale
+  (~110 of ~150; Color/BackgroundColor/Border/Rule/GlyphSubst/InlineSpace
+  specials deferred — using one of those keywords is `invalidStyleKeyword`
+  until their increment).
+- **`MakeExpression` split** (Expression.cxx 1250–1420): per key —
+  FO-class NIC (DisplayNIC family for paragraph/paragraph-break/
+  display-group; InlineNIC accepted-and-dropped for line-field, its fot
+  dump ignores them) / `use:` / IC (via `ident.inherited_c`) / else
+  `invalidStyleKeyword`. Transform FO classes keep the existing collapsed
+  path byte-identically.
+- **`SgmlFOTBuilder.scaly`:** ctor/dtor frame (`<?xml version="1.0"?>`,
+  `<fot>`/`</fot>`), `ics_` characteristic buffer + `outputIcs`, Data
+  escaping (`&amp;/&lt;/&gt;/&quot;` + `&#N;` ≥0x80), millipoint `Units`
+  formatting, `displayNIC`/`displaySpaceNIC` dumps, `<text>`, sdata,
+  startNode/endNode pending-anchor machinery (`<a name=…/>`), FOs:
+  sequence, paragraph, paragraph-break, display-group, line-field.
+  Remaining FO classes arrive by demand (simple-page-sequence + its
+  header/footer six-way diff machinery next, then tables — dazzledoc).
+- **ProcessContext:** `sgml_fotb` + `style_stack` fields; style push/pop
+  brackets FO processing ONLY on the fot path (transform path untouched =
+  Family A byte-safety; the reference pushes always, but its transform
+  set* are no-ops — revisit when `inherited-*` primitives land).
+- **CLI:** `-t fot`, default output `<docbase>.fot`, unitsPerInch 72000
+  for ALL backends per JadeApp (was 1440 — transform output never prints
+  lengths; codegen suite + sweep must stay byte-identical), extension FO
+  public-ids not installed under fot (a transform `declare-flow-object-
+  class` then errors `unknownFlowObjectClass`, like the reference).
+
+RBMM: the sink's buffers live on the sink's own page (S67 rope lesson:
+memoize on `Page.get(this)`, never the caller host); StyleStack info array
+on the run page, `InheritedCInfo`/`PopList` nodes in the current node's
+eval scratch (they are popped inside the same bracket; inner→outer
+pointers only). Eagerly-evaluated IC values are converted to plain scalars
+/ interned strings inside the make insn, so nothing IC-related escapes the
+bracket except via the sink's output bytes.

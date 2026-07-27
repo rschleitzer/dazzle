@@ -1,0 +1,697 @@
+; SgmlFOTBuilder — the `-t fot` backend: the flow object tree dumped as SGML
+; (Stage 6a Inc 8, slice 1). Ported from ~/repos/dazzle/jade/SgmlFOTBuilder.cxx
+; (C++ oracle; C# mirror openjade-net/src/OpenJade/Jade/SgmlFOTBuilder.cs).
+;
+; Structure mirror: the reference's ~147 characteristic setters each render
+; ` name="value"` into the `ics_` string stream, flushed by the next flow
+; object's start into its start tag; here one set_ic renders a Style.InheritedC
+; by kind (the fot backend is a pure printer — the semantic setters return
+; with the RTF port). Flow objects of this slice: sequence, paragraph,
+; paragraph-break, display-group, line-field, plus text/characters and the
+; pending-anchor machinery (<a name=.../> for source elements). Units print in
+; the reference's millipoint format (72000 units/inch, "%03d" + point-insert —
+; quirks preserved: 500 -> ".5pt"); the LengthSpec display-size factor is NEVER
+; printed (dead sprintf in the reference operator<<).
+;
+; Output frame: `<?xml version="1.0"?>` RE `<fot>` RE ... `</fot>` RE, RE =
+; 0x0D rendered as the output newline by the record encoder at flush (the
+; RecordOutputCharStream seam, same as the transform sink).
+;
+; RBMM: both buffers (out, ics) live on the sink's own page; ics is reused
+; via a length cursor (the open_elements pattern), never reallocated per FO.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String.String
+use opensp.StringC.StringC
+use opensp.CodingSystem.CodingSystem
+use dazzle.Grove.GroveNode
+use dazzle.ELObj.Identifier
+use dazzle.Style.InheritedC
+use dazzle.Style.LengthSpec
+use dazzle.Style.DisplaySpace
+use dazzle.Style.FotSym
+use dazzle.Style.DisplayNIC
+
+define SgmlFOTBuilder
+(
+    out: pointer[Array[u32]]
+    ics: pointer[Array[u32]]
+    ics_len: size_t
+    in_ics: bool
+    pending_elements: pointer[Array[pointer[GroveNode]]]
+    pending_levels: pointer[Array[int]]
+    pending_count: size_t
+    n_pending_non_empty: int
+    node_level: int
+    suppress_anchors: bool
+    host: pointer[Page]
+)
+{
+    function make(host: pointer[Page]) returns pointer[SgmlFOTBuilder]
+    {
+        let f host.allocate(sizeof SgmlFOTBuilder, alignof SgmlFOTBuilder) as pointer[SgmlFOTBuilder]
+        set f.out: Array[u32]^host()
+        set f.ics: Array[u32]^host()
+        set f.ics_len: 0
+        set f.in_ics: false
+        set f.pending_elements: Array[pointer[GroveNode]]^host()
+        set f.pending_levels: Array[int]^host()
+        set f.pending_count: 0
+        set f.n_pending_non_empty: 0
+        set f.node_level: 0
+        set f.suppress_anchors: false
+        set f.host: host
+        f.raw("<?xml version=\"1.0\"?>")
+        f.re()
+        f.raw("<fot>")
+        f.re()
+        f
+    }
+
+    ; the destructor's closing tag — the CLI calls this before flushing.
+    function finish(this: pointer[SgmlFOTBuilder])
+    {
+        this.raw("</fot>")
+        this.re()
+    }
+
+    ; --- low-level output ----------------------------------------------------
+    ; one char into the current stream (out, or ics while a set_ic renders).
+    function put(this: pointer[SgmlFOTBuilder], c: u32)
+    {
+        if this.in_ics
+        {
+            if this.ics_len < this.ics.get_length()
+                this.ics.put(this.ics_len, c)
+            else
+                this.ics.add(c)
+            set this.ics_len: this.ics_len + (1 as size_t)
+            return
+        }
+        this.out.add(c)
+    }
+
+    function raw(this: pointer[SgmlFOTBuilder], s: pointer[const_char])
+    {
+        var i: size_t 0
+        while true
+        {
+            let b *((s as pointer[u8]) + i)
+            if b = (0 as u8)
+                break
+            this.put(b as u32)
+            set i: i + 1
+        }
+    }
+
+    function re(this: pointer[SgmlFOTBuilder])
+        this.put(0x0D as u32)
+
+    function raw_stringc(this: pointer[SgmlFOTBuilder], s: StringC)
+    {
+        let n s.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            this.put(s.get(i))
+            set i: i + 1
+        }
+    }
+
+    ; unsigned decimal.
+    function raw_uint(this: pointer[SgmlFOTBuilder], n_in: int)
+    {
+        var n n_in
+        if n = 0
+        {
+            this.put(0x30 as u32)
+            return
+        }
+        var digits u8[24]
+        var k 0
+        while n > 0
+        {
+            set *((digits as pointer[u8]) + k): ((n % 10) + 0x30) as u8
+            set n: n / 10
+            set k: k + 1
+        }
+        while k > 0
+        {
+            set k: k - 1
+            this.put((*((digits as pointer[u8]) + k)) as u32)
+        }
+    }
+
+    ; signed long per the reference operator<< (sign, then magnitude).
+    function raw_int(this: pointer[SgmlFOTBuilder], n: int)
+    {
+        if n < 0
+        {
+            this.put(0x2D as u32)
+            this.raw_uint(0 - n)
+        }
+        else
+            this.raw_uint(n)
+    }
+
+    ; Data escaping (operator<<(Data)): &amp; &lt; &gt; &quot;, raw ASCII,
+    ; numeric char refs at and above 0x80.
+    function data_escaped(this: pointer[SgmlFOTBuilder], s: pointer[u32], n: size_t)
+    {
+        var i: size_t 0
+        while i < n
+        {
+            let c *(s + i)
+            if c = (0x26 as u32)
+                this.raw("&amp;")
+            else if c = (0x3C as u32)
+                this.raw("&lt;")
+            else if c = (0x3E as u32)
+                this.raw("&gt;")
+            else if c = (0x22 as u32)
+                this.raw("&quot;")
+            else if c < (0x80 as u32)
+                this.put(c)
+            else
+            {
+                this.raw("&#")
+                this.raw_uint(c as int)
+                this.put(0x3B as u32)
+            }
+            set i: i + (1 as size_t)
+        }
+    }
+
+    ; Units — the reference "%03d" + point-insertion algorithm, quirks intact
+    ; (500 -> ".5pt", -500 -> "-.5pt", 0 -> "0pt", 12000 -> "12pt").
+    function units(this: pointer[SgmlFOTBuilder], n_in: int)
+    {
+        var buf u8[32]
+        var len 0
+        var n n_in
+        if n < 0
+        {
+            set *((buf as pointer[u8])): 0x2D as u8
+            set len: 1
+            set n: 0 - n
+        }
+        var tmp u8[24]
+        var k 0
+        while n > 0
+        {
+            set *((tmp as pointer[u8]) + k): ((n % 10) + 0x30) as u8
+            set n: n / 10
+            set k: k + 1
+        }
+        while k < 3
+        {
+            set *((tmp as pointer[u8]) + k): 0x30 as u8
+            set k: k + 1
+        }
+        while k > 0
+        {
+            set k: k - 1
+            set *((buf as pointer[u8]) + len): *((tmp as pointer[u8]) + k)
+            set len: len + 1
+        }
+        ; count up to three trailing zeros
+        var i 0
+        while i < 3
+        {
+            if *((buf as pointer[u8]) + (len - i - 1)) <> (0x30 as u8)
+                break
+            set i: i + 1
+        }
+        if i = 3
+        {
+            ; whole points: drop the three zeros
+            set i: len - 3
+            if i = 0
+            {
+                set *((buf as pointer[u8])): 0x30 as u8
+                set i: 1
+            }
+        }
+        else
+        {
+            ; shift the last digits right and insert the point (sprintf-quirk
+            ; faithful: ".5pt", "-.5pt", "1.005pt")
+            let j len + 1 - i
+            while i < 3
+            {
+                set *((buf as pointer[u8]) + (len - i)): *((buf as pointer[u8]) + (len - i - 1))
+                set i: i + 1
+            }
+            set *((buf as pointer[u8]) + (len - 3)): 0x2E as u8
+            set i: j
+        }
+        var m 0
+        while m < i
+        {
+            this.put((*((buf as pointer[u8]) + m)) as u32)
+            set m: m + 1
+        }
+        this.raw("pt")
+    }
+
+    ; operator<<(LengthSpec) — factor-bearing specs print ONLY the length part
+    ; (the reference never streams the sprintf'd percentage; dead code kept
+    ; faithfully).
+    function length_spec(this: pointer[SgmlFOTBuilder], ls: LengthSpec)
+    {
+        if ls.factor <> 0.0
+        {
+            if ls.length <> 0
+            {
+                this.units(ls.length)
+                if ls.factor >= 0.0
+                    this.put(0x2B as u32)
+            }
+            return
+        }
+        this.units(ls.length)
+    }
+
+    function sym_out(this: pointer[SgmlFOTBuilder], s: FotSym)
+    {
+        if s.code = SYM_FALSE
+        {
+            this.raw("false")
+            return
+        }
+        if s.code = SYM_TRUE
+        {
+            this.raw("true")
+            return
+        }
+        this.raw_stringc(s.name)
+    }
+
+    ; --- characteristic rendering (the set* family) --------------------------
+    function set_ic(this: pointer[SgmlFOTBuilder], ic: pointer[InheritedC])
+    {
+        set this.in_ics: true
+        this.put(0x20 as u32)
+        this.raw_stringc(ic.print_name)
+        this.put(0x3D as u32)
+        this.put(0x22 as u32)
+        let kind ic.get_kind()
+        if kind = IC_BOOL
+        {
+            if ic.bval
+                this.raw("true")
+            else
+                this.raw("false")
+        }
+        else if kind = IC_LENGTH
+            this.units(ic.lval)
+        else if kind = IC_LENGTH_SPEC
+            this.length_spec(ic.ls)
+        else if kind = IC_SYMBOL
+            this.sym_out(ic.sym)
+        else if kind = IC_STRING
+            this.raw_stringc(ic.sval)
+        else if kind = IC_INT
+            this.raw_int(ic.lval)
+        else if kind = IC_PUBLIC_ID
+        {
+            ; publicIdC: an unset/empty id prints "false"
+            if ic.bval or (ic.sval.get_size() = (0 as size_t))
+                this.raw("false")
+            else
+                this.raw_stringc(ic.sval)
+        }
+        else if kind = IC_LETTER2
+        {
+            if ic.bval or (ic.sval.get_size() = (0 as size_t))
+                this.raw("false")
+            else
+                this.raw_stringc(ic.sval)
+        }
+        this.put(0x22 as u32)
+        set this.in_ics: false
+    }
+
+    function output_ics(this: pointer[SgmlFOTBuilder])
+    {
+        let n this.ics_len
+        let b this.ics.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            this.out.add(*(b + i))
+            set i: i + (1 as size_t)
+        }
+        set this.ics_len: 0
+    }
+
+    ; --- NIC rendering --------------------------------------------------------
+    function display_space_nic(this: pointer[SgmlFOTBuilder], name: pointer[const_char], ds: DisplaySpace)
+    {
+        var any ds.nominal.is_set()
+        if ds.min.is_set()
+            set any: true
+        if ds.max.is_set()
+            set any: true
+        if any
+        {
+            this.put(0x20 as u32)
+            this.raw(name)
+            this.put(0x3D as u32)
+            this.put(0x22 as u32)
+            this.length_spec(ds.nominal)
+            var diff ds.min.differs(ds.nominal)
+            if ds.max.differs(ds.nominal)
+                set diff: true
+            if diff
+            {
+                this.put(0x2C as u32)
+                this.length_spec(ds.min)
+                this.put(0x2C as u32)
+                this.length_spec(ds.max)
+            }
+            this.put(0x22 as u32)
+        }
+        if ds.force
+        {
+            this.put(0x20 as u32)
+            this.raw(name)
+            this.raw("-priority=\"force\"")
+        }
+        else if ds.priority <> 0
+        {
+            this.put(0x20 as u32)
+            this.raw(name)
+            this.raw("-priority=")
+            this.put(0x22 as u32)
+            this.raw_int(ds.priority)
+            this.put(0x22 as u32)
+        }
+        if ds.conditional = false
+        {
+            this.put(0x20 as u32)
+            this.raw(name)
+            this.raw("-conditional=\"false\"")
+        }
+    }
+
+    function display_nic(this: pointer[SgmlFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        if nic = null
+            return
+        if nic.keep_with_previous
+            this.raw(" keep-with-previous=\"true\"")
+        if nic.keep_with_next
+            this.raw(" keep-with-next=\"true\"")
+        if nic.may_violate_keep_before
+            this.raw(" may-violate-keep-before=\"true\"")
+        if nic.may_violate_keep_after
+            this.raw(" may-violate-keep-after=\"true\"")
+        if nic.position_preference.code <> SYM_FALSE
+        {
+            this.raw(" position-preference=\"")
+            this.sym_out(nic.position_preference)
+            this.put(0x22 as u32)
+        }
+        if nic.keep.code <> SYM_FALSE
+        {
+            this.raw(" keep=\"")
+            this.sym_out(nic.keep)
+            this.put(0x22 as u32)
+        }
+        if nic.break_before.code <> SYM_FALSE
+        {
+            this.raw(" break-before=\"")
+            this.sym_out(nic.break_before)
+            this.put(0x22 as u32)
+        }
+        if nic.break_after.code <> SYM_FALSE
+        {
+            this.raw(" break-after=\"")
+            this.sym_out(nic.break_after)
+            this.put(0x22 as u32)
+        }
+        this.display_space_nic("space-before", nic.space_before)
+        this.display_space_nic("space-after", nic.space_after)
+    }
+
+    ; --- pending element anchors ----------------------------------------------
+    function start_node(this: pointer[SgmlFOTBuilder], node: pointer[GroveNode], mode_name: StringC)
+    {
+        set this.node_level: this.node_level + 1
+        if mode_name.get_size() <> (0 as size_t)
+            return
+        if node.get_class() <> GN_ELEMENT
+            return
+        var i: size_t 0
+        while i < this.pending_count
+        {
+            let pp this.pending_elements.get(i)
+            if pp <> null
+            {
+                if *pp = node
+                    return
+            }
+            set i: i + (1 as size_t)
+        }
+        if this.pending_count < this.pending_elements.get_length()
+        {
+            this.pending_elements.put(this.pending_count, node)
+            this.pending_levels.put(this.pending_count, this.node_level)
+        }
+        else
+        {
+            this.pending_elements.add(node)
+            this.pending_levels.add(this.node_level)
+        }
+        set this.pending_count: this.pending_count + (1 as size_t)
+    }
+
+    function end_node(this: pointer[SgmlFOTBuilder])
+    {
+        if this.pending_count > (0 as size_t)
+        {
+            let lp this.pending_levels.get(this.pending_count - (1 as size_t))
+            if lp <> null
+            {
+                if (*lp = this.node_level) and (this.n_pending_non_empty < (this.pending_count as int))
+                    set this.pending_count: this.pending_count - (1 as size_t)
+            }
+        }
+        set this.node_level: this.node_level - 1
+    }
+
+    function output_element_name(this: pointer[SgmlFOTBuilder], node: pointer[GroveNode])
+    {
+        let id node.get_id()
+        if id.get_size() > (0 as size_t)
+        {
+            this.data_escaped(id.data_ptr(), id.get_size())
+            return
+        }
+        ; groveIndex prefix omitted: the document grove is index 0 (external
+        ; groves arrive with sgml-parse); elementIndex only.
+        let ei node.get_element_index()
+        if ei >= 0
+            this.raw_uint(ei)
+    }
+
+    function flush_pending_elements(this: pointer[SgmlFOTBuilder])
+    {
+        if this.suppress_anchors
+            return
+        var i: size_t 0
+        while i < this.pending_count
+        {
+            let pp this.pending_elements.get(i)
+            if pp <> null
+            {
+                this.raw("<a name=\"")
+                this.output_element_name(*pp)
+                this.raw("\"/>")
+                this.re()
+            }
+            set i: i + (1 as size_t)
+        }
+        set this.n_pending_non_empty: 0
+        set this.pending_count: 0
+    }
+
+    ; --- text ------------------------------------------------------------------
+    function characters(this: pointer[SgmlFOTBuilder], s: pointer[u32], n: size_t)
+    {
+        if n = (0 as size_t)
+            return
+        this.flush_pending_elements()
+        this.raw("<text>")
+        this.data_escaped(s, n)
+        this.raw("</text>")
+        this.re()
+    }
+
+    ; SDATA substitution is deferred grove-wide (see the transform sink); the
+    ; plain character path matches.
+    function characters_from_node(this: pointer[SgmlFOTBuilder], node: pointer[GroveNode], s: pointer[u32], n: size_t)
+        this.characters(s, n)
+
+    ; --- flow objects ------------------------------------------------------------
+    function start_simple_flow_obj(this: pointer[SgmlFOTBuilder], name: pointer[const_char])
+    {
+        this.put(0x3C as u32)
+        this.raw(name)
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    function end_flow(this: pointer[SgmlFOTBuilder], name: pointer[const_char])
+    {
+        this.raw("</")
+        this.raw(name)
+        this.raw(">")
+        this.re()
+    }
+
+    function start_sequence(this: pointer[SgmlFOTBuilder])
+        this.start_simple_flow_obj("sequence")
+
+    function end_sequence(this: pointer[SgmlFOTBuilder])
+        this.end_flow("sequence")
+
+    function start_paragraph(this: pointer[SgmlFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        this.raw("<paragraph")
+        this.display_nic(nic)
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    function end_paragraph(this: pointer[SgmlFOTBuilder])
+        this.end_flow("paragraph")
+
+    function paragraph_break(this: pointer[SgmlFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        this.raw("<paragraph-break")
+        this.display_nic(nic)
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    function start_display_group(this: pointer[SgmlFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        this.raw("<display-group")
+        if nic <> null
+        {
+            if nic.has_coalesce_id
+            {
+                this.raw(" coalesce-id=\"")
+                this.data_escaped(nic.coalesce_id.data_ptr(), nic.coalesce_id.get_size())
+                this.put(0x22 as u32)
+            }
+        }
+        this.display_nic(nic)
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    function end_display_group(this: pointer[SgmlFOTBuilder])
+        this.end_flow("display-group")
+
+    function start_line_field(this: pointer[SgmlFOTBuilder])
+    {
+        ; LineFieldNIC (inline priorities) is not printed by the reference.
+        this.flush_pending_elements()
+        this.start_simple_flow_obj("line-field")
+    }
+
+    function end_line_field(this: pointer[SgmlFOTBuilder])
+        this.end_flow("line-field")
+
+    ; --- flush ---------------------------------------------------------------
+    ; the whole tree, record-encoded (RE -> NL, RS dropped) and UTF-8-encoded —
+    ; the RecordOutputCharStream(EncodeOutputCharStream(file)) seam.
+    function to_utf8(this: pointer[SgmlFOTBuilder]) returns String
+    {
+        let host this.host
+        let buf this.out.get_buffer()
+        let n this.out.get_length()
+        let cap n * (4 as size_t) + (1 as size_t)
+        let src host.allocate(n * (4 as size_t) + (4 as size_t), 4) as pointer[u32]
+        var m: size_t 0
+        var i: size_t 0
+        while i < n
+        {
+            let c *(buf + i)
+            if c = (0x0D as u32)
+            {
+                set *(src + m): (0x0A as u32)
+                set m: m + (1 as size_t)
+            }
+            else if c = (0x0A as u32)
+                0
+            else
+            {
+                set *(src + m): c
+                set m: m + (1 as size_t)
+            }
+            set i: i + (1 as size_t)
+        }
+        let bytes host.allocate(cap, 1) as pointer[u8]
+        let cs CodingSystem.UTF8()
+        let blen cs.encode(src, m, bytes, cap)
+        String(bytes as pointer[const_char], blen)
+    }
+
+    ; the raw tree as a StringC — the unit-test observation point.
+    function to_stringc(this: pointer[SgmlFOTBuilder], host: pointer[Page]) returns StringC
+        StringC^host(this.out.get_buffer(), this.out.get_length())
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+
+        ; 1. Units quirks (millipoints; reference "%03d" + point-insert)
+        let f SgmlFOTBuilder.make(host)
+        f.units(12000)
+        f.units(500)
+        f.units(0 - 500)
+        f.units(0)
+        f.units(1005)
+        f.units(5)
+        let got f.to_stringc(host)
+        if got.equals(StringC("<?xml version=\"1.0\"?>\r<fot>\r12pt.5pt-.5pt0pt1.005pt.005pt")) = false
+            return 0 - 1
+
+        ; 2. text escaping incl. numeric char refs >= 0x80
+        let f2 SgmlFOTBuilder.make(host)
+        let chars Array[u32]^host()
+        chars.add(0x61 as u32)
+        chars.add(0x26 as u32)
+        chars.add(0x3C as u32)
+        chars.add(0xFC as u32)
+        f2.characters(chars.get_buffer(), chars.get_length())
+        f2.finish()
+        let got2 f2.to_stringc(host)
+        if got2.equals(StringC("<?xml version=\"1.0\"?>\r<fot>\r<text>a&amp;&lt;&#252;</text>\r</fot>\r")) = false
+            return 0 - 2
+
+        ; 3. ics buffer: a length IC flushed into a paragraph start tag
+        let f3 SgmlFOTBuilder.make(host)
+        let ident3 Identifier.make(host, StringC("font-size"))
+        let ic3 InheritedC.make(host, IC_LENGTH, ident3, 0, StringC("font-size"))
+        set ic3.lval: 18000
+        f3.set_ic(ic3)
+        f3.start_paragraph(null)
+        f3.end_paragraph()
+        let got3 f3.to_stringc(host)
+        if got3.equals(StringC("<?xml version=\"1.0\"?>\r<fot>\r<paragraph font-size=\"18pt\">\r</paragraph>\r")) = false
+            return 0 - 3
+
+        0
+    }
+}

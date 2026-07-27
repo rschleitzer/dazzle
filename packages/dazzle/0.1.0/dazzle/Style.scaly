@@ -1,0 +1,779 @@
+; Style — the inherited-characteristics foundation (Stage 6a Inc 8, slice 1).
+; Ported from ~/repos/dazzle/style/Style.{h,cxx} + InheritedC.cxx (C++ oracle;
+; the C# mirror is openjade-net/src/OpenJade/Style). The reference models an
+; InheritedC as a class hierarchy (six generic kinds + specials) whose set()
+; drives a FOTBuilder setter; here it is one kind-tagged record whose set_ic
+; renders through the SgmlFOTBuilder (the fot backend is the only IC consumer
+; in this slice — the transform backend's setters are no-ops and its path never
+; pushes styles).
+;
+; Deliberate collapse (recorded in DESIGN.md Inc 8): non-constant IC value
+; expressions are evaluated EAGERLY in the make insn (reference: VarInheritedC
+; code evaluated lazily at style-push, needed only for actual-*/inherited-*,
+; which are deferred). StyleSpec entries at runtime are therefore always
+; constant ICs; IC_PENDING marks a make-key whose value is converted from the
+; VM stack at make-execution time.
+;
+; RBMM: prototype ICs + registry live on the interpreter's run page; per-make
+; constant ICs on the compile host (with the insn chain); pending conversions
+; and StyleStack push nodes (InheritedCInfo/PopList) on the current node's
+; eval scratch region — they are popped inside the same bracket (inner→outer
+; pointers only). The StyleStack record + its info array live on the run page.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
+use dazzle.ELObj.QuantityValue
+use dazzle.Interpreter.Interpreter
+use dazzle.InterpreterMessages.InterpreterMessages
+use opensp.Location.Location
+
+; --- InheritedC kinds (the generic classes of InheritedC.cxx) ---------------
+define IC_BOOL: int 0
+define IC_LENGTH: int 1
+define IC_LENGTH_SPEC: int 2
+define IC_SYMBOL: int 3
+define IC_STRING: int 4
+define IC_INT: int 5
+define IC_PUBLIC_ID: int 6
+define IC_LETTER2: int 7
+
+; --- make-keyword classification (MakeExpression::compile split) ------------
+define KEY_NIC: int 0
+define KEY_IC_CONST: int 1
+define KEY_IC_PENDING: int 2
+define KEY_USE: int 3
+define KEY_IGNORE: int 4
+
+; --- FOTBuilder::Symbol codes the NIC enum sets need ------------------------
+; (full table installed as symbol c-values by Interpreter.install_c_value_
+; symbols; codes = enum order in FOTBuilder.h)
+define SYM_FALSE: int 0
+define SYM_TRUE: int 1
+define SYM_PAGE: int 61
+define SYM_PAGE_REGION: int 62
+define SYM_COLUMN_SET: int 63
+define SYM_COLUMN: int 64
+define SYM_TOP: int 88
+define SYM_BOTTOM: int 89
+
+; FOTBuilder::LengthSpec — length in units (millipoints at 72000 upi) plus a
+; display-size factor (display-size-relative specs; slice 1 produces factors
+; only through length-spec VALUES, not arithmetic — see DESIGN.md).
+define LengthSpec (length: int, factor: double)
+{
+    init()
+    {
+        set this.length: 0
+        set this.factor: 0.0
+    }
+
+    function is_set(this: LengthSpec) returns bool
+    {
+        if length <> 0
+            return true
+        if factor <> 0.0
+            return true
+        false
+    }
+
+    function differs(this: LengthSpec, other: LengthSpec) returns bool
+    {
+        if length <> other.length
+            return true
+        if factor <> other.factor
+            return true
+        false
+    }
+}
+
+; FOTBuilder::DisplaySpace (defaults per its ctor: priority 0, conditional 1,
+; force 0).
+define DisplaySpace (nominal: LengthSpec, min: LengthSpec, max: LengthSpec, priority: int, conditional: bool, force: bool)
+{
+    init()
+    {
+        set this.nominal: LengthSpec()
+        set this.min: LengthSpec()
+        set this.max: LengthSpec()
+        set this.priority: 0
+        set this.conditional: true
+        set this.force: false
+    }
+}
+
+; a validated FOT symbol value: the c-value code plus the interned print name
+; (code 0 = false, 1 = true; names render as "false"/"true").
+define FotSym (code: int, name: StringC)
+{
+    init()
+    {
+        set this.code: SYM_FALSE
+        set this.name: StringC()
+    }
+}
+
+; FOTBuilder::DisplayNIC (+ DisplayGroupNIC's coalesce-id, carried flat).
+define DisplayNIC
+(
+    space_before: DisplaySpace
+    space_after: DisplaySpace
+    position_preference: FotSym
+    keep: FotSym
+    break_before: FotSym
+    break_after: FotSym
+    keep_with_previous: bool
+    keep_with_next: bool
+    may_violate_keep_before: bool
+    may_violate_keep_after: bool
+    has_coalesce_id: bool
+    coalesce_id: StringC
+)
+{
+    function make(host: pointer[Page]) returns pointer[DisplayNIC]
+    {
+        let n host.allocate(sizeof DisplayNIC, alignof DisplayNIC) as pointer[DisplayNIC]
+        set n.space_before: DisplaySpace()
+        set n.space_after: DisplaySpace()
+        set n.position_preference: FotSym()
+        set n.keep: FotSym()
+        set n.break_before: FotSym()
+        set n.break_after: FotSym()
+        set n.keep_with_previous: false
+        set n.keep_with_next: false
+        set n.may_violate_keep_before: false
+        set n.may_violate_keep_after: false
+        set n.has_coalesce_id: false
+        set n.coalesce_id: StringC()
+        n
+    }
+}
+
+; InheritedC — one record for the reference's class family. `kind` selects the
+; payload; `slot` <> -1 marks a pending entry (value converted from the VM
+; stack at make-exec); `proto` is the registry prototype a pending/converted
+; entry derives from. `print_name` is the exact attribute name SgmlFOTBuilder
+; emits (faithful quirks included: "inhibit-line-breaks?" keeps its '?',
+; justify-spread? prints "jystify-spread").
+define InheritedC
+(
+    kind: int
+    ident: pointer[Identifier]
+    index: int
+    print_name: StringC
+    bval: bool
+    lval: int
+    sym: FotSym
+    sval: StringC
+    ls: LengthSpec
+    slot: int
+    proto: pointer[InheritedC]
+    loc: Location
+)
+{
+    function make(host: pointer[Page], kind: int, ident: pointer[Identifier], index: int, print_name: StringC) returns pointer[InheritedC]
+    {
+        let ic host.allocate(sizeof InheritedC, alignof InheritedC) as pointer[InheritedC]
+        set ic.kind: kind
+        set ic.ident: ident
+        set ic.index: index
+        set ic.print_name: print_name
+        set ic.bval: false
+        set ic.lval: 0
+        set ic.sym: FotSym()
+        set ic.sval: StringC()
+        set ic.ls: LengthSpec()
+        set ic.slot: 0 - 1
+        set ic.proto: null
+        set ic.loc: Location()
+        ic
+    }
+
+    function get_index(this: InheritedC) returns int
+        index
+
+    function get_kind(this: InheritedC) returns int
+        kind
+
+    function get_slot(this: InheritedC) returns int
+        slot
+
+    function get_proto(this: InheritedC) returns pointer[InheritedC]
+        proto
+
+    ; a pending entry: value comes from make-exec stack slot `slot`; `loc` is
+    ; the value expression's location (the invalid-value message anchor).
+    function make_pending(host: pointer[Page], proto: pointer[InheritedC], slot: int, loc: Location) returns pointer[InheritedC]
+    {
+        let ic InheritedC.make(host, proto.get_kind(), proto.ident, proto.get_index(), proto.print_name)
+        set ic.slot: slot
+        set ic.proto: proto
+        set ic.loc: loc
+        ic
+    }
+}
+
+; --- value conversions (Interpreter::convert*C, InheritedC.cxx make()) ------
+define Convert
+{
+    procedure invalid_value(interp: pointer[Interpreter], ident: pointer[Identifier], loc: Location)
+    {
+        interp.set_next_location(loc)
+        interp.message1(InterpreterMessages.invalidCharacteristicValue(), ident.get_name())
+    }
+
+    ; convertLengthC: an exact/inexact quantity of dimension 1.
+    function convert_length(val: pointer[ELObj], out: pointer[int]) returns bool
+    {
+        let qv: QuantityValue val.quantity_value()
+        if qv.get_qtype() = QT_LONG
+        {
+            if qv.get_dim() = 1
+            {
+                set *out: qv.get_lval()
+                return true
+            }
+        }
+        if qv.get_qtype() = QT_DOUBLE
+        {
+            if qv.get_dim() = 1
+            {
+                set *out: qv.get_dval() as int
+                return true
+            }
+        }
+        false
+    }
+
+    ; convertLengthSpec: a plain length quantity (length-spec objects with a
+    ; display-size factor arrive with the display-size arithmetic port).
+    function convert_length_spec(val: pointer[ELObj], out: pointer[LengthSpec]) returns bool
+    {
+        var n 0
+        if Convert.convert_length(val, &n)
+        {
+            var ls LengthSpec()
+            set ls.length: n
+            set *out: ls
+            return true
+        }
+        false
+    }
+
+    function convert_boolean(val: pointer[ELObj], out: pointer[bool]) returns bool
+    {
+        if val.is_false()
+        {
+            set *out: false
+            return true
+        }
+        if val.is_true()
+        {
+            set *out: true
+            return true
+        }
+        false
+    }
+
+    ; convertEnumC (identifier-less overload): #f / #t / any symbol installed
+    ; with a c-value.
+    function convert_enum(val: pointer[ELObj], out: pointer[FotSym]) returns bool
+    {
+        var r FotSym()
+        if val.is_false()
+        {
+            set *out: r
+            return true
+        }
+        if val.is_symbol_p()
+        {
+            let code val.symbol_c_value()
+            if code <> SYM_FALSE
+            {
+                set r.code: code
+                set r.name: val.symbol_name()
+                set *out: r
+                return true
+            }
+            return false
+        }
+        if val.is_true()
+        {
+            set r.code: SYM_TRUE
+            set *out: r
+            return true
+        }
+        false
+    }
+
+    ; convertEnumC (allowed-set overload, the NIC form): the value must convert
+    ; AND its code must be in `allowed` (codes array, n entries).
+    function convert_enum_set(val: pointer[ELObj], allowed: pointer[int], n_allowed: int, out: pointer[FotSym]) returns bool
+    {
+        var r FotSym()
+        if Convert.convert_enum(val, &r) = false
+            return false
+        var i 0
+        while i < n_allowed
+        {
+            if *(allowed + i) = r.code
+            {
+                set *out: r
+                return true
+            }
+            set i: i + 1
+        }
+        false
+    }
+
+    function convert_string(host: pointer[Page], val: pointer[ELObj], out: pointer[StringC]) returns bool
+    {
+        if val.is_string_p() = false
+            return false
+        let s val.string_data(host)
+        set *out: StringC^host(s.data_ptr(), s.get_size())
+        true
+    }
+
+    function convert_integer(val: pointer[ELObj], out: pointer[int]) returns bool
+    {
+        let qv: QuantityValue val.quantity_value()
+        if qv.get_qtype() = QT_LONG
+        {
+            if qv.get_dim() = 0
+            {
+                set *out: qv.get_lval()
+                return true
+            }
+        }
+        false
+    }
+
+    ; convertPublicIdC: #f (empty) or a (possibly empty) string.
+    function convert_public_id(host: pointer[Page], val: pointer[ELObj], out: pointer[StringC], out_false: pointer[bool]) returns bool
+    {
+        if val.is_false()
+        {
+            set *out_false: true
+            return true
+        }
+        if val.is_string_p()
+        {
+            set *out_false: false
+            let s val.string_data(host)
+            set *out: StringC^host(s.data_ptr(), s.get_size())
+            return true
+        }
+        false
+    }
+
+    ; convertLetter2C: #f clears; a STRING of exactly two UPPERCASE letters
+    ; (the reference accepts no symbols and does not case-fold — "de" is an
+    ; invalid value); the empty string also clears.
+    function convert_letter2(host: pointer[Page], val: pointer[ELObj], out: pointer[StringC], out_false: pointer[bool]) returns bool
+    {
+        if val.is_false()
+        {
+            set *out_false: true
+            return true
+        }
+        if val.is_string_p() = false
+            return false
+        let s val.string_data(host)
+        if s.get_size() = (0 as size_t)
+        {
+            set *out_false: true
+            return true
+        }
+        if s.get_size() <> (2 as size_t)
+            return false
+        var up u32[2]
+        var i: size_t 0
+        while i < (2 as size_t)
+        {
+            let c s.get(i)
+            if c < (0x41 as u32)
+                return false
+            if c > (0x5A as u32)
+                return false
+            set *((up as pointer[u32]) + i): c
+            set i: i + (1 as size_t)
+        }
+        set *out_false: false
+        ; ^host, NOT the plain copying init: a plain StringC(ptr, n) temporary
+        ; copies onto the TEMPORARY's page (Page.get(this)) — the record then
+        ; stores a pointer into the dead frame region (bug found by the fot
+        ; toy diff: language="DE" printed NULs).
+        set *out: StringC^host(up as pointer[u32], 2 as size_t)
+        true
+    }
+
+    ; InheritedC::make(value, loc, interp) — derive a constant IC from the
+    ; prototype `proto` with the converted value; null + message on invalid.
+    ; Quantities resolve first (a parse-time datum like 18pt is an
+    ; UnresolvedLengthObj until forced — ResolveQuantitiesInsn's job on the
+    ; eval path; the compile-time constant path forces here).
+    function ic_from_value(host: pointer[Page], proto: pointer[InheritedC], val_in: pointer[ELObj], loc: Location, interp: pointer[Interpreter]) returns pointer[InheritedC]
+    {
+        var val val_in
+        let resolved val.resolve_quantities(true, interp, loc)
+        if resolved <> null
+            set val: resolved
+        let ic InheritedC.make(host, proto.get_kind(), proto.ident, proto.get_index(), proto.print_name)
+        set ic.proto: proto
+        set ic.loc: loc
+        let kind proto.get_kind()
+        var ok false
+        if kind = IC_BOOL
+        {
+            var b false
+            set ok: Convert.convert_boolean(val, &b)
+            set ic.bval: b
+        }
+        else if kind = IC_LENGTH
+        {
+            var n 0
+            set ok: Convert.convert_length(val, &n)
+            set ic.lval: n
+        }
+        else if kind = IC_LENGTH_SPEC
+        {
+            var ls LengthSpec()
+            set ok: Convert.convert_length_spec(val, &ls)
+            set ic.ls: ls
+        }
+        else if kind = IC_SYMBOL
+        {
+            var sym FotSym()
+            set ok: Convert.convert_enum(val, &sym)
+            set ic.sym: sym
+        }
+        else if kind = IC_STRING
+        {
+            var s StringC()
+            set ok: Convert.convert_string(host, val, &s)
+            set ic.sval: s
+        }
+        else if kind = IC_INT
+        {
+            var n 0
+            set ok: Convert.convert_integer(val, &n)
+            set ic.lval: n
+        }
+        else if kind = IC_PUBLIC_ID
+        {
+            var s StringC()
+            var was_false false
+            set ok: Convert.convert_public_id(host, val, &s, &was_false)
+            set ic.sval: s
+            set ic.bval: was_false
+        }
+        else if kind = IC_LETTER2
+        {
+            var s StringC()
+            var was_false false
+            set ok: Convert.convert_letter2(host, val, &s, &was_false)
+            set ic.sval: s
+            set ic.bval: was_false
+        }
+        if ok = false
+        {
+            Convert.invalid_value(interp, proto.ident, loc)
+            return null
+        }
+        ic
+    }
+
+    ; FlowObj::setDisplayNIC — returns true when `sk` is a display NIC key
+    ; (value converted into `nic`; an invalid value messages and leaves the
+    ; default, per the reference convert*C behaviour).
+    function set_display_nic(nic: pointer[DisplayNIC], sk: int, val: pointer[ELObj], ident: pointer[Identifier], loc: Location, interp: pointer[Interpreter], host: pointer[Page]) returns bool
+    {
+        if sk = SK_POSITION_PREFERENCE
+        {
+            let allowed host.allocate(12, 4) as pointer[int]
+            set *allowed: SYM_FALSE
+            set *(allowed + 1): SYM_TOP
+            set *(allowed + 2): SYM_BOTTOM
+            var s FotSym()
+            if Convert.convert_enum_set(val, allowed, 3, &s)
+                set nic.position_preference: s
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if sk = SK_KEEP_WITH_PREVIOUS
+        {
+            var b false
+            if Convert.convert_boolean(val, &b)
+                set nic.keep_with_previous: b
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if sk = SK_KEEP_WITH_NEXT
+        {
+            var b false
+            if Convert.convert_boolean(val, &b)
+                set nic.keep_with_next: b
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if sk = SK_KEEP
+        {
+            let allowed host.allocate(20, 4) as pointer[int]
+            set *allowed: SYM_FALSE
+            set *(allowed + 1): SYM_TRUE
+            set *(allowed + 2): SYM_PAGE
+            set *(allowed + 3): SYM_COLUMN_SET
+            set *(allowed + 4): SYM_COLUMN
+            var s FotSym()
+            if Convert.convert_enum_set(val, allowed, 5, &s)
+                set nic.keep: s
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if (sk = SK_BREAK_BEFORE) or (sk = SK_BREAK_AFTER)
+        {
+            let allowed host.allocate(20, 4) as pointer[int]
+            set *allowed: SYM_FALSE
+            set *(allowed + 1): SYM_PAGE
+            set *(allowed + 2): SYM_PAGE_REGION
+            set *(allowed + 3): SYM_COLUMN_SET
+            set *(allowed + 4): SYM_COLUMN
+            var s FotSym()
+            if Convert.convert_enum_set(val, allowed, 5, &s)
+            {
+                if sk = SK_BREAK_BEFORE
+                    set nic.break_before: s
+                else
+                    set nic.break_after: s
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if sk = SK_MAY_VIOLATE_KEEP_BEFORE
+        {
+            var b false
+            if Convert.convert_boolean(val, &b)
+                set nic.may_violate_keep_before: b
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if sk = SK_MAY_VIOLATE_KEEP_AFTER
+        {
+            var b false
+            if Convert.convert_boolean(val, &b)
+                set nic.may_violate_keep_after: b
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if (sk = SK_SPACE_BEFORE) or (sk = SK_SPACE_AFTER)
+        {
+            ; a display-space object or a plain length spec (min = max =
+            ; nominal); the display-space primitive arrives later.
+            var ls LengthSpec()
+            if Convert.convert_length_spec(val, &ls)
+            {
+                var ds DisplaySpace()
+                set ds.nominal: ls
+                set ds.min: ls
+                set ds.max: ls
+                if sk = SK_SPACE_BEFORE
+                    set nic.space_before: ds
+                else
+                    set nic.space_after: ds
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        false
+    }
+
+    function is_display_nic_key(sk: int) returns bool
+    {
+        if sk = SK_POSITION_PREFERENCE
+            return true
+        if sk = SK_KEEP_WITH_PREVIOUS
+            return true
+        if sk = SK_KEEP_WITH_NEXT
+            return true
+        if sk = SK_KEEP
+            return true
+        if sk = SK_BREAK_BEFORE
+            return true
+        if sk = SK_BREAK_AFTER
+            return true
+        if sk = SK_MAY_VIOLATE_KEEP_BEFORE
+            return true
+        if sk = SK_MAY_VIOLATE_KEEP_AFTER
+            return true
+        if sk = SK_SPACE_BEFORE
+            return true
+        if sk = SK_SPACE_AFTER
+            return true
+        false
+    }
+}
+
+; --- StyleStack (Style.cxx) --------------------------------------------------
+; InheritedCInfo — one pushed spec for one characteristic index; `prev` chains
+; to the spec shadowed at an outer level (restored by pop).
+define InheritedCInfo (spec: pointer[InheritedC], prev: pointer[InheritedCInfo], val_level: int)
+{
+    function make(host: pointer[Page], spec: pointer[InheritedC], prev: pointer[InheritedCInfo], val_level: int) returns pointer[InheritedCInfo]
+    {
+        let info host.allocate(sizeof InheritedCInfo, alignof InheritedCInfo) as pointer[InheritedCInfo]
+        set info.spec: spec
+        set info.prev: prev
+        set info.val_level: val_level
+        info
+    }
+}
+
+define PopList (list: pointer[Array[int]], prev: pointer[PopList])
+{
+    function make(host: pointer[Page], prev: pointer[PopList]) returns pointer[PopList]
+    {
+        let pl host.allocate(sizeof PopList, alignof PopList) as pointer[PopList]
+        set pl.list: Array[int]^host()
+        set pl.prev: prev
+        pl
+    }
+}
+
+define StyleStack (info: pointer[Array[pointer[InheritedCInfo]]], level: int, pop_list: pointer[PopList], host: pointer[Page])
+{
+    function make(host: pointer[Page]) returns pointer[StyleStack]
+    {
+        let ss host.allocate(sizeof StyleStack, alignof StyleStack) as pointer[StyleStack]
+        set ss.info: Array[pointer[InheritedCInfo]]^host()
+        set ss.level: 0
+        set ss.pop_list: null
+        set ss.host: host
+        ss
+    }
+
+    function push_start(this: pointer[StyleStack], scratch: pointer[Page])
+    {
+        set this.level: this.level + 1
+        set this.pop_list: PopList.make(scratch, this.pop_list)
+    }
+
+    ; grow the info vector to cover index `ind`.
+    function info_at(this: pointer[StyleStack], ind: int) returns pointer[InheritedCInfo]
+    {
+        if (ind as size_t) >= this.info.get_length()
+            return null
+        let p this.info.get(ind as size_t)
+        if p = null
+            return null
+        *p
+    }
+
+    function info_set(this: pointer[StyleStack], ind: int, v: pointer[InheritedCInfo])
+    {
+        while this.info.get_length() <= (ind as size_t)
+            this.info.add(null)
+        this.info.put(ind as size_t, v)
+    }
+
+    ; StyleStack::pushContinue — walk the style chain (spec vector order, then
+    ; the use chain), first spec per characteristic wins within this level.
+    function push_continue(this: pointer[StyleStack], style: pointer[ELObj], scratch: pointer[Page])
+    {
+        if style = null
+            return
+        let spec_arr style.style_spec() as pointer[Array[pointer[InheritedC]]]
+        if spec_arr <> null
+        {
+            let n spec_arr.get_length()
+            var i: size_t 0
+            while i < n
+            {
+                let icp spec_arr.get(i)
+                if icp <> null
+                {
+                    let ic *icp
+                    if ic <> null
+                        this.push_spec(ic, scratch)
+                }
+                set i: i + (1 as size_t)
+            }
+        }
+        let u style.style_use()
+        if u <> null
+            this.push_continue(u, scratch)
+    }
+
+    function push_spec(this: pointer[StyleStack], spec: pointer[InheritedC], scratch: pointer[Page])
+    {
+        let ind spec.get_index()
+        let cur this.info_at(ind)
+        if cur <> null
+        {
+            if cur.val_level = this.level
+                return
+        }
+        this.pop_list.list.add(ind)
+        this.info_set(ind, InheritedCInfo.make(scratch, spec, cur, this.level))
+    }
+
+    function pop(this: pointer[StyleStack])
+    {
+        let pl this.pop_list
+        if pl <> null
+        {
+            let n pl.list.get_length()
+            var i: size_t 0
+            while i < n
+            {
+                let indp pl.list.get(i)
+                if indp <> null
+                {
+                    let ind *indp
+                    let cur this.info_at(ind)
+                    if cur <> null
+                        this.info_set(ind, cur.prev)
+                }
+                set i: i + (1 as size_t)
+            }
+            set this.pop_list: pl.prev
+        }
+        set this.level: this.level - 1
+    }
+
+    function push_empty(this: pointer[StyleStack])
+        set this.level: this.level + 1
+
+    function pop_empty(this: pointer[StyleStack])
+        set this.level: this.level - 1
+
+    function get_level(this: pointer[StyleStack]) returns int
+        level
+
+    ; the specs pushed at the CURRENT level, in push order — the set* feed for
+    ; pushEnd (the caller renders them through its sink).
+    function current_specs(this: pointer[StyleStack]) returns pointer[Array[int]]
+    {
+        if this.pop_list = null
+            return null
+        this.pop_list.list
+    }
+
+    function spec_of(this: pointer[StyleStack], ind: int) returns pointer[InheritedC]
+    {
+        let cur this.info_at(ind)
+        if cur = null
+            return null
+        cur.spec
+    }
+}
