@@ -94,4 +94,29 @@ if [ "$rc6" -ne 0 ] || [ "$got6" != "$want6" ]; then
   exit 1
 fi
 
+# (data nl) over a MULTI-node list concatenates every member's data
+# (modules sweep: multi-<return> sprocs were truncated to the first).
+got7="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/data.dsl" "$HERE/axis.sgml")"
+rc7=$?
+want7="$(cat "$HERE/data.expected")"
+if [ "$rc7" -ne 0 ] || [ "$got7" != "$want7" ]; then
+  echo "dazzle-cli: FAIL data-multinode (rc=$rc7)"
+  echo "  want: $(printf '%s' "$want7" | cat -v)"
+  echo "  got:  $(printf '%s' "$got7" | cat -v)"
+  exit 1
+fi
+
+# entity FO whose output file cannot be created: reference reports
+# cannotOpenOutputError on stderr, the content falls through to stdout,
+# rc stays 0 (the modules sweep ran against un-created output dirs).
+got8="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/entityfall.dsl" "$HERE/axis.sgml" 2>"$OUT.eferr")"
+rc8=$?
+if [ "$rc8" -ne 0 ] || [ "$got8" != "FALLBACK" ] \
+   || ! grep -qF ':E: cannot open output file "no_such_dir/out.txt" (No such file or directory)' "$OUT.eferr"; then
+  echo "dazzle-cli: FAIL entity-open-fallback (rc=$rc8)"
+  echo "  got:  $(printf '%s' "$got8" | cat -v)"
+  echo "  err:  $(cat "$OUT.eferr")"
+  exit 1
+fi
+
 echo "dazzle-cli: PASS"

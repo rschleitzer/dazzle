@@ -30,9 +30,31 @@ define TFB_MIDDLE: int 0
 define TFB_START_OF_ELEMENT: int 1
 define TFB_PENDING_RE: int 2
 
-; An open entity file: its content buffer, the parent buffer to restore on end,
-; and the resolved output filename (empty = no name -> content dropped).
-define TfbOpenFile (buf: pointer[Array[u32]], save: pointer[Array[u32]], filename: String)
+; libc + shim externs for the entity-FO open probe. Prototypes match the
+; other roots' declarations (runtime.scaly fopen/fclose, Storage.scaly
+; strerror/errno — extern declares must type-match across the whole root).
+; fopen is non-variadic, so a direct extern is fine (open(2) is variadic —
+; containment rule (b) would force the shim).
+function fopen(filename: pointer[const_char], mode: pointer[const_char]) returns pointer[void] extern
+function fclose(stream: pointer[void]) returns int extern
+function strerror(code: i32) returns pointer[const_char] extern
+function scaly_eio_errno() returns i32 extern
+procedure scaly_eputs(s: pointer[const_char]) extern
+procedure scaly_eputnl() extern
+
+; argv0 for the app-message prefix: the reference reports entity-file
+; failures through CmdLineApp::message, which renders `<argv0>:E: <text>`.
+; The CLI driver sets this once (set_prog_name). A `shared` module global,
+; not a TransformFOTBuilder field — growing a heap-hosted struct in the
+; dazzle run region trips the S62 page-boundary fragility.
+shared tfb_prog: pointer[const_char] null
+
+; An open entity file: its content buffer, the parent buffer to restore on
+; end, the resolved output filename (empty = not redirected: open failed or
+; no name — content flows to the parent stream, like the reference leaving
+; os_ untouched), and the raw system id (the close-error message argument —
+; endEntity reports of.systemId, not the directory-joined path).
+define TfbOpenFile (buf: pointer[Array[u32]], save: pointer[Array[u32]], filename: String, sysid: String)
 
 define TransformFOTBuilder
 (
@@ -315,7 +337,37 @@ define TransformFOTBuilder
         this.output_stringc(s)
     }
 
+    ; the CLI driver's argv0 — the prefix of the entity-file app messages.
+    function set_prog_name(prog: pointer[const_char])
+        set tfb_prog: prog
+
+    ; render `<argv0>:E: <text-head>"<arg>" (<errno text>)` on stderr — the
+    ; observed CmdLineApp::message shape (%1 StringMessageArg quoted,
+    ; %2 ErrnoMessageArg raw). rc is NOT affected (matches the reference:
+    ; the runs exit 0 with these errors on stderr).
+    function file_error(this: pointer[TransformFOTBuilder], head: pointer[const_char], arg: String, err: i32)
+    {
+        if tfb_prog <> null
+            scaly_eputs(tfb_prog)
+        scaly_eputs ":E: "
+        scaly_eputs head
+        scaly_eputs "\""
+        let arg_c arg.to_c_string()
+        scaly_eputs(arg_c)
+        scaly_eputs "\" ("
+        let et strerror(err)
+        scaly_eputs(et)
+        scaly_eputs ")"
+        scaly_eputnl()
+    }
+
     ; --- entity flow object: redirect output to a file ----------------------
+    ; startEntity (TransformFOTBuilder.cxx): the output file is opened HERE.
+    ; A failed open reports cannotOpenOutputError and leaves os_ on the
+    ; PARENT stream — the entity's content falls through to it (ultimately
+    ; stdout). Only a successful open redirects. Our sink buffers and writes
+    ; on end, so the open is a probe (create/truncate, like the reference's
+    ; eager FileOutputByteStream::open) whose failure routes the content.
     function start_entity(this: pointer[TransformFOTBuilder], system_id: StringC)
     {
         this.flush_pending_re()
@@ -330,14 +382,31 @@ define TransformFOTBuilder
                 set filename: this.join_path(dir, name_str)
             }
         }
-        let newbuf Array[u32]^this.host()
-        let of TfbOpenFile(newbuf, this.out, filename)
+        var redirected false
+        if filename.get_length() > (0 as size_t)
+        {
+            let fn_c filename.to_c_string()
+            let fh fopen(fn_c, "w")
+            if fh = null
+                this.file_error("cannot open output file ", filename, scaly_eio_errno())
+            else
+            {
+                fclose(fh)
+                set redirected: true
+            }
+        }
+        var of TfbOpenFile(this.out, this.out, String(), String())
+        if redirected
+        {
+            let newbuf Array[u32]^this.host()
+            set of: TfbOpenFile(newbuf, this.out, filename, name_str)
+            set this.out: newbuf
+        }
         if this.file_count < this.file_stack.get_length()
             this.file_stack.put(this.file_count, of)
         else
             this.file_stack.add(of)
         set this.file_count: this.file_count + (1 as size_t)
-        set this.out: newbuf
     }
 
     function end_entity(this: pointer[TransformFOTBuilder])
@@ -351,7 +420,13 @@ define TransformFOTBuilder
             {
                 let of *ofp
                 if of.filename.get_length() > (0 as size_t)
-                    this.flush_buffer_to_file(of.buf, of.filename)
+                {
+                    ; a failed write is the reference's fb.close() failure:
+                    ; closeFileError, %1 = the RAW system id (endEntity
+                    ; reports of.systemId, not the joined path).
+                    if this.flush_buffer_to_file(of.buf, of.filename) = false
+                        this.file_error("cannot close output file ", of.sysid, scaly_eio_errno())
+                }
                 set this.out: of.save
             }
         }
@@ -443,7 +518,7 @@ define TransformFOTBuilder
         String(bytes as pointer[const_char], blen)
     }
 
-    function flush_buffer_to_file(this: pointer[TransformFOTBuilder], buf: pointer[Array[u32]], filename: String)
+    function flush_buffer_to_file(this: pointer[TransformFOTBuilder], buf: pointer[Array[u32]], filename: String) returns bool
     {
         let content this.encode_records(buf.get_buffer(), buf.get_length())
         File.write_from_string(filename, content)
