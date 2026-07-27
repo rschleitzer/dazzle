@@ -133,4 +133,17 @@ if [ "$rc9" -ne 0 ] || [ "$got9" != "$want9" ]; then
   exit 1
 fi
 
+# with-mode + named modes, ancestor-qualified patterns ((grp test) outranks
+# the plain GI rule), define-language/declare-default-language case tables.
+# Golden validated against the reference dazzle.
+got10="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/langmode.dsl" "$HERE/axis.sgml")"
+rc10=$?
+want10="$(cat "$HERE/langmode.expected")"
+if [ "$rc10" -ne 0 ] || [ "$got10" != "$want10" ]; then
+  echo "dazzle-cli: FAIL langmode (rc=$rc10)"
+  echo "  want: $(printf '%s' "$want10" | cat -v)"
+  echo "  got:  $(printf '%s' "$got10" | cat -v)"
+  exit 1
+fi
+
 echo "dazzle-cli: PASS"
