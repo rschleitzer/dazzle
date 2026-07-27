@@ -3,6 +3,7 @@ use scaly.containers.Array
 use scaly.containers.Vector
 use opensp.StringC.StringC
 use opensp.Location.Location
+use opensp.Location.Origin
 use opensp.XcharMap.XcharMap
 use opensp.Message.MessageType
 use opensp.Message.MessageArg
@@ -55,6 +56,19 @@ use dazzle.Sdata.Sdata
 ; run; a self-scaling `for` never promotes a loop that touches a mutable
 ; global, so no promoted loop can race this cell.
 shared eval_region: pointer[Page] null
+
+; argv0 for the MessageReporter prefix (`<argv0>:<file>:<line>:<col>:<sev>: …`,
+; exactly the reference where the app object IS the Messenger). The CLI driver
+; sets this once before processing; unset (unit tests, --jit suite) the prefix
+; stays the historical package name `dazzle`. A `shared` module global, not an
+; Interpreter field — growing a heap-hosted struct in the dazzle run region
+; trips the page-boundary RBMM fragility (S62), and `mutable` (TLS) in a dep
+; package aborts under --jit.
+shared msg_prog: pointer[const_char] null
+
+; MessageReporter's column-omission sentinel (opensp.Location COL_OMITTED —
+; module-level consts are not cross-package-visible; mirrored here).
+define MSG_COL_OMITTED: u32 0xFFFFFFFF
 
 ; Interpreter::LexCategory
 define LEX_LETTER: int 0            ; a-z A-Z
@@ -1337,6 +1351,18 @@ define Interpreter
         this.emit(mt, args)
     }
 
+    ; NumberMessageArg shape (stackTraceEllipsis's omitted-call count): %1
+    ; renders unquoted.
+    function message_num(this: pointer[Interpreter], mt: MessageType, n: u64)
+    {
+        var args Vector[MessageArg](1 as size_t)
+        set *(args.get(0 as size_t)): MessageArg.Num(n)
+        this.emit(mt, args)
+    }
+
+    function get_debug_mode(this: Interpreter) returns bool
+        debug_mode
+
     ; MessageType3 shape of PrimitiveObj::argError: %1 primitive name,
     ; %2 ordinal, %3 printed object.
     function message3(this: pointer[Interpreter], mt: MessageType, a1: StringC, ord2: u64, a3: StringC)
@@ -1455,21 +1481,93 @@ define Interpreter
         0
     }
 
-    ; render `dazzle:<severity>: <text with %N substituted>` to stderr and
-    ; count errors (the driver's location-prefixed reporting is Inc 7).
+    ; the CLI driver's argv0 — the MessageReporter prefix. Unset, messages keep
+    ; the historical package prefix `dazzle` (unit tests / --jit suite).
+    function set_msg_prog(prog: pointer[const_char])
+        set msg_prog: prog
+
+    ; render one diagnostic line to stderr, byte-identical to the reference
+    ; MessageReporter::dispatchMessage the style Interpreter reports through:
+    ;   <prog>:[<file>:<line>[:<col>]:]<sev>: <formatted text>\n
+    ; The location is the Messenger's next-location (setNextLocation), CONSUMED
+    ; by this message (initMessage clears it). A null-origin location renders
+    ; no location segment at all (`<prog>:I: called from here`); a non-null
+    ; origin whose chain names no real backing source renders the reference's
+    ; "(invalid location)". Errors count; Info (stack traces) does not.
     function emit(this: pointer[Interpreter], mt: MessageType, args: Vector[MessageArg])
     {
+        let loc this.next_loc
+        set this.next_loc: Location()
+
         var buf u32[2048]
         let bp buf as pointer[u32]
         let cap 2048 as size_t
         var p: size_t 0
-        set p: ParserState.put_char(bp, cap, p, 0x64 as u32)
-        set p: ParserState.put_char(bp, cap, p, 0x61 as u32)
-        set p: ParserState.put_char(bp, cap, p, 0x7A as u32)
-        set p: ParserState.put_char(bp, cap, p, 0x7A as u32)
-        set p: ParserState.put_char(bp, cap, p, 0x6C as u32)
-        set p: ParserState.put_char(bp, cap, p, 0x65 as u32)
+
+        ; program name (raw ASCII bytes) + ':'
+        if msg_prog <> null
+        {
+            let pb msg_prog as pointer[u8]
+            var pi: size_t 0
+            while (*(pb + pi)) <> (0 as u8)
+            {
+                set p: ParserState.put_char(bp, cap, p, (*(pb + pi)) as u32)
+                set pi: pi + 1
+            }
+        }
+        else
+        {
+            set p: ParserState.put_char(bp, cap, p, 0x64 as u32)
+            set p: ParserState.put_char(bp, cap, p, 0x61 as u32)
+            set p: ParserState.put_char(bp, cap, p, 0x7A as u32)
+            set p: ParserState.put_char(bp, cap, p, 0x7A as u32)
+            set p: ParserState.put_char(bp, cap, p, 0x6C as u32)
+            set p: ParserState.put_char(bp, cap, p, 0x65 as u32)
+        }
         set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+
+        if loc.get_origin() <> null
+        {
+            var line: u32 0
+            var col: u32 0
+            var ridx: size_t 0
+            let resolved Origin.resolve_chain(loc, false, &line, &col, &ridx)
+            ; a chain that names no real backing source prints NO location
+            ; segment at all — MessageReporter::dispatchMessage skips
+            ; printLocation when locationHeader returns null (the builtins
+            ; prolog's InputSourceOrigin::make() has no external info).
+            if resolved <> null
+            {
+                ; file name + ':' + line ':' [col ':'] — the same rendering
+                ; rules as ParserState.emit_message (printLocation).
+                let fname resolved.file_name_at(ridx)
+                var fi: size_t 0
+                while fi < fname.get_size()
+                {
+                    set p: ParserState.put_char(bp, cap, p, fname.get(fi))
+                    set fi: fi + 1
+                }
+                set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+                set p: ParserState.put_dec(bp, cap, p, line as u64)
+                set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+                var omit_col false
+                if (loc.get_index() = (0 as u32)) and (line = (1 as u32)) and (col = (0 as u32))
+                {
+                    if resolved.get_buf_length() > (0 as size_t)
+                        set omit_col: true
+                }
+                if resolved.on_segment_leading_rs(ridx)
+                    set omit_col: true
+                if col = MSG_COL_OMITTED
+                    set omit_col: true
+                if omit_col = false
+                {
+                    set p: ParserState.put_dec(bp, cap, p, col as u64)
+                    set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
+                }
+            }
+        }
+
         set p: ParserState.put_char(bp, cap, p, mt.severity_char())
         set p: ParserState.put_char(bp, cap, p, 0x3A as u32)
         set p: ParserState.put_char(bp, cap, p, 0x20 as u32)

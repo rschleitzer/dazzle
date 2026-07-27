@@ -3,6 +3,8 @@ use scaly.containers.Array
 use opensp.StringC.StringC
 use opensp.Location.Location
 use opensp.Location.InputSource
+use opensp.Location.Origin
+use opensp.Location.TextChunk
 use opensp.ParserState.ParserState
 use opensp.Parser.Parser
 use opensp.Event.Event
@@ -13,6 +15,7 @@ use opensp.Attribute.AttributeValue
 use opensp.Attribute.AttributeSemantics
 use opensp.Attribute.Text
 use opensp.Entity.Entity
+use opensp.Entity.InternalEntity
 use opensp.Notation.Notation
 use opensp.ExternalId.ExternalId
 use opensp.Dtd.Dtd
@@ -102,8 +105,12 @@ define DeclarationElement (decl_type: int, content: StringC, name: StringC, text
 }
 
 ; A body element: either immediate gathered text or an entity reference
-; (STYLE-SPECIFICATION-BODY with a CONTENT= entity attribute).
-define ImmediateBody (text: StringC)
+; (STYLE-SPECIFICATION-BODY with a CONTENT= entity attribute). The immediate
+; arm carries the per-chunk source-location table (the reference Text object)
+; so a diagnostic in the gathered Scheme resolves to the original source —
+; a chunk gathered from an expanded `&file.scm;` reference resolves INTO that
+; file (TextInputSourceOrigin::defLocation → Text::charLocation).
+define ImmediateBody (text: StringC, chunks: pointer[Array[TextChunk]])
 define EntityBody (entity: pointer[Entity])
 
 define BodyElement union
@@ -112,10 +119,10 @@ define BodyElement union
     Entity: EntityBody
 )
 {
-    function make_immediate(host: pointer[Page], text: StringC) returns pointer[BodyElement]
+    function make_immediate(host: pointer[Page], text: StringC, chunks: pointer[Array[TextChunk]]) returns pointer[BodyElement]
     {
         let b host.allocate(sizeof BodyElement, alignof BodyElement) as pointer[BodyElement]
-        set *b: BodyElement.Immediate(ImmediateBody(text))
+        set *b: BodyElement.Immediate(ImmediateBody(text, chunks))
         b
     }
 
@@ -325,6 +332,10 @@ define DssslSpecEventHandler
     gathering_body: bool
     current_part: pointer[Part]
     current_body: pointer[Array[u32]]
+    ; the gathered text's per-chunk source locations (the reference gathers
+    ; into a Text, which records a chunk per addChars) — cleared with
+    ; current_body, snapshotted into the ImmediateBody.
+    current_chunks: pointer[Array[TextChunk]]
     current_doc: pointer[Doc]
     current_decl: pointer[DeclarationElement]
     docs: pointer[Array[pointer[Doc]]]
@@ -339,6 +350,7 @@ define DssslSpecEventHandler
         set eh.gathering_body: false
         set eh.current_part: null
         set eh.current_body: Array[u32]^host()
+        set eh.current_chunks: Array[TextChunk]^host()
         set eh.current_doc: null
         set eh.current_decl: null
         set eh.docs: Array[pointer[Doc]]^host()
@@ -511,6 +523,7 @@ define DssslSpecEventHandler
         if this.current_part = null
             return
         this.current_body.clear()
+        this.current_chunks.clear()
         let ent DssslSpecEventHandler.attribute_entity(ev, "CONTENT")
         if ent = null
             set this.gathering_body: true
@@ -526,7 +539,17 @@ define DssslSpecEventHandler
             if this.current_part <> null
             {
                 let text StringC^host(this.current_body.get_buffer(), this.current_body.get_length())
-                this.current_part.append_body(BodyElement.make_immediate(this.host, text))
+                ; snapshot the chunk table — current_chunks is reused by the
+                ; next gathered element.
+                let chunks Array[TextChunk]^host()
+                let cn this.current_chunks.get_length()
+                var ci: size_t 0
+                while ci < cn
+                {
+                    chunks.add(*(this.current_chunks.get_buffer() + ci))
+                    set ci: ci + 1
+                }
+                this.current_part.append_body(BodyElement.make_immediate(this.host, text, chunks))
             }
             set this.gathering_body: false
         }
@@ -537,6 +560,7 @@ define DssslSpecEventHandler
         if (this.current_part = null) and (this.current_doc = null)
             return
         this.current_body.clear()
+        this.current_chunks.clear()
         set this.gathering_body: true
         let decl DeclarationElement.make(this.host, decl_type)
         let nm DssslSpecEventHandler.attribute_string(ev, "NAME")
@@ -645,6 +669,9 @@ define DssslSpecEventHandler
                 if this.gathering_body
                 {
                     let d ev.get_data()
+                    ; Text::addChars — record where this run came from before
+                    ; appending it (one chunk per data event).
+                    this.current_chunks.add(TextChunk(this.current_body.get_length(), ev.get_loc()))
                     var di: size_t 0
                     let dn d.get_size()
                     while di < dn
@@ -718,6 +745,44 @@ define DssslSpecEventHandler
             set i: i + 1
         }
         part.set_mark(false)
+    }
+
+    ; makeInputSource (BodyElement::makeInputSource): ONE InputSource per body
+    ; element, each read by its own SchemeParser (StyleEngine::parseSpec). An
+    ; immediate body reads the gathered text through a text origin whose chunk
+    ; table resolves a diagnostic back into the original source — a chunk
+    ; gathered from an expanded `&file.scm;` reference anchors INSIDE that
+    ; file. A CONTENT= internal entity reads its replacement text under an
+    ; entity origin with no reference location (EntityOrigin::make(entity,
+    ; Location()) — renders "(invalid location)", like the reference). The
+    ; CONTENT= EXTERNAL entity fresh-open (entityManager().open) is not
+    ; wired yet — no corpus stylesheet uses it; returns null (skipped).
+    function make_input_source(host: pointer[Page], be: pointer[BodyElement]) returns pointer[InputSource]
+    {
+        choose *be
+            when im: Immediate
+            {
+                if im.text.get_size() = (0 as size_t)
+                    return null
+                let org Origin.make_text(host, im.chunks)
+                return InputSource.make(host, org, im.text.data_ptr(), im.text.get_size())
+            }
+            when en: Entity
+            {
+                let ent en.entity
+                choose *ent
+                    when ie: Internal
+                    {
+                        let t ie.get_text()
+                        if t.get_size() = (0 as size_t)
+                            return null
+                        let org Origin.make_entity_origin(host, ent as pointer[void])
+                        return InputSource.make(host, org, t.data_ptr(), t.get_size())
+                    }
+                    else
+                        return null
+            }
+        null
     }
 
     ; body_text(part): concatenate the part's immediate body elements into one

@@ -146,4 +146,24 @@ if [ "$rc10" -ne 0 ] || [ "$got10" != "$want10" ]; then
   exit 1
 fi
 
+# Inc-7 stderr fidelity: interpreter diagnostics carry the MessageReporter
+# location prefix (<argv0>:<file>:<line>:<col>:<sev>:) resolved through the
+# gathered style-spec body's chunk table into the external trace.scm entity,
+# and -G disables tail-call replacement + prints the `called from here`
+# backtrace. Golden (trace.expected, argv0 normalized to PROG) validated
+# byte-identical against the reference openjade 1.3.2 incl. stdout `abc`.
+# run from $HERE with RELATIVE paths — the displayed entity file name is the
+# sysid resolved against the .dsl's directory as given (`trace.scm`).
+got11="$(cd "$HERE" && SCALY_HOME="$ROOT" "$OUT" -G -t sgml -d trace.dsl suite.sgml 2>"$OUT.trerr")"
+rc11=$?
+err11="$(sed "s|^$OUT|PROG|" "$OUT.trerr")"
+want11="$(cat "$HERE/trace.expected")"
+if [ "$rc11" -ne 0 ] || [ "$got11" != "abc" ] || [ "$err11" != "$want11" ]; then
+  echo "dazzle-cli: FAIL trace (rc=$rc11)"
+  echo "  out:  $(printf '%s' "$got11" | cat -v)"
+  echo "  want: $(printf '%s' "$want11" | cat -v)"
+  echo "  err:  $(printf '%s' "$err11" | cat -v)"
+  exit 1
+fi
+
 echo "dazzle-cli: PASS"
