@@ -2,6 +2,7 @@ use scaly.memory.Page
 use scaly.containers.Array
 use opensp.StringC.StringC
 use opensp.Location.Location
+use opensp.Location.Origin
 use opensp.ElementType.ElementType
 use opensp.AttributeList.AttributeList
 use opensp.Attribute.AttributeValue
@@ -91,24 +92,71 @@ define IdEntry (id: StringC, node: pointer[GroveNode])
 {
 }
 
+; Incremental grove construction state — the streaming drain (opensp's
+; do_content pump calling back into GroveBuilder.feed) consumes the event
+; queue in chunks, so the builder can no longer be a one-shot walk. The
+; pending-data fields mirror the reference's data COALESCING
+; (GroveBuilder.cxx DataNode::add): consecutive data events whose location
+; is contiguous (same origin, index continues the run) extend ONE data
+; chunk; any other event — or a non-contiguous data event — flushes the
+; pending chunk as a single data node. (The per-event data nodes the old
+; walk produced were a port deviation: 3.4M nodes on a 5 MB parse.)
+define GroveBuildState (host: pointer[Page], root: pointer[GroveNode], current: pointer[GroveNode], pend: pointer[Array[u32]], pend_org: pointer[Origin], pend_next: u32)
+{
+}
+
 define GroveBuilder
 {
-    function build(host: pointer[Page], ps: pointer[ParserState]) returns pointer[GroveNode]
+    function begin(host: pointer[Page]) returns pointer[GroveBuildState]
     {
+        let st host.allocate(sizeof GroveBuildState, alignof GroveBuildState) as pointer[GroveBuildState]
+        set st.host: host
         let root GroveNode.make(host, GN_DOCUMENT)
+        set st.root: root
+        set st.current: root
+        set st.pend: null
+        set st.pend_org: null
+        set st.pend_next: 0 as u32
+        st
+    }
+
+    ; flush the pending coalesced data run as ONE data node (the reference's
+    ; DataChunk boundary — GroveImpl::push/appendSibling flush pendingData_).
+    function flush_pending(st: pointer[GroveBuildState])
+    {
+        if st.pend = null
+            return
+        let host st.host
+        let pb st.pend
+        let node GroveNode.make(host, GN_DATA)
+        set node.chars: StringC^host(pb.get_buffer(), pb.get_length())
+        let cur st.current
+        set node.parent: cur
+        cur.add_child(node)
+        set st.pend: null
+        set st.pend_org: null
+    }
+
+    ; consume the queued events [ps.get_drained(), ps.n_events()) — called
+    ; from the streaming drain callback (which then resets the event scratch
+    ; region, so everything kept here is deep-copied; the borrowed
+    ; AttributeList pointers live on the run page and survive).
+    function feed(st: pointer[GroveBuildState], ps: pointer[ParserState])
+    {
         let events ps.get_events()
         if events = null
-            return root
-        var current root
-        let n events.get_length()
+            return
+        let host st.host
         let buf events.get_buffer()
-        var i: size_t 0
+        let n events.get_length()
+        var i ps.get_drained()
         while i < n
         {
             let ev *(buf + i)
             let t ev.get_type()
             if t = GEV_START_ELEMENT
             {
+                GroveBuilder.flush_pending(st)
                 let et ev.get_element_type()
                 let node GroveNode.make(host, GN_ELEMENT)
                 if et <> null
@@ -117,35 +165,99 @@ define GroveBuilder
                     set node.gi: StringC^host(nm.data_ptr(), nm.get_size())
                 }
                 set node.attributes: ev.get_attributes()
-                set node.parent: current
-                current.add_child(node)
-                set current: node
+                let cur st.current
+                set node.parent: cur
+                cur.add_child(node)
+                set st.current: node
             }
             else if t = GEV_END_ELEMENT
             {
-                let p current.get_parent()
+                GroveBuilder.flush_pending(st)
+                let cur st.current
+                let p cur.get_parent()
                 if p <> null
-                    set current: p
+                    set st.current: p
             }
-            else if (t = GEV_DATA) or (t = GEV_SDATA)
+            else if t = GEV_DATA
             {
+                ; DataNode::add — a zero-length event adds nothing; a
+                ; location-contiguous event extends the pending run.
+                let d ev.get_data()
+                let dl d.get_size()
+                if dl > (0 as size_t)
+                {
+                    let loc ev.get_loc()
+                    let org loc.get_origin()
+                    let idx loc.get_index()
+                    var extend false
+                    if st.pend <> null
+                    {
+                        if org = st.pend_org
+                        {
+                            if idx = st.pend_next
+                                set extend: true
+                        }
+                    }
+                    if extend = false
+                    {
+                        GroveBuilder.flush_pending(st)
+                        let fresh Array[u32]^host()
+                        set st.pend: fresh
+                        set st.pend_org: org
+                    }
+                    ; bind the pointer field — a method call through a
+                    ; pointer-FIELD receiver mis-emits (the documented
+                    ; deref-receiver class).
+                    let pb st.pend
+                    let dp d.data_ptr()
+                    var k: size_t 0
+                    while k < dl
+                    {
+                        pb.add(*(dp + k))
+                        set k: k + 1
+                    }
+                    set st.pend_next: idx + (dl as u32)
+                }
+            }
+            else if t = GEV_SDATA
+            {
+                ; the reference keeps SDATA as its OWN node (SdataNode) —
+                ; never coalesced into neighboring data.
+                GroveBuilder.flush_pending(st)
                 let d ev.get_data()
                 let node GroveNode.make(host, GN_DATA)
                 set node.chars: StringC^host(d.data_ptr(), d.get_size())
-                set node.parent: current
-                current.add_child(node)
+                let cur st.current
+                set node.parent: cur
+                cur.add_child(node)
             }
             else if t = GEV_PI
             {
+                GroveBuilder.flush_pending(st)
                 let d ev.get_data()
                 let node GroveNode.make(host, GN_PI)
                 set node.chars: StringC^host(d.data_ptr(), d.get_size())
-                set node.parent: current
-                current.add_child(node)
+                let cur st.current
+                set node.parent: cur
+                cur.add_child(node)
             }
             set i: i + 1
         }
-        root
+    }
+
+    function finish(st: pointer[GroveBuildState]) returns pointer[GroveNode]
+    {
+        GroveBuilder.flush_pending(st)
+        st.root
+    }
+
+    function build(host: pointer[Page], ps: pointer[ParserState]) returns pointer[GroveNode]
+    {
+        let st GroveBuilder.begin(host)
+        GroveBuilder.feed(st, ps)
+        ; bind — returning the call directly trips the silent-stub trap
+        let root GroveBuilder.finish(st)
+        return root
     }
 
     ; build_id_index: walk the grove and collect (id-value -> element node) for

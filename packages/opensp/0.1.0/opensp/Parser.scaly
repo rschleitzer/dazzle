@@ -98,6 +98,9 @@ use scaly.io.Path
 ; Storage.scaly — extern declares must type-match across the whole root).
 function strerror(code: i32) returns pointer[const_char] extern
 function scaly_eio_errno() returns i32 extern
+; the emitter-lowered indirect ptr(ptr) call (fiber.scaly declares the same
+; prototype) — invokes the streaming sink callback with the ParserState.
+function scaly_call_ptr(fn: pointer[void], arg: pointer[void]) returns pointer[void] extern
 
 ; Parser — the FIRST slice of Parser.cs (the 11801-LOC integration tail): the
 ; prolog + DTD declaration-subset parser. It drives ParserState.get_token(mode)
@@ -10726,8 +10729,18 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let d ps.get_drained()
         if (n - d) < EV_STREAM_CHUNK
             return
-        let w ps.get_stream_w() as pointer[EsisW]
-        Esis.write_events(w, ps, d, n)
+        let cb ps.get_stream_cb()
+        if cb <> null
+        {
+            ; custom sink (dazzle grove builder): consumes [drained, n).
+            let pv ps as pointer[void]
+            scaly_call_ptr(cb, pv)
+        }
+        else
+        {
+            let w ps.get_stream_w() as pointer[EsisW]
+            Esis.write_events(w, ps, d, n)
+        }
         ps.set_drained(n)
         ps.reset_event_scratch()
     }
@@ -19174,7 +19187,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; feature-info-only Esis.write would otherwise differ). arc_names, rast and
     ; out_conforming behave as before (the transform mutates ps.events in place;
     ; the caller renders).
-    function parse_document_to_state(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, out_enc: pointer[OutputEncoder], charset_fixed: bool, active_links: pointer[Array[String]], options: pointer[ParserOptions], error_limit: u32, reporter_options: u32, output_flags: u32, msg_fd: int, prolog_only: bool, rast: bool, em_cfg: pointer[EmConfig], doc_specs: pointer[Array[String]], out_conforming: pointer[bool], arc_names: pointer[Array[String]], stream_esis: bool, early_empty: pointer[bool]) returns pointer[ParserState]
+    function parse_document_to_state(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, out_enc: pointer[OutputEncoder], charset_fixed: bool, active_links: pointer[Array[String]], options: pointer[ParserOptions], error_limit: u32, reporter_options: u32, output_flags: u32, msg_fd: int, prolog_only: bool, rast: bool, em_cfg: pointer[EmConfig], doc_specs: pointer[Array[String]], out_conforming: pointer[bool], arc_names: pointer[Array[String]], stream_esis: bool, stream_cb: pointer[void], stream_ctx: pointer[void], early_empty: pointer[bool]) returns pointer[ParserState]
     {
         set *early_empty: false
         ; Record normalization (ExtendEntityManager, `lf` record type — the whole
@@ -19280,11 +19293,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.set_sd(sd)
         ps.set_syntax(syn)
 
-        ; ---- streaming ESIS delivery (memory Front B) ----------------------
-        ; Only the plain ESIS path streams; RAST/-A/-a/-p need the whole
-        ; event queue (see ParserState.streaming). The writer exists before
-        ; the parse; the do_content pump drains chunks into it.
-        if stream_esis
+        ; ---- streaming event delivery (memory Front B) ---------------------
+        ; Only the plain paths stream; RAST/-A/-a/-p need the whole event
+        ; queue (see ParserState.streaming). The sink exists before the
+        ; parse; the do_content pump drains chunks into it — the ESIS writer
+        ; (stream_esis) or a custom callback sink (stream_cb, e.g. the
+        ; dazzle grove builder).
+        if stream_esis or (stream_cb <> null)
         {
             if rast = false
             {
@@ -19303,8 +19318,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 }
                 if stream_ok
                 {
-                    let w Esis.begin(host, ps)
-                    ps.enable_streaming(w as pointer[void])
+                    if stream_esis
+                    {
+                        let w Esis.begin(host, ps)
+                        ps.enable_streaming(w as pointer[void])
+                    }
+                    else
+                        ps.enable_streaming_cb(stream_cb, stream_ctx)
                 }
             }
         }
@@ -19777,7 +19797,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     function parse_to_esis(host: pointer[Page], doc_bytes: String, base_dir: String, doc_name: StringC, prog_name: String, output_utf8: bool, out_enc: pointer[OutputEncoder], charset_fixed: bool, active_links: pointer[Array[String]], options: pointer[ParserOptions], error_limit: u32, reporter_options: u32, output_flags: u32, msg_fd: int, prolog_only: bool, rast: bool, em_cfg: pointer[EmConfig], doc_specs: pointer[Array[String]], out_conforming: pointer[bool], arc_names: pointer[Array[String]]) returns String
     {
         var early_empty false
-        let ps Parser.parse_document_to_state(host, doc_bytes, base_dir, doc_name, prog_name, output_utf8, out_enc, charset_fixed, active_links, options, error_limit, reporter_options, output_flags, msg_fd, prolog_only, rast, em_cfg, doc_specs, out_conforming, arc_names, true, &early_empty)
+        let ps Parser.parse_document_to_state(host, doc_bytes, base_dir, doc_name, prog_name, output_utf8, out_enc, charset_fixed, active_links, options, error_limit, reporter_options, output_flags, msg_fd, prolog_only, rast, em_cfg, doc_specs, out_conforming, arc_names, true, null, null, &early_empty)
         if rast
             return Rast.write(host, ps)
         if early_empty
@@ -19802,7 +19822,26 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let doc_name StringC^host(doc_path.to_c_string())
         var conforming false
         var early_empty false
-        Parser.parse_document_to_state(host, String(), String(), doc_name, prog_name, true, null, false, null, null, 0 as u32, 0 as u32, 0 as u32, 2, false, false, em, specs, &conforming, null, false, &early_empty)
+        Parser.parse_document_to_state(host, String(), String(), doc_name, prog_name, true, null, false, null, null, 0 as u32, 0 as u32, 0 as u32, 2, false, false, em, specs, &conforming, null, false, null, null, &early_empty)
+    }
+
+    ; parse_simple with a streaming sink: cb (C-shaped fn(ParserState*)->void*,
+    ; called via scaly_call_ptr at every chunk drain) consumes queued events
+    ; [get_drained(), n_events()) and reaches its own state via get_stream_w()
+    ; = ctx; the event scratch region resets after each drain, so the sink
+    ; must deep-copy anything it keeps (run-page payloads like AttributeList
+    ; pointers are safe — only Event records + their data StringCs live on
+    ; the scratch). The caller consumes the final tail after this returns.
+    function parse_simple_stream(host: pointer[Page], doc_path: String, prog_name: String, cb: pointer[void], ctx: pointer[void]) returns pointer[ParserState]
+    {
+        let em host.allocate(sizeof EmConfig, alignof EmConfig) as pointer[EmConfig]
+        set *em: EmConfig()
+        let specs Array[String]^host()
+        specs.add(String^host(doc_path))
+        let doc_name StringC^host(doc_path.to_c_string())
+        var conforming false
+        var early_empty false
+        Parser.parse_document_to_state(host, String(), String(), doc_name, prog_name, true, null, false, null, null, 0 as u32, 0 as u32, 0 as u32, 2, false, false, em, specs, &conforming, null, false, cb, ctx, &early_empty)
     }
 
     ; parse_simple with an explicit (must-exist) catalog file — resolves PUBLIC
@@ -19825,7 +19864,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let doc_name StringC^host(doc_path.to_c_string())
         var conforming false
         var early_empty false
-        Parser.parse_document_to_state(host, String(), String(), doc_name, prog_name, true, null, false, null, null, 0 as u32, 0 as u32, 0 as u32, 2, false, false, em, specs, &conforming, null, false, &early_empty)
+        Parser.parse_document_to_state(host, String(), String(), doc_name, prog_name, true, null, false, null, null, 0 as u32, 0 as u32, 0 as u32, 2, false, false, em, specs, &conforming, null, false, null, null, &early_empty)
     }
 
     ; ---- self-test: parse a synthetic DTD subset, assert the built Dtd -----
