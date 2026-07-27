@@ -81,4 +81,17 @@ if [ "$rc5" -ne 0 ] || [ "$got5" != "$want5" ]; then
   exit 1
 fi
 
+# sibling/axis primitives from the modules reproduction: children over a
+# multi-node list, id, node-list-reverse, node-list=?, first-sibling?,
+# last-sibling?, child-number, node-list-map.
+got6="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/axis.dsl" "$HERE/axis.sgml")"
+rc6=$?
+want6="$(cat "$HERE/axis.expected")"
+if [ "$rc6" -ne 0 ] || [ "$got6" != "$want6" ]; then
+  echo "dazzle-cli: FAIL axis-primitives (rc=$rc6)"
+  echo "  want: $(printf '%s' "$want6" | cat -v)"
+  echo "  got:  $(printf '%s' "$got6" | cat -v)"
+  exit 1
+fi
+
 echo "dazzle-cli: PASS"
