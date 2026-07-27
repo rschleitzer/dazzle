@@ -50,9 +50,12 @@ if ! "$BIN" -o "$TMP/unit" "$HERE/unit.scaly" "$TMP/libdazzle.a" "$TMP/libopensp
   echo "dazzle: FAIL (link)"; tail -8 "$TMP/link.log"; exit 1
 fi
 
-# Expected stderr: the SchemeParser vector-gating check provokes exactly one
-# reference diagnostic (#( outside dsssl2 -> unknownHash).
-experr="dazzle:E: invalid character after '#'"
+# Expected stderr, in test order: the SchemeParser vector-gating check
+# (#( outside dsssl2 -> unknownHash), then the errors-are-LOUD checks
+# (undefinedVariableReference; PrimitiveObj::argError name/ordinal/object).
+experr="dazzle:E: invalid character after '#'
+dazzle:E: reference to undefined variable \"bogusvar\"
+dazzle:E: 2nd argument for primitive \"string-append\" of wrong type: \"3\" not a string"
 out="$("$TMP/unit" 2>"$TMP/err")"
 rc=$?
 err="$(cat "$TMP/err")"
