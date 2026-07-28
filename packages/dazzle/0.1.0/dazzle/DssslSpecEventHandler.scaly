@@ -72,6 +72,7 @@ define DECL_SGML_GROVE_PLAN: int 10
 define EVK_START: int 0
 define EVK_END: int 1
 define EVK_DATA: int 2
+define EVK_END_PROLOG: int 8
 
 ; --- the assembled structures (Link subclasses in the reference) -----------
 
@@ -214,6 +215,13 @@ define PartHeader
     function get_id(this: PartHeader) returns StringC
         id
 
+    ; setRefLoc — first reference wins (the reference guards on a null origin).
+    function set_ref_loc(this: pointer[PartHeader], loc: Location)
+    {
+        if this.ref_loc.get_origin() = null
+            set this.ref_loc: loc
+    }
+
     function set_concrete(this: pointer[PartHeader], host: pointer[Page], part: pointer[Part])
     {
         let sp host.allocate(sizeof SpecPart, alignof SpecPart) as pointer[SpecPart]
@@ -294,19 +302,30 @@ define Doc
     function append_decl(this: pointer[Doc], d: pointer[DeclarationElement])
         this.declarations.add(d)
 
-    ; resolveFirstPart: the LAST header's part (the reference walks to the last).
+    ; the doc's own location (its end-prolog event; anchors noParts).
+    function set_location(this: pointer[Doc], loc: Location)
+        set this.loc: loc
+
+    ; resolveFirstPart: the FIRST-created header's part — the reference walks
+    ; its headers_ IList to the last iteration position, and IList::insert
+    ; PREPENDS, so that is the EARLIEST refPart (the document's first
+    ; style-specification in practice; a USE ref can create headers later).
     function resolve_first_part(this: pointer[Doc], eh: pointer[DssslSpecEventHandler]) returns pointer[Part]
     {
         this.load(eh)
         let n this.headers.get_length()
         if n = (0 as size_t)
         {
-            eh.interp.set_next_location(this.loc)
-            eh.interp.message0(InterpreterMessages.noParts())
+            ; the reference messages only when the doc's location is known
+            if this.loc.get_origin() <> null
+            {
+                eh.interp.set_next_location(this.loc)
+                eh.interp.message0(InterpreterMessages.noParts())
+            }
             return null
         }
-        let last *(this.headers.get_buffer() + (n - (1 as size_t)))
-        last.resolve(eh)
+        let first *(this.headers.get_buffer())
+        first.resolve(eh)
     }
 
     ; Doc::load — parse the referenced spec file (sysid) and assemble it.
@@ -339,9 +358,14 @@ define DssslSpecEventHandler
     current_doc: pointer[Doc]
     current_decl: pointer[DeclarationElement]
     docs: pointer[Array[pointer[Doc]]]
+    ; parse parameters for loading EXTERNAL-SPECIFICATION documents (the
+    ; reference derives a child SgmlParser from the main parser's params;
+    ; we re-parse with the same program name and DSSSL catalog).
+    prog_name: String
+    catalog_path: String
 )
 {
-    function make(host: pointer[Page], interp: pointer[Interpreter]) returns pointer[DssslSpecEventHandler]
+    function make(host: pointer[Page], interp: pointer[Interpreter], prog_name: String, catalog_path: String) returns pointer[DssslSpecEventHandler]
     {
         let eh host.allocate(sizeof DssslSpecEventHandler, alignof DssslSpecEventHandler) as pointer[DssslSpecEventHandler]
         set eh.host: host
@@ -354,6 +378,8 @@ define DssslSpecEventHandler
         set eh.current_doc: null
         set eh.current_decl: null
         set eh.docs: Array[pointer[Doc]]^host()
+        set eh.prog_name: String^host(prog_name)
+        set eh.catalog_path: String^host(catalog_path)
         eh
     }
 
@@ -439,6 +465,37 @@ define DssslSpecEventHandler
         t.string()
     }
 
+    ; attributeText — the attribute's value Text (per-char source locations).
+    function attribute_text(ev: pointer[Event], name: pointer[const_char]) returns pointer[Text]
+    {
+        let atts ev.get_attributes()
+        if atts = null
+            return null
+        let idx atts.attribute_index(StringC(name))
+        if idx < 0
+            return null
+        let v atts.value(idx as size_t)
+        if v = null
+            return null
+        v.get_text()
+    }
+
+    ; Text::charLocation(i) — the recorded per-char location (one past the
+    ; last for i == size, like the reference).
+    function text_char_loc(t: pointer[Text], i: size_t) returns Location
+    {
+        let locs t.get_locs()
+        if locs = null
+            return Location()
+        let n t.size()
+        if n = (0 as size_t)
+            return Location()
+        if i < n
+            return *(locs + i)
+        let last *(locs + (n - (1 as size_t)))
+        Location(last.get_origin(), last.get_index() + (1 as u32))
+    }
+
     function attribute_entity(ev: pointer[Event], name: pointer[const_char]) returns pointer[Entity]
     {
         let atts ev.get_attributes()
@@ -479,7 +536,9 @@ define DssslSpecEventHandler
             header.set_external_first(this.host, doc)
         else
         {
+            ; refPart(specid, event.location()) — the missingPart anchor
             let sub_header doc.ref_part(this.host, specid)
+            sub_header.set_ref_loc(ev.get_loc())
             header.set_external(this.host, sub_header)
         }
     }
@@ -491,8 +550,13 @@ define DssslSpecEventHandler
         let part Part.make(this.host, this.current_doc)
         set this.current_part: part
         header.set_concrete(this.host, part)
-        ; USE="id1 id2 …" — space-separated part references (this doc).
-        let use_str DssslSpecEventHandler.attribute_string(ev, "USE")
+        ; USE="id1 id2 …" — space-separated part references (this doc); each
+        ; header's refLoc anchors at the id's char inside the attribute value
+        ; (reference useP->charLocation(i)).
+        let use_text DssslSpecEventHandler.attribute_text(ev, "USE")
+        if use_text = null
+            return
+        let use_str use_text.string()
         let un use_str.get_size()
         var i: size_t 0
         while i < un
@@ -507,7 +571,10 @@ define DssslSpecEventHandler
             if j > i
             {
                 let sub use_str.substr(i, j - i)
-                part.add_use(this.current_doc.ref_part(this.host, sub))
+                let uh this.current_doc.ref_part(this.host, sub)
+                let uloc DssslSpecEventHandler.text_char_loc(use_text, i)
+                uh.set_ref_loc(uloc)
+                part.add_use(uh)
             }
             if j >= un
                 break
@@ -522,8 +589,12 @@ define DssslSpecEventHandler
     {
         if this.current_part = null
             return
-        this.current_body.clear()
-        this.current_chunks.clear()
+        ; reset the gather buffers (fresh arrays — Array has no clear; the
+        ; old .clear() calls were silently dropped no-ops and every element
+        ; accumulated ALL prior body text)
+        let bhost this.host
+        set this.current_body: Array[u32]^bhost()
+        set this.current_chunks: Array[TextChunk]^bhost()
         let ent DssslSpecEventHandler.attribute_entity(ev, "CONTENT")
         if ent = null
             set this.gathering_body: true
@@ -559,8 +630,12 @@ define DssslSpecEventHandler
     {
         if (this.current_part = null) and (this.current_doc = null)
             return
-        this.current_body.clear()
-        this.current_chunks.clear()
+        ; reset the gather buffers (fresh arrays — Array has no clear; the
+        ; old .clear() calls were silently dropped no-ops and every element
+        ; accumulated ALL prior body text)
+        let bhost this.host
+        set this.current_body: Array[u32]^bhost()
+        set this.current_chunks: Array[TextChunk]^bhost()
         set this.gathering_body: true
         let decl DeclarationElement.make(this.host, decl_type)
         let nm DssslSpecEventHandler.attribute_string(ev, "NAME")
@@ -664,6 +739,12 @@ define DssslSpecEventHandler
                         this.declaration_end()
                 }
             }
+            else if ty = EVK_END_PROLOG
+            {
+                ; endProlog — the current doc's own location (anchors noParts)
+                if this.current_doc <> null
+                    this.current_doc.set_location(ev.get_loc())
+            }
             else if ty = EVK_DATA
             {
                 if this.gathering_body
@@ -685,12 +766,58 @@ define DssslSpecEventHandler
         }
     }
 
-    ; load an external spec document by re-parsing its file, then walk it.
+    ; load an external spec document by re-parsing its file, then walk it
+    ; (reference Doc::load → loadDoc: a child SgmlParser over the sysid, the
+    ; DSSSL-architecture gate per document, currentDoc_ rebound for the walk).
     function load_external_doc(this: pointer[DssslSpecEventHandler], doc: pointer[Doc])
     {
-        ; Cross-file EXTERNAL-SPECIFICATION: parse the referenced .dsl and walk
-        ; its events into `doc`. The saved/restored current_doc keeps the
-        ; nested assembly scoped. (Wired but not yet corpus-exercised at Inc 2.)
+        let host this.host
+        var sysid doc.get_sysid()
+        ; the effective system id is a storage object spec — strip the
+        ; storage-manager prefix (`<OSFILE>…`) down to the file path (the
+        ; reference hands the spec to a child parser's entity manager).
+        if (sysid.get_size() > (0 as size_t)) and (sysid.get(0 as size_t) = (0x3C as u32))
+        {
+            var gt: size_t 0
+            let sn sysid.get_size()
+            while gt < sn
+            {
+                if sysid.get(gt) = (0x3E as u32)
+                    break
+                set gt: gt + 1
+            }
+            if gt < sn
+                set sysid: sysid.substr(gt + (1 as size_t), sn - (gt + (1 as size_t)))
+        }
+        ; StringC (u32 chars) -> NUL-terminated byte path
+        let n sysid.get_size()
+        let pb host.allocate(n + (1 as size_t), 1 as size_t) as pointer[u8]
+        var ci: size_t 0
+        while ci < n
+        {
+            set *(pb + ci): sysid.get(ci) as u8
+            set ci: ci + 1
+        }
+        set *(pb + n): 0 as u8
+        let path String^host(pb as pointer[char])
+        let ps Parser.parse_simple_cat(host, path, this.prog_name, this.catalog_path)
+        if ps = null
+            return
+        let saved_doc this.current_doc
+        let saved_part this.current_part
+        let saved_gathering this.gathering_body
+        set this.current_part: null
+        set this.gathering_body: false
+        if this.check_dsssl_arch(ps) = false
+            this.interp.message0(InterpreterMessages.specNotArc())
+        else
+        {
+            set this.current_doc: doc
+            this.walk(ps)
+        }
+        set this.current_doc: saved_doc
+        set this.current_part: saved_part
+        set this.gathering_body: saved_gathering
     }
 
     ; --- top-level entry ---------------------------------------------------
@@ -836,7 +963,7 @@ define DssslSpecEventHandler
         if ps = null
             return 1
 
-        let eh DssslSpecEventHandler.make(host, interp)
+        let eh DssslSpecEventHandler.make(host, interp, String("dazzle"), String(""))
         ; the arch gate must recognize the DSSSL notation
         if eh.check_dsssl_arch(ps) = false
             return 2
@@ -882,7 +1009,7 @@ define DssslSpecEventHandler
         if File.write_from_string(path2, dsl2) = false
             return 8
         let ps2 Parser.parse_simple(host, path2, String("dazzle"))
-        let eh2 DssslSpecEventHandler.make(host, interp)
+        let eh2 DssslSpecEventHandler.make(host, interp, String("dazzle"), String(""))
         if eh2.check_dsssl_arch(ps2)
             return 9
 

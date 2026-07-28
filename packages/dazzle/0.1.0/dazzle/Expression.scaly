@@ -5,6 +5,7 @@ use opensp.StringC.StringC
 use dazzle.ELObj.ELObj
 use dazzle.ELObj.Identifier
 use dazzle.ELObj.FlowObj
+use dazzle.ELObj.OutputCharStream
 use dazzle.Insn.Insn
 use dazzle.Insn.Signature
 use dazzle.Interpreter.Interpreter
@@ -2045,7 +2046,12 @@ define Expression union
             {
                 let op e.op
                 let args e.args
-                let n args.get_length() as int
+                var n args.get_length() as int
+                ; CallExpression::compile: op_->optimize BEFORE constantValue —
+                ; a top-level define folds to its (eagerly computed) function
+                ; value here, so calls take the constant FunctionCall path and
+                ; the arity diagnostics fire at COMPILE (reference behavior).
+                op.fold_variable(interp, env)
                 let value op.constant_value()
                 var result: pointer[Insn] null
                 ; -G disables the tail-call replacement (`!interp.debugMode()`
@@ -2054,6 +2060,14 @@ define Expression union
                 let debug interp.get_debug_mode()
                 if value <> null
                 {
+                    ; CallExpression::compile constant-op arity checks: a
+                    ; non-function or missing arg is an ErrorInsn; excess args
+                    ; (no rest) and odd key args are reported here and the
+                    ; arg list truncated (reference args_.resize).
+                    let eff Expression.check_call_arity(interp, value, n, e.loc)
+                    if eff < 0
+                        return Insn.make_error(host)
+                    set n: eff
                     var caller_args 0
                     if ((next <> null) and next.is_return()) and (debug = false)
                     {
@@ -2088,6 +2102,49 @@ define Expression union
             else
                 return next
         next
+    }
+
+    ; CallExpression::compile constant-op arity check: returns the effective
+    ; arg count (truncated on tooManyArgs/oddKeyArgs like args_.resize), or
+    ; -1 when the call must compile to an ErrorInsn (non-function/missingArg).
+    function check_call_arity(interp: pointer[Interpreter], value: pointer[ELObj], n: int, loc: Location) returns int
+    {
+        if value.is_function() = false
+        {
+            interp.set_next_location(loc)
+            let host interp.get_host()
+            let os OutputCharStream.make(host)
+            value.print(os, interp.get_units_per_inch())
+            interp.message1(InterpreterMessages.callNonFunction(), os.to_string_c(host))
+            return 0 - 1
+        }
+        let n_req value.n_required_args()
+        if n < n_req
+        {
+            interp.set_next_location(loc)
+            interp.message0(InterpreterMessages.missingArg())
+            return 0 - 1
+        }
+        let n_opt value.n_optional_args()
+        if n - n_req > n_opt
+        {
+            if value.n_key_args() > 0
+            {
+                if ((n - n_req - n_opt) % 2) = 1
+                {
+                    interp.set_next_location(loc)
+                    interp.message0(InterpreterMessages.oddKeyArgs())
+                    return n_req + n_opt
+                }
+            }
+            else if value.has_rest_arg() = false
+            {
+                interp.set_next_location(loc)
+                interp.message0(InterpreterMessages.tooManyArgs())
+                return n_req + n_opt
+            }
+        }
+        n
     }
 
     ; LetExpression::compile.
@@ -2387,7 +2444,7 @@ define Expression union
                 var code Expression.optimize_compile(e.body, interp, lambda_env, n_formals, Insn.make_return(host, n_formals))
 
                 if (sig.n_optional > 0) or sig.rest_arg or (sig.n_key > 0)
-                    set code: Expression.compile_lambda_varargs(interp, sig, formals, inits, formal_vars, bound_vars, code, host)
+                    set code: Expression.compile_lambda_varargs(interp, sig, formals, inits, formal_vars, bound_vars, code, host, e.loc)
 
                 set i: 0
                 while i < sig.n_required
@@ -2405,11 +2462,18 @@ define Expression union
     }
 
     ; the optional/rest/key entry-point construction (LambdaExpression.compile).
-    function compile_lambda_varargs(interp: pointer[Interpreter], sig: Signature, formals: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], formal_vars: pointer[BoundVarList], bound_vars: pointer[BoundVarList], code: pointer[Insn], host: pointer[Page]) returns pointer[Insn]
+    function compile_lambda_varargs(interp: pointer[Interpreter], sig: Signature, formals: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], formal_vars: pointer[BoundVarList], bound_vars: pointer[BoundVarList], code: pointer[Insn], host: pointer[Page], lambda_loc: Location) returns pointer[Insn]
     {
         var extra 0
         if sig.rest_arg or (sig.n_key > 0)
             set extra: 1
+        ; init-env resizes use the REST slot only (reference: nRequiredArgs +
+        ; i + restArg) — keys are NOT in scope for their own inits, and the
+        ; sp-relative StackRef offsets derive from this size: one too many
+        ; reads a slot below the frame.
+        var rest_slot 0
+        if sig.rest_arg
+            set rest_slot: 1
         let ep_count sig.n_optional + extra + 1
         let entry host.allocate((ep_count as size_t) * sizeof pointer[Insn], alignof pointer[Insn]) as pointer[pointer[Insn]]
         var z 0
@@ -2440,7 +2504,7 @@ define Expression union
                 if (i < n_inits) and (*(ib + i) <> null)
                 {
                     let f BoundVarList.copy(host, formal_vars)
-                    f.resize(sig.n_required + i + extra)
+                    f.resize(sig.n_required + i + rest_slot)
                     let ev Environment.make_with(host, f, bound_vars)
                     set set_insn: Expression.optimize_compile(*(ib + i), interp, ev, n_formals, set_insn)
                 }
@@ -2462,7 +2526,7 @@ define Expression union
                 if (i < n_inits) and (*(ib + i) <> null)
                 {
                     let f BoundVarList.copy(host, formal_vars)
-                    f.resize(sig.n_required + i + extra)
+                    f.resize(sig.n_required + i + rest_slot)
                     let ev Environment.make_with(host, f, bound_vars)
                     set code_no_rest: Expression.optimize_compile(*(ib + i), interp, ev, f.count(), code_no_rest)
                 }
@@ -2519,15 +2583,9 @@ define Expression union
             set i: i + 1
         }
 
-        Insn.make_varargs(host, sig, entry, ep_count, sig_loc_placeholder())
+        Insn.make_varargs(host, sig, entry, ep_count, lambda_loc)
     }
 }
-
-; a placeholder location for the Varargs insn (the reference uses the lambda's
-; location; a synthesized one suffices — Varargs never reports a diagnostic in
-; the eval core).
-function sig_loc_placeholder() returns Location
-    Location()
 
 ; the host page reachable from a BoundVarList (used by markBoundVars' Lambda
 ; sub-list construction).

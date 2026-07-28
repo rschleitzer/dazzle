@@ -69,6 +69,31 @@
 # atomic rule class, invalid fraction-bar / glyph-subst-table characteristic
 # values (constants at compile, non-constants per process), and the
 # glyph-subst-table/glyph-subst/glyph-id primitive argument errors.
+# toy11 (doc.sgml): format-number / format-number-list — letter (a/A incl.
+# aa/zz), roman (i/I incl. subtractive forms, |n|>5000 decimal fallback),
+# zero-padded decimal widths, negatives, and list forms with string/list
+# formats and separators.
+# bad9/bad10 (doc.sgml): the format-number error paths — invalidNumberFormat
+# is non-fatal (result still emitted), argument type errors abort the rule
+# (default-processing fallback), incl. the reference arg-index quirks
+# (list-element format/number errors report index 0, an exhausted format
+# list reports the remaining tail as "not a list").
+# toy12 (doc.sgml): #!optional/#!rest/#!key formals — defaults referencing
+# earlier formals (incl. key-arg inits, the reference rest-only init-env
+# resize), (lambda x body), repeated keywords (first wins), rest+key combos.
+# bad11 (doc.sgml): the call-arity diagnostics — missingArg/tooManyArgs/
+# oddKeyArgs fire at COMPILE on constant ops (args truncated, reference
+# CallExpression::compile), invalidKeyArg/keyArgsNotKey per process at the
+# defining lambda's location (VarargsInsn).
+# toy13 (doc.sgml; ext1.dsl/ext2.dsl): external-specification — a CDATA DSSSL
+# document entity re-parsed as its own doc, specid= part selection vs the
+# first-part form (reference IList prepend: the FIRST-created header),
+# cross-doc use= chains, define precedence across parts (earlier part wins
+# silently), main-part rule override, external-part element rules.
+# bad12 (doc.sgml): duplicateDefinition in the same part (with the
+# "first definition was here" auxiliary location line) + a user define
+# displacing a builtin (part -1) so the later call reports
+# callNonFunction at compile.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -123,6 +148,9 @@ run_case toy7 "$HERE/toy7.expected" "" tdoc.sgml
 run_case toy8 "$HERE/toy8.expected" "" tdoc.sgml
 run_case toy9 "$HERE/toy9.expected" "" tdoc.sgml
 run_case toy10 "$HERE/toy10.expected"
+run_case toy11 "$HERE/toy11.expected"
+run_case toy12 "$HERE/toy12.expected"
+run_case toy13 "$HERE/toy13.expected"
 run_case bad  "$HERE/bad.expected" "$HERE/bad.expected.err"
 run_case bad2 "$HERE/bad2.expected" "$HERE/bad2.expected.err"
 run_case bad3 "$HERE/bad3.expected" "$HERE/bad3.expected.err"
@@ -131,6 +159,10 @@ run_case bad5 "$HERE/bad5.expected" "$HERE/bad5.expected.err" tdoc.sgml
 run_case bad6 "$HERE/bad6.expected" "$HERE/bad6.expected.err"
 run_case bad7 "$HERE/bad7.expected" "$HERE/bad7.expected.err" tdoc.sgml
 run_case bad8 "$HERE/bad8.expected" "$HERE/bad8.expected.err"
+run_case bad9 "$HERE/bad9.expected" "$HERE/bad9.expected.err"
+run_case bad10 "$HERE/bad10.expected" "$HERE/bad10.expected.err"
+run_case bad11 "$HERE/bad11.expected" "$HERE/bad11.expected.err"
+run_case bad12 "$HERE/bad12.expected" "$HERE/bad12.expected.err"
 
 # default output name: <docbase>.fot in the current directory (JadeApp).
 ( cd "$WORK" && rm -f doc.fot && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
