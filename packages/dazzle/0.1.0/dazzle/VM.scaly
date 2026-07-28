@@ -1,11 +1,18 @@
 use scaly.memory.Page
 use scaly.containers.Array
 use opensp.Location.Location
+use opensp.StringC.StringC
 use dazzle.ELObj.ELObj
 use dazzle.Grove.GroveNode
 use dazzle.Insn.Insn
 use dazzle.Interpreter.Interpreter
 use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.Style.StyleStack
+use dazzle.Style.InheritedCInfo
+use dazzle.Style.InheritedC
+use dazzle.Style.VarStyleRec
+use dazzle.Style.Convert
+use dazzle.Style.FotSym
 
 ; VM — the threaded-code virtual machine (Style/VM.cxx). The evaluation loop
 ; is `while (insn) insn = insn->execute(this)`; each Insn advances the value
@@ -67,6 +74,12 @@ define VM
     ; idiom.
     mode_stack: pointer[Array[pointer[void]]]
     mode_sp: size_t
+    ; EvalContext.styleStack/specLevel/actualDependencies — non-null only while
+    ; an inherited-characteristic value is being evaluated (style push,
+    ; inherited-*/actual-*). spec_level -1 = the C++ unsigned(-1) sentinel.
+    style_stack: pointer[StyleStack]
+    spec_level: int
+    actual_deps: pointer[Array[int]]
 )
 {
     function make(host: pointer[Page], interp: pointer[Interpreter]) returns pointer[VM]
@@ -89,8 +102,20 @@ define VM
         set vm.processing_mode: null
         set vm.mode_stack: null
         set vm.mode_sp: 0
+        set vm.style_stack: null
+        set vm.spec_level: 0 - 1
+        set vm.actual_deps: null
         vm
     }
+
+    function get_style_stack(this: VM) returns pointer[StyleStack]
+        style_stack
+
+    function get_spec_level(this: VM) returns int
+        spec_level
+
+    function get_actual_deps(this: VM) returns pointer[Array[int]]
+        actual_deps
 
     ; --- EvalContext current node (cross-module accessors) ------------------
     function get_current_node(this: VM) returns pointer[GroveNode]
@@ -395,5 +420,205 @@ define VM
         set *(this.sbase + this.sp): func
         set this.sp: this.sp + 1
         true
+    }
+
+    ; --- inherited-characteristics evaluation glue ---------------------------
+    ; Ports InheritedC::value / VarInheritedC::set+value and StyleStack::
+    ; inherited/actual (Style.cxx, InheritedC.cxx). It lives HERE because
+    ; Style.scaly cannot evaluate code (Style importing VM would close the
+    ; VM→Insn→Style cycle). Evaluation always runs in a FRESH VM (the
+    ; reference's StyleStack::inherited does the same; pushEnd's reuse of the
+    ; processing VM is not reentrancy-safe for our eval loop).
+
+    ; InheritedC::value — the ELObj form of a CONSTANT spec's value.
+    function ic_value_of(host: pointer[Page], interp: pointer[Interpreter], ic: pointer[InheritedC]) returns pointer[ELObj]
+    {
+        let kind ic.get_kind()
+        if kind = IC_BOOL
+        {
+            if ic.bval
+                return interp.make_true()
+            return interp.make_false()
+        }
+        if kind = IC_LENGTH
+            return ELObj.make_length(host, ic.lval)
+        if kind = IC_LENGTH_SPEC
+            ; makeLengthSpec: no display-size factor in this slice -> LengthObj
+            return ELObj.make_length(host, ic.ls.length)
+        if kind = IC_SYMBOL
+        {
+            if ic.sym.code = SYM_FALSE
+                return interp.make_false()
+            if ic.sym.code = SYM_TRUE
+                return interp.make_true()
+            return interp.make_symbol(ic.sym.name)
+        }
+        if kind = IC_STRING
+            return ELObj.make_string(host, ic.sval)
+        if kind = IC_INT
+            return ELObj.make_integer(host, ic.lval)
+        if kind = IC_MAYBE_INT
+        {
+            if ic.lval = 0
+                return interp.make_false()
+            return ELObj.make_integer(host, ic.lval)
+        }
+        if kind = IC_PUBLIC_ID
+        {
+            if ic.bval or (ic.sval.get_size() = (0 as size_t))
+                return interp.make_false()
+            return ELObj.make_string(host, ic.sval)
+        }
+        if kind = IC_LETTER2
+        {
+            if ic.bval or (ic.sval.get_size() = (0 as size_t))
+                return interp.make_false()
+            ; Letter2InheritedC::value quirk: the symbol name is the two
+            ; letters PLUS an appended NUL char (reference `buf += 0`).
+            var buf u32[3]
+            set *(buf as pointer[u32]): ic.sval.get(0 as size_t)
+            set *((buf as pointer[u32]) + 1): ic.sval.get(1 as size_t)
+            set *((buf as pointer[u32]) + 2): 0 as u32
+            let nul_name StringC(buf as pointer[u32], 3 as size_t)
+            return interp.make_symbol(nul_name)
+        }
+        if kind = IC_IGNORED
+            return ic.obj
+        interp.make_false()
+    }
+
+    ; evaluate a spec's value: VarInheritedC::value (fresh VM, the style's
+    ; display + creation node, spec_level per caller) or the constant form.
+    function eval_spec_value(spec: pointer[InheritedC], style: pointer[VarStyleRec], ss: pointer[StyleStack], spec_level: int, interp: pointer[Interpreter], deps: pointer[Array[int]]) returns pointer[ELObj]
+    {
+        let host interp.get_host()
+        if spec.is_var()
+        {
+            let vm VM.make(host, interp)
+            set vm.style_stack: ss
+            set vm.spec_level: spec_level
+            set vm.actual_deps: deps
+            var disp: pointer[pointer[ELObj]] null
+            if style <> null
+            {
+                set vm.current_node: style.node as pointer[GroveNode]
+                set disp: style.display
+            }
+            return vm.eval(spec.code as pointer[Insn], disp, null)
+        }
+        VM.ic_value_of(host, interp, spec)
+    }
+
+    ; StyleStack::inherited — the value of `ic` as seen from a spec at
+    ; `spec_level` (the level below its own specification).
+    function stack_inherited(ss: pointer[StyleStack], ic: pointer[InheritedC], spec_level: int, interp: pointer[Interpreter], deps: pointer[Array[int]]) returns pointer[ELObj]
+    {
+        var spec ic
+        var style: pointer[VarStyleRec] null
+        var new_spec_level 0 - 1
+        var p ss.info_at(ic.get_index())
+        while p <> null
+        {
+            if p.spec_level < spec_level
+                break
+            set p: p.prev
+        }
+        if p <> null
+        {
+            if p.cached_value <> null
+            {
+                ; the cached value holds only while none of the values it
+                ; depended on was re-specified since it was computed.
+                var cache_ok true
+                let pd p.dependencies
+                let nd pd.get_length()
+                var i: size_t 0
+                while i < nd
+                {
+                    let dp pd.get(i)
+                    if dp <> null
+                    {
+                        let q ss.info_at(*dp)
+                        if q <> null
+                        {
+                            if q.val_level > p.val_level
+                                set cache_ok: false
+                        }
+                    }
+                    set i: i + (1 as size_t)
+                }
+                if cache_ok
+                    return p.cached_value
+            }
+            set style: p.style
+            set spec: p.spec
+            set new_spec_level: p.spec_level
+        }
+        VM.eval_spec_value(spec, style, ss, new_spec_level, interp, deps)
+    }
+
+    ; StyleStack::actual — the actual (current-level) value of `ic`, with
+    ; circularity detection over the accumulating dependency list.
+    function stack_actual(ss: pointer[StyleStack], ic: pointer[InheritedC], loc: Location, interp: pointer[Interpreter], deps: pointer[Array[int]]) returns pointer[ELObj]
+    {
+        let ind ic.get_index()
+        let n deps.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let dp deps.get(i)
+            if dp <> null
+            {
+                if *dp = ind
+                {
+                    interp.set_next_location(loc)
+                    interp.message1(InterpreterMessages.actualLoop(), ic.ident.get_name())
+                    return interp.make_error()
+                }
+            }
+            set i: i + (1 as size_t)
+        }
+        deps.add(ind)
+        var spec ic
+        var style: pointer[VarStyleRec] null
+        let p ss.info_at(ind)
+        if p <> null
+        {
+            if p.cached_value <> null
+            {
+                let pd p.dependencies
+                let nd pd.get_length()
+                var j: size_t 0
+                while j < nd
+                {
+                    let ddp pd.get(j)
+                    if ddp <> null
+                        deps.add(*ddp)
+                    set j: j + (1 as size_t)
+                }
+                return p.cached_value
+            }
+            set style: p.style
+            set spec: p.spec
+        }
+        VM.eval_spec_value(spec, style, ss, ss.get_level(), interp, deps)
+    }
+
+    ; pushEnd's per-spec body (VarInheritedC::set): resolve a pushed spec to
+    ; the CONSTANT characteristic the sink renders — evaluating + caching a
+    ; VarInheritedC's value on first use; null = invalid/error (nothing set).
+    function resolve_set(ss: pointer[StyleStack], info: pointer[InheritedCInfo], interp: pointer[Interpreter]) returns pointer[InheritedC]
+    {
+        let spec info.spec
+        if spec.is_var() = false
+            return spec
+        if info.cached_value = null
+            set info.cached_value: VM.eval_spec_value(spec, info.style, ss, info.spec_level, interp, info.dependencies)
+        let v info.cached_value
+        if v = null
+            return null
+        if interp.is_error(v)
+            return null
+        Convert.ic_from_value(interp.get_host(), spec.get_proto(), v, spec.loc, interp)
     }
 }

@@ -21,6 +21,13 @@
 # external-procedure (Clark if-first-page / if-front-page + unknown-id -> #f);
 # bad2: non-sosofo header/footer values (value-location anchor, process-time
 # order after the compile-time keyword message) + left-header: on paragraph.
+# toy5/toy6: lazy IC values (VarInheritedC) — inherited-* over initial values,
+# pushed specs and nested levels, display-var capture (let-bound var in an IC
+# expr), a lazy (style ...) via use:, dimensioned arithmetic on characteristic
+# values, actual-* with the depending re-push at a deeper level (toy6's
+# display-group re-evaluates the outer font-size) and the circular-use error;
+# bad3: inherited-* outside a characteristic value (rule falls back to default
+# processing) + the actual-* circularity loop (one message per <p>).
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -69,8 +76,11 @@ run_case toy1 "$HERE/toy1.expected"
 run_case toy2 "$HERE/toy2.expected"
 run_case toy3 "$HERE/toy3.expected"
 run_case toy4 "$HERE/toy4.expected"
+run_case toy5 "$HERE/toy5.expected"
+run_case toy6 "$HERE/toy6.expected" "$HERE/toy6.expected.err"
 run_case bad  "$HERE/bad.expected" "$HERE/bad.expected.err"
 run_case bad2 "$HERE/bad2.expected" "$HERE/bad2.expected.err"
+run_case bad3 "$HERE/bad3.expected" "$HERE/bad3.expected.err"
 
 # default output name: <docbase>.fot in the current directory (JadeApp).
 ( cd "$WORK" && rm -f doc.fot && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \

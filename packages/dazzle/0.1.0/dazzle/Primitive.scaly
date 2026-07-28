@@ -5,8 +5,11 @@ use opensp.Location.Location
 use opensp.Message.MessageType
 use dazzle.InterpreterMessages.InterpreterMessages
 use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
 use dazzle.ELObj.OutputCharStream
 use dazzle.ELObj.QuantityValue
+use dazzle.Style.InheritedC
+use dazzle.Style.StyleStack
 use dazzle.Grove.GroveNode
 use dazzle.Grove.GN_DOCUMENT
 use dazzle.Grove.GN_ELEMENT
@@ -157,6 +160,11 @@ define PRIM_EXTERNAL_PROCEDURE: int 114
 ; XPRIMITIVEs (Clark externals; reachable only via external-procedure)
 define PRIM_IF_FIRST_PAGE: int 115
 define PRIM_IF_FRONT_PAGE: int 116
+; the per-characteristic inherited-<name> / actual-<name> primitives
+; (InheritedCPrimitiveObj / ActualCPrimitiveObj, InheritedC.cxx): the target
+; characteristic is recovered from the primitive's own name (prefix strip).
+define PRIM_INHERITED_C: int 117
+define PRIM_ACTUAL_C: int 118
 
 define Primitive
 {
@@ -465,6 +473,28 @@ define Primitive
                 return ELObj.make_empty_sosofo(host)
             return ELObj.make_process_node_sosofo(host, nd, ctx.get_processing_mode())
         }
+        if (id = PRIM_INHERITED_C) or (id = PRIM_ACTUAL_C)
+        {
+            ; InheritedCPrimitiveObj / ActualCPrimitiveObj::primitiveCall.
+            let ss ctx.get_style_stack()
+            if ss = null
+            {
+                interp.set_next_location(loc)
+                interp.message0(InterpreterMessages.notInCharacteristicValue())
+                return interp.make_error()
+            }
+            var plen: size_t 10
+            if id = PRIM_ACTUAL_C
+                set plen: 7
+            let base interp.lookup(StringC(name.data_ptr() + plen, name.get_size() - plen))
+            let icraw base.get_inherited_c()
+            if icraw = null
+                return interp.make_error()
+            let ic icraw as pointer[InheritedC]
+            if id = PRIM_INHERITED_C
+                return VM.stack_inherited(ss, ic, ctx.get_spec_level(), interp, ctx.get_actual_deps())
+            return VM.stack_actual(ss, ic, loc, interp, ctx.get_actual_deps())
+        }
         if id = PRIM_PAGE_NUMBER_SOSOFO
             return ELObj.make_page_number_sosofo(host)
         if id = PRIM_CURRENT_NODE_PAGE_NUMBER_SOSOFO
@@ -694,12 +724,71 @@ define Primitive
     ; Accumulate args as exact-long while all operands are exact, promoting to
     ; double on the first inexact. Dimensions are not tracked in the starter
     ; set (numbers assumed dimensionless); length/quantity dims join later.
+    ; a dimensioned arithmetic result (the DEFPRIMITIVE tails): exact — dim 0
+    ; integer, dim 1 length, else promoted to an inexact quantity; inexact —
+    ; dim 0 real, else quantity.
+    function quantity_result(host: pointer[Page], is_double: bool, l: int, d: double, dim: int) returns pointer[ELObj]
+    {
+        if is_double = false
+        {
+            if dim = 0
+                return ELObj.make_integer(host, l)
+            if dim = 1
+                return ELObj.make_length(host, l)
+            return ELObj.make_quantity(host, l as double, dim)
+        }
+        if dim = 0
+            return ELObj.make_real(host, d)
+        ELObj.make_quantity(host, d, dim)
+    }
+
+    ; signed-64 overflow predicates (the reference's LONG_MIN/LONG_MAX
+    ; guards); overflow promotes the accumulation to double.
+    function add_overflows(a: int, b: int) returns bool
+    {
+        let maxv 0x7FFFFFFFFFFFFFFF
+        let minv 0 - maxv - 1
+        if b > 0
+            return a > maxv - b
+        if b < 0
+            return a < minv - b
+        false
+    }
+
+    function mul_overflows(a: int, b: int) returns bool
+    {
+        if (a = 0) or (b = 0)
+            return false
+        let maxv 0x7FFFFFFFFFFFFFFF
+        let minv 0 - maxv - 1
+        if a > 0
+        {
+            if b > 0
+                return a > maxv / b
+            return b < minv / a
+        }
+        if b > 0
+            return a < minv / b
+        a < maxv / b
+    }
+
+    ; Plus (primitive.cxx): all args must share ONE dimension
+    ; (incompatibleDimensions otherwise); exact stays exact unless an inexact
+    ; arg or overflow promotes. (The reference's length-spec operand path
+    ; needs length-spec VALUES, which this engine does not have yet.)
     function arith_add(host: pointer[Page], interp: pointer[Interpreter], name: StringC, args: pointer[pointer[ELObj]], n_args: int, loc: Location) returns pointer[ELObj]
     {
-        var is_double false
-        var lsum 0
-        var dsum 0.0
-        var i 0
+        if n_args = 0
+            return ELObj.make_integer(host, 0)
+        let a0 *args
+        let qv0 a0.quantity_value()
+        if qv0.get_qtype() = QT_NONE
+            return Primitive.arg_error(interp, loc, InterpreterMessages.notAQuantityOrLengthSpec(), name, 0, a0)
+        var is_double qv0.get_qtype() = QT_DOUBLE
+        let dim qv0.get_dim()
+        var lsum qv0.get_lval()
+        var dsum qv0.get_dval()
+        var i 1
         while i < n_args
         {
             let a *(args + i)
@@ -707,6 +796,8 @@ define Primitive
             let qt qv.get_qtype()
             if qt = QT_NONE
                 return Primitive.arg_error(interp, loc, InterpreterMessages.notAQuantityOrLengthSpec(), name, i, a)
+            if qv.get_dim() <> dim
+                return Primitive.simple_error(interp, loc, InterpreterMessages.incompatibleDimensions())
             if qt = QT_DOUBLE
             {
                 if is_double = false
@@ -721,27 +812,43 @@ define Primitive
                 if is_double
                     set dsum: dsum + (qv.get_lval() as double)
                 else
-                    set lsum: lsum + qv.get_lval()
+                {
+                    if Primitive.add_overflows(lsum, qv.get_lval())
+                    {
+                        set dsum: (lsum as double) + (qv.get_lval() as double)
+                        set is_double: true
+                    }
+                    else
+                        set lsum: lsum + qv.get_lval()
+                }
             }
             set i: i + 1
         }
-        if is_double
-            return ELObj.make_real(host, dsum)
-        ELObj.make_integer(host, lsum)
+        Primitive.quantity_result(host, is_double, lsum, dsum, dim)
     }
 
+    ; Multiply (primitive.cxx): dimensions ADD; an exact product whose
+    ; dimension exceeds 1 (or overflows) is promoted to an inexact quantity.
     function arith_mul(host: pointer[Page], interp: pointer[Interpreter], name: StringC, args: pointer[pointer[ELObj]], n_args: int, loc: Location) returns pointer[ELObj]
     {
-        var is_double false
-        var lprod 1
-        var dprod 1.0
-        var i 0
+        if n_args = 0
+            return ELObj.make_integer(host, 1)
+        let a0 *args
+        let qv0 a0.quantity_value()
+        if qv0.get_qtype() = QT_NONE
+            return Primitive.arg_error(interp, loc, InterpreterMessages.notAQuantity(), name, 0, a0)
+        var is_double qv0.get_qtype() = QT_DOUBLE
+        var dim qv0.get_dim()
+        var lprod qv0.get_lval()
+        var dprod qv0.get_dval()
+        var i 1
         while i < n_args
         {
             let a *(args + i)
             let qv a.quantity_value()
             if qv.get_qtype() = QT_NONE
                 return Primitive.arg_error(interp, loc, InterpreterMessages.notAQuantity(), name, i, a)
+            set dim: dim + qv.get_dim()
             if qv.get_qtype() = QT_DOUBLE
             {
                 if is_double = false
@@ -756,15 +863,24 @@ define Primitive
                 if is_double
                     set dprod: dprod * (qv.get_lval() as double)
                 else
-                    set lprod: lprod * qv.get_lval()
+                {
+                    ; the reference forces exact results past dim 1 inexact
+                    ; (lengths are inexact millipoints).
+                    if (dim > 1) or Primitive.mul_overflows(lprod, qv.get_lval())
+                    {
+                        set dprod: (lprod as double) * (qv.get_lval() as double)
+                        set is_double: true
+                    }
+                    else
+                        set lprod: lprod * qv.get_lval()
+                }
             }
             set i: i + 1
         }
-        if is_double
-            return ELObj.make_real(host, dprod)
-        ELObj.make_integer(host, lprod)
+        Primitive.quantity_result(host, is_double, lprod, dprod, dim)
     }
 
+    ; Minus (primitive.cxx): like Plus — one shared dimension.
     function arith_sub(host: pointer[Page], interp: pointer[Interpreter], name: StringC, args: pointer[pointer[ELObj]], n_args: int, loc: Location) returns pointer[ELObj]
     {
         let a0 *args
@@ -772,6 +888,7 @@ define Primitive
         if qv0.get_qtype() = QT_NONE
             return Primitive.arg_error(interp, loc, InterpreterMessages.notAQuantityOrLengthSpec(), name, 0, a0)
         var is_double qv0.get_qtype() = QT_DOUBLE
+        let dim qv0.get_dim()
         var lacc qv0.get_lval()
         var dacc qv0.get_dval()
         if is_double = false
@@ -779,8 +896,8 @@ define Primitive
         if n_args = 1
         {
             if is_double
-                return ELObj.make_real(host, 0.0 - dacc)
-            return ELObj.make_integer(host, 0 - lacc)
+                return Primitive.quantity_result(host, true, 0, 0.0 - dacc, dim)
+            return Primitive.quantity_result(host, false, 0 - lacc, 0.0, dim)
         }
         var i 1
         while i < n_args
@@ -789,6 +906,8 @@ define Primitive
             let qv a.quantity_value()
             if qv.get_qtype() = QT_NONE
                 return Primitive.arg_error(interp, loc, InterpreterMessages.notAQuantityOrLengthSpec(), name, i, a)
+            if qv.get_dim() <> dim
+                return Primitive.simple_error(interp, loc, InterpreterMessages.incompatibleDimensions())
             if qv.get_qtype() = QT_DOUBLE
             {
                 if is_double = false
@@ -803,21 +922,31 @@ define Primitive
                 if is_double
                     set dacc: dacc - (qv.get_lval() as double)
                 else
-                    set lacc: lacc - qv.get_lval()
+                {
+                    if Primitive.add_overflows(lacc, 0 - qv.get_lval())
+                    {
+                        set dacc: (lacc as double) - (qv.get_lval() as double)
+                        set is_double: true
+                    }
+                    else
+                        set lacc: lacc - qv.get_lval()
+                }
             }
             set i: i + 1
         }
-        if is_double
-            return ELObj.make_real(host, dacc)
-        ELObj.make_integer(host, lacc)
+        Primitive.quantity_result(host, is_double, lacc, dacc, dim)
     }
 
+    ; Divide (primitive.cxx): dimensions SUBTRACT; an exact quotient stays
+    ; exact only for dimensionless divisors that divide evenly (dividing BY a
+    ; dimensioned quantity — lengths are inexact — promotes to double).
     function arith_div(host: pointer[Page], interp: pointer[Interpreter], name: StringC, args: pointer[pointer[ELObj]], n_args: int, loc: Location) returns pointer[ELObj]
     {
         let a0 *args
         let qv0 a0.quantity_value()
         if qv0.get_qtype() = QT_NONE
             return Primitive.arg_error(interp, loc, InterpreterMessages.notAQuantity(), name, 0, a0)
+        var dim qv0.get_dim()
         var acc qv0.get_dval()
         if qv0.get_qtype() <> QT_DOUBLE
             set acc: qv0.get_lval() as double
@@ -825,9 +954,9 @@ define Primitive
         {
             if acc = 0.0
                 return Primitive.simple_error(interp, loc, InterpreterMessages.divideBy0())
-            return ELObj.make_real(host, 1.0 / acc)
+            return Primitive.quantity_result(host, true, 0, 1.0 / acc, 0 - dim)
         }
-        var all_exact qv0.get_qtype() <> QT_DOUBLE
+        var is_double qv0.get_qtype() = QT_DOUBLE
         var lnum qv0.get_lval()
         var i 1
         while i < n_args
@@ -841,21 +970,20 @@ define Primitive
                 set d: qv.get_lval() as double
             if d = 0.0
                 return Primitive.simple_error(interp, loc, InterpreterMessages.divideBy0())
+            set dim: dim - qv.get_dim()
             set acc: acc / d
             if qv.get_qtype() = QT_DOUBLE
-                set all_exact: false
+                set is_double: true
             else
             {
-                if all_exact and ((lnum % qv.get_lval()) = 0)
+                if (is_double = false) and (qv.get_dim() = 0) and ((lnum % qv.get_lval()) = 0)
                     set lnum: lnum / qv.get_lval()
                 else
-                    set all_exact: false
+                    set is_double: true
             }
             set i: i + 1
         }
-        if all_exact
-            return ELObj.make_integer(host, lnum)
-        ELObj.make_real(host, acc)
+        Primitive.quantity_result(host, is_double, lnum, acc, dim)
     }
 
     ; op: 0 =, 1 <, 2 >, 3 <=, 4 >=. Chain comparison over adjacent operands.

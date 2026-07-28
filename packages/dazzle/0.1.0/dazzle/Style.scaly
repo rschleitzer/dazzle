@@ -7,18 +7,20 @@
 ; in this slice — the transform backend's setters are no-ops and its path never
 ; pushes styles).
 ;
-; Deliberate collapse (recorded in DESIGN.md Inc 8): non-constant IC value
-; expressions are evaluated EAGERLY in the make insn (reference: VarInheritedC
-; code evaluated lazily at style-push, needed only for actual-*/inherited-*,
-; which are deferred). StyleSpec entries at runtime are therefore always
-; constant ICs; IC_PENDING marks a make-key whose value is converted from the
-; VM stack at make-execution time.
+; Lazy IC values (the reference design, replacing the slice-1 eager collapse):
+; a non-constant IC value expression compiles to standalone code (VarInheritedC
+; = a proto + code + loc record) evaluated at style-PUSH time against the
+; style's captured display vars and creation node (VarStyleRec). The push
+; machinery (InheritedCInfo cached_value/spec_level/dependencies, PopList
+; depending_list) supports the inherited-*/actual-* primitives; the VM-facing
+; evaluation glue lives in VM.scaly (Style cannot import VM — VM→Insn→Style).
 ;
 ; RBMM: prototype ICs + registry live on the interpreter's run page; per-make
-; constant ICs on the compile host (with the insn chain); pending conversions
-; and StyleStack push nodes (InheritedCInfo/PopList) on the current node's
-; eval scratch region — they are popped inside the same bracket (inner→outer
-; pointers only). The StyleStack record + its info array live on the run page.
+; constant ICs + VarInheritedC records + spec arrays on the compile host (with
+; the insn chain); push-time conversions and StyleStack push nodes
+; (InheritedCInfo/PopList) on the current node's eval scratch region — they are
+; popped inside the same bracket (inner→outer pointers only). The StyleStack
+; record + its info array live on the run page.
 
 use scaly.memory.Page
 use scaly.containers.Array
@@ -39,12 +41,22 @@ define IC_STRING: int 4
 define IC_INT: int 5
 define IC_PUBLIC_ID: int 6
 define IC_LETTER2: int 7
+; #f or strictly positive integer (GenericMaybeIntegerInheritedC); lval 0 = #f.
+define IC_MAYBE_INT: int 8
+; an ignored characteristic (IgnoredC): any value accepted, set() emits
+; nothing, value() returns the stored ELObj.
+define IC_IGNORED: int 9
 
 ; --- make-keyword classification (MakeExpression::compile split) ------------
 define KEY_NIC: int 0
+; an IC key, fully handled at compile (constant or VarInheritedC entry in the
+; insn's prebuilt spec arrays) — no stack slot, nothing to do at exec.
 define KEY_IC_CONST: int 1
-define KEY_IC_PENDING: int 2
+; an unknown keyword (messaged at compile): the reference never compiles its
+; value expression — no stack slot.
+define KEY_DROP: int 2
 define KEY_USE: int 3
+; evaluated and dropped (label:/content-map:, line-field priorities).
 define KEY_IGNORE: int 4
 ; a simple-page-sequence header/footer sosofo NIC (left-header: …); the key_ic
 ; slot carries a location/part-index record (InheritedC.make_hf).
@@ -171,7 +183,8 @@ define InheritedC
     sym: FotSym
     sval: StringC
     ls: LengthSpec
-    slot: int
+    obj: pointer[ELObj]
+    code: pointer[void]
     proto: pointer[InheritedC]
     loc: Location
 )
@@ -188,7 +201,8 @@ define InheritedC
         set ic.sym: FotSym()
         set ic.sval: StringC()
         set ic.ls: LengthSpec()
-        set ic.slot: 0 - 1
+        set ic.obj: null
+        set ic.code: null
         set ic.proto: null
         set ic.loc: Location()
         ic
@@ -200,22 +214,23 @@ define InheritedC
     function get_kind(this: InheritedC) returns int
         kind
 
-    function get_slot(this: InheritedC) returns int
-        slot
-
     function get_proto(this: InheritedC) returns pointer[InheritedC]
         proto
 
-    ; a pending entry: value comes from make-exec stack slot `slot`; `loc` is
-    ; the value expression's location (the invalid-value message anchor).
-    function make_pending(host: pointer[Page], proto: pointer[InheritedC], slot: int, loc: Location) returns pointer[InheritedC]
+    ; VarInheritedC (Style.cxx): a non-constant spec — `code` (an Insn chain,
+    ; typed void: Style cannot import Insn) evaluated at style-push against the
+    ; owning style's display + node; `loc` anchors the invalid-value message.
+    function make_var(host: pointer[Page], proto: pointer[InheritedC], code: pointer[void], loc: Location) returns pointer[InheritedC]
     {
         let ic InheritedC.make(host, proto.get_kind(), proto.ident, proto.get_index(), proto.print_name)
-        set ic.slot: slot
+        set ic.code: code
         set ic.proto: proto
         set ic.loc: loc
         ic
     }
+
+    function is_var(this: InheritedC) returns bool
+        code <> null
 
     ; a KEY_HF carrier: `index` is the header/footer part slot (0..5), `loc`
     ; the value expression's location (setNonInheritedC's message anchor).
@@ -490,6 +505,34 @@ define Convert
             set ic.sval: s
             set ic.bval: was_false
         }
+        else if kind = IC_MAYBE_INT
+        {
+            ; convertOptPositiveIntegerC: #f -> 0, else a strictly positive
+            ; exact integer.
+            if val.is_false()
+            {
+                set ic.lval: 0
+                set ok: true
+            }
+            else
+            {
+                var n 0
+                if Convert.convert_integer(val, &n)
+                {
+                    if n > 0
+                    {
+                        set ic.lval: n
+                        set ok: true
+                    }
+                }
+            }
+        }
+        else if kind = IC_IGNORED
+        {
+            ; IgnoredC::make — any value is accepted and stored.
+            set ic.obj: val
+            set ok: true
+        }
         if ok = false
         {
             Convert.invalid_value(interp, proto.ident, loc)
@@ -637,26 +680,67 @@ define Convert
 }
 
 ; --- StyleStack (Style.cxx) --------------------------------------------------
-; InheritedCInfo — one pushed spec for one characteristic index; `prev` chains
-; to the spec shadowed at an outer level (restored by pop).
-define InheritedCInfo (spec: pointer[InheritedC], prev: pointer[InheritedCInfo], val_level: int)
+; VarStyleObj's payload (the ELObj Style arm keeps its two-pointer shape: spec
+; points here, use_chain stays in the arm). `display` is the captured closure
+; vars of the style's VarInheritedC codes (null-terminated, like a closure
+; display); `node` the current node at style creation (typed void: Style does
+; not import Grove — only the VM glue dereferences it).
+define VarStyleRec
+(
+    force_specs: pointer[Array[pointer[InheritedC]]]
+    specs: pointer[Array[pointer[InheritedC]]]
+    display: pointer[pointer[ELObj]]
+    node: pointer[void]
+)
 {
-    function make(host: pointer[Page], spec: pointer[InheritedC], prev: pointer[InheritedCInfo], val_level: int) returns pointer[InheritedCInfo]
+    function make(host: pointer[Page], force_specs: pointer[Array[pointer[InheritedC]]], specs: pointer[Array[pointer[InheritedC]]], display: pointer[pointer[ELObj]], node: pointer[void]) returns pointer[VarStyleRec]
+    {
+        let r host.allocate(sizeof VarStyleRec, alignof VarStyleRec) as pointer[VarStyleRec]
+        set r.force_specs: force_specs
+        set r.specs: specs
+        set r.display: display
+        set r.node: node
+        r
+    }
+}
+
+; InheritedCInfo — one pushed spec for one characteristic index; `prev` chains
+; to the spec shadowed at an outer level (restored by pop). `style` is the
+; VarStyleRec the spec came from (display + node for VarInheritedC evaluation);
+; `cached_value` the push-time evaluated value (valid only while none of
+; `dependencies` — indices this value read via actual-*/inherited-* — changed).
+define InheritedCInfo
+(
+    spec: pointer[InheritedC]
+    prev: pointer[InheritedCInfo]
+    val_level: int
+    spec_level: int
+    style: pointer[VarStyleRec]
+    cached_value: pointer[ELObj]
+    dependencies: pointer[Array[int]]
+)
+{
+    function make(host: pointer[Page], spec: pointer[InheritedC], style: pointer[VarStyleRec], prev: pointer[InheritedCInfo], val_level: int, spec_level: int) returns pointer[InheritedCInfo]
     {
         let info host.allocate(sizeof InheritedCInfo, alignof InheritedCInfo) as pointer[InheritedCInfo]
         set info.spec: spec
         set info.prev: prev
         set info.val_level: val_level
+        set info.spec_level: spec_level
+        set info.style: style
+        set info.cached_value: null
+        set info.dependencies: Array[int]^host()
         info
     }
 }
 
-define PopList (list: pointer[Array[int]], prev: pointer[PopList])
+define PopList (list: pointer[Array[int]], depending_list: pointer[Array[int]], prev: pointer[PopList])
 {
     function make(host: pointer[Page], prev: pointer[PopList]) returns pointer[PopList]
     {
         let pl host.allocate(sizeof PopList, alignof PopList) as pointer[PopList]
         set pl.list: Array[int]^host()
+        set pl.depending_list: Array[int]^host()
         set pl.prev: prev
         pl
     }
@@ -698,35 +782,45 @@ define StyleStack (info: pointer[Array[pointer[InheritedCInfo]]], level: int, po
         this.info.put(ind as size_t, v)
     }
 
-    ; StyleStack::pushContinue — walk the style chain (spec vector order, then
-    ; the use chain), first spec per characteristic wins within this level.
+    ; StyleStack::pushContinue — walk the style chain per VarStyleObj::
+    ; appendIter: own force! specs, own specs, then the use chain (its force
+    ; and normal specs at that point); first spec per characteristic wins
+    ; within this level.
     function push_continue(this: pointer[StyleStack], style: pointer[ELObj], scratch: pointer[Page])
     {
         if style = null
             return
-        let spec_arr style.style_spec() as pointer[Array[pointer[InheritedC]]]
-        if spec_arr <> null
+        let rec style.style_spec() as pointer[VarStyleRec]
+        if rec <> null
         {
-            let n spec_arr.get_length()
-            var i: size_t 0
-            while i < n
-            {
-                let icp spec_arr.get(i)
-                if icp <> null
-                {
-                    let ic *icp
-                    if ic <> null
-                        this.push_spec(ic, scratch)
-                }
-                set i: i + (1 as size_t)
-            }
+            this.push_spec_array(rec.force_specs, rec, scratch)
+            this.push_spec_array(rec.specs, rec, scratch)
         }
         let u style.style_use()
         if u <> null
             this.push_continue(u, scratch)
     }
 
-    function push_spec(this: pointer[StyleStack], spec: pointer[InheritedC], scratch: pointer[Page])
+    function push_spec_array(this: pointer[StyleStack], arr: pointer[Array[pointer[InheritedC]]], rec: pointer[VarStyleRec], scratch: pointer[Page])
+    {
+        if arr = null
+            return
+        let n arr.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let icp arr.get(i)
+            if icp <> null
+            {
+                let ic *icp
+                if ic <> null
+                    this.push_spec(ic, rec, scratch)
+            }
+            set i: i + (1 as size_t)
+        }
+    }
+
+    function push_spec(this: pointer[StyleStack], spec: pointer[InheritedC], rec: pointer[VarStyleRec], scratch: pointer[Page])
     {
         let ind spec.get_index()
         let cur this.info_at(ind)
@@ -736,7 +830,74 @@ define StyleStack (info: pointer[Array[pointer[InheritedCInfo]]], level: int, po
                 return
         }
         this.pop_list.list.add(ind)
-        this.info_set(ind, InheritedCInfo.make(scratch, spec, cur, this.level))
+        this.info_set(ind, InheritedCInfo.make(scratch, spec, rec, cur, this.level, this.level))
+    }
+
+    ; StyleStack::pushEnd's prologue: a characteristic that DEPENDS (via
+    ; actual-*) on another characteristic re-evaluates at this level when any
+    ; of its dependencies was re-specified here — re-push it (keeping its
+    ; original spec_level); otherwise it keeps depending at this level too.
+    function push_end_prologue(this: pointer[StyleStack], scratch: pointer[Page])
+    {
+        let pl this.pop_list
+        if pl = null
+            return
+        let old pl.prev
+        if old = null
+            return
+        let n old.depending_list.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let dp old.depending_list.get(i)
+            if dp <> null
+            {
+                let d *dp
+                let info this.info_at(d)
+                if info <> null
+                {
+                    if info.val_level <> this.level
+                    {
+                        var changed false
+                        let deps info.dependencies
+                        let nd deps.get_length()
+                        var j: size_t 0
+                        while j < nd
+                        {
+                            if changed = false
+                            {
+                                let ip deps.get(j)
+                                if ip <> null
+                                {
+                                    let p this.info_at(*ip)
+                                    if p <> null
+                                    {
+                                        if p.val_level = this.level
+                                        {
+                                            this.info_set(d, InheritedCInfo.make(scratch, info.spec, info.style, info, this.level, info.spec_level))
+                                            pl.list.add(d)
+                                            set changed: true
+                                        }
+                                    }
+                                }
+                            }
+                            set j: j + (1 as size_t)
+                        }
+                        if changed = false
+                            pl.depending_list.add(d)
+                    }
+                }
+            }
+            set i: i + (1 as size_t)
+        }
+    }
+
+    ; pushEnd's per-spec epilogue: a spec whose evaluation recorded
+    ; dependencies keeps re-evaluating at deeper levels (see prologue).
+    function note_depending(this: pointer[StyleStack], ind: int)
+    {
+        if this.pop_list <> null
+            this.pop_list.depending_list.add(ind)
     }
 
     function pop(this: pointer[StyleStack])
@@ -781,11 +942,4 @@ define StyleStack (info: pointer[Array[pointer[InheritedCInfo]]], level: int, po
         this.pop_list.list
     }
 
-    function spec_of(this: pointer[StyleStack], ind: int) returns pointer[InheritedC]
-    {
-        let cur this.info_at(ind)
-        if cur = null
-            return null
-        cur.spec
-    }
 }

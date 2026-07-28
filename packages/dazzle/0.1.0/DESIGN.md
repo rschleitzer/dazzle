@@ -171,22 +171,38 @@ the reference binaries on toy stylesheets (`tests/dazzle/fot/`):
   (`pushContinue` first-wins dedup per level, `pushEnd` emits the set*
   calls in spec order; the `dependencies`/`actual-*` machinery and style
   RULES are deferred with the `inherited-*`/`actual-*` primitives).
-- **Eager IC evaluation (deliberate collapse, recorded):** the reference
-  compiles non-constant IC value exprs into `VarInheritedC` code evaluated
-  lazily at style-push (needed for `actual-*`); DSSSL exprs are pure, so
-  slice 1 evaluates them EAGERLY in the make insn (the frame is live) and
-  stores constant ICs. Revisit when porting `inherited-*`/`actual-*`
-  (Family B) — those need true deferred evaluation + the display-vars
-  capture (`VarStyleInsn` boundVars) and `VarStyleObj.node`.
+- **Lazy IC evaluation (2026-07-28, superseding slice 1's eager collapse):**
+  non-constant IC value exprs compile to standalone `VarInheritedC` code
+  against a closure env of the marked bound vars (`StyleExpression::
+  compile`); the make/style insns capture those vars into a display array +
+  the current node (`VarStyleRec` — the VarStyleObj payload behind the
+  two-pointer ELObj Style arm) and carry compile-time-prebuilt
+  `force_specs`/`specs` arrays (`force!<name>` keys included). Push-time
+  evaluation, caching and dependency tracking live in
+  `StyleStack`/`InheritedCInfo`/`PopList` (Style.scaly) with the VM-facing
+  glue (`ic_value_of`/`eval_spec_value`/`stack_inherited`/`stack_actual`/
+  `resolve_set`) in VM.scaly — Style cannot import VM (VM→Insn→Style).
+  `inherited-<name>`/`actual-<name>` primitives are installed per registry
+  entry (prefix-strip recovers the characteristic); `actual-*` circularity
+  is the `actualLoop` message; outside a characteristic value the
+  primitives error `notInCharacteristicValue`. Arithmetic (`+ - * /`)
+  tracks quantity DIMENSIONS per the reference (Plus/Minus demand one
+  shared dimension; Multiply/Divide add/subtract them; exact dim-1 results
+  are LengthObj) — the pre-existing dimensionless collapse made every
+  computed length invalid. The dsssl2 trailing-'?' alias is NOT installed
+  (reference gates it on the unported `-2` flag).
 - **`Identifier.inherited_c` slot** (the S62 struct-growth trap measured
   GONE 2026-07-27: Identifier/FlowObj/ProcessContext growth probes all
   green — suites + codegen byte-identical); FOT symbols installed with
   their `c_value` codes (the full 120-entry FOTBuilder::Symbol enum;
   faithful quirk: `symbolBevel`'s name is "join").
-- **IC registry:** `installInheritedCs` generic entries ported wholesale
-  (~110 of ~150; Color/BackgroundColor/Border/Rule/GlyphSubst/InlineSpace
-  specials deferred — using one of those keywords is `invalidStyleKeyword`
-  until their increment).
+- **IC registry:** `installInheritedCs` ported with the reference INITIAL
+  values (the inherited-* fallback; upi=72000), the maybe-integer entries
+  (expand-tabs?/hyphenation-ladder-count) and the 14 IgnoredC entries
+  (accepted, never rendered). Still deferred to their features:
+  Color/BackgroundColor/Border/Rule/GlyphSubst/OptLengthSpec/InlineSpace
+  specials — using one of those keywords is `invalidStyleKeyword` until
+  their increment.
 - **`MakeExpression` split** (Expression.cxx 1250–1420): per key —
   FO-class NIC (DisplayNIC family for paragraph/paragraph-break/
   display-group; InlineNIC accepted-and-dropped for line-field, its fot
@@ -204,7 +220,9 @@ the reference binaries on toy stylesheets (`tests/dazzle/fot/`):
 - **ProcessContext:** `sgml_fotb` + `style_stack` fields; style push/pop
   brackets FO processing ONLY on the fot path (transform path untouched =
   Family A byte-safety; the reference pushes always, but its transform
-  set* are no-ops — revisit when `inherited-*` primitives land).
+  set* are no-ops — recorded deviation: `inherited-*` under `-t sgml/xml`
+  errors `notInCharacteristicValue` where the reference would resolve; no
+  corpus stylesheet uses it).
 - **CLI:** `-t fot`, default output `<docbase>.fot`, unitsPerInch 72000
   for ALL backends per JadeApp (was 1440 — transform output never prints
   lengths; codegen suite + sweep must stay byte-identical), extension FO
