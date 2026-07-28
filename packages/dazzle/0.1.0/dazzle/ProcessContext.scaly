@@ -24,12 +24,54 @@ use dazzle.ProcessingMode.Rule
 use dazzle.ProcessingMode.Specificity
 use dazzle.TransformFOTBuilder.TransformFOTBuilder
 use dazzle.SgmlFOTBuilder.SgmlFOTBuilder
+use dazzle.ELObj.Identifier
 use dazzle.Style.StyleStack
 use dazzle.Style.InheritedC
 use dazzle.Style.InheritedCInfo
 use dazzle.Style.DisplayNIC
+use dazzle.Style.Convert
+use dazzle.Style.TableNICRec
+use dazzle.Style.TableColumnNICRec
+use dazzle.Style.TableCellNICRec
+use dazzle.InterpreterMessages.InterpreterMessages
+use opensp.Location.Location
 
-define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: pointer[TransformFOTBuilder], match_spec: Specificity, mode: pointer[ProcessingMode], sgml_fotb: pointer[void], style_stack: pointer[void], have_page_type: bool, page_type: int)
+; ProcessContext::Table — the per-table state (row/column styles, the covered
+; rowspan tracker). Lives on the eval region CURRENT AT startTable (the table
+; node's bracket, which outlives all row/cell child brackets); every internal
+; allocation must use `host`, never the (deeper) region current at add time.
+; NOTE (RBMM hazard, documented): a column/row STYLE made by a DESCENDANT
+; node's rule lives on that descendant's bracket and dangles once its bracket
+; pops — the reference-faithful common shape (columns made in the table's own
+; rule, row styles used only while the row processes) is safe.
+define TableRec
+(
+    prev: pointer[TableRec]
+    host: pointer[Page]
+    row_style: pointer[ELObj]
+    current_column: int
+    in_row: bool
+    n_columns: int
+    covered: pointer[Array[int]]
+    column_styles: pointer[Array[pointer[Array[pointer[ELObj]]]]]
+)
+{
+    function make(host: pointer[Page], prev: pointer[TableRec]) returns pointer[TableRec]
+    {
+        let t host.allocate(sizeof TableRec, alignof TableRec) as pointer[TableRec]
+        set t.prev: prev
+        set t.host: host
+        set t.row_style: null
+        set t.current_column: 0
+        set t.in_row: false
+        set t.n_columns: 0
+        set t.covered: Array[int]^host()
+        set t.column_styles: Array[pointer[Array[pointer[ELObj]]]]^host()
+        t
+    }
+}
+
+define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: pointer[TransformFOTBuilder], match_spec: Specificity, mode: pointer[ProcessingMode], sgml_fotb: pointer[void], style_stack: pointer[void], have_page_type: bool, page_type: int, table_stack: pointer[TableRec])
 {
     function make(host: pointer[Page], interp: pointer[Interpreter], fotb: pointer[TransformFOTBuilder]) returns pointer[ProcessContext]
     {
@@ -43,6 +85,7 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
         set pc.style_stack: null
         set pc.have_page_type: false
         set pc.page_type: 0
+        set pc.table_stack: null
         pc
     }
 
@@ -64,6 +107,7 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
         set pc.style_stack: StyleStack.make(host) as pointer[void]
         set pc.have_page_type: false
         set pc.page_type: 0
+        set pc.table_stack: null
         pc
     }
 
@@ -459,6 +503,14 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
             ss.push_empty()
             return
         }
+        this.push_style_obj(style)
+    }
+
+    ; StyleStack::push(style, vm, fotb) — the raw style push (borders, table
+    ; column/row styles): push + render this level's specs through set_ic.
+    function push_style_obj(this: pointer[ProcessContext], style: pointer[ELObj])
+    {
+        let ss this.style_stack as pointer[StyleStack]
         let scratch this.interp.get_host()
         ss.push_start(scratch)
         ss.push_continue(style, scratch)
@@ -502,6 +554,339 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
             return
         }
         ss.pop()
+    }
+
+    ; --- tables (ProcessContext.cxx Table machinery + Table*FlowObj) ---------
+    function in_table(this: pointer[ProcessContext]) returns bool
+        table_stack <> null
+
+    function in_table_row(this: pointer[ProcessContext]) returns bool
+    {
+        if this.table_stack = null
+            return false
+        this.table_stack.in_row
+    }
+
+    function current_table_column(this: pointer[ProcessContext]) returns int
+    {
+        if this.table_stack = null
+            return 0
+        this.table_stack.current_column
+    }
+
+    function table_row_style(this: pointer[ProcessContext]) returns pointer[ELObj]
+    {
+        if this.table_stack = null
+            return null
+        this.table_stack.row_style
+    }
+
+    ; ProcessContext::addTableColumn — per-column styles indexed [column][span-1].
+    procedure add_table_column(this: pointer[ProcessContext], column_index: int, span: int, style: pointer[ELObj])
+    {
+        let t this.table_stack
+        if t = null
+            return
+        set t.current_column: column_index + span
+        while t.column_styles.get_length() <= (column_index as size_t)
+            t.column_styles.add(null)
+        var tem: pointer[Array[pointer[ELObj]]] null
+        let tp t.column_styles.get(column_index as size_t)
+        if tp <> null
+            set tem: *tp
+        if tem = null
+        {
+            let h t.host
+            set tem: Array[pointer[ELObj]]^h()
+            t.column_styles.put(column_index as size_t, tem)
+        }
+        if span > 0
+        {
+            while tem.get_length() < (span as size_t)
+                tem.add(null)
+            tem.put((span - 1) as size_t, style)
+        }
+    }
+
+    function table_column_style(this: pointer[ProcessContext], column_index: int, span: int) returns pointer[ELObj]
+    {
+        let t this.table_stack
+        if t = null
+            return null
+        if (column_index as size_t) >= t.column_styles.get_length()
+            return null
+        let tp t.column_styles.get(column_index as size_t)
+        if tp = null
+            return null
+        let tem *tp
+        if tem = null
+            return null
+        if span <= 0
+            return null
+        if (span as size_t) > tem.get_length()
+            return null
+        let sp tem.get((span - 1) as size_t)
+        if sp = null
+            return null
+        *sp
+    }
+
+    ; ProcessContext::noteTableCell — record coverage (rowspan countdown).
+    procedure note_table_cell(this: pointer[ProcessContext], column_index: int, colspan: int, rowspan: int)
+    {
+        let t this.table_stack
+        if t = null
+            return
+        set t.current_column: column_index + colspan
+        while t.covered.get_length() < ((column_index + colspan) as size_t)
+            t.covered.add(0)
+        var i 0
+        while i < colspan
+        {
+            t.covered.put((column_index + i) as size_t, rowspan)
+            set i: i + 1
+        }
+        if column_index + colspan > t.n_columns
+            set t.n_columns: column_index + colspan
+    }
+
+    procedure start_table_row(this: pointer[ProcessContext], style: pointer[ELObj])
+    {
+        let t this.table_stack
+        if t <> null
+        {
+            set t.row_style: style
+            set t.current_column: 0
+            set t.in_row: true
+        }
+        this.sgml_sink().start_table_row()
+    }
+
+    ; ProcessContext::endTableRow — fill uncovered columns with synthesized
+    ; cells (the trailing one is the "missing" dummy), then count down the
+    ; rowspans.
+    procedure end_table_row(this: pointer[ProcessContext])
+    {
+        let t this.table_stack
+        if t <> null
+        {
+            var i 0
+            while i < t.n_columns + 1
+            {
+                var cov 0
+                if (i as size_t) < t.covered.get_length()
+                {
+                    let cp t.covered.get(i as size_t)
+                    if cp <> null
+                        set cov: *cp
+                }
+                if cov = 0
+                {
+                    set t.current_column: i
+                    let scratch this.interp.get_host()
+                    let rec TableCellNICRec.make(scratch)
+                    if i >= t.n_columns
+                        set rec.missing: true
+                    this.process_table_cell(rec, null, null)
+                }
+                if i < t.n_columns
+                {
+                    let cp2 t.covered.get(i as size_t)
+                    if cp2 <> null
+                        t.covered.put(i as size_t, *cp2 - 1)
+                }
+                set i: i + 1
+            }
+            set t.in_row: false
+        }
+        this.sgml_sink().end_table_row()
+    }
+
+    ; ProcessContext::coverSpannedRows — synthesize empty rows until every
+    ; vertical span is covered (each end_table_row fills + counts down).
+    procedure cover_spanned_rows(this: pointer[ProcessContext])
+    {
+        let t this.table_stack
+        if t = null
+            return
+        var n 0
+        let len t.covered.get_length()
+        var i: size_t 0
+        while i < len
+        {
+            let cp t.covered.get(i)
+            if cp <> null
+            {
+                if *cp > n
+                    set n: *cp
+            }
+            set i: i + (1 as size_t)
+        }
+        while n > 0
+        {
+            this.start_table_row(null)
+            this.end_table_row()
+            set n: n - 1
+        }
+    }
+
+    ; the actual value of a border characteristic resolved to the style to
+    ; push (Table*FlowObj::border): #f/#t -> the canned border-present styles,
+    ; a table-border sosofo -> its style, anything else -> null.
+    function border_style_actual(this: pointer[ProcessContext], name: pointer[const_char]) returns pointer[ELObj]
+    {
+        let ident this.interp.lookup(StringC(name))
+        let proto ident.get_inherited_c() as pointer[InheritedC]
+        if proto = null
+            return null
+        let scratch this.interp.get_host()
+        let deps Array[int]^scratch()
+        let ss this.style_stack as pointer[StyleStack]
+        let obj VM.stack_actual(ss, proto, Location(), this.interp, deps)
+        if obj = null
+            return null
+        if this.interp.is_error(obj)
+            return null
+        if obj = this.interp.make_false()
+            return this.interp.border_false_style()
+        if obj = this.interp.make_true()
+            return this.interp.border_true_style()
+        if Convert.is_table_border_sosofo(obj)
+            return obj.sosofo_flowobj().get_style()
+        null
+    }
+
+    ; TableFlowObj::border — push the NIC style (or the table-border
+    ; fallback), emit the atomic border element, pop.
+    procedure emit_table_border(this: pointer[ProcessContext], style_in: pointer[ELObj], fallback: pointer[ELObj], which: int)
+    {
+        var style style_in
+        if style = null
+            set style: fallback
+        if style <> null
+            this.push_style_obj(style)
+        let sg this.sgml_sink()
+        if which = 0
+            sg.table_before_row_border()
+        if which = 1
+            sg.table_after_row_border()
+        if which = 2
+            sg.table_before_column_border()
+        if which = 3
+            sg.table_after_column_border()
+        if style <> null
+        {
+            let ss this.style_stack as pointer[StyleStack]
+            ss.pop()
+        }
+    }
+
+    ; TableCellFlowObj::border — always from the cell-*-border actual value.
+    procedure emit_cell_border(this: pointer[ProcessContext], which: int)
+    {
+        var style: pointer[ELObj] null
+        if which = 0
+            set style: this.border_style_actual("cell-before-row-border")
+        if which = 1
+            set style: this.border_style_actual("cell-after-row-border")
+        if which = 2
+            set style: this.border_style_actual("cell-before-column-border")
+        if which = 3
+            set style: this.border_style_actual("cell-after-column-border")
+        if style <> null
+            this.push_style_obj(style)
+        let sg this.sgml_sink()
+        if which = 0
+            sg.table_cell_before_row_border()
+        if which = 1
+            sg.table_cell_after_row_border()
+        if which = 2
+            sg.table_cell_before_column_border()
+        if which = 3
+            sg.table_cell_after_column_border()
+        if style <> null
+        {
+            let ss this.style_stack as pointer[StyleStack]
+            ss.pop()
+        }
+    }
+
+    ; TableCellFlowObj::pushStyle + processInner + popStyle — shared by real
+    ; cells (rec/style from the FO) and the synthesized fillers (defaults,
+    ; null style, no content).
+    procedure process_table_cell(this: pointer[ProcessContext], rec: pointer[TableCellNICRec], style: pointer[ELObj], sosofo: pointer[ELObj])
+    {
+        let sg this.sgml_sink()
+        let ss this.style_stack as pointer[StyleStack]
+        if this.in_table_row()
+        {
+            if rec.starts_row
+            {
+                this.end_table_row()
+                this.start_table_row(null)
+            }
+        }
+        else
+            this.start_table_row(null)
+        var colnum rec.column_index
+        if rec.has_column_number = false
+            set colnum: this.current_table_column()
+        var n_push 0
+        let col_style this.table_column_style(colnum, rec.n_columns_spanned)
+        if col_style <> null
+        {
+            this.push_style_obj(col_style)
+            sg.start_sequence()
+            set n_push: n_push + 1
+        }
+        let row_style this.table_row_style()
+        if row_style <> null
+        {
+            this.push_style_obj(row_style)
+            sg.start_sequence()
+            set n_push: n_push + 1
+        }
+        if style <> null
+            this.push_style_obj(style)
+        else
+            ss.push_empty()
+        if this.in_table() = false
+        {
+            this.interp.message0(InterpreterMessages.tableCellOutsideTable())
+            if sosofo <> null
+                this.process_flow_obj_content(sosofo)
+        }
+        else
+        {
+            var erec rec
+            if rec.has_column_number = false
+            {
+                set erec: rec.copy(this.interp.get_host())
+                set erec.column_index: colnum
+            }
+            sg.start_table_cell(erec)
+            if rec.missing = false
+                this.note_table_cell(colnum, rec.n_columns_spanned, rec.n_rows_spanned)
+            this.emit_cell_border(0)
+            this.emit_cell_border(1)
+            this.emit_cell_border(2)
+            this.emit_cell_border(3)
+            if sosofo <> null
+                this.process_flow_obj_content(sosofo)
+            sg.end_table_cell()
+        }
+        if style <> null
+            ss.pop()
+        else
+            ss.pop_empty()
+        while n_push > 0
+        {
+            sg.end_sequence()
+            ss.pop()
+            set n_push: n_push - 1
+        }
+        if rec.ends_row
+            this.end_table_row()
     }
 
     ; the fot flow-object dispatch (SgmlFOTBuilder's slice: sequence,
@@ -588,6 +973,114 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
             this.pop_fo_style(fo)
             return
         }
+        if foc = FOC_TABLE
+        {
+            ; TableFlowObj::processInner: table state pushed, the four border
+            ; flow objects (NIC style, else the table-border actual), content,
+            ; the dangling row closed, spanned rows covered.
+            this.push_fo_style(fo)
+            set this.table_stack: TableRec.make(this.interp.get_host(), this.table_stack)
+            var rec fo.get_tnic() as pointer[TableNICRec]
+            if rec = null
+                set rec: TableNICRec.make(this.interp.get_host())
+            let tdn fo.get_dnic() as pointer[DisplayNIC]
+            sg.start_table(rec, tdn)
+            let fallback this.border_style_actual("table-border")
+            this.emit_table_border(rec.before_row_border, fallback, 0)
+            this.emit_table_border(rec.after_row_border, fallback, 1)
+            this.emit_table_border(rec.before_column_border, fallback, 2)
+            this.emit_table_border(rec.after_column_border, fallback, 3)
+            this.process_flow_obj_content(sosofo)
+            if this.in_table_row()
+                this.end_table_row()
+            this.cover_spanned_rows()
+            set this.table_stack: this.table_stack.prev
+            sg.end_table()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_TABLE_PART
+        {
+            ; TablePartFlowObj::processInner + the SerialFOTBuilder header/
+            ; footer decomposition (empty until the label: port machinery —
+            ; content all flows to the principal port).
+            this.push_fo_style(fo)
+            let t this.table_stack
+            if t <> null
+            {
+                set t.current_column: 0
+                set t.row_style: null
+                let h t.host
+                set t.column_styles: Array[pointer[Array[pointer[ELObj]]]]^h()
+                set t.covered: Array[int]^h()
+                set t.n_columns: 0
+            }
+            sg.start_table_part_serial(fo.get_dnic() as pointer[DisplayNIC])
+            this.process_flow_obj_content(sosofo)
+            if this.in_table_row()
+                this.end_table_row()
+            this.cover_spanned_rows()
+            sg.start_table_part_header()
+            sg.end_table_part_header()
+            sg.start_table_part_footer()
+            sg.end_table_part_footer()
+            sg.end_table_part_serial()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_TABLE_COLUMN
+        {
+            this.push_fo_style(fo)
+            var rec2 fo.get_tnic() as pointer[TableColumnNICRec]
+            if rec2 = null
+                set rec2: TableColumnNICRec.make(this.interp.get_host())
+            let col_fo_style fo.get_style()
+            if rec2.has_column_number
+            {
+                sg.table_column(rec2)
+                this.add_table_column(rec2.column_index, rec2.n_columns_spanned, col_fo_style)
+            }
+            else
+            {
+                let rec3 rec2.copy(this.interp.get_host())
+                set rec3.column_index: this.current_table_column()
+                sg.table_column(rec3)
+                this.add_table_column(rec3.column_index, rec2.n_columns_spanned, col_fo_style)
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_TABLE_ROW
+        {
+            ; TableRowFlowObj: pushStyle/popStyle are empty — the row style is
+            ; stored and pushed per cell.
+            if this.in_table() = false
+            {
+                this.interp.message0(InterpreterMessages.tableRowOutsideTable())
+                this.process_flow_obj_content(sosofo)
+                return
+            }
+            if this.in_table_row()
+                this.end_table_row()
+            let row_fo_style fo.get_style()
+            this.start_table_row(row_fo_style)
+            this.process_flow_obj_content(sosofo)
+            if this.in_table_row()
+                this.end_table_row()
+            return
+        }
+        if foc = FOC_TABLE_CELL
+        {
+            var rec4 fo.get_tnic() as pointer[TableCellNICRec]
+            if rec4 = null
+                set rec4: TableCellNICRec.make(this.interp.get_host())
+            let cell_fo_style fo.get_style()
+            this.process_table_cell(rec4, cell_fo_style, sosofo)
+            return
+        }
+        ; TableBorderFlowObj::process is empty — a pure style carrier.
+        if foc = FOC_TABLE_BORDER
+            return
         if foc = FOC_FORMATTING_INSTRUCTION
             return
         ; FOC_UNKNOWN and anything unported: content only.

@@ -28,6 +28,18 @@
 # display-group re-evaluates the outer font-size) and the circular-use error;
 # bad3: inherited-* outside a characteristic value (rule falls back to default
 # processing) + the actual-* circularity loop (one message per <p>).
+# toy7 (tdoc.sgml): the table family — table/table-part/table-column/table-row/
+# table-cell/table-border, table-width (explicit/#f-minimum), the four table
+# border NICs with the table-border IC fallback, per-cell cell-*-border
+# actuals, column/row styles wrapped in <sequence> (always-attached make
+# styles), column-number/n-columns-spanned/n-rows-spanned spans with the
+# covered-rowspan fill (synthesized cells incl. the trailing missing dummy),
+# starts-row? cells without row FOs (tokenized-attribute pattern match), and
+# the table-part principal/header/footer serial decomposition.
+# bad4 (tdoc.sgml): constant table NIC errors at COMPILE (value-anchored,
+# once: bad border value, column-number 0), table-row/table-cell outside a
+# table (location-less, per occurrence, unclosed <table-row> quirk), and a
+# non-constant invalid n-rows-spanned (per-process, value-anchored).
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -45,12 +57,12 @@ fi
 
 # inputs are COPIED into a scratch workdir (sweep-harness lesson: outputs must
 # never land next to repo fixtures).
-cp "$HERE"/doc.sgml "$HERE"/*.dsl "$HERE"/*.scm "$WORK/"
+cp "$HERE"/*.sgml "$HERE"/*.dsl "$HERE"/*.scm "$WORK/"
 
-run_case() { # name expected [expected_err]
-  local name="$1" expected="$2" experr="${3:-}"
+run_case() { # name expected [expected_err] [document]
+  local name="$1" expected="$2" experr="${3:-}" doc="${4:-doc.sgml}"
   ( cd "$WORK" && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
-      "$OUT" -t fot -o "$name.out.fot" -d "$name.dsl" doc.sgml 2> "$name.err" )
+      "$OUT" -t fot -o "$name.out.fot" -d "$name.dsl" "$doc" 2> "$name.err" )
   local rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "dazzle-fot: FAIL $name (rc=$rc)"; cat "$WORK/$name.err"; exit 1
@@ -78,9 +90,11 @@ run_case toy3 "$HERE/toy3.expected"
 run_case toy4 "$HERE/toy4.expected"
 run_case toy5 "$HERE/toy5.expected"
 run_case toy6 "$HERE/toy6.expected" "$HERE/toy6.expected.err"
+run_case toy7 "$HERE/toy7.expected" "" tdoc.sgml
 run_case bad  "$HERE/bad.expected" "$HERE/bad.expected.err"
 run_case bad2 "$HERE/bad2.expected" "$HERE/bad2.expected.err"
 run_case bad3 "$HERE/bad3.expected" "$HERE/bad3.expected.err"
+run_case bad4 "$HERE/bad4.expected" "$HERE/bad4.expected.err" tdoc.sgml
 
 # default output name: <docbase>.fot in the current directory (JadeApp).
 ( cd "$WORK" && rm -f doc.fot && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
