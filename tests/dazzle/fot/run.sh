@@ -46,6 +46,16 @@
 # line-field break-*-priority conversion diagnostics: constant invalid value
 # once at compile, non-constant invalid value per process (2 x <p>), valid
 # priorities accepted but never printed (startLineField drops its NIC).
+# toy9 (tdoc.sgml): label:/content-map: — table-part header/footer ports fed
+# by labeled row groups through a content-map (incl. (bd #f) principal
+# routing), the nested same-port connection (save-queue replay as a sibling
+# in the header), repeated <a> anchors per connection, and default content
+# ((make paragraph) with no content = (process-children)).
+# bad7 (tdoc.sgml): the connection diagnostics — badContentMap (once per map,
+# value-anchored), contentMapBadPort, badConnection (label with no port,
+# content follows inline), labelNotASymbol (hard eval error per node, initial-
+# mode children fallback), and content-map on a non-ported paragraph
+# (rows outside a table).
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -98,12 +108,14 @@ run_case toy5 "$HERE/toy5.expected"
 run_case toy6 "$HERE/toy6.expected" "$HERE/toy6.expected.err"
 run_case toy7 "$HERE/toy7.expected" "" tdoc.sgml
 run_case toy8 "$HERE/toy8.expected" "" tdoc.sgml
+run_case toy9 "$HERE/toy9.expected" "" tdoc.sgml
 run_case bad  "$HERE/bad.expected" "$HERE/bad.expected.err"
 run_case bad2 "$HERE/bad2.expected" "$HERE/bad2.expected.err"
 run_case bad3 "$HERE/bad3.expected" "$HERE/bad3.expected.err"
 run_case bad4 "$HERE/bad4.expected" "$HERE/bad4.expected.err" tdoc.sgml
 run_case bad5 "$HERE/bad5.expected" "$HERE/bad5.expected.err" tdoc.sgml
 run_case bad6 "$HERE/bad6.expected" "$HERE/bad6.expected.err"
+run_case bad7 "$HERE/bad7.expected" "$HERE/bad7.expected.err" tdoc.sgml
 
 # default output name: <docbase>.fot in the current directory (JadeApp).
 ( cd "$WORK" && rm -f doc.fot && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \

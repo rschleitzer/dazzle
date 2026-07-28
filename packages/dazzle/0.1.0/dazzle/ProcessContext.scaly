@@ -17,6 +17,7 @@ use opensp.StringC.StringC
 use dazzle.Grove.GroveNode
 use dazzle.ELObj.ELObj
 use dazzle.ELObj.FlowObj
+use dazzle.ELObj.SosofoCtlRec
 use dazzle.VM.VM
 use dazzle.Interpreter.Interpreter
 use dazzle.ProcessingMode.ProcessingMode
@@ -54,6 +55,9 @@ define TableRec
     current_column: int
     in_row: bool
     n_columns: int
+    ; the connectable level current when the row started (Table::
+    ; rowConnectableLevel) — endConnection closes a row it opened.
+    row_connectable_level: int
     covered: pointer[Array[int]]
     column_styles: pointer[Array[pointer[Array[pointer[ELObj]]]]]
 )
@@ -67,13 +71,122 @@ define TableRec
         set t.current_column: 0
         set t.in_row: false
         set t.n_columns: 0
+        set t.row_connectable_level: 0
         set t.covered: Array[int]^host()
         set t.column_styles: Array[pointer[Array[pointer[ELObj]]]]^host()
         t
     }
 }
 
-define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: pointer[TransformFOTBuilder], match_spec: Specificity, mode: pointer[ProcessingMode], sgml_fotb: pointer[void], style_stack: pointer[void], have_page_type: bool, page_type: int, table_stack: pointer[TableRec])
+; ProcessContext::Port — a named connection target of a flow object with
+; non-principal ports (table-part header/footer). `buf` is the port's sink
+; (the byte-level SaveFOTBuilder the owner replays); over-connections while
+; `connected` queue their own buffers, flushed into `buf` in order when the
+; count drops to zero. All allocations live on the OWNER's region (`host`,
+; the region current at push_ports — it outlives the deeper node brackets
+; that connect).
+define PortRec
+(
+    labels: pointer[Array[pointer[ELObj]]]
+    buf: pointer[Array[u32]]
+    save_queue: pointer[Array[pointer[Array[u32]]]]
+    connected: int
+    host: pointer[Page]
+)
+{
+    function make(host: pointer[Page], lbl: pointer[ELObj], buf: pointer[Array[u32]]) returns pointer[PortRec]
+    {
+        let p host.allocate(sizeof PortRec, alignof PortRec) as pointer[PortRec]
+        let labels Array[pointer[ELObj]]^host()
+        labels.add(lbl)
+        set p.labels: labels
+        set p.buf: buf
+        set p.save_queue: Array[pointer[Array[u32]]]^host()
+        set p.connected: 0
+        set p.host: host
+        p
+    }
+}
+
+; ProcessContext::Connectable — a flow object that can be connected to
+; (push_ports), or the portless carrier startMapContent synthesizes for
+; principal-port relabeling. Carries a style-stack SNAPSHOT (ported content
+; inherits through the port, not from its lexical position).
+define ConnectableRec
+(
+    prev: pointer[ConnectableRec]
+    ports: pointer[Array[pointer[PortRec]]]
+    principal_port_labels: pointer[Array[pointer[ELObj]]]
+    style_stack: pointer[StyleStack]
+    flow_obj_level: int
+    host: pointer[Page]
+)
+{
+    function make(host: pointer[Page], style_stack: pointer[StyleStack], flow_obj_level: int, prev: pointer[ConnectableRec]) returns pointer[ConnectableRec]
+    {
+        let c host.allocate(sizeof ConnectableRec, alignof ConnectableRec) as pointer[ConnectableRec]
+        set c.prev: prev
+        set c.ports: Array[pointer[PortRec]]^host()
+        set c.principal_port_labels: Array[pointer[ELObj]]^host()
+        set c.style_stack: style_stack
+        set c.flow_obj_level: flow_obj_level
+        set c.host: host
+        c
+    }
+}
+
+; ProcessContext::Connection — a label: connection between a flow object and
+; its flow parent. `buf` = the output target (null = the base stream);
+; `style_stack` = the connection's own copy of the connectable's snapshot
+; (null on the base connection = the ProcessContext's stack). n_bad_follow
+; counts startConnection failures so the matching endConnection pops nothing.
+define ConnectionRec
+(
+    prev: pointer[ConnectionRec]
+    buf: pointer[Array[u32]]
+    style_stack: pointer[StyleStack]
+    port: pointer[PortRec]
+    connectable_level: int
+    n_bad_follow: int
+)
+{
+    function make(host: pointer[Page], buf: pointer[Array[u32]], style_stack: pointer[StyleStack], port: pointer[PortRec], connectable_level: int, prev: pointer[ConnectionRec]) returns pointer[ConnectionRec]
+    {
+        let c host.allocate(sizeof ConnectionRec, alignof ConnectionRec) as pointer[ConnectionRec]
+        set c.prev: prev
+        set c.buf: buf
+        set c.style_stack: style_stack
+        set c.port: port
+        set c.connectable_level: connectable_level
+        set c.n_bad_follow: 0
+        c
+    }
+}
+
+; principalPortSaveQueues_ — buffers of principal-restored connections made
+; at a DEEPER flow-obj level than their connectable; flushed (and the record
+; unlinked) when the level unwinds back to `level`. Lives on the
+; connectable's region — flush + unlink always precede that bracket's death.
+define PrincipalQueueRec
+(
+    prev: pointer[PrincipalQueueRec]
+    level: int
+    bufs: pointer[Array[pointer[Array[u32]]]]
+    host: pointer[Page]
+)
+{
+    function make(host: pointer[Page], level: int, prev: pointer[PrincipalQueueRec]) returns pointer[PrincipalQueueRec]
+    {
+        let q host.allocate(sizeof PrincipalQueueRec, alignof PrincipalQueueRec) as pointer[PrincipalQueueRec]
+        set q.prev: prev
+        set q.level: level
+        set q.bufs: Array[pointer[Array[u32]]]^host()
+        set q.host: host
+        q
+    }
+}
+
+define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: pointer[TransformFOTBuilder], match_spec: Specificity, mode: pointer[ProcessingMode], sgml_fotb: pointer[void], style_stack: pointer[void], have_page_type: bool, page_type: int, table_stack: pointer[TableRec], connection_stack: pointer[ConnectionRec], connectable_stack: pointer[ConnectableRec], connectable_level: int, flow_obj_level: int, principal_queues: pointer[PrincipalQueueRec])
 {
     function make(host: pointer[Page], interp: pointer[Interpreter], fotb: pointer[TransformFOTBuilder]) returns pointer[ProcessContext]
     {
@@ -88,6 +201,11 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
         set pc.have_page_type: false
         set pc.page_type: 0
         set pc.table_stack: null
+        set pc.connection_stack: ConnectionRec.make(host, null, null, null, 0, null)
+        set pc.connectable_stack: null
+        set pc.connectable_level: 0
+        set pc.flow_obj_level: 0
+        set pc.principal_queues: null
         pc
     }
 
@@ -107,6 +225,11 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
         set pc.mode: null
         set pc.sgml_fotb: sgml as pointer[void]
         set pc.style_stack: StyleStack.make(host) as pointer[void]
+        set pc.connection_stack: ConnectionRec.make(host, null, null, null, 0, null)
+        set pc.connectable_stack: null
+        set pc.connectable_level: 0
+        set pc.flow_obj_level: 0
+        set pc.principal_queues: null
         set pc.have_page_type: false
         set pc.page_type: 0
         set pc.table_stack: null
@@ -115,6 +238,456 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
 
     function sgml_sink(this: ProcessContext) returns pointer[SgmlFOTBuilder]
         sgml_fotb as pointer[SgmlFOTBuilder]
+
+    ; --- connections & ports (label:/content-map:, ProcessContext.cxx) -------
+
+    ; currentStyleStack — the top connection's stack (its copy of the
+    ; connectable's snapshot), else the base stack.
+    function current_style_stack(this: pointer[ProcessContext]) returns pointer[StyleStack]
+    {
+        let c this.connection_stack
+        if c <> null
+        {
+            if c.style_stack <> null
+                return c.style_stack
+        }
+        this.style_stack as pointer[StyleStack]
+    }
+
+    ; route the fot sink at the top connection's buffer (null = base stream).
+    procedure apply_conn_target(this: pointer[ProcessContext])
+    {
+        let sg this.sgml_sink()
+        if sg = null
+            return
+        var buf: pointer[Array[u32]] null
+        if this.connection_stack <> null
+            set buf: this.connection_stack.buf
+        sg.set_conn_target(buf)
+    }
+
+    procedure append_buf(dst: pointer[Array[u32]], src: pointer[Array[u32]])
+    {
+        if dst = null
+            return
+        if src = null
+            return
+        let n src.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let p src.get(i)
+            if p <> null
+                dst.add(*p)
+            set i: i + (1 as size_t)
+        }
+    }
+
+    ; FlowObj::process's flow-object-level bracket.
+    procedure start_flow_obj(this: pointer[ProcessContext])
+        set this.flow_obj_level: this.flow_obj_level + 1
+
+    ; endFlowObj — unwind the level; flush (and unlink) the principal-port
+    ; save queue parked at the new level into the current output.
+    procedure end_flow_obj(this: pointer[ProcessContext])
+    {
+        set this.flow_obj_level: this.flow_obj_level - 1
+        var q this.principal_queues
+        var prev_q: pointer[PrincipalQueueRec] null
+        while q <> null
+        {
+            if q.level = this.flow_obj_level
+            {
+                let sg this.sgml_sink()
+                let n q.bufs.get_length()
+                var i: size_t 0
+                while i < n
+                {
+                    let bp q.bufs.get(i)
+                    if bp <> null
+                    {
+                        if sg <> null
+                            sg.emit_captured(*bp)
+                    }
+                    set i: i + (1 as size_t)
+                }
+                if prev_q = null
+                    set this.principal_queues: q.prev
+                else
+                    set prev_q.prev: q.prev
+                return
+            }
+            set prev_q: q
+            set q: q.prev
+        }
+    }
+
+    ; pushPorts — a flow object with named ports (table-part header/footer):
+    ; snapshot the current style stack, install the ports, bump the level.
+    procedure push_ports(this: pointer[ProcessContext], labels: pointer[Array[pointer[ELObj]]], bufs: pointer[Array[pointer[Array[u32]]]], host: pointer[Page])
+    {
+        var css: pointer[StyleStack] null
+        let cur this.current_style_stack()
+        if cur <> null
+            set css: cur.copy(host)
+        let c ConnectableRec.make(host, css, this.flow_obj_level, this.connectable_stack)
+        let n labels.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let lp labels.get(i)
+            let bp bufs.get(i)
+            if (lp <> null) and (bp <> null)
+            {
+                let port PortRec.make(host, *lp, *bp)
+                c.ports.add(port)
+            }
+            set i: i + (1 as size_t)
+        }
+        set this.connectable_stack: c
+        set this.connectable_level: this.connectable_level + 1
+    }
+
+    procedure pop_ports(this: pointer[ProcessContext])
+    {
+        set this.connectable_level: this.connectable_level - 1
+        if this.connectable_stack <> null
+            set this.connectable_stack: this.connectable_stack.prev
+    }
+
+    ; startConnection — walk the connectable stack for a port (or principal
+    ; label) carrying `label`; no match is a badConnection error and the
+    ; content follows into the current output (nBadFollow).
+    procedure start_connection(this: pointer[ProcessContext], lbl: pointer[ELObj], loc: Location)
+    {
+        var conn_level this.connectable_level
+        var c this.connectable_stack
+        while c <> null
+        {
+            let np c.ports.get_length()
+            var i: size_t 0
+            while i < np
+            {
+                let pp c.ports.get(i)
+                if pp <> null
+                {
+                    let port *pp
+                    let nl port.labels.get_length()
+                    var j: size_t 0
+                    while j < nl
+                    {
+                        let lp port.labels.get(j)
+                        if lp <> null
+                        {
+                            ; symbols are interned — identity compare.
+                            if *lp = lbl
+                            {
+                                this.restore_connection_port(c, port, conn_level)
+                                return
+                            }
+                        }
+                        set j: j + (1 as size_t)
+                    }
+                }
+                set i: i + (1 as size_t)
+            }
+            let npl c.principal_port_labels.get_length()
+            var k: size_t 0
+            while k < npl
+            {
+                let plp c.principal_port_labels.get(k)
+                if plp <> null
+                {
+                    if *plp = lbl
+                    {
+                        this.restore_connection_principal(c, conn_level)
+                        return
+                    }
+                }
+                set k: k + (1 as size_t)
+            }
+            set c: c.prev
+            set conn_level: conn_level - 1
+        }
+        this.interp.set_next_location(loc)
+        this.interp.message1(InterpreterMessages.badConnection(), lbl.symbol_name())
+        let head this.connection_stack
+        if head <> null
+            set head.n_bad_follow: head.n_bad_follow + 1
+    }
+
+    ; restoreConnection, port case: first connection writes the port's buffer
+    ; directly; concurrent ones queue their own (flushed at last end).
+    procedure restore_connection_port(this: pointer[ProcessContext], c: pointer[ConnectableRec], port: pointer[PortRec], conn_level: int)
+    {
+        let host this.interp.get_host()
+        var buf: pointer[Array[u32]] null
+        if port.connected > 0
+        {
+            set port.connected: port.connected + 1
+            let ch c.host
+            set buf: Array[u32]^ch()
+            port.save_queue.add(buf)
+        }
+        else
+        {
+            set buf: port.buf
+            set port.connected: 1
+        }
+        var css: pointer[StyleStack] null
+        if c.style_stack <> null
+            set css: c.style_stack.copy(host)
+        let cn ConnectionRec.make(host, buf, css, port, conn_level, this.connection_stack)
+        set this.connection_stack: cn
+        this.apply_conn_target()
+        this.connection_start_node()
+    }
+
+    ; restoreConnection, principal case ((label #f) content-map entries): at
+    ; the connectable's own flow-obj level the content joins the current
+    ; output; from deeper levels it buffers until the level unwinds.
+    procedure restore_connection_principal(this: pointer[ProcessContext], c: pointer[ConnectableRec], conn_level: int)
+    {
+        let host this.interp.get_host()
+        var buf: pointer[Array[u32]] null
+        if c.flow_obj_level = this.flow_obj_level
+        {
+            let head this.connection_stack
+            if head <> null
+                set buf: head.buf
+        }
+        else
+        {
+            let ch c.host
+            set buf: Array[u32]^ch()
+            var q this.principal_queues
+            var found: pointer[PrincipalQueueRec] null
+            while q <> null
+            {
+                if q.level = c.flow_obj_level
+                {
+                    set found: q
+                    break
+                }
+                set q: q.prev
+            }
+            if found = null
+            {
+                set found: PrincipalQueueRec.make(ch, c.flow_obj_level, this.principal_queues)
+                set this.principal_queues: found
+            }
+            found.bufs.add(buf)
+        }
+        var css: pointer[StyleStack] null
+        if c.style_stack <> null
+            set css: c.style_stack.copy(host)
+        let cn ConnectionRec.make(host, buf, css, null, conn_level, this.connection_stack)
+        set this.connection_stack: cn
+        this.apply_conn_target()
+        this.connection_start_node()
+    }
+
+    ; the startNode a restored connection emits (pending-anchor bookkeeping).
+    procedure connection_start_node(this: pointer[ProcessContext])
+    {
+        let sg this.sgml_sink()
+        if sg = null
+            return
+        let node this.vm.get_current_node()
+        var mname StringC()
+        if this.mode <> null
+            set mname: this.mode.get_name()
+        sg.start_node(node, mname)
+    }
+
+    procedure end_connection(this: pointer[ProcessContext])
+    {
+        ; a table row opened under this connection's connectable closes here.
+        if this.in_table_row()
+        {
+            let t this.table_stack
+            if t.row_connectable_level = this.connectable_level
+                this.end_table_row()
+        }
+        let head this.connection_stack
+        if head = null
+            return
+        if head.n_bad_follow > 0
+        {
+            set head.n_bad_follow: head.n_bad_follow - 1
+            return
+        }
+        let sg this.sgml_sink()
+        if sg <> null
+            sg.end_node()
+        let port head.port
+        if port <> null
+        {
+            set port.connected: port.connected - 1
+            if port.connected = 0
+            {
+                let n port.save_queue.get_length()
+                var i: size_t 0
+                while i < n
+                {
+                    let bp port.save_queue.get(i)
+                    if bp <> null
+                        ProcessContext.append_buf(port.buf, *bp)
+                    set i: i + (1 as size_t)
+                }
+                let ph port.host
+                set port.save_queue: Array[pointer[Array[u32]]]^ph()
+            }
+        }
+        set this.connection_stack: head.prev
+        this.apply_conn_target()
+    }
+
+    procedure bad_content_map(this: pointer[ProcessContext], flagged: pointer[bool], loc: Location)
+    {
+        if *flagged
+            return
+        set *flagged: true
+        this.interp.set_next_location(loc)
+        this.interp.message0(InterpreterMessages.badContentMap())
+    }
+
+    ; startMapContent — rebind the port labels of the nearest connectable at
+    ; this flow-obj level (synthesizing a portless one if needed) from a
+    ; ((label port|#f) ...) list; #f targets the principal port.
+    procedure start_map_content(this: pointer[ProcessContext], map_in: pointer[ELObj], loc: Location)
+    {
+        let interp this.interp
+        let host interp.get_host()
+        var need false
+        if this.connectable_stack = null
+            set need: true
+        else
+        {
+            if this.connectable_stack.flow_obj_level <> this.flow_obj_level
+                set need: true
+        }
+        if need
+        {
+            var css: pointer[StyleStack] null
+            let cur this.current_style_stack()
+            if cur <> null
+                set css: cur.copy(host)
+            let nc ConnectableRec.make(host, css, this.flow_obj_level, this.connectable_stack)
+            ; NOTE: no connectable_level bump (reference startMapContent).
+            set this.connectable_stack: nc
+        }
+        let conn this.connectable_stack
+        ; snapshot each port's current (first) label, then clear the labels.
+        let np conn.ports.get_length()
+        let port_names Array[pointer[ELObj]]^host()
+        var i: size_t 0
+        while i < np
+        {
+            let pp conn.ports.get(i)
+            if pp <> null
+            {
+                let port *pp
+                var nm: pointer[ELObj] null
+                if port.labels.get_length() > (0 as size_t)
+                {
+                    let l0 port.labels.get(0 as size_t)
+                    if l0 <> null
+                        set nm: *l0
+                }
+                port_names.add(nm)
+                let ph port.host
+                set port.labels: Array[pointer[ELObj]]^ph()
+            }
+            else
+                port_names.add(null)
+            set i: i + (1 as size_t)
+        }
+        var bad false
+        var m map_in
+        while true
+        {
+            if m = null
+                break
+            if m.is_nil()
+                break
+            if m.is_pair() = false
+            {
+                this.bad_content_map(&bad, loc)
+                break
+            }
+            let entry m.get_car()
+            set m: m.get_cdr()
+            if entry.is_pair() = false
+            {
+                this.bad_content_map(&bad, loc)
+                continue
+            }
+            let lbl entry.get_car()
+            if lbl.is_symbol_p() = false
+            {
+                this.bad_content_map(&bad, loc)
+                continue
+            }
+            let rest entry.get_cdr()
+            if rest.is_pair() = false
+            {
+                this.bad_content_map(&bad, loc)
+                continue
+            }
+            let port_val rest.get_car()
+            if port_val.is_symbol_p()
+            {
+                var found false
+                var pi: size_t 0
+                while pi < np
+                {
+                    if found = false
+                    {
+                        let nmp port_names.get(pi)
+                        if nmp <> null
+                        {
+                            if *nmp = port_val
+                            {
+                                let pp2 conn.ports.get(pi)
+                                if pp2 <> null
+                                {
+                                    let port2 *pp2
+                                    port2.labels.add(lbl)
+                                }
+                                set found: true
+                            }
+                        }
+                    }
+                    set pi: pi + (1 as size_t)
+                }
+                if found = false
+                {
+                    interp.set_next_location(loc)
+                    interp.message1(InterpreterMessages.contentMapBadPort(), port_val.symbol_name())
+                }
+            }
+            else
+            {
+                if port_val = interp.make_false()
+                    conn.principal_port_labels.add(lbl)
+                else
+                    this.bad_content_map(&bad, loc)
+            }
+            if rest.get_cdr().is_nil() = false
+                this.bad_content_map(&bad, loc)
+        }
+    }
+
+    procedure end_map_content(this: pointer[ProcessContext])
+    {
+        let c this.connectable_stack
+        if c <> null
+        {
+            if c.ports.get_length() = (0 as size_t)
+                set this.connectable_stack: c.prev
+        }
+    }
 
     ; characters dispatch — the two sinks (exactly one is non-null).
     function emit_characters(this: pointer[ProcessContext], s: pointer[u32], n: size_t)
@@ -403,6 +976,36 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
             }
             return
         }
+        if kind = SOSO_LABEL
+        {
+            ; LabelSosofoObj::process — connect, process, disconnect.
+            let ctl: pointer[SosofoCtlRec] sosofo.sosofo_ctl()
+            let content sosofo.sosofo_aux()
+            if ctl <> null
+            {
+                let cloc ctl.get_loc()
+                this.start_connection(ctl.obj, cloc)
+            }
+            this.process_sosofo(content)
+            if ctl <> null
+                this.end_connection()
+            return
+        }
+        if kind = SOSO_CONTENT_MAP
+        {
+            ; ContentMapSosofoObj::process.
+            let ctl2: pointer[SosofoCtlRec] sosofo.sosofo_ctl()
+            let content2 sosofo.sosofo_aux()
+            if ctl2 <> null
+            {
+                let mloc ctl2.get_loc()
+                this.start_map_content(ctl2.obj, mloc)
+            }
+            this.process_sosofo(content2)
+            if ctl2 <> null
+                this.end_map_content()
+            return
+        }
         if kind = SOSO_FLOWOBJ
             this.process_flow_obj(sosofo)
     }
@@ -434,11 +1037,19 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
         if fo = null
             return
         let foc fo.get_foc()
+        ; FlowObj::process — the flow-object-level bracket (the principal-port
+        ; save queues flush as the level unwinds).
+        this.start_flow_obj()
         if this.sgml_sink() <> null
-        {
             this.process_flow_obj_fot(sosofo, fo, foc)
-            return
-        }
+        else
+            this.process_flow_obj_transform(sosofo, fo, foc)
+        this.end_flow_obj()
+    }
+
+    ; the transform backend's flow-object dispatch (jade/TransformFOTBuilder).
+    function process_flow_obj_transform(this: pointer[ProcessContext], sosofo: pointer[ELObj], fo: pointer[FlowObj], foc: int)
+    {
         if foc = FOC_ELEMENT
         {
             let gi this.element_gi(fo)
@@ -498,7 +1109,7 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
     ; spec pushed at this level), emit the flow object, process content, pop.
     function push_fo_style(this: pointer[ProcessContext], fo: pointer[FlowObj])
     {
-        let ss this.style_stack as pointer[StyleStack]
+        let ss this.current_style_stack()
         let style fo.get_style()
         if style = null
         {
@@ -512,7 +1123,7 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
     ; column/row styles): push + render this level's specs through set_ic.
     function push_style_obj(this: pointer[ProcessContext], style: pointer[ELObj])
     {
-        let ss this.style_stack as pointer[StyleStack]
+        let ss this.current_style_stack()
         let scratch this.interp.get_host()
         ss.push_start(scratch)
         ss.push_continue(style, scratch)
@@ -549,7 +1160,7 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
 
     function pop_fo_style(this: pointer[ProcessContext], fo: pointer[FlowObj])
     {
-        let ss this.style_stack as pointer[StyleStack]
+        let ss this.current_style_stack()
         if fo.get_style() = null
         {
             ss.pop_empty()
@@ -660,6 +1271,11 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
             set t.row_style: style
             set t.current_column: 0
             set t.in_row: true
+            var rcl 0
+            let head this.connection_stack
+            if head <> null
+                set rcl: head.connectable_level
+            set t.row_connectable_level: rcl
         }
         this.sgml_sink().start_table_row()
     }
@@ -743,7 +1359,7 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
             return null
         let scratch this.interp.get_host()
         let deps Array[int]^scratch()
-        let ss this.style_stack as pointer[StyleStack]
+        let ss this.current_style_stack()
         let obj VM.stack_actual(ss, proto, Location(), this.interp, deps)
         if obj = null
             return null
@@ -778,7 +1394,7 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
             sg.table_after_column_border()
         if style <> null
         {
-            let ss this.style_stack as pointer[StyleStack]
+            let ss this.current_style_stack()
             ss.pop()
         }
     }
@@ -808,7 +1424,7 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
             sg.table_cell_after_column_border()
         if style <> null
         {
-            let ss this.style_stack as pointer[StyleStack]
+            let ss this.current_style_stack()
             ss.pop()
         }
     }
@@ -867,7 +1483,7 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
                 set disp: rec.display
             }
         }
-        let ss this.style_stack as pointer[StyleStack]
+        let ss this.current_style_stack()
         set vm.style_stack: ss
         set vm.spec_level: ss.get_level()
         let deps Array[int]^host()
@@ -889,7 +1505,7 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
     procedure process_table_cell(this: pointer[ProcessContext], rec: pointer[TableCellNICRec], style: pointer[ELObj], sosofo: pointer[ELObj], fo: pointer[FlowObj])
     {
         let sg this.sgml_sink()
-        let ss this.style_stack as pointer[StyleStack]
+        let ss this.current_style_stack()
         if this.in_table_row()
         {
             if rec.starts_row
@@ -1132,8 +1748,8 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
         if foc = FOC_TABLE_PART
         {
             ; TablePartFlowObj::processInner + the SerialFOTBuilder header/
-            ; footer decomposition (empty until the label: port machinery —
-            ; content all flows to the principal port).
+            ; footer decomposition: the header/footer ports (label:) capture
+            ; into buffers replayed after the principal content.
             this.push_fo_style(fo)
             var rfo fo
             if fo.get_nic_code() <> null
@@ -1151,13 +1767,28 @@ define ProcessContext (vm: pointer[VM], interp: pointer[Interpreter], fotb: poin
                     set t.n_columns: 0
                 }
                 sg.start_table_part_serial(rfo.get_dnic() as pointer[DisplayNIC])
+                let phost this.interp.get_host()
+                let hdr_buf Array[u32]^phost()
+                let ftr_buf Array[u32]^phost()
+                let hdr_sym this.interp.make_symbol(StringC("header"))
+                let ftr_sym this.interp.make_symbol(StringC("footer"))
+                let labels Array[pointer[ELObj]]^phost()
+                labels.add(hdr_sym)
+                labels.add(ftr_sym)
+                let bufs Array[pointer[Array[u32]]]^phost()
+                bufs.add(hdr_buf)
+                bufs.add(ftr_buf)
+                this.push_ports(labels, bufs, phost)
                 this.process_flow_obj_content(sosofo)
+                this.pop_ports()
                 if this.in_table_row()
                     this.end_table_row()
                 this.cover_spanned_rows()
                 sg.start_table_part_header()
+                sg.emit_captured(hdr_buf)
                 sg.end_table_part_header()
                 sg.start_table_part_footer()
+                sg.emit_captured(ftr_buf)
                 sg.end_table_part_footer()
                 sg.end_table_part_serial()
             }
