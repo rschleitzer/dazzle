@@ -11,6 +11,7 @@ use dazzle.Interpreter.Interpreter
 use dazzle.InterpreterMessages.InterpreterMessages
 use dazzle.Style.InheritedC
 use dazzle.Style.Convert
+use dazzle.Style.DisplayNIC
 
 ; Expression — the compiled-form AST (Style/Expression.cxx). Each Expression
 ; compiles to an Insn chain against a compilation Environment that resolves
@@ -938,7 +939,6 @@ define Expression union
         ; (key_class stays null); FOC_UNKNOWN swallows every keyword
         ; (UnknownFlowObj::hasNonInheritedC).
         var key_class: pointer[Array[int]] null
-        var key_ic: pointer[Array[pointer[InheritedC]]] null
         var key_slot: pointer[Array[int]] null
         var force_specs: pointer[Array[pointer[InheritedC]]] null
         var specs: pointer[Array[pointer[InheritedC]]] null
@@ -950,11 +950,20 @@ define Expression union
         if (foc >= FOC_PARAGRAPH) and (foc <= FOC_TABLE_BORDER)
             set styled: true
         var tnic_proto: pointer[void] null
+        var dnic_proto: pointer[DisplayNIC] null
+        var hf_proto: pointer[Array[pointer[ELObj]]] null
+        ; the header/footer part index per key (>= 0 only for the spseq sosofo
+        ; NICs) — the SetNic insns carry it into the lazy chain.
+        var nic_part: pointer[Array[int]] null
+        ; the lazy NIC chain (SetNonInheritedCsSosofo code) and the post-make
+        ; construction chain (cell pseudo NICs prepended onto `next`).
+        var nic_code: pointer[Insn] null
+        var post_make next
         if styled and (n_key > 0)
         {
             set key_class: Array[int]^host()
-            set key_ic: Array[pointer[InheritedC]]^host()
             set key_slot: Array[int]^host()
+            set nic_part: Array[int]^host()
             let ic_proto Array[pointer[InheritedC]]^host()
             let ic_force Array[int]^host()
             var display_foc false
@@ -974,7 +983,7 @@ define Expression union
             while i < n_key
             {
                 var cls KEY_DROP
-                var icp: pointer[InheritedC] null
+                var part 0 - 1
                 var proto: pointer[InheritedC] null
                 var is_force 0
                 let kp keys.get(i as size_t)
@@ -990,26 +999,51 @@ define Expression union
                     ; keyword message).
                     if (foc = FOC_TABLE_PART) and (sk = SK_POSITION_PREFERENCE)
                         set disp_key: false
-                    if display_foc and disp_key
+                    var coalesce_key false
+                    if (foc = FOC_DISPLAY_GROUP) and (sk = SK_COALESCE_ID)
+                        set coalesce_key: true
+                    if (display_foc and disp_key) or coalesce_key
                     {
-                        set cls: KEY_NIC
+                        ; applyConstNonInheritedCs: a CONSTANT display NIC
+                        ; converts right here into the insn's DisplayNIC
+                        ; prototype (message once, anchored at the value);
+                        ; non-constants join the lazy nic_code chain.
+                        let cv ei.constant_datum()
+                        if cv <> null
+                        {
+                            var cvr cv
+                            let res cv.resolve_quantities(true, interp, ei.location())
+                            if res <> null
+                                set cvr: res
+                            if dnic_proto = null
+                                set dnic_proto: DisplayNIC.make(host)
+                            if coalesce_key
+                            {
+                                var s StringC()
+                                if Convert.convert_string(host, cvr, &s)
+                                {
+                                    set dnic_proto.has_coalesce_id: true
+                                    set dnic_proto.coalesce_id: s
+                                }
+                                else
+                                    Convert.invalid_value(interp, ident, ei.location())
+                            }
+                            else
+                                Convert.set_display_nic(dnic_proto, sk, cvr, ident, ei.location(), interp, host)
+                            set cls: KEY_TABLE_CONST
+                        }
+                        else
+                            set cls: KEY_NIC
                         set handled: true
                     }
                     if handled = false
                     {
-                        if (foc = FOC_DISPLAY_GROUP) and (sk = SK_COALESCE_ID)
-                        {
-                            set cls: KEY_NIC
-                            set handled: true
-                        }
-                    }
-                    if handled = false
-                    {
-                        ; the table-family NICs: a CONSTANT value converts
-                        ; right here into the insn's prototype record
-                        ; (applyConstNonInheritedCs — message once at compile,
-                        ; anchored at the value); a non-constant key keeps a
-                        ; slot, converted at exec against a location carrier.
+                        ; the table-family NICs: constants convert into the
+                        ; prototype record; the table-cell PSEUDO NICs
+                        ; (column-number / spans / starts-row? / ends-row? —
+                        ; the cell's pushStyle reads them) evaluate at
+                        ; CONSTRUCTION on the main chain; everything else
+                        ; joins the lazy chain.
                         if Convert.is_table_nic_key(foc, sk)
                         {
                             let cv ei.constant_datum()
@@ -1025,7 +1059,11 @@ define Expression union
                             else
                             {
                                 set cls: KEY_NIC
-                                set icp: InheritedC.make_hf(host, ident, 0, ei.location())
+                                if foc = FOC_TABLE_CELL
+                                {
+                                    if sk <> SK_N_ROWS_SPANNED
+                                        set cls: KEY_PSEUDO_NIC
+                                }
                             }
                             set handled: true
                         }
@@ -1043,14 +1081,39 @@ define Expression union
                     if handled = false
                     {
                         ; simple-page-sequence's sosofo NICs (SimplePageSequence-
-                        ; FlowObj::hasNonInheritedC — the six header/footer parts).
+                        ; FlowObj::hasNonInheritedC — the six header/footer
+                        ; parts). Constants convert at compile like every NIC.
                         if foc = FOC_SIMPLE_PAGE_SEQUENCE
                         {
-                            let part Expression.hf_part_index(sk)
-                            if part >= 0
+                            let hf_part Expression.hf_part_index(sk)
+                            if hf_part >= 0
                             {
-                                set cls: KEY_HF
-                                set icp: InheritedC.make_hf(host, ident, part, ei.location())
+                                let cv ei.constant_datum()
+                                if cv <> null
+                                {
+                                    if cv.is_sosofo_p()
+                                    {
+                                        if hf_proto = null
+                                        {
+                                            set hf_proto: Array[pointer[ELObj]]^host()
+                                            var hz 0
+                                            while hz < 6
+                                            {
+                                                hf_proto.add(null)
+                                                set hz: hz + 1
+                                            }
+                                        }
+                                        hf_proto.put(hf_part as size_t, cv)
+                                    }
+                                    else
+                                        Convert.invalid_value(interp, ident, ei.location())
+                                    set cls: KEY_TABLE_CONST
+                                }
+                                else
+                                {
+                                    set cls: KEY_NIC
+                                    set part: hf_part
+                                }
                                 set handled: true
                             }
                         }
@@ -1106,7 +1169,7 @@ define Expression union
                     }
                 }
                 key_class.add(cls)
-                key_ic.add(icp)
+                nic_part.add(part)
                 ic_proto.add(proto)
                 ic_force.add(is_force)
                 if Insn.key_has_slot(cls)
@@ -1118,21 +1181,33 @@ define Expression union
                     key_slot.add(0 - 1)
                 set i: i + 1
             }
-            ; the bound-vars capture env for the lazy IC codes (reference:
-            ; env.boundVars + markBoundVars over the IC exprs + removeUnused).
+            ; the bound-vars capture env for the lazy IC codes AND the lazy
+            ; NIC value codes (reference: env.boundVars + markBoundVars over
+            ; the participating exprs + removeUnused; the reference keeps two
+            ; separate captures — one merged display serves both here, the
+            ; codes compile against the same env).
             set bound_vars: BoundVarList.make(host)
             env.bound_vars(bound_vars)
             set i: 0
             while i < n_key
             {
+                var participates false
                 let pp ic_proto.get(i as size_t)
                 if pp <> null
                 {
                     if *pp <> null
-                    {
-                        let ei *(eb + i)
-                        ei.mark_bound_vars(bound_vars, false)
-                    }
+                        set participates: true
+                }
+                let ccp key_class.get(i as size_t)
+                if ccp <> null
+                {
+                    if *ccp = KEY_NIC
+                        set participates: true
+                }
+                if participates
+                {
+                    let ei *(eb + i)
+                    ei.mark_bound_vars(bound_vars, false)
                 }
                 set i: i + 1
             }
@@ -1196,11 +1271,61 @@ define Expression union
                 }
                 set i: i + 1
             }
+            ; the lazy NIC chain (compileNonInheritedCs): each non-constant
+            ; NIC value compiles against the capture env, prepending onto the
+            ; chain — forward loop = REVERSE execution order (faithful; the
+            ; resolve aborts at the first error value). The seed flow object
+            ; sits at stack 0, each value at 1.
+            set i: 0
+            while i < n_key
+            {
+                let ccp2 key_class.get(i as size_t)
+                if ccp2 <> null
+                {
+                    if *ccp2 = KEY_NIC
+                    {
+                        let kp3 keys.get(i as size_t)
+                        if kp3 <> null
+                        {
+                            let ei *(eb + i)
+                            var part2 0 - 1
+                            let ptp nic_part.get(i as size_t)
+                            if ptp <> null
+                                set part2: *ptp
+                            let sni Insn.make_set_nic(host, *kp3, part2, true, ei.location(), nic_code)
+                            set nic_code: Expression.optimize_compile(ei, interp, new_env, 1, sni)
+                        }
+                    }
+                }
+                set i: i + 1
+            }
+            ; the cell pseudo NICs (SetPseudoNonInheritedCInsn): evaluated at
+            ; CONSTRUCTION right after the make insn (outer env), reverse key
+            ; order like the reference prepend loop.
+            set i: 0
+            while i < n_key
+            {
+                let ccp3 key_class.get(i as size_t)
+                if ccp3 <> null
+                {
+                    if *ccp3 = KEY_PSEUDO_NIC
+                    {
+                        let kp4 keys.get(i as size_t)
+                        if kp4 <> null
+                        {
+                            let ei *(eb + i)
+                            let pni Insn.make_set_nic(host, *kp4, 0 - 1, false, ei.location(), post_make)
+                            set post_make: Expression.optimize_compile(ei, interp, env, stack_pos + 1, pni)
+                        }
+                    }
+                }
+                set i: i + 1
+            }
         }
         var n_bound 0
         if bound_vars <> null
             set n_bound: bound_vars.count()
-        var result Insn.make_flow_obj(host, foc, keys, key_class, key_ic as pointer[void], tnic_proto, force_specs, specs, n_bound, n_content, loc, next)
+        var result Insn.make_flow_obj(host, foc, keys, key_class, nic_code as pointer[void], tnic_proto, dnic_proto as pointer[void], hf_proto, force_specs, specs, n_bound, n_content, loc, post_make)
         if n_bound > 0
             set result: Expression.compile_push_vars(interp, env, stack_pos + n_slots + n_content, bound_vars, 0, result)
         let b exprs.get_buffer()

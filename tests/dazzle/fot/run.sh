@@ -91,10 +91,12 @@ run_case toy4 "$HERE/toy4.expected"
 run_case toy5 "$HERE/toy5.expected"
 run_case toy6 "$HERE/toy6.expected" "$HERE/toy6.expected.err"
 run_case toy7 "$HERE/toy7.expected" "" tdoc.sgml
+run_case toy8 "$HERE/toy8.expected" "" tdoc.sgml
 run_case bad  "$HERE/bad.expected" "$HERE/bad.expected.err"
 run_case bad2 "$HERE/bad2.expected" "$HERE/bad2.expected.err"
 run_case bad3 "$HERE/bad3.expected" "$HERE/bad3.expected.err"
 run_case bad4 "$HERE/bad4.expected" "$HERE/bad4.expected.err" tdoc.sgml
+run_case bad5 "$HERE/bad5.expected" "$HERE/bad5.expected.err" tdoc.sgml
 
 # default output name: <docbase>.fot in the current directory (JadeApp).
 ( cd "$WORK" && rm -f doc.fot && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \

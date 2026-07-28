@@ -198,17 +198,59 @@ the reference binaries on toy stylesheets (`tests/dazzle/fot/`):
   faithful quirk: `symbolBevel`'s name is "join").
 - **IC registry:** `installInheritedCs` ported with the reference INITIAL
   values (the inherited-* fallback; upi=72000), the maybe-integer entries
-  (expand-tabs?/hyphenation-ladder-count) and the 14 IgnoredC entries
-  (accepted, never rendered). Still deferred to their features:
-  Color/BackgroundColor/Border/Rule/GlyphSubst/OptLengthSpec/InlineSpace
-  specials — using one of those keywords is `invalidStyleKeyword` until
+  (expand-tabs?/hyphenation-ladder-count), the 14 IgnoredC entries
+  (accepted, never rendered), the Border entries (table-border +
+  cell-*-border with the canned border-present styles), and (2026-07-28)
+  color/background-color (ColorC/BackgroundColorC — `#RRGGBB`, `"false"`
+  background), min-pre-line-spacing/min-post-line-spacing/min-leading
+  (GenericOptLengthSpecInheritedC — the `#f` arm prints ` name"false"`
+  with the reference's missing '='), escapement-space-before/-after
+  (GenericInlineSpaceInheritedC — inlineSpaceC never closes its quote,
+  faithful) and inline-space-space (GenericOptInlineSpaceInheritedC —
+  setInlineSpaceSpace is not overridden in the reference SgmlFOTBuilder,
+  so a set renders nothing). Still deferred: Rule (fraction-bar) and
+  GlyphSubstTable — using those keywords is `invalidStyleKeyword` until
   their increment.
+- **Length-spec / space / color values (2026-07-28):** new ELObj arms
+  LenSpec (the engine 3-vector `EngLenSpec` — length, display-size
+  factor, table-unit factor; produced by `display-size`/`table-unit` and
+  by `+ - * /` over length-specs per the reference spec paths, incl. the
+  quirks: only the FIRST arg of `* /` may be a spec, the not-a-number
+  error always names argument 1, the Divide loop's not-a-quantity error
+  names argument 0), DispSpace/InlSpace (opaque Style.DisplaySpace/
+  InlineSpace payloads from the `display-space`/`inline-space` primitives
+  with min:/max:/conditional?:/priority: keyword scans), Color and
+  ColorSpace (`color`/`color-space` — the four Device families plus the
+  full CIE LUV/LAB/ABC/A machinery with the XYZ phosphor-matrix
+  conversion and decode-function calls on a fresh VM). TableColumnNIC
+  width is a TableLengthSpec (the table-unit factor prints "%.2f*", the
+  display-size factor "%.2f%%" — unlike the plain LengthSpec operator
+  whose factor sprintf is dead code).
 - **`MakeExpression` split** (Expression.cxx 1250–1420): per key —
   FO-class NIC (DisplayNIC family for paragraph/paragraph-break/
   display-group; InlineNIC accepted-and-dropped for line-field, its fot
   dump ignores them) / `use:` / IC (via `ident.inherited_c`) / else
   `invalidStyleKeyword`. Transform FO classes keep the existing collapsed
   path byte-identically.
+- **Lazy NIC evaluation (2026-07-28, the full reference shape):**
+  CONSTANT NIC values (display, table, header/footer sosofos) convert at
+  COMPILE into insn prototypes (`applyConstNonInheritedCs`: message once,
+  anchored at the value expression); non-constant ones compile into a
+  side chain of SetNic insns (`compileNonInheritedCs`) that the flow
+  object carries (`FlowObj.nic_code`) and `ProcessContext.resolve_nics`
+  evaluates PER PROCESS on a fresh deep copy — after the style push
+  (`SetNonInheritedCsSosofoObj::process`: startFlowObj, pushStyle,
+  resolve, processInner, popStyle), against the CURRENT style stack
+  (inherited-*/actual-* in NIC values read the pushed context) and the
+  make-time display/node. The chain executes in REVERSE key order and an
+  error VALUE aborts the whole resolve — the FO then emits nothing while
+  its push/pop bracket still closes (bad5 pins all of this). The
+  table-cell pseudo NICs (column-number/spans/starts-row?/ends-row? —
+  the cell's pushStyle needs them) evaluate at CONSTRUCTION on the main
+  chain (`SetPseudoNonInheritedCInsn`), only n-rows-spanned is lazy.
+  Rule bodies compile in REVERSE file order per mode (the reference
+  elementRules_ IList prepends) — observable through compile-time
+  diagnostics ordering.
 - **`SgmlFOTBuilder.scaly`:** ctor/dtor frame (`<?xml version="1.0"?>`,
   `<fot>`/`</fot>`), `ics_` characteristic buffer + `outputIcs`, Data
   escaping (`&amp;/&lt;/&gt;/&quot;` + `&#N;` ≥0x80), millipoint `Units`
@@ -233,6 +275,6 @@ RBMM: the sink's buffers live on the sink's own page (S67 rope lesson:
 memoize on `Page.get(this)`, never the caller host); StyleStack info array
 on the run page, `InheritedCInfo`/`PopList` nodes in the current node's
 eval scratch (they are popped inside the same bracket; inner→outer
-pointers only). Eagerly-evaluated IC values are converted to plain scalars
-/ interned strings inside the make insn, so nothing IC-related escapes the
-bracket except via the sink's output bytes.
+pointers only). The lazy-NIC resolve copy, its fresh VM and every
+converted NIC record live on the eval scratch too — their bytes reach the
+sink inside the same bracket.
