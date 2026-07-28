@@ -40,6 +40,12 @@
 # once: bad border value, column-number 0), table-row/table-cell outside a
 # table (location-less, per occurrence, unclosed <table-row> quirk), and a
 # non-constant invalid n-rows-spanned (per-process, value-anchored).
+# bad6 (doc.sgml): atomicContent (content on make paragraph-break — message
+# at the make location, content dropped, the <paragraph-break/> still emitted;
+# fires in reverse rule-compile order BEFORE title's const conversion) +
+# line-field break-*-priority conversion diagnostics: constant invalid value
+# once at compile, non-constant invalid value per process (2 x <p>), valid
+# priorities accepted but never printed (startLineField drops its NIC).
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -97,6 +103,7 @@ run_case bad2 "$HERE/bad2.expected" "$HERE/bad2.expected.err"
 run_case bad3 "$HERE/bad3.expected" "$HERE/bad3.expected.err"
 run_case bad4 "$HERE/bad4.expected" "$HERE/bad4.expected.err" tdoc.sgml
 run_case bad5 "$HERE/bad5.expected" "$HERE/bad5.expected.err" tdoc.sgml
+run_case bad6 "$HERE/bad6.expected" "$HERE/bad6.expected.err"
 
 # default output name: <docbase>.fot in the current directory (JadeApp).
 ( cd "$WORK" && rm -f doc.fot && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
