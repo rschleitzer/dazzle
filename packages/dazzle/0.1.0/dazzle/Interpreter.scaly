@@ -21,10 +21,15 @@ use dazzle.Style.LengthSpec
 use dazzle.Style.FotSym
 use dazzle.Style.VarStyleRec
 use dazzle.Style.InlineSpace
+use dazzle.Style.Convert
 use dazzle.Expression.Expression
 use dazzle.Expression.Environment
 use dazzle.VM.VM
 use dazzle.Insn.Signature
+use dazzle.Insn.Insn
+use dazzle.ELObj.QuantityValue
+use dazzle.ELObj.QT_NONE
+use dazzle.ELObj.QT_LONG
 use dazzle.ProcessingMode.ProcessingMode
 use dazzle.InterpreterMessages.InterpreterMessages
 use dazzle.CharNames.CharNames
@@ -120,13 +125,11 @@ define CharPart (name: StringC, c: u32, def_part: u32)
 }
 
 ; Unit — a named measurement unit (Interpreter.h class Unit : Named).
-; Inc-2 carries the computed-value half (builtin units get their value from
-; unitsPerInch in installUnits; setValue marks them computedExact/Inexact).
-; The define-unit expression path (def_/insn_, tryCompute's VM evaluation)
-; lands with Inc 3 — until then computed_ stays notComputed for user units
-; and resolveQuantity returns null (exactly the reference's "can't be done
-; yet" answer for an uncomputed unit without force).
-define Unit (name: StringC, computed: int, exact: int, inexact: double, dim: int, def_part: u32)
+; Builtin units get their value from unitsPerInch in installUnits (setValue
+; marks them computedExact/Inexact); define-unit bodies arrive via
+; setDefinition and compute lazily in tryCompute (canEval-gated without
+; force, exactly the reference's eager-top-level shape).
+define Unit (name: StringC, computed: int, exact: int, inexact: double, dim: int, def_part: u32, def_expr: pointer[Expression], def_insn: pointer[Insn], def_loc: Location)
 {
     function make(host: pointer[Page], name: StringC) returns pointer[Unit]
     {
@@ -137,7 +140,33 @@ define Unit (name: StringC, computed: int, exact: int, inexact: double, dim: int
         set u.inexact: 0.0
         set u.dim: 0
         set u.def_part: 0xFFFFFFFF as u32
+        set u.def_expr: null
+        set u.def_insn: null
+        set u.def_loc: Location()
         u
+    }
+
+    ; void setDefinition(Owner<Expression> &, unsigned part, const Location &)
+    ; — the define-unit body; computed resets so the next resolve recomputes.
+    function set_definition(this: pointer[Unit], expr: pointer[Expression], part: u32, loc: Location)
+    {
+        set this.def_expr: expr
+        set this.def_part: part
+        set this.def_loc: loc
+        set this.computed: UNIT_NOT_COMPUTED
+    }
+
+    ; bool defined(unsigned &part, Location &loc)
+    function defined(this: pointer[Unit], part_out: pointer[u32], loc_out: pointer[Location]) returns bool
+    {
+        if this.def_expr = null
+        {
+            if this.computed = UNIT_NOT_COMPUTED
+                return false
+        }
+        set *part_out: this.def_part
+        set *loc_out: this.def_loc
+        true
     }
 
     function get_name(this: Unit) returns StringC
@@ -265,12 +294,63 @@ define Unit (name: StringC, computed: int, exact: int, inexact: double, dim: int
         ELObj.make_quantity(interp.host, result_val, result_dim)
     }
 
-    ; void tryCompute(bool force, Interpreter &): Inc-2 subset — a unit
-    ; without a computed value has no definition expression yet (define-unit
-    ; parsing is Inc 3), so notComputed simply stays notComputed; the
-    ; beingComputed/unitLoop and VM-evaluation branches land with Inc 3.
+    ; void tryCompute(bool force, Interpreter &) — evaluate the define-unit
+    ; body (compiled once); without force only a canEval body computes (the
+    ; reference's lazy top-level shape); a recursive resolve is the unitLoop
+    ; error; a non-quantity result is badUnitDefinition at the definition.
     function try_compute(this: pointer[Unit], force: bool, interp: pointer[Interpreter])
     {
+        if this.computed = UNIT_NOT_COMPUTED
+        {
+            if this.def_expr = null
+                return
+            set this.computed: UNIT_BEING_COMPUTED
+            let host interp.get_host()
+            if this.def_insn = null
+            {
+                let env Environment.make(host)
+                set this.def_insn: Expression.optimize_compile(this.def_expr, interp, env, 0, null)
+            }
+            var run force
+            if run = false
+                set run: this.def_expr.can_eval(false, interp)
+            if run
+            {
+                let vm VM.make(host, interp)
+                let v vm.eval(this.def_insn, null, null)
+                let qv v.quantity_value()
+                let qt qv.get_qtype()
+                if qt = QT_NONE
+                {
+                    if interp.is_error(v) = false
+                    {
+                        interp.set_next_location(this.def_loc)
+                        interp.message1(InterpreterMessages.badUnitDefinition(), this.name)
+                    }
+                    set this.computed: UNIT_COMPUTED_ERROR
+                }
+                else if qt = QT_LONG
+                {
+                    set this.exact: qv.get_lval()
+                    set this.dim: qv.get_dim()
+                    set this.computed: UNIT_COMPUTED_EXACT
+                }
+                else
+                {
+                    set this.inexact: qv.get_dval()
+                    set this.dim: qv.get_dim()
+                    set this.computed: UNIT_COMPUTED_INEXACT
+                }
+            }
+            if this.computed = UNIT_BEING_COMPUTED
+                set this.computed: UNIT_NOT_COMPUTED
+        }
+        else if this.computed = UNIT_BEING_COMPUTED
+        {
+            interp.set_next_location(this.def_loc)
+            interp.message1(InterpreterMessages.unitLoop(), this.name)
+            set this.computed: UNIT_COMPUTED_ERROR
+        }
     }
 }
 
@@ -322,6 +402,11 @@ define Interpreter
     ; grove ID index (element-with-id); set by the driver after the grove is
     ; built. Null until then -> element-with-id yields the empty node-list.
     grove_id_index: pointer[Array[pointer[IdEntry]]]
+    ; the document DTD (the grove root's getEntities axis backing) — a
+    ; pointer[Dtd], set by the driver after the parse; null -> the entity-*
+    ; primitives answer #f. Stored untyped: opensp.Dtd stays out of this
+    ; module's type graph (like ExternalDataEntity's notation field).
+    grove_dtd: pointer[void]
     ; declare-default-language: the declaration expression (evaluated by
     ; compile(), like the reference compileDefaultLanguage) and the resulting
     ; language value char-upcase/downcase consult.
@@ -336,6 +421,15 @@ define Interpreter
     border_false_style_obj: pointer[ELObj]
     ; nextGlyphSubstTableUniqueId_ — the fot dump's gst<n> ids.
     next_gst_unique_id: int
+    ; nInheritedC_ — the next fresh IC index (registry entries end at 164;
+    ; declare-characteristic extensions allocate from here).
+    next_ic_index: int
+    ; declared initial values (declare-initial-value / declare-characteristic):
+    ; parallel ident/expr arrays, compiled into initialStyle_ by compile().
+    initial_value_names: pointer[Array[pointer[Identifier]]]
+    initial_value_exprs: pointer[Array[pointer[Expression]]]
+    current_part_first_initial_value: int
+    initial_style_obj: pointer[ELObj]
 )
 {
     function make(host: pointer[Page], units_per_inch: int, debug_mode: bool, dsssl2: bool, strict_mode: bool) returns pointer[Interpreter]
@@ -363,6 +457,7 @@ define Interpreter
         set interp.next_loc: Location()
         set interp.processing_mode_table: null
         set interp.grove_id_index: null
+        set interp.grove_dtd: null
         set interp.default_language_def: null
         set interp.default_language_loc: Location()
         set interp.default_language: null
@@ -370,6 +465,11 @@ define Interpreter
         set interp.border_true_style_obj: null
         set interp.border_false_style_obj: null
         set interp.next_gst_unique_id: 0
+        set interp.next_ic_index: 0
+        set interp.initial_value_names: Array[pointer[Identifier]]^host()
+        set interp.initial_value_exprs: Array[pointer[Expression]]^host()
+        set interp.current_part_first_initial_value: 0
+        set interp.initial_style_obj: null
         set interp.initial_mode: ProcessingMode.make(host, StringC(), null)
         interp.initial_mode.set_defined()
 
@@ -451,6 +551,12 @@ define Interpreter
     function set_grove_id_index(this: pointer[Interpreter], index: pointer[Array[pointer[IdEntry]]])
         set this.grove_id_index: index
 
+    function set_grove_dtd(this: pointer[Interpreter], dtd: pointer[void])
+        set this.grove_dtd: dtd
+
+    function get_grove_dtd(this: Interpreter) returns pointer[void]
+        grove_dtd
+
     function lookup_element_by_id(this: Interpreter, id: StringC) returns pointer[GroveNode]
     {
         let index this.grove_id_index
@@ -502,7 +608,11 @@ define Interpreter
     ; endPart(): the next specification part (later parts' defines lose to
     ; earlier ones — doDefine's defPart gate).
     function end_part(this: pointer[Interpreter])
+    {
         set this.part_index: this.part_index + (1 as u32)
+        ; endPart: the duplicate-initial-value window closes with the part.
+        set this.current_part_first_initial_value: this.initial_value_names.get_length() as int
+    }
 
     ; installBuiltins brackets the builtins parse with part index -1 (so any
     ; user define overrides a builtin), then endPart wraps back to 0.
@@ -564,6 +674,9 @@ define Interpreter
     ; region, and a lazily-built sorted array would dangle after the bracket.
     function compile(this: pointer[Interpreter])
     {
+        ; reference order: compileInitialValues runs FIRST (Interpreter::
+        ; compile), before the modes.
+        this.compile_initial_values()
         this.compile_default_language()
         this.initial_mode.compile(this)
         this.initial_mode.build_sorted(this.host)
@@ -751,6 +864,8 @@ define Interpreter
         this.install_syntactic_key("use", SK_KEY_USE)
         this.install_syntactic_key("label", SK_KEY_LABEL)
         this.install_syntactic_key("content-map", SK_KEY_CONTENT_MAP)
+        this.install_syntactic_key("declare-initial-value", SK_DECLARE_INITIAL_VALUE)
+        this.install_syntactic_key("declare-characteristic", SK_DECLARE_CHARACTERISTIC)
         this.install_syntactic_key("declare-flow-object-class", SK_DECLARE_FLOW_OBJECT_CLASS)
         this.install_syntactic_key("define-language", SK_DEFINE_LANGUAGE)
         this.install_syntactic_key("declare-default-language", SK_DECLARE_DEFAULT_LANGUAGE)
@@ -1178,7 +1293,100 @@ define Interpreter
         let gst_ic this.make_proto_ic("glyph-subst-table", IC_GST, "glyph-subst-table", 164)
         set gst_ic.gst: Array[pointer[GlyphSubstTableRec]]^host()
         this.finish_ic(gst_ic)
+        ; nInheritedC_ continues past the registry for declare-characteristic.
+        set this.next_ic_index: 165
     }
+
+    ; Interpreter::installExtensionInheritedC — resolve the public id against
+    ; the backend's extension table. Neither ported backend exposes one (the
+    ; reference fot backend passes none either; the transform table's only
+    ; entry, preserve-sdata?, backs behavior our port defers), so every
+    ; declared characteristic takes the reference's fallback: an IgnoredC —
+    ; accepted anywhere, renders nothing, value slot #f. The extension-table
+    ; seam arrives with the RTF backend.
+    function install_extension_inherited_c(this: pointer[Interpreter], ident: pointer[Identifier], pubid: StringC, loc: Location)
+    {
+        let host this.host
+        let nm ident.get_name()
+        let pn StringC^host(nm.data_ptr(), nm.get_size())
+        let ic InheritedC.make(host, IC_IGNORED, ident, this.next_ic_index, pn)
+        set this.next_ic_index: this.next_ic_index + 1
+        set ic.obj: this.make_false()
+        this.finish_ic(ic)
+    }
+
+    ; Interpreter::installInitialValue — collect (ident, expr); a same-part
+    ; re-declaration is duplicateInitialValue with the first one as aux line.
+    function install_initial_value(this: pointer[Interpreter], ident: pointer[Identifier], expr: pointer[Expression])
+    {
+        let names this.initial_value_names
+        let n names.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            if *(names.get_buffer() + i) = ident
+            {
+                if (i as int) >= this.current_part_first_initial_value
+                {
+                    let prev *(this.initial_value_exprs.get_buffer() + i)
+                    this.set_next_location(expr.location())
+                    this.message1(InterpreterMessages.duplicateInitialValue(), ident.get_name())
+                    this.emit_aux(InterpreterMessages.duplicateInitialValue_aux(), prev.location())
+                }
+                return
+            }
+            set i: i + (1 as size_t)
+        }
+        names.add(ident)
+        this.initial_value_exprs.add(expr)
+    }
+
+    ; Interpreter::compileInitialValues — each declared value becomes a
+    ; constant IC (via the per-kind conversion) or a VarInheritedC; together
+    ; they form the initial style ProcessContext::process pushes around the
+    ; whole run.
+    function compile_initial_values(this: pointer[Interpreter])
+    {
+        let names this.initial_value_names
+        let n names.get_length()
+        if n = (0 as size_t)
+            return
+        let host this.host
+        let ics Array[pointer[InheritedC]]^host()
+        var i: size_t 0
+        while i < n
+        {
+            let ident *(names.get_buffer() + i)
+            let expr *(this.initial_value_exprs.get_buffer() + i)
+            let proto ident.get_inherited_c() as pointer[InheritedC]
+            if proto <> null
+            {
+                let env Environment.make(host)
+                let oexpr expr.optimize(this, env)
+                let val oexpr.constant_value()
+                if val <> null
+                {
+                    let cic Convert.ic_from_value(host, proto, val, oexpr.location(), this)
+                    if cic <> null
+                        ics.add(cic)
+                }
+                else
+                {
+                    let code oexpr.compile(this, env, 0, null)
+                    ics.add(InheritedC.make_var(host, proto, code as pointer[void], oexpr.location()))
+                }
+            }
+            set i: i + (1 as size_t)
+        }
+        if ics.get_length() > (0 as size_t)
+        {
+            let rec VarStyleRec.make(host, null, ics, null, null)
+            set this.initial_style_obj: ELObj.make_style(host, rec as pointer[void], null)
+        }
+    }
+
+    function initial_style(this: Interpreter) returns pointer[ELObj]
+        initial_style_obj
 
     function make_border_style(this: pointer[Interpreter], b: bool) returns pointer[ELObj]
     {
@@ -1438,6 +1646,7 @@ define Interpreter
         ; --- grove / node-list (Inc 4) ------------------------------------
         this.install_primitive("node-list?", PRIM_IS_NODE_LIST, Signature(1, 0, false))
         this.install_primitive("node-list-empty?", PRIM_NODE_LIST_EMPTY, Signature(1, 0, false))
+        this.install_primitive("node-list-error", PRIM_NODE_LIST_ERROR, Signature(2, 0, false))
         this.install_primitive("node-list-length", PRIM_NODE_LIST_LENGTH, Signature(1, 0, false))
         this.install_primitive("node-list-first", PRIM_NODE_LIST_FIRST, Signature(1, 0, false))
         this.install_primitive("node-list-rest", PRIM_NODE_LIST_REST, Signature(1, 0, false))
@@ -1445,32 +1654,45 @@ define Interpreter
         this.install_primitive("empty-node-list", PRIM_EMPTY_NODE_LIST, Signature(0, 0, false))
         this.install_primitive("node-list", PRIM_NODE_LIST, Signature(0, 0, true))
         this.install_primitive("children", PRIM_CHILDREN, Signature(1, 0, false))
-        this.install_primitive("gi", PRIM_GI, Signature(1, 0, false))
+        this.install_primitive("preced", PRIM_PRECED, Signature(1, 0, false))
+        this.install_primitive("gi", PRIM_GI, Signature(0, 1, false))
         this.install_primitive("data", PRIM_DATA, Signature(1, 0, false))
         ; --- grove / property axis (Inc 4) --------------------------------
-        this.install_primitive("parent", PRIM_PARENT, Signature(1, 0, false))
-        this.install_primitive("attribute-string", PRIM_ATTRIBUTE_STRING, Signature(2, 0, false))
-        this.install_primitive("ancestor", PRIM_ANCESTOR, Signature(2, 0, false))
+        this.install_primitive("parent", PRIM_PARENT, Signature(0, 1, false))
+        this.install_primitive("attribute-string", PRIM_ATTRIBUTE_STRING, Signature(1, 1, false))
+        this.install_primitive("inherited-attribute-string", PRIM_INHERITED_ATTRIBUTE_STRING, Signature(1, 1, false))
+        this.install_primitive("ancestor", PRIM_ANCESTOR, Signature(1, 1, false))
         this.install_primitive("descendants", PRIM_DESCENDANTS, Signature(1, 0, false))
         this.install_primitive("sosofo?", PRIM_IS_SOSOFO, Signature(1, 0, false))
         this.install_primitive("empty-sosofo", PRIM_EMPTY_SOSOFO, Signature(0, 0, false))
         this.install_primitive("sosofo-append", PRIM_SOSOFO_APPEND, Signature(0, 0, true))
         this.install_primitive("process-children", PRIM_PROCESS_CHILDREN, Signature(0, 0, false))
         this.install_primitive("process-children-trim", PRIM_PROCESS_CHILDREN_TRIM, Signature(0, 0, false))
+        this.install_primitive("process-element-with-id", PRIM_PROCESS_ELEMENT_WITH_ID, Signature(1, 0, false))
         this.install_primitive("process-node-list", PRIM_PROCESS_NODE_LIST, Signature(1, 0, false))
         this.install_primitive("current-node", PRIM_CURRENT_NODE, Signature(0, 0, false))
-        this.install_primitive("literal", PRIM_LITERAL, Signature(1, 0, false))
-        this.install_primitive("next-match", PRIM_NEXT_MATCH, Signature(0, 0, false))
+        this.install_primitive("literal", PRIM_LITERAL, Signature(0, 0, true))
+        this.install_primitive("next-match", PRIM_NEXT_MATCH, Signature(0, 1, false))
         this.install_primitive("process-node", PRIM_PROCESS_NODE, Signature(1, 0, false))
         this.install_primitive("select-elements", PRIM_SELECT_ELEMENTS, Signature(2, 0, false))
         this.install_primitive("element-with-id", PRIM_ELEMENT_WITH_ID, Signature(1, 1, false))
         this.install_primitive("id", PRIM_ID, Signature(0, 1, false))
         this.install_primitive("first-sibling?", PRIM_IS_FIRST_SIBLING, Signature(0, 1, false))
+        this.install_primitive("absolute-first-sibling?", PRIM_IS_ABSOLUTE_FIRST_SIBLING, Signature(0, 1, false))
         this.install_primitive("last-sibling?", PRIM_IS_LAST_SIBLING, Signature(0, 1, false))
+        this.install_primitive("absolute-last-sibling?", PRIM_IS_ABSOLUTE_LAST_SIBLING, Signature(0, 1, false))
+        this.install_primitive("have-ancestor?", PRIM_HAVE_ANCESTOR, Signature(1, 1, false))
         this.install_primitive("child-number", PRIM_CHILD_NUMBER, Signature(0, 1, false))
+        this.install_primitive("hierarchical-number-recursive", PRIM_HIERARCHICAL_NUMBER_RECURSIVE, Signature(1, 1, false))
+        this.install_primitive("element-number", PRIM_ELEMENT_NUMBER, Signature(0, 1, false))
+        this.install_primitive("entity-public-id", PRIM_ENTITY_PUBLIC_ID, Signature(1, 1, false))
+        this.install_primitive("entity-generated-system-id", PRIM_ENTITY_GENERATED_SYSTEM_ID, Signature(1, 1, false))
+        this.install_primitive("entity-notation", PRIM_ENTITY_NOTATION, Signature(1, 1, false))
+        this.install_primitive("general-name-normalize", PRIM_GENERAL_NAME_NORMALIZE, Signature(1, 1, false))
         this.install_primitive("node-list=?", PRIM_IS_NODE_LIST_EQUAL, Signature(2, 0, false))
         this.install_primitive("node-list-map", PRIM_NODE_LIST_MAP, Signature(2, 0, false))
         this.install_primitive("node-list-reverse", PRIM_NODE_LIST_REVERSE, Signature(1, 0, false))
+        this.install_primitive("sgml-parse", PRIM_SGML_PARSE, Signature(1, 0, true))
         ; reference PRIMITIVE(NodeProperty, "node-property", 2, 0, 1) — the
         ; keyword args (default:/null:/rcs?) arrive through the rest slot.
         this.install_primitive("node-property", PRIM_NODE_PROPERTY, Signature(2, 0, true))
@@ -1478,6 +1700,9 @@ define Interpreter
         this.install_primitive("current-node-page-number-sosofo", PRIM_CURRENT_NODE_PAGE_NUMBER_SOSOFO, Signature(0, 0, false))
         this.install_primitive("format-number", PRIM_FORMAT_NUMBER, Signature(2, 0, false))
         this.install_primitive("format-number-list", PRIM_FORMAT_NUMBER_LIST, Signature(3, 0, false))
+        ; reference neighborhood: Error sits between format-number-list and
+        ; external-procedure (primitive.h).
+        this.install_primitive("error", PRIM_ERROR, Signature(1, 0, false))
         this.install_primitive("external-procedure", PRIM_EXTERNAL_PROCEDURE, Signature(1, 0, false))
         ; length-spec / space / color (Family-B front)
         this.install_primitive("display-size", PRIM_DISPLAY_SIZE, Signature(0, 0, false))
@@ -1497,8 +1722,11 @@ define Interpreter
         this.install_primitive("glyph-subst-table", PRIM_GLYPH_SUBST_TABLE, Signature(1, 0, false))
         this.install_primitive("glyph-subst", PRIM_GLYPH_SUBST, Signature(2, 0, false))
         ; XPRIMITIVEs — reachable only via external-procedure (Clark prefix).
+        this.install_x_primitive("UNREGISTERED::James Clark//Procedure::", "read-entity", PRIM_READ_ENTITY, Signature(1, 0, false))
+        this.install_x_primitive("UNREGISTERED::James Clark//Procedure::", "debug", PRIM_DEBUG, Signature(1, 0, false))
         this.install_x_primitive("UNREGISTERED::James Clark//Procedure::", "if-first-page", PRIM_IF_FIRST_PAGE, Signature(2, 0, false))
         this.install_x_primitive("UNREGISTERED::James Clark//Procedure::", "if-front-page", PRIM_IF_FRONT_PAGE, Signature(2, 0, false))
+        this.install_x_primitive("UNREGISTERED::James Clark//Procedure::", "all-element-number", PRIM_ALL_ELEMENT_NUMBER, Signature(0, 1, false))
         ; apply and call/cc are FunctionObj subclasses (custom call/tailCall),
         ; not PrimitiveObj — install the dedicated arms.
         this.install_apply()
