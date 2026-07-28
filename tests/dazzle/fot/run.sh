@@ -56,6 +56,19 @@
 # content follows inline), labelNotASymbol (hard eval error per node, initial-
 # mode children fallback), and content-map on a non-ported paragraph
 # (rows outside a table).
+# toy10 (doc.sgml): the rule flow object (orientation/length/break-*-priority
+# NICs; display NICs for the display orientations, inline NICs otherwise),
+# fraction-bar (RuleC; the rule class binding as the inherited initial),
+# glyph-subst-table (single/list/#f values, gst<n> dedup with the
+# <define-glyph-subst-table> stream blocks, inherited-glyph-subst-table
+# rewrap) and the glyph-id/glyph-subst-table/glyph-subst primitives — incl.
+# the eager top-level define evaluation (canEval) whose order the gst
+# numbering observes (dbprint *small-caps* shape).
+# bad8 (doc.sgml): the error paths — invalid orientation/length on rule
+# (defaults kept: bare <rule orientation="horizontal"/>), content on the
+# atomic rule class, invalid fraction-bar / glyph-subst-table characteristic
+# values (constants at compile, non-constants per process), and the
+# glyph-subst-table/glyph-subst/glyph-id primitive argument errors.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -109,6 +122,7 @@ run_case toy6 "$HERE/toy6.expected" "$HERE/toy6.expected.err"
 run_case toy7 "$HERE/toy7.expected" "" tdoc.sgml
 run_case toy8 "$HERE/toy8.expected" "" tdoc.sgml
 run_case toy9 "$HERE/toy9.expected" "" tdoc.sgml
+run_case toy10 "$HERE/toy10.expected"
 run_case bad  "$HERE/bad.expected" "$HERE/bad.expected.err"
 run_case bad2 "$HERE/bad2.expected" "$HERE/bad2.expected.err"
 run_case bad3 "$HERE/bad3.expected" "$HERE/bad3.expected.err"
@@ -116,6 +130,7 @@ run_case bad4 "$HERE/bad4.expected" "$HERE/bad4.expected.err" tdoc.sgml
 run_case bad5 "$HERE/bad5.expected" "$HERE/bad5.expected.err" tdoc.sgml
 run_case bad6 "$HERE/bad6.expected" "$HERE/bad6.expected.err"
 run_case bad7 "$HERE/bad7.expected" "$HERE/bad7.expected.err" tdoc.sgml
+run_case bad8 "$HERE/bad8.expected" "$HERE/bad8.expected.err"
 
 # default output name: <docbase>.fot in the current directory (JadeApp).
 ( cd "$WORK" && rm -f doc.fot && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \

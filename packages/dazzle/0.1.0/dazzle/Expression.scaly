@@ -347,7 +347,9 @@ define Environment (closure_vars: pointer[BoundVarList], frame_var_list: pointer
 ; --- expression arm records ------------------------------------------------
 define ConstantExpr (obj: pointer[ELObj], loc: Location)
 define ResolvedConstantExpr (obj: pointer[ELObj], loc: Location)
-define VariableExpr (ident: pointer[Identifier], loc: Location)
+; is_top mirrors VariableExpression::isTop_ — stamped when a compile/fold
+; resolves the reference to the TOP level (no frame binding); canEval reads it.
+define VariableExpr (ident: pointer[Identifier], loc: Location, is_top: bool)
 define IfExpr (test: pointer[Expression], consequent: pointer[Expression], alternate: pointer[Expression], loc: Location)
 define OrExpr (test1: pointer[Expression], test2: pointer[Expression], loc: Location)
 define AndExpr (test1: pointer[Expression], test2: pointer[Expression], loc: Location)
@@ -421,7 +423,7 @@ define Expression union
     function make_variable(host: pointer[Page], ident: pointer[Identifier], loc: Location) returns pointer[Expression]
     {
         let p Expression.alloc(host)
-        set *p: Expression.Variable(VariableExpr(ident, loc))
+        set *p: Expression.Variable(VariableExpr(ident, loc, false))
         p
     }
 
@@ -610,15 +612,265 @@ define Expression union
         null
     }
 
-    ; --- canEval (conservative: only literals are compile-time evaluable) --
-    function can_eval(this: pointer[Expression], maybe_call: bool) returns bool
+    ; --- canEval (Expression.cxx, faithful) ---------------------------------
+    ; Whether the expression can be EAGERLY evaluated at compile time
+    ; (Identifier::computeValue's force-0 gate). Runs on a compiled tree:
+    ; Variable is_top stamps come from compile_variable/fold_variable; a
+    ; Constant stands in for the reference's post-optimize state via a silent
+    ; resolve probe (resolved -> ResolvedConstantExpression, canEval 1).
+    function can_eval(this: pointer[Expression], maybe_call: bool, interp: pointer[Interpreter]) returns bool
     {
         choose *this
             when e: ResolvedConstant
                 return true
+            when e: Constant
+            {
+                let r e.obj.resolve_quantities(false, interp, e.loc)
+                return r <> null
+            }
+            when e: Variable
+            {
+                if e.is_top = false
+                    return true
+                return e.ident.get_value_raw() <> null
+            }
+            when e: If
+            {
+                if e.test.can_eval(maybe_call, interp) = false
+                    return false
+                if e.consequent.can_eval(maybe_call, interp) = false
+                    return false
+                ; a null alternate is the parser's constant #f (resolved).
+                if e.alternate <> null
+                {
+                    if e.alternate.can_eval(maybe_call, interp) = false
+                        return false
+                }
+                return true
+            }
+            when e: Or
+            {
+                if e.test1.can_eval(maybe_call, interp) = false
+                    return false
+                return e.test2.can_eval(maybe_call, interp)
+            }
+            when e: And
+            {
+                if e.test1.can_eval(maybe_call, interp) = false
+                    return false
+                return e.test2.can_eval(maybe_call, interp)
+            }
+            when e: Call
+            {
+                if e.op.can_eval(true, interp) = false
+                    return false
+                let n e.args.get_length() as int
+                let b e.args.get_buffer()
+                var i 0
+                while i < n
+                {
+                    let a *(b + i)
+                    if a.can_eval(true, interp) = false
+                        return false
+                    set i: i + 1
+                }
+                return true
+            }
+            when e: Sequence
+            {
+                let n e.seq.get_length() as int
+                let b e.seq.get_buffer()
+                var i 0
+                while i < n
+                {
+                    let se *(b + i)
+                    if se.can_eval(maybe_call, interp) = false
+                        return false
+                    set i: i + 1
+                }
+                return true
+            }
+            when e: Let
+            {
+                if e.body.can_eval(maybe_call, interp) = false
+                    return false
+                return Expression.can_eval_inits(e.inits, interp)
+            }
+            when e: LetStar
+            {
+                if e.body.can_eval(maybe_call, interp) = false
+                    return false
+                return Expression.can_eval_inits(e.inits, interp)
+            }
+            when e: Letrec
+            {
+                if e.body.can_eval(maybe_call, interp) = false
+                    return false
+                return Expression.can_eval_inits(e.inits, interp)
+            }
+            when e: CondFail
+                return true
+            when e: Case
+            {
+                if e.key.can_eval(maybe_call, interp) = false
+                    return false
+                if e.else_expr <> null
+                {
+                    if e.else_expr.can_eval(maybe_call, interp) = false
+                        return false
+                }
+                let n_cases e.results.get_length() as int
+                let n_datums e.datums.get_length() as int
+                var ci 0
+                while ci < n_cases
+                {
+                    let rp e.results.get(ci as size_t)
+                    if rp <> null
+                    {
+                        let re *rp
+                        if re.can_eval(maybe_call, interp) = false
+                            return false
+                    }
+                    ; the reference nResolved_ check: a case whose datums all
+                    ; resolved blocks eager evaluation.
+                    var lo 0
+                    let sp e.case_starts.get(ci as size_t)
+                    if sp <> null
+                        set lo: *sp
+                    var hi n_datums
+                    if (ci + 1) < n_cases
+                    {
+                        let sp2 e.case_starts.get((ci + 1) as size_t)
+                        if sp2 <> null
+                            set hi: *sp2
+                    }
+                    var all_resolved true
+                    var j lo
+                    while j < hi
+                    {
+                        let dp e.datums.get(j as size_t)
+                        var r: pointer[ELObj] null
+                        if dp <> null
+                            set r: (*dp).resolve_quantities(false, interp, e.loc)
+                        if r = null
+                            set all_resolved: false
+                        set j: j + 1
+                    }
+                    if all_resolved
+                        return false
+                    set ci: ci + 1
+                }
+                return true
+            }
+            when e: Lambda
+            {
+                if maybe_call = false
+                    return true
+                if e.body.can_eval(true, interp) = false
+                    return false
+                return Expression.can_eval_inits(e.inits, interp)
+            }
+            when e: Quasiquote
+            {
+                let n e.members.get_length() as int
+                let b e.members.get_buffer()
+                var i 0
+                while i < n
+                {
+                    let me *(b + i)
+                    if me.can_eval(maybe_call, interp) = false
+                        return false
+                    set i: i + 1
+                }
+                return true
+            }
+            when e: Assignment
+                return e.value.can_eval(maybe_call, interp)
+            when e: WithMode
+                return e.content.can_eval(maybe_call, interp)
+            when e: Make
+                return Expression.can_eval_exprs(e.exprs, maybe_call, interp)
+            when e: StyleE
+                return Expression.can_eval_exprs(e.exprs, maybe_call, interp)
             else
                 return false
         false
+    }
+
+    ; Let/Letrec/Lambda init lists: every (non-null) init must canEval(1).
+    function can_eval_inits(inits: pointer[Array[pointer[Expression]]], interp: pointer[Interpreter]) returns bool
+    {
+        if inits = null
+            return true
+        let n inits.get_length() as int
+        let b inits.get_buffer()
+        var i 0
+        while i < n
+        {
+            let ie *(b + i)
+            if ie <> null
+            {
+                if ie.can_eval(true, interp) = false
+                    return false
+            }
+            set i: i + 1
+        }
+        true
+    }
+
+    function can_eval_exprs(exprs: pointer[Array[pointer[Expression]]], maybe_call: bool, interp: pointer[Interpreter]) returns bool
+    {
+        if exprs = null
+            return true
+        let n exprs.get_length() as int
+        let b exprs.get_buffer()
+        var i 0
+        while i < n
+        {
+            let ee *(b + i)
+            if ee <> null
+            {
+                if ee.can_eval(maybe_call, interp) = false
+                    return false
+            }
+            set i: i + 1
+        }
+        true
+    }
+
+    ; VariableExpression::optimize — fold a TOP-LEVEL reference to a defined
+    ; identifier whose value computes eagerly (canEval-gated inside
+    ; compute_value) into a resolved constant, stamping is_top either way.
+    ; The classification loops call this where the reference calls
+    ; expr->optimize before constantValue().
+    procedure fold_variable(this: pointer[Expression], interp: pointer[Interpreter], env: pointer[Environment])
+    {
+        var ident: pointer[Identifier] null
+        var loc Location()
+        choose *this
+            when e: Variable
+            {
+                set ident: e.ident
+                set loc: e.loc
+            }
+            else
+                return
+        if ident = null
+            return
+        var is_frame false
+        var index 0
+        var flags: u32 0
+        if env.lookup(ident, &is_frame, &index, &flags)
+            return
+        set *this: Expression.Variable(VariableExpr(ident, loc, true))
+        if ident.is_def() = false
+            return
+        let val ident.compute_value(false, interp)
+        if val = null
+            return
+        if interp.is_error(val)
+            return
+        set *this: Expression.ResolvedConstant(ResolvedConstantExpr(val, loc))
     }
 
     ; keyword(): the keyword identifier of a constant keyword (make/style).
@@ -956,7 +1208,7 @@ define Expression union
         var styled false
         if foc = FOC_SEQUENCE
             set styled: true
-        if (foc >= FOC_PARAGRAPH) and (foc <= FOC_TABLE_BORDER)
+        if (foc >= FOC_PARAGRAPH) and (foc <= FOC_RULE)
             set styled: true
         var tnic_proto: pointer[void] null
         var dnic_proto: pointer[DisplayNIC] null
@@ -986,6 +1238,8 @@ define Expression union
                 set display_foc: true
             if foc = FOC_TABLE_PART
                 set display_foc: true
+            if foc = FOC_RULE
+                set display_foc: true
             var has_use false
             let eb exprs.get_buffer()
             var i 0
@@ -1001,6 +1255,10 @@ define Expression union
                     let ident *kp
                     let sk ident.syntactic_key()
                     let ei *(eb + i)
+                    ; the reference optimizes every characteristic value
+                    ; before probing constantValue (applyConstNonInheritedCs /
+                    ; StyleExpression::compile) — fold top-level defines here.
+                    ei.fold_variable(interp, env)
                     var handled false
                     var disp_key Convert.is_display_nic_key(sk)
                     ; TablePartFlowObj::hasNonInheritedC excludes
@@ -1074,6 +1332,28 @@ define Expression union
                                         set cls: KEY_PSEUDO_NIC
                                 }
                             }
+                            set handled: true
+                        }
+                    }
+                    if handled = false
+                    {
+                        ; the rule extras (orientation/length/priorities):
+                        ; constants convert into the RuleNICRec prototype,
+                        ; non-constants join the lazy chain.
+                        if Convert.is_rule_nic_key(foc, sk)
+                        {
+                            let cv ei.constant_datum()
+                            if cv <> null
+                            {
+                                var cvr cv
+                                let res cv.resolve_quantities(true, interp, ei.location())
+                                if res <> null
+                                    set cvr: res
+                                Convert.apply_rule_nic(&tnic_proto, sk, cvr, ident, ei.location(), interp, host)
+                                set cls: KEY_TABLE_CONST
+                            }
+                            else
+                                set cls: KEY_NIC
                             set handled: true
                         }
                     }
@@ -1507,6 +1787,9 @@ define Expression union
             {
                 let ident *kp
                 let sk ident.syntactic_key()
+                let ei0 *(eb + i)
+                ; see the make classifier — fold top-level defines first.
+                ei0.fold_variable(interp, env)
                 var handled false
                 if sk = SK_KEY_USE
                 {
@@ -1734,7 +2017,10 @@ define Expression union
                 return Insn.make_stack_ref(host, index - stack_pos, index, tem)
             return Insn.make_closure_ref(host, index, tem)
         }
-        ; top-level reference
+        ; top-level reference (VariableExpression::compile: isTop_ stamped,
+        ; the value computed eagerly when canEval allows, the node memoized
+        ; as a resolved constant like the reference's optimize replacement).
+        set *this: Expression.Variable(VariableExpr(ident, loc, true))
         if ident.is_def() = false
         {
             interp.set_next_location(loc)
@@ -1746,6 +2032,7 @@ define Expression union
             return Insn.make_top_ref(host, ident, next)
         if interp.is_error(val)
             return Insn.make_error(host)
+        set *this: Expression.ResolvedConstant(ResolvedConstantExpr(val, loc))
         Insn.make_constant(host, val, next)
     }
 
