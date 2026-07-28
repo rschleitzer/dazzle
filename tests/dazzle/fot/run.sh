@@ -15,7 +15,12 @@
 # pending <a name=…/> element anchors (ID + element index), text escaping
 # (&amp;/&lt; + numeric char refs), the default <docbase>.fot output name, and
 # the invalid-value / invalid-keyword diagnostics (make vs style message,
-# make-location anchor).
+# make-location anchor). toy3/toy4: simple-page-sequence — the six
+# header/footer sosofo NICs with the four-page-type dedup (front=/first=
+# attributes), page-number-sosofo / current-node-page-number-sosofo, and
+# external-procedure (Clark if-first-page / if-front-page + unknown-id -> #f);
+# bad2: non-sosofo header/footer values (value-location anchor, process-time
+# order after the compile-time keyword message) + left-header: on paragraph.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -62,7 +67,10 @@ run_case() { # name expected [expected_err]
 
 run_case toy1 "$HERE/toy1.expected"
 run_case toy2 "$HERE/toy2.expected"
+run_case toy3 "$HERE/toy3.expected"
+run_case toy4 "$HERE/toy4.expected"
 run_case bad  "$HERE/bad.expected" "$HERE/bad.expected.err"
+run_case bad2 "$HERE/bad2.expected" "$HERE/bad2.expected.err"
 
 # default output name: <docbase>.fot in the current directory (JadeApp).
 ( cd "$WORK" && rm -f doc.fot && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
