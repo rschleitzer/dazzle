@@ -1,0 +1,360 @@
+; SaveFOTBuilder — the recorded-call capture medium for non-principal ports
+; and connections (FOTBuilder.cxx SaveFOTBuilder). The byte-level capture the
+; fot backend started with is unsound for the delta-state RTF stream
+; (syncCharFormat deltas, first-use font numbers), so ProcessContext captures
+; CALLS: each FotSink method invoked while a connection routes elsewhere is
+; recorded as a SaveCallRec (tag + deep-copied args, singly-linked with a
+; tail pointer — the reference Call list) and replayed through the sink when
+; the owner flushes. Replaying into a sink that is itself capturing simply
+; re-records onto the outer queue (the reference's emit-into-SaveFOTBuilder
+; splice, expressed as a re-record — payload copies land on the outer
+; queue's host, which is what keeps them alive across brackets).
+;
+; RBMM: all records and payload copies live on the queue's own `host` (the
+; owner's region — it outlives the deeper node brackets that connect).
+; charactersFromNode keeps the RAW grove data pointer (the reference does
+; not copy it — grove storage is run-lived and pointer adjacency drives the
+; fot text-run regrouping); characters() copies (the reference builds a
+; StringC).
+
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use dazzle.Grove.GroveNode
+use dazzle.Style.InheritedC
+use dazzle.Style.DisplayNIC
+use dazzle.Style.RuleNICRec
+use dazzle.Style.LinkNICRec
+use dazzle.Style.GraphicNICRec
+use dazzle.Style.LeaderNICRec
+use dazzle.Style.BoxNICRec
+use dazzle.Style.ScoreNICRec
+use dazzle.Style.TableNICRec
+use dazzle.Style.TableColumnNICRec
+use dazzle.Style.TableCellNICRec
+
+; call tags — one per FotSink method that can occur inside captured content.
+define SV_SET_IC: int 1
+define SV_CHARACTERS: int 2
+define SV_CHARS_FROM_NODE: int 3
+define SV_START_NODE: int 4
+define SV_END_NODE: int 5
+define SV_START_SEQUENCE: int 6
+define SV_END_SEQUENCE: int 7
+define SV_START_PARAGRAPH: int 8
+define SV_END_PARAGRAPH: int 9
+define SV_PARAGRAPH_BREAK: int 10
+define SV_START_DISPLAY_GROUP: int 11
+define SV_END_DISPLAY_GROUP: int 12
+define SV_START_LINE_FIELD: int 13
+define SV_END_LINE_FIELD: int 14
+define SV_START_LEADER: int 15
+define SV_END_LEADER: int 16
+define SV_START_LINK: int 17
+define SV_END_LINK: int 18
+define SV_START_SCORE: int 19
+define SV_END_SCORE: int 20
+define SV_START_BOX: int 21
+define SV_END_BOX: int 22
+define SV_RULE: int 23
+define SV_EXTERNAL_GRAPHIC: int 24
+define SV_PAGE_NUMBER: int 25
+define SV_CUR_NODE_PAGE_NUMBER: int 26
+define SV_START_SPS: int 27
+define SV_END_SPS_HF: int 28
+define SV_END_ALL_SPS_HF: int 29
+define SV_END_SPS: int 30
+define SV_START_TABLE: int 31
+define SV_END_TABLE: int 32
+define SV_START_TP_SERIAL: int 33
+define SV_END_TP_SERIAL: int 34
+define SV_START_TP_HEADER: int 35
+define SV_END_TP_HEADER: int 36
+define SV_START_TP_FOOTER: int 37
+define SV_END_TP_FOOTER: int 38
+define SV_TABLE_COLUMN: int 39
+define SV_START_TABLE_ROW: int 40
+define SV_END_TABLE_ROW: int 41
+define SV_START_TABLE_CELL: int 42
+define SV_END_TABLE_CELL: int 43
+define SV_TABLE_BEFORE_ROW_BORDER: int 44
+define SV_TABLE_AFTER_ROW_BORDER: int 45
+define SV_TABLE_BEFORE_COLUMN_BORDER: int 46
+define SV_TABLE_AFTER_COLUMN_BORDER: int 47
+define SV_CELL_BEFORE_ROW_BORDER: int 48
+define SV_CELL_AFTER_ROW_BORDER: int 49
+define SV_CELL_BEFORE_COLUMN_BORDER: int 50
+define SV_CELL_AFTER_COLUMN_BORDER: int 51
+
+; one recorded call: `tag` selects which payload slots are live (union by
+; convention — every slot is initialized; the replay walker in FotSink casts
+; `nic` per tag).
+define SaveCallRec
+(
+    next: pointer[SaveCallRec]
+    tag: int
+    ic: pointer[InheritedC]
+    node: pointer[GroveNode]
+    str: StringC
+    data: pointer[u32]
+    n: size_t
+    dnic: pointer[DisplayNIC]
+    nic: pointer[void]
+    flags: int
+)
+{
+    function make(host: pointer[Page], tag: int) returns pointer[SaveCallRec]
+    {
+        let r host.allocate(sizeof SaveCallRec, alignof SaveCallRec) as pointer[SaveCallRec]
+        set r.next: null
+        set r.tag: tag
+        set r.ic: null
+        set r.node: null
+        set r.str: StringC()
+        set r.data: null
+        set r.n: 0 as size_t
+        set r.dnic: null
+        set r.nic: null
+        set r.flags: 0
+        r
+    }
+}
+
+define SaveFOTBuilder
+(
+    head: pointer[SaveCallRec]
+    tail: pointer[SaveCallRec]
+    node: pointer[GroveNode]
+    mode_name: StringC
+    host: pointer[Page]
+)
+{
+    function make(host: pointer[Page]) returns pointer[SaveFOTBuilder]
+    {
+        let q host.allocate(sizeof SaveFOTBuilder, alignof SaveFOTBuilder) as pointer[SaveFOTBuilder]
+        set q.head: null
+        set q.tail: null
+        set q.node: null
+        set q.mode_name: StringC()
+        set q.host: host
+        q
+    }
+
+    ; the reference SaveFOTBuilder(currentNode, processingMode) form — emit
+    ; wraps the replay in startNode/endNode (over-connection save-queue and
+    ; principal-queue entries).
+    function make_node(host: pointer[Page], node: pointer[GroveNode], mode_name: StringC) returns pointer[SaveFOTBuilder]
+    {
+        let q SaveFOTBuilder.make(host)
+        set q.node: node
+        set q.mode_name: InheritedC.pin_string(host, mode_name)
+        q
+    }
+
+    function append(this: pointer[SaveFOTBuilder], r: pointer[SaveCallRec])
+    {
+        if this.tail = null
+        {
+            set this.head: r
+            set this.tail: r
+            return
+        }
+        set this.tail.next: r
+        set this.tail: r
+    }
+
+    function record0(this: pointer[SaveFOTBuilder], tag: int)
+    {
+        let h this.host
+        let r SaveCallRec.make(h, tag)
+        this.append(r)
+    }
+
+    function record_set_ic(this: pointer[SaveFOTBuilder], ic: pointer[InheritedC])
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_SET_IC)
+        if ic <> null
+            set r.ic: ic.copy_for_save(h)
+        this.append(r)
+    }
+
+    function record_characters(this: pointer[SaveFOTBuilder], s: pointer[u32], n: size_t)
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_CHARACTERS)
+        if n > (0 as size_t)
+        {
+            let buf h.allocate(n * 4, 4) as pointer[u32]
+            var i: size_t 0
+            while i < n
+            {
+                set *(buf + i): *(s + i)
+                set i: i + (1 as size_t)
+            }
+            set r.data: buf
+        }
+        set r.n: n
+        this.append(r)
+    }
+
+    ; grove data is run-lived — keep the raw pointer (reference shape; the
+    ; pointer feeds the fot sink's text-run regrouping).
+    function record_chars_from_node(this: pointer[SaveFOTBuilder], node: pointer[GroveNode], s: pointer[u32], n: size_t)
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_CHARS_FROM_NODE)
+        set r.node: node
+        set r.data: s
+        set r.n: n
+        this.append(r)
+    }
+
+    function record_start_node(this: pointer[SaveFOTBuilder], node: pointer[GroveNode], mode_name: StringC)
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_START_NODE)
+        set r.node: node
+        set r.str: InheritedC.pin_string(h, mode_name)
+        this.append(r)
+    }
+
+    function pin_dnic(this: pointer[SaveFOTBuilder], dnic: pointer[DisplayNIC]) returns pointer[DisplayNIC]
+    {
+        if dnic = null
+            return null
+        let h this.host
+        let c dnic.copy(h)
+        set c.coalesce_id: InheritedC.pin_string(h, c.coalesce_id)
+        c
+    }
+
+    function record_dnic(this: pointer[SaveFOTBuilder], tag: int, dnic: pointer[DisplayNIC])
+    {
+        let h this.host
+        let r SaveCallRec.make(h, tag)
+        let dc this.pin_dnic(dnic)
+        set r.dnic: dc
+        this.append(r)
+    }
+
+    function record_start_leader(this: pointer[SaveFOTBuilder], nic: pointer[LeaderNICRec])
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_START_LEADER)
+        if nic <> null
+            set r.nic: nic.copy(h) as pointer[void]
+        this.append(r)
+    }
+
+    function record_start_link(this: pointer[SaveFOTBuilder], nic: pointer[LinkNICRec])
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_START_LINK)
+        if nic <> null
+            set r.nic: nic.copy(h) as pointer[void]
+        this.append(r)
+    }
+
+    function record_start_score(this: pointer[SaveFOTBuilder], nic: pointer[ScoreNICRec])
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_START_SCORE)
+        if nic <> null
+        {
+            let c nic.copy(h)
+            set c.sym: InheritedC.pin_fotsym(h, c.sym)
+            set r.nic: c as pointer[void]
+        }
+        this.append(r)
+    }
+
+    function record_start_box(this: pointer[SaveFOTBuilder], nic: pointer[BoxNICRec], dnic: pointer[DisplayNIC])
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_START_BOX)
+        if nic <> null
+            set r.nic: nic.copy(h) as pointer[void]
+        let dc this.pin_dnic(dnic)
+        set r.dnic: dc
+        this.append(r)
+    }
+
+    function record_rule(this: pointer[SaveFOTBuilder], nic: pointer[RuleNICRec], dnic: pointer[DisplayNIC])
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_RULE)
+        if nic <> null
+        {
+            let c nic.copy(h)
+            set c.orientation: InheritedC.pin_fotsym(h, c.orientation)
+            set r.nic: c as pointer[void]
+        }
+        let dc this.pin_dnic(dnic)
+        set r.dnic: dc
+        this.append(r)
+    }
+
+    function record_external_graphic(this: pointer[SaveFOTBuilder], nic: pointer[GraphicNICRec], dnic: pointer[DisplayNIC])
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_EXTERNAL_GRAPHIC)
+        if nic <> null
+        {
+            let c nic.copy(h)
+            set c.entity_system_id: InheritedC.pin_string(h, c.entity_system_id)
+            set c.notation_system_id: InheritedC.pin_string(h, c.notation_system_id)
+            set c.scale_type: InheritedC.pin_fotsym(h, c.scale_type)
+            set c.escapement_direction: InheritedC.pin_fotsym(h, c.escapement_direction)
+            set r.nic: c as pointer[void]
+        }
+        let dc this.pin_dnic(dnic)
+        set r.dnic: dc
+        this.append(r)
+    }
+
+    function record_node(this: pointer[SaveFOTBuilder], tag: int, node: pointer[GroveNode])
+    {
+        let h this.host
+        let r SaveCallRec.make(h, tag)
+        set r.node: node
+        this.append(r)
+    }
+
+    function record_flags(this: pointer[SaveFOTBuilder], tag: int, flags: int)
+    {
+        let h this.host
+        let r SaveCallRec.make(h, tag)
+        set r.flags: flags
+        this.append(r)
+    }
+
+    function record_start_table(this: pointer[SaveFOTBuilder], nic: pointer[TableNICRec], dnic: pointer[DisplayNIC])
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_START_TABLE)
+        if nic <> null
+            set r.nic: nic.copy(h) as pointer[void]
+        let dc this.pin_dnic(dnic)
+        set r.dnic: dc
+        this.append(r)
+    }
+
+    function record_table_column(this: pointer[SaveFOTBuilder], nic: pointer[TableColumnNICRec])
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_TABLE_COLUMN)
+        if nic <> null
+            set r.nic: nic.copy(h) as pointer[void]
+        this.append(r)
+    }
+
+    function record_start_table_cell(this: pointer[SaveFOTBuilder], nic: pointer[TableCellNICRec])
+    {
+        let h this.host
+        let r SaveCallRec.make(h, SV_START_TABLE_CELL)
+        if nic <> null
+            set r.nic: nic.copy(h) as pointer[void]
+        this.append(r)
+    }
+}

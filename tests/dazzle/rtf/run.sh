@@ -22,12 +22,11 @@
 # small-caps detection, and the compile/process diagnostics of the bad*
 # fixtures (identical stderr shape to the fot suite).
 #
-# toy9 is EXCLUDED here: it routes content through non-principal ports
-# (label:/content-map:), which the byte-level capture seam cannot replay
-# into the delta-state RTF stream — the port hard-traps exit 17 by design
-# (DESIGN.md "RtfFOTBuilder — design note"; the fix is the SaveFOTBuilder
-# call-queue port, deferred until a real document needs it). port_trap
-# below pins exactly that behavior so the boundary stays loud.
+# toy9 (content routed through non-principal ports via label:/content-map:)
+# is a golden case since the SaveFOTBuilder call-queue port landed
+# (2026-07-29): ports capture recorded CALLS at the FotSink seam and replay
+# them against the live delta state — sound for RTF, unlike the byte-level
+# capture it replaced.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 FOT="$(cd "$HERE/../fot" && pwd)"
@@ -79,6 +78,7 @@ run_case toy5 "$HERE/toy5.expected"
 run_case toy6 "$HERE/toy6.expected" "$HERE/toy6.expected.err"
 run_case toy7 "$HERE/toy7.expected" "" tdoc.sgml
 run_case toy8 "$HERE/toy8.expected" "" tdoc.sgml
+run_case toy9 "$HERE/toy9.expected" "" tdoc.sgml
 run_case toy10 "$HERE/toy10.expected"
 run_case toy11 "$HERE/toy11.expected"
 run_case toy12 "$HERE/toy12.expected"
@@ -95,18 +95,6 @@ run_case bad9 "$HERE/bad9.expected" "$HERE/bad9.expected.err"
 run_case bad10 "$HERE/bad10.expected" "$HERE/bad10.expected.err"
 run_case bad11 "$HERE/bad11.expected" "$HERE/bad11.expected.err"
 run_case bad12 "$HERE/bad12.expected" "$HERE/bad12.expected.err"
-
-# the deferred non-principal-port boundary: toy9 must trap LOUD (exit 17)
-( cd "$WORK" && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
-    "$OUT" -t rtf -o toy9.out.rtf -d toy9.dsl tdoc.sgml 2> toy9.err )
-rc=$?
-if [ "$rc" -ne 17 ]; then
-  echo "dazzle-rtf: FAIL port-trap (rc=$rc, want 17 — if the SaveFOTBuilder"
-  echo "  call-queue landed, promote toy9 to a golden case)"; exit 1
-fi
-if ! grep -q "non-principal port content is not supported" "$WORK/toy9.err"; then
-  echo "dazzle-rtf: FAIL port-trap (message missing)"; cat "$WORK/toy9.err"; exit 1
-fi
 
 # default output name: <docbase>.rtf in the current directory (JadeApp).
 ( cd "$WORK" && rm -f doc.rtf && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \

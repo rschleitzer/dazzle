@@ -312,13 +312,28 @@ Decisions:
   Interpreter length-typed IC initial values were transcribed at 72000
   — they become `upi*pt/72` computed (reference InheritedC.cxx shape:
   `(unitsPerInch()*10)/72`); byte-identical at 72000.
-- **Capture:** the byte-level conn_target seam carries over to the rtf
-  sink; port/connection replay with a NON-EMPTY buffer hard-traps LOUD —
-  RTF output is delta-state (syncCharFormat) and first-use-numbered
-  (fonts/colors), so spliced bytes are unsound in general. The gate
-  corpus never routes content to non-principal ports (no thead). When a
-  real document does, the capture medium becomes a recorded-call queue
-  (SaveFOTBuilder port) — deferred, documented here.
+- **Capture (2026-07-29, SaveFOTBuilder call queue):** ports/connections
+  capture recorded CALLS, not bytes — RTF output is delta-state
+  (syncCharFormat) and first-use-numbered (fonts/colors), so spliced
+  bytes are unsound in general. The seam lives at FotSink: while `save`
+  is set every sink call is recorded onto that queue
+  (`SaveFOTBuilder.scaly` — tag + deep-copied args, linked list with
+  tail, the reference Call list); `emit_saved` replays through the sink,
+  re-recording onto the outer queue when the sink is itself capturing
+  (the reference emit-into-SaveFOTBuilder splice, expressed as a
+  re-record so payload copies land on the outer queue's host).
+  Over-connections and deep principal connections get the reference's
+  ctor node wrapper (`make_node`: startNode/endNode around the replay).
+  Deep-copy rules: set_ic ICs via `InheritedC.copy_for_save` (StringC
+  payloads re-pinned, color ELObj rematerialized from color_rgb,
+  InlineSpace record cloned, gst array copied); NIC records via their
+  `copy` + re-pinned StringC/FotSym-name fields; `characters` copies its
+  chars, `charactersFromNode` keeps the RAW grove pointer (reference
+  shape — grove storage is run-lived and pointer adjacency drives the
+  fot text-run regrouping). Gate that forced this: the Scaly docs RTF
+  (CALS thead → 19 \trhdr header rows), byte-identical vs the
+  reference binary; dsssl.fot/dsssl.rtf and all suites stayed
+  byte-identical across the seam move.
 - **Two-stream architecture:** body accumulates in a temp buffer (the
   reference TmpOutputByteStream block list collapses to one Array[u8] —
   no output-observable blocking); finish() writes the prolog (fonttbl in
