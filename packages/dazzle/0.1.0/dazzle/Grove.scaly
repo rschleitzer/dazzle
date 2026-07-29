@@ -17,6 +17,7 @@ define GEV_START_ELEMENT: int 0
 define GEV_END_ELEMENT: int 1
 define GEV_DATA: int 2
 define GEV_PI: int 3
+define GEV_END_PROLOG: int 8
 define GEV_SDATA: int 9
 
 ; Grove — the SGML property set (DSSSL grove). Inc-4 foundation: a Node tree
@@ -137,9 +138,35 @@ define IdEntry (id: StringC, node: pointer[GroveNode])
 ; chunk; any other event — or a non-contiguous data event — flushes the
 ; pending chunk as a single data node. (The per-event data nodes the old
 ; walk produced were a port deviation: 3.4M nodes on a 5 MB parse.)
-define GroveBuildState (host: pointer[Page], root: pointer[GroveNode], current: pointer[GroveNode], pend: pointer[Array[u32]], pend_org: pointer[Origin], pend_next: u32, n_elements: int)
+;
+; The sim_* fields replicate GroveImpl's CHUNK ALLOCATOR byte-exactly —
+; a data run also breaks where the reference's tryExtend fails (block
+; exhausted), which is OBSERVABLE (one fot <text> per data chunk, chunk-
+; stepped node lists). Geometry: blocks start at 8192 bytes and double
+; every 20 blocks; each block reserves BlockHeader(8) + ForwardingChunk(24);
+; chunk sizes are the reference build's C++ sizeofs (arm64 LP64, Char=4):
+; SgmlDocumentChunk 56, ElementChunk 48, AttElementChunk 56+8*nAtts,
+; LocOriginChunk 24, DataChunk/PiChunk header 32 (+4/char, 8-rounded),
+; SdataChunk 32, ForwardingChunk 24. A LocOriginChunk lands when the event
+; origin changes or 100 allocChunk calls have passed (setLocOrigin);
+; finishProlog/finishDocumentElement add barrier ForwardingChunks.
+define GroveBuildState (host: pointer[Page], root: pointer[GroveNode], current: pointer[GroveNode], pend: pointer[Array[u32]], pend_org: pointer[Origin], pend_next: u32, n_elements: int, sim_n_free: size_t, sim_block_size: size_t, sim_blocks_this_size: int, sim_chunks_since_lo: int, sim_cur_lo: pointer[Origin], sim_block_live: bool, doc_started: bool, prolog_chunk_added: bool, epilog_set: bool, tok_buf: pointer[Array[u32]], tok_org: pointer[Origin], tok_start: u32, tok_bound: u32)
 {
 }
+
+; --- GroveImpl allocator simulation (sizes: reference build sizeofs) --------
+define SIM_BLOCK_HEADER: int 8
+define SIM_FORWARDING: int 24
+define SIM_SGML_DOCUMENT: int 56
+define SIM_ELEMENT: int 48
+define SIM_ATT_ELEMENT: int 56
+define SIM_LOC_ORIGIN: int 24
+define SIM_CHARS_HEADER: int 32
+define SIM_SDATA: int 32
+define SIM_NONSGML: int 24
+define SIM_INITIAL_BLOCK: int 8192
+define SIM_MAX_BLOCKS_PER_SIZE: int 20
+define SIM_MAX_CHUNKS_WITHOUT_LO: int 100
 
 define GroveBuilder
 {
@@ -154,7 +181,202 @@ define GroveBuilder
         set st.pend_org: null
         set st.pend_next: 0 as u32
         set st.n_elements: 0
+        set st.sim_n_free: 0 as size_t
+        set st.sim_block_size: SIM_INITIAL_BLOCK as size_t
+        set st.sim_blocks_this_size: 0
+        set st.sim_chunks_since_lo: 0
+        set st.sim_cur_lo: null
+        set st.sim_block_live: false
+        set st.doc_started: false
+        set st.prolog_chunk_added: false
+        set st.epilog_set: false
+        set st.tok_buf: null
+        set st.tok_org: null
+        set st.tok_start: 0 as u32
+        set st.tok_bound: 0 as u32
+        ; GroveImpl ctor: root_ = new (allocChunk(sizeof(SgmlDocumentChunk)))
+        GroveBuilder.sim_alloc_chunk(st, SIM_SGML_DOCUMENT as size_t)
         st
+    }
+
+    ; CharsChunk::allocSize — header + 4 bytes/char, rounded to 8.
+    function sim_chars_alloc_size(n_chars: size_t) returns size_t
+        (((SIM_CHARS_HEADER as size_t) + n_chars * (4 as size_t)) + (7 as size_t)) & ((0 as size_t) - (8 as size_t))
+
+    ; GroveImpl::allocFinish — possibly double the block size, then open a
+    ; fresh block reserving BlockHeader + a ForwardingChunk slot.
+    procedure sim_alloc_finish(st: pointer[GroveBuildState], n: size_t)
+    {
+        set st.sim_blocks_this_size: st.sim_blocks_this_size + 1
+        if st.sim_blocks_this_size >= SIM_MAX_BLOCKS_PER_SIZE
+        {
+            set st.sim_block_size: st.sim_block_size * (2 as size_t)
+            set st.sim_blocks_this_size: 0
+        }
+        let alloc_size n + ((SIM_FORWARDING + SIM_BLOCK_HEADER) as size_t)
+        if alloc_size < st.sim_block_size
+            set st.sim_n_free: st.sim_block_size - alloc_size
+        else
+            set st.sim_n_free: 0 as size_t
+        set st.sim_block_live: true
+    }
+
+    ; GroveImpl::allocChunk — bump within the block or finish into a new one.
+    procedure sim_alloc_chunk(st: pointer[GroveBuildState], n: size_t)
+    {
+        set st.sim_chunks_since_lo: st.sim_chunks_since_lo + 1
+        if n <= st.sim_n_free
+        {
+            set st.sim_n_free: st.sim_n_free - n
+            return
+        }
+        GroveBuilder.sim_alloc_finish(st, n)
+    }
+
+    ; GroveImpl::tryExtend
+    function sim_try_extend(st: pointer[GroveBuildState], n: size_t) returns bool
+    {
+        if n <= st.sim_n_free
+        {
+            set st.sim_n_free: st.sim_n_free - n
+            return true
+        }
+        false
+    }
+
+    ; GroveImpl::setLocOrigin/storeLocOrigin — a LocOriginChunk lands when
+    ; the origin changed or 100 allocChunk calls have passed.
+    procedure sim_set_loc_origin(st: pointer[GroveBuildState], org: pointer[Origin])
+    {
+        var store false
+        if org <> st.sim_cur_lo
+            set store: true
+        if st.sim_chunks_since_lo >= SIM_MAX_CHUNKS_WITHOUT_LO
+            set store: true
+        if store = false
+            return
+        GroveBuilder.sim_alloc_chunk(st, SIM_LOC_ORIGIN as size_t)
+        set st.sim_chunks_since_lo: 0
+        set st.sim_cur_lo: org
+    }
+
+    ; GroveImpl::addBarrier — a ForwardingChunk written into the block's
+    ; reserved slot; a (nearly) full block dies.
+    procedure sim_add_barrier(st: pointer[GroveBuildState])
+    {
+        if st.sim_block_live = false
+            return
+        if st.sim_n_free <= (SIM_FORWARDING as size_t)
+        {
+            set st.sim_n_free: 0 as size_t
+            set st.sim_block_live: false
+            return
+        }
+        set st.sim_n_free: st.sim_n_free - (SIM_FORWARDING as size_t)
+    }
+
+    ; appendSibling/push bookkeeping shared bits: prolog/epilog tracking for
+    ; the finishProlog/finishDocumentElement barriers.
+    procedure sim_note_append(st: pointer[GroveBuildState])
+    {
+        if st.doc_started = false
+        {
+            set st.prolog_chunk_added: true
+            return
+        }
+        ; back at root after the document element: first append claims epilog.
+        if st.current = st.root
+            set st.epilog_set: true
+    }
+
+    ; DataNode::add — ONE reference data event (a token): extend the pending
+    ; chunk when the origin is current, the index continues the run AND the
+    ; extension fits the reference's allocation block; else a fresh chunk
+    ; (= a fresh grove data node).
+    procedure data_add(st: pointer[GroveBuildState], org: pointer[Origin], idx: u32, chars: pointer[u32], n: size_t)
+    {
+        var extend false
+        if st.pend <> null
+        {
+            if org = st.sim_cur_lo
+            {
+                if idx = st.pend_next
+                {
+                    let pb0 st.pend
+                    let old_n pb0.get_length()
+                    let delta GroveBuilder.sim_chars_alloc_size(old_n + n) - GroveBuilder.sim_chars_alloc_size(old_n)
+                    if GroveBuilder.sim_try_extend(st, delta)
+                        set extend: true
+                }
+            }
+        }
+        if extend = false
+        {
+            GroveBuilder.flush_pending(st)
+            GroveBuilder.sim_set_loc_origin(st, org)
+            GroveBuilder.sim_alloc_chunk(st, GroveBuilder.sim_chars_alloc_size(n))
+            GroveBuilder.sim_note_append(st)
+            let host st.host
+            let fresh Array[u32]^host()
+            set st.pend: fresh
+            set st.pend_org: org
+        }
+        let pb st.pend
+        var k: size_t 0
+        while k < n
+        {
+            pb.add(*(chars + k))
+            set k: k + 1
+        }
+        set st.pend_next: idx + (n as u32)
+    }
+
+    ; The first read-block boundary past `idx` in this origin's fill-bounds
+    ; list (see Origin.set_fill_bounds) — u32 max when none (in-memory
+    ; sources never refill).
+    function next_fill_bound(org: pointer[Origin], idx: u32) returns u32
+    {
+        if org = null
+            return 0xFFFFFFFF as u32
+        let fb org.get_fill_bounds()
+        if fb = null
+            return 0xFFFFFFFF as u32
+        let n fb.get_length()
+        let b fb.get_buffer()
+        var lo: size_t 0
+        var hi n
+        while lo < hi
+        {
+            let mid lo + ((hi - lo) / (2 as size_t))
+            if (*(b + mid)) <= (idx as size_t)
+                set lo: mid + (1 as size_t)
+            else
+                set hi: mid
+        }
+        if lo < n
+            return (*(b + lo)) as u32
+        0xFFFFFFFF as u32
+    }
+
+    ; Close the open re-grouped token: it becomes one reference data event.
+    ; (The parser port emits content data PER CHARACTER; the reference's
+    ; extendData batches a maximal run of normal chars into ONE
+    ; ImmediateDataEvent, and the chunk-extension quantum is per EVENT —
+    ; observable through where chunks break. Contiguous same-origin 1-char
+    ; data events are regrouped here into that token; RE function-char
+    ; events, origin changes and index gaps close it, as extendData's
+    ; normal-map/buffer boundaries do. Caveat: a record longer than the
+    ; reference's read block would split mid-record there — unmodeled.)
+    procedure close_token(st: pointer[GroveBuildState])
+    {
+        let tb st.tok_buf
+        if tb = null
+            return
+        let n tb.get_length()
+        if n > (0 as size_t)
+            GroveBuilder.data_add(st, st.tok_org, st.tok_start, tb.get_buffer(), n)
+        set st.tok_buf: null
+        set st.tok_org: null
     }
 
     ; flush the pending coalesced data run as ONE data node (the reference's
@@ -193,7 +415,48 @@ define GroveBuilder
             let t ev.get_type()
             if t = GEV_START_ELEMENT
             {
+                ; ElementNode::add: setLocOrigin, chunk alloc (plain or
+                ; att-bearing), then push (which flushes pending data).
+                GroveBuilder.close_token(st)
+                let loc ev.get_loc()
+                GroveBuilder.sim_set_loc_origin(st, loc.get_origin())
+                let atts0 ev.get_attributes()
+                var plain true
+                if atts0 <> null
+                {
+                    if atts0.n_spec_of() > (0 as size_t)
+                        set plain: false
+                    if atts0.any_current()
+                        set plain: false
+                }
+                if plain
+                    GroveBuilder.sim_alloc_chunk(st, SIM_ELEMENT as size_t)
+                else
+                {
+                    ; makeAttElementChunk: trailing unspecified/non-current
+                    ; attributes are trimmed off the pointer array.
+                    var n_atts atts0.size()
+                    while n_atts > (0 as size_t)
+                    {
+                        let last n_atts - (1 as size_t)
+                        if atts0.specified(last)
+                            break
+                        if atts0.current(last)
+                            break
+                        set n_atts: last
+                    }
+                    GroveBuilder.sim_alloc_chunk(st, (SIM_ATT_ELEMENT as size_t) + n_atts * (8 as size_t))
+                }
                 GroveBuilder.flush_pending(st)
+                if st.current = st.root
+                {
+                    ; push at root: the first element becomes the document
+                    ; element; later ones append (claiming the epilog).
+                    if st.doc_started
+                        set st.epilog_set: true
+                    else
+                        set st.doc_started: true
+                }
                 let et ev.get_element_type()
                 let node GroveNode.make(host, GN_ELEMENT)
                 set node.element_index: st.n_elements
@@ -211,16 +474,25 @@ define GroveBuilder
             }
             else if t = GEV_END_ELEMENT
             {
+                GroveBuilder.close_token(st)
                 GroveBuilder.flush_pending(st)
                 let cur st.current
                 let p cur.get_parent()
                 if p <> null
                     set st.current: p
+                ; pop back to root: finishDocumentElement adds a barrier
+                ; ForwardingChunk while the epilog is unclaimed.
+                if st.current = st.root
+                {
+                    if st.epilog_set = false
+                        GroveBuilder.sim_add_barrier(st)
+                }
             }
             else if t = GEV_DATA
             {
-                ; DataNode::add — a zero-length event adds nothing; a
-                ; location-contiguous event extends the pending run.
+                ; a zero-length event adds nothing; otherwise regroup the
+                ; port's per-char data events into reference-sized tokens
+                ; (see close_token) and run DataNode::add per token.
                 let d ev.get_data()
                 let dl d.get_size()
                 if dl > (0 as size_t)
@@ -228,41 +500,80 @@ define GroveBuilder
                     let loc ev.get_loc()
                     let org loc.get_origin()
                     let idx loc.get_index()
-                    var extend false
-                    if st.pend <> null
+                    let dp d.data_ptr()
+                    ; an RE function char (emitted by the pending-RE
+                    ; machinery) is its OWN reference data event, never
+                    ; part of an extendData token. Content data can only
+                    ; carry RE/RS values via char refs, which arrive with
+                    ; an index gap and close the token anyway.
+                    var re_like false
+                    if dl = (1 as size_t)
                     {
-                        if org = st.pend_org
+                        let c0 *dp
+                        if c0 = (0x0D as u32)
+                            set re_like: true
+                        if c0 = (0x0A as u32)
+                            set re_like: true
+                    }
+                    var joins false
+                    if st.tok_buf <> null
+                    {
+                        if re_like = false
                         {
-                            if idx = st.pend_next
-                                set extend: true
+                            if org = st.tok_org
+                            {
+                                let tb0 st.tok_buf
+                                let tn tb0.get_length()
+                                if idx = st.tok_start + (tn as u32)
+                                {
+                                    ; a token never crosses the reference's
+                                    ; read-block edge (extendData stops at
+                                    ; the decoded buffer end).
+                                    if idx < st.tok_bound
+                                        set joins: true
+                                }
+                            }
                         }
                     }
-                    if extend = false
+                    if joins = false
+                        GroveBuilder.close_token(st)
+                    if re_like
+                        GroveBuilder.data_add(st, org, idx, dp, dl)
+                    else
                     {
-                        GroveBuilder.flush_pending(st)
-                        let fresh Array[u32]^host()
-                        set st.pend: fresh
-                        set st.pend_org: org
+                        if st.tok_buf = null
+                        {
+                            let fresh_tok Array[u32]^host()
+                            set st.tok_buf: fresh_tok
+                            set st.tok_org: org
+                            set st.tok_start: idx
+                            set st.tok_bound: GroveBuilder.next_fill_bound(org, idx)
+                        }
+                        ; bind the pointer field — a method call through a
+                        ; pointer-FIELD receiver mis-emits (the documented
+                        ; deref-receiver class).
+                        let tb st.tok_buf
+                        var k: size_t 0
+                        while k < dl
+                        {
+                            tb.add(*(dp + k))
+                            set k: k + 1
+                        }
                     }
-                    ; bind the pointer field — a method call through a
-                    ; pointer-FIELD receiver mis-emits (the documented
-                    ; deref-receiver class).
-                    let pb st.pend
-                    let dp d.data_ptr()
-                    var k: size_t 0
-                    while k < dl
-                    {
-                        pb.add(*(dp + k))
-                        set k: k + 1
-                    }
-                    set st.pend_next: idx + (dl as u32)
                 }
             }
             else if t = GEV_SDATA
             {
                 ; the reference keeps SDATA as its OWN node (SdataNode) —
-                ; never coalesced into neighboring data.
+                ; never coalesced into neighboring data. Its loc origin is
+                ; the entity REFERENCE's (the event origin's parent).
+                GroveBuilder.close_token(st)
+                let loc ev.get_loc()
+                let par loc.parent()
+                GroveBuilder.sim_set_loc_origin(st, par.get_origin())
+                GroveBuilder.sim_alloc_chunk(st, SIM_SDATA as size_t)
                 GroveBuilder.flush_pending(st)
+                GroveBuilder.sim_note_append(st)
                 let d ev.get_data()
                 let node GroveNode.make(host, GN_DATA)
                 set node.chars: StringC^host(d.data_ptr(), d.get_size())
@@ -272,13 +583,25 @@ define GroveBuilder
             }
             else if t = GEV_PI
             {
-                GroveBuilder.flush_pending(st)
+                GroveBuilder.close_token(st)
+                let loc ev.get_loc()
+                GroveBuilder.sim_set_loc_origin(st, loc.get_origin())
                 let d ev.get_data()
+                GroveBuilder.sim_alloc_chunk(st, GroveBuilder.sim_chars_alloc_size(d.get_size()))
+                GroveBuilder.flush_pending(st)
+                GroveBuilder.sim_note_append(st)
                 let node GroveNode.make(host, GN_PI)
                 set node.chars: StringC^host(d.data_ptr(), d.get_size())
                 let cur st.current
                 set node.parent: cur
                 cur.add_child(node)
+            }
+            else if t = GEV_END_PROLOG
+            {
+                GroveBuilder.close_token(st)
+                ; finishProlog: a barrier if any prolog chunk was appended.
+                if st.prolog_chunk_added
+                    GroveBuilder.sim_add_barrier(st)
             }
             set i: i + 1
         }
@@ -286,6 +609,7 @@ define GroveBuilder
 
     function finish(st: pointer[GroveBuildState]) returns pointer[GroveNode]
     {
+        GroveBuilder.close_token(st)
         GroveBuilder.flush_pending(st)
         st.root
     }

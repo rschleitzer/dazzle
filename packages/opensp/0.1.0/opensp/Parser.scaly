@@ -98,6 +98,11 @@ use scaly.io.Path
 ; Storage.scaly — extern declares must type-match across the whole root).
 function strerror(code: i32) returns pointer[const_char] extern
 function scaly_eio_errno() returns i32 extern
+; PosixBaseStorageObject::getBlockSize — st_blksize of a regular file, 8192
+; otherwise (the reference build defines SP_STAT_BLKSIZE). Determines the
+; read-block quantum whose boundaries split data tokens.
+function scaly_eio_blksize_path(path: pointer[const_char]) returns i64 extern
+function scaly_eio_blksize_fd(fd: i32) returns i64 extern
 ; the emitter-lowered indirect ptr(ptr) call (fiber.scaly declares the same
 ; prototype) — invokes the streaming sink callback with the ParserState.
 function scaly_call_ptr(fn: pointer[void], arg: pointer[void]) returns pointer[void] extern
@@ -9569,13 +9574,19 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     ; checkRef + checkEntlvl; non-empty text emits a
                     ; CdataEntityEvent — a DataEvent, the chars are DATA and
                     ; are never re-scanned as markup; empty text emits nothing.
+                    ; The event's location is Location(entityOrigin, 0) — the
+                    ; reference's DataEntityEvent ctor — NOT the reference
+                    ; site: the grove keys data-chunk coalescing on the loc
+                    ; origin, so a CDATA entity always lands in its own chunk.
                     this.check_ref_internal(refc_loc)
                     this.check_entlvl()
                     let ctext i.get_text()
                     if ctext.get_size() > (0 as size_t)
                     {
                         ps.note_data()
-                        let cev Event.make_data(ps.event_host(), ctext, ref_start)
+                        let corg host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+                        set *corg: Origin(ref_start, ent as pointer[void], ref_len)
+                        let cev Event.make_data(ps.event_host(), ctext, Location(corg, 0 as u32))
                         ps.queue_event(cev)
                     }
                     return true
@@ -11329,6 +11340,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; Continuation bytes are all >= 0x80, so no multibyte sequence can hide an LF —
     ; the record normalization stays correct after decoding.
     function make_char_source(host: pointer[Page], bytes: String, org: pointer[Origin]) returns pointer[InputSource]
+        Parser.make_char_source_block(host, bytes, org, 8192 as size_t)
+
+    ; `block` = the storage object's read-block size (st_blksize of the file;
+    ; 8192 for non-files) — the reference reads in blocks of this many RAW
+    ; BYTES, and a data token never crosses a block edge.
+    function make_char_source_block(host: pointer[Page], bytes: String, org: pointer[Origin], block: size_t) returns pointer[InputSource]
     {
         let n bytes.get_length()
         ; upper bound: at most one Char per input byte (multibyte sequences only
@@ -11339,12 +11356,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         var pending_rs true
         ; (single storage object: the returned startsWithRS is implicit in the
         ; non-empty buffer's leading RS — only segmented documents store it.)
-        let flushed Parser.normalize_append(bytes, buf, &out, &pending_rs)
+        let bounds Array[size_t]^host()
+        let flushed Parser.normalize_append_bounds(bytes, buf, &out, &pending_rs, bounds, block)
 
         ; stash the normalized buffer on the origin so a diagnostic that resolves
         ; to this source (possibly below the current top input) can compute line/col
         ; from it — MessageReporter::printLocation's origin-chain resolution.
         org.set_buffer(buf, out)
+        org.set_fill_bounds(bounds)
         let src host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
         set *src: InputSource(org, buf, out)
         src
@@ -11362,6 +11381,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     ; the RS then belongs to the NEXT object, like ExternalInfoImpl::noteRS's
     ; boundary-offset rule).
     function normalize_append(bytes: String, buf: pointer[u32], out_pos: pointer[size_t], pending_rs: pointer[bool]) returns bool
+        Parser.normalize_append_bounds(bytes, buf, out_pos, pending_rs, null, 8192 as size_t)
+
+    function normalize_append_bounds(bytes: String, buf: pointer[u32], out_pos: pointer[size_t], pending_rs: pointer[bool], bounds: pointer[Array[size_t]], block: size_t) returns bool
     {
         let n bytes.get_length()
         var out *out_pos
@@ -11411,6 +11433,14 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 set s: s + (1 as size_t)
         }
 
+        ; reference read-block tracking: fill() reads 8192 RAW BYTES per
+        ; block; a char whose last byte falls past the block edge is carried
+        ; into the next block (decoder leftover), and a pending RS always
+        ; materializes at the START of the freshly read block. Record the
+        ; normalized index where each new block begins.
+        var next_bound: size_t block
+        if next_bound = (0 as size_t)
+            set next_bound: 8192 as size_t
         while i < n
         {
             let b0 bytes.get(i) as u32
@@ -11474,6 +11504,16 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                         set ch: acc
                         set len: need + (1 as size_t)
                     }
+                }
+            }
+            ; this char's last raw byte crosses the read-block edge: the char
+            ; (and any pending RS) belongs to the NEXT block.
+            if bounds <> null
+            {
+                while (i + len) > next_bound
+                {
+                    bounds.add(out)
+                    set next_bound: next_bound + block
                 }
             }
             ; flush the RS armed by the entity start / the previous record end.
@@ -11555,8 +11595,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; `dtd/model.dtd`, the RESOLVED path — Path.join(base_dir, system_id). Pin
         ; the widened StringC on host (^host) so it outlives the transient String.
         let disp Path.join(base_dir, system_id)
+        let dblk scaly_eio_blksize_path(disp.to_c_string()) as size_t
         org.set_file_name(StringC^host(disp.to_c_string()))
-        Parser.make_char_source(host, bytes, org)
+        Parser.make_char_source_block(host, bytes, org, dblk)
     }
 
     ; EntityManager::open for an external TEXT entity: resolve its (relative)
@@ -11584,8 +11625,9 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; dtd/model.dtd as SYSTEM "chap.sgm" prints `dtd/chap.sgm`, the RESOLVED
         ; path — Path.join(base_dir, system_id). Pin the widened StringC on host.
         let disp Path.join(base_dir, system_id)
+        let dblk scaly_eio_blksize_path(disp.to_c_string()) as size_t
         org.set_file_name(StringC^host(disp.to_c_string()))
-        Parser.make_char_source(host, bytes, org)
+        Parser.make_char_source_block(host, bytes, org, dblk)
     }
 
     ; ---- effective-system-id (FSI) opening --------------------------------
@@ -12036,9 +12078,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     let closed fclose(f)
                     let bytes File.read_to_string(*hcand)
                     ; the FOUND path is the storage id diagnostics display.
+                    let cblk scaly_eio_blksize_path(hcand.to_c_string()) as size_t
                     org.set_file_name(StringC^host(hcand.to_c_string()))
                     set *out_found: *hcand
-                    return Parser.make_char_source(host, bytes, org)
+                    return Parser.make_char_source_block(host, bytes, org, cblk)
                 }
                 if single and (restrict = false)
                 {
@@ -19446,9 +19489,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; the displayed storage id and its directory the base.
         var doc_text String^host(doc_bytes)
         var doc_id doc_name
+        ; the document storage object's read-block size (stdin = fd 0's).
+        var doc_block: size_t scaly_eio_blksize_fd(0) as size_t
         ; the multi-file (mergeSystemIds) document's prebuilt buffer +
         ; storage-object table; null/0 = the historical single-file path.
         var multi_segs: pointer[Array[DocSegment]] null
+        var multi_bounds: pointer[Array[size_t]] null
         var multi_buf: pointer[u32] null
         var multi_out: size_t 0
         var multi false
@@ -19524,6 +19570,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             }
             let dpath String^host(rpath)
             let dread File.read_to_string(*dpath)
+            set doc_block: scaly_eio_blksize_path(dpath.to_c_string()) as size_t
             set doc_text: String^host(dread)
             set doc_id: StringC^host(dpath.to_c_string())
             let dpdir Path.get_directory_name(*dpath)
@@ -19584,6 +19631,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             ; one shared normalized buffer (the per-file upper bound summed).
             set multi_buf: host.allocate(((sum_bytes * (2 as size_t)) + (nspec * (2 as size_t)) + (2 as size_t)) * (4 as size_t), 4) as pointer[u32]
             let segs Array[DocSegment]^host()
+            let mbounds Array[size_t]^host()
             var mout: size_t 0
             var mpending true
             var any_fail false
@@ -19595,7 +19643,13 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 {
                     var sg DocSegment()
                     set sg.start: mout
-                    let msw Parser.normalize_append(frv.bytes, multi_buf, &mout, &mpending)
+                    let fblk_p String^host(frv.path)
+                    var fblk: size_t 8192
+                    if frv.path.equals("<OSFD>0") = false
+                        set fblk: scaly_eio_blksize_path(fblk_p.to_c_string()) as size_t
+                    else
+                        set fblk: scaly_eio_blksize_fd(0) as size_t
+                    let msw Parser.normalize_append_bounds(frv.bytes, multi_buf, &mout, &mpending, mbounds, fblk)
                     set sg.starts_with_rs: msw
                     let sgp String^host(frv.path)
                     set sg.name: StringC^host(sgp.to_c_string())
@@ -19613,6 +19667,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 set mk: mk + 1
             }
             set multi_segs: segs
+            set multi_bounds: mbounds
             set multi_out: mout
             ; the display id / global base fallbacks: the FIRST FOUND object.
             var stamped false
@@ -19671,11 +19726,12 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             ; mergeSystemIds: the buffer and segment table were built above.
             org.set_segments(multi_segs)
             org.set_buffer(multi_buf, multi_out)
+            org.set_fill_bounds(multi_bounds)
             set src: host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
             set *src: InputSource(org, multi_buf, multi_out)
         }
         else
-            set src: Parser.make_char_source(host, *doc_text, org)
+            set src: Parser.make_char_source_block(host, *doc_text, org, doc_block)
         ps.push_input(src)
 
         ; doInit's findMissingMinimum over the initial internal charset
