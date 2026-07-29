@@ -166,4 +166,34 @@ if [ "$rc11" -ne 0 ] || [ "$got11" != "abc" ] || [ "$err11" != "$want11" ]; then
   exit 1
 fi
 
+# -V runtime variables (StyleEngine::defineVariable + the parseSpec cmdline
+# part): name=value -> string, bare name -> #t, and the cmdline part parses
+# BEFORE the stylesheet's parts, so -V mode=cli overrides the sheet's
+# (define mode "sheet"). Golden minted from the reference dazzle.
+got12="$(cd "$HERE" && SCALY_HOME="$ROOT" "$OUT" -t sgml -d vdef.dsl -V mode=cli -V dbg axis.sgml 2>/dev/null)"
+rc12=$?
+want12="$(cat "$HERE/vdef.expected")"
+if [ "$rc12" -ne 0 ] || [ "$got12" != "$want12" ]; then
+  echo "dazzle-cli: FAIL -V runtime variables (rc=$rc12)"
+  echo "  want: $(printf '%s' "$want12" | cat -v)"
+  echo "  got:  $(printf '%s' "$got12" | cat -v)"
+  exit 1
+fi
+
+# -E error limit (ParserApp): the document parse stops at the limit, prints
+# the errorLimitExceeded info line, rc=1 (doc-parse errors only). stderr
+# golden argv0-normalized, minted from the reference dazzle.
+got13="$(cd "$HERE" && SCALY_HOME="$ROOT" "$OUT" -E 2 -t sgml -d vdef.dsl -V mode=cli -V dbg elimit.sgml 2>"$OUT.elerr")"
+rc13=$?
+err13="$(sed 's|^[^:]*:|PROG:|' "$OUT.elerr")"
+want13="$(cat "$HERE/elimit.expected")"
+wanterr13="$(cat "$HERE/elimit.expected.err")"
+if [ "$rc13" -ne 1 ] || [ "$got13" != "$want13" ] || [ "$err13" != "$wanterr13" ]; then
+  echo "dazzle-cli: FAIL -E error limit (rc=$rc13)"
+  echo "  want: $(printf '%s' "$want13" | cat -v)"
+  echo "  got:  $(printf '%s' "$got13" | cat -v)"
+  echo "  err:  $(printf '%s' "$err13" | cat -v)"
+  exit 1
+fi
+
 echo "dazzle-cli: PASS"
