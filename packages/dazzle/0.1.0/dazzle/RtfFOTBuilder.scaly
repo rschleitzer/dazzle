@@ -1,0 +1,5372 @@
+; RtfFOTBuilder — the `-t rtf` backend (Stage 6a step 3). Ported from
+; ~/repos/dazzle/jade/RtfFOTBuilder.cxx (C++ oracle; C# mirror
+; openjade-net/src/OpenJade/Jade/RtfFOTBuilder.cs). Design note: DESIGN.md
+; "RtfFOTBuilder (`-t rtf`) — design note (2026-07-29)".
+;
+; Architecture mirror: the body accumulates in a temp byte buffer (the
+; reference TmpOutputByteStream collapses to one Array[u8] — no
+; output-observable blocking); finish() renders the prolog (fonttbl in
+; OpenSP HashTable iteration order, colortbl, stylesheet) and copies the
+; body patching INSERTION_CHAR ('\0' + 'b' + two big-endian words) into
+; bookmark start/end pairs for referenced elements. Character formatting is
+; DELTA-encoded (sync_char_format diffs spec against output state); fonts
+; and colors are numbered in first-use order. The engine runs at
+; units-per-inch 1440 (twips) under this backend.
+;
+; NOT ported (unreachable through our engine — it has no math/grid FO
+; classes): the EQ-field math family, grids, ReorderFlowObject; WIN32 OLE
+; object embedding (the mac reference binary compiles it out). initJIS
+; (JIS0208 doublebyte rows) is deferred until a corpus document contains
+; CJK — a LOUD stderr note marks any doublebyte fallback taken. Known
+; stderr deviation: includePicture does not attempt to open the graphic
+; file, so a MISSING figure produces no "cannot open" message (the RTF
+; bytes are identical either way; measured runs have the figures).
+;
+; Capture seam: set_conn_target/emit_captured mirror the fot sink's
+; byte-level port capture. RTF output is delta-state, so replaying a
+; NON-EMPTY captured buffer is unsound in general — emit_captured
+; hard-traps LOUD on non-empty input (the gate corpus never routes content
+; to non-principal ports; the fix, when needed, is the SaveFOTBuilder
+; call-queue port — see DESIGN.md).
+;
+; RBMM: all builder state lives on the sink's own page. Format stacks are
+; arrays of page-hosted records with slot reuse (depth cursors), so
+; allocation is bounded by maximum nesting depth, not push count.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String.String
+use opensp.StringC.StringC
+use dazzle.Grove.GroveNode
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.GlyphSubstTableRec
+use dazzle.Style.InheritedC
+use dazzle.Style.LengthSpec
+use dazzle.Style.FotSym
+use dazzle.Style.DisplaySpace
+use dazzle.Style.DisplayNIC
+use dazzle.Style.RuleNICRec
+use dazzle.Style.LinkNICRec
+use dazzle.Style.GraphicNICRec
+use dazzle.Style.LeaderNICRec
+use dazzle.Style.BoxNICRec
+use dazzle.Style.ScoreNICRec
+use dazzle.Style.TableNICRec
+use dazzle.Style.TableColumnNICRec
+use dazzle.Style.TableCellNICRec
+use dazzle.Interpreter.Interpreter
+use dazzle.InterpreterMessages.InterpreterMessages
+
+; --- static data (extracted from RtfFOTBuilder.cxx 4162-4385) --------------
+; winCharsets: 7 entries; codes 0/238/204/161/162/128/2; suffixes below;
+; mapping rows flattened 7 x 128 (entry 6, the Symbol charset, is all zero
+; and treated specially). symbolFonts: Symbol/Wingdings/ZapfDingbats,
+; mapping rows flattened 3 x 256.
+define RTF_WIN_CHARSET_CODES: int[] [0, 238, 204, 161, 162, 128, 2]
+
+define RTF_WIN_CHARSET_MAP: u32[] [
+    0x0000, 0x0000, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x0000, 0x0000, 0x0178,
+    0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7,
+    0x00A8, 0x00A9, 0x00AA, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x00AF,
+    0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6, 0x00B7,
+    0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF,
+    0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00C4, 0x00C5, 0x00C6, 0x00C7,
+    0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC, 0x00CD, 0x00CE, 0x00CF,
+    0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00D5, 0x00D6, 0x00D7,
+    0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x00DD, 0x00DE, 0x00DF,
+    0x00E0, 0x00E1, 0x00E2, 0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7,
+    0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED, 0x00EE, 0x00EF,
+    0x00F0, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7,
+    0x00F8, 0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x00FD, 0x00FE, 0x00FF,
+    0x0000, 0x0000, 0x201A, 0x0000, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x0000, 0x2030, 0x0160, 0x2039, 0x015A, 0x0164, 0x017D, 0x0179,
+    0x0000, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x0000, 0x2122, 0x0161, 0x203A, 0x015B, 0x0165, 0x017E, 0x017A,
+    0x00A0, 0x02C7, 0x02D8, 0x0141, 0x00A4, 0x0104, 0x00A6, 0x00A7,
+    0x00A8, 0x00A9, 0x015E, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x017B,
+    0x00B0, 0x00B1, 0x02DB, 0x0142, 0x00B4, 0x00B5, 0x00B6, 0x00B7,
+    0x00B8, 0x0105, 0x015F, 0x00BB, 0x013D, 0x02DD, 0x013E, 0x017C,
+    0x0154, 0x00C1, 0x00C2, 0x0102, 0x00C4, 0x0139, 0x0106, 0x00C7,
+    0x010C, 0x00C9, 0x0118, 0x00CB, 0x011A, 0x00CD, 0x00CE, 0x010E,
+    0x0110, 0x0143, 0x0147, 0x00D3, 0x00D4, 0x0150, 0x00D6, 0x00D7,
+    0x0158, 0x016E, 0x00DA, 0x0170, 0x00DC, 0x00DD, 0x0162, 0x00DF,
+    0x0155, 0x00E1, 0x00E2, 0x0103, 0x00E4, 0x013A, 0x0107, 0x00E7,
+    0x010D, 0x00E9, 0x0119, 0x00EB, 0x011B, 0x00ED, 0x00EE, 0x010F,
+    0x0111, 0x0144, 0x0148, 0x00F3, 0x00F4, 0x0151, 0x00F6, 0x00F7,
+    0x0159, 0x016F, 0x00FA, 0x0171, 0x00FC, 0x00FD, 0x0163, 0x02D9,
+    0x0402, 0x0403, 0x201A, 0x0453, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x0000, 0x2030, 0x0409, 0x2039, 0x040A, 0x040C, 0x040B, 0x040F,
+    0x0452, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x0000, 0x2122, 0x0459, 0x203A, 0x045A, 0x045C, 0x045B, 0x045F,
+    0x00A0, 0x040E, 0x045E, 0x0408, 0x00A4, 0x0490, 0x00A6, 0x00A7,
+    0x0401, 0x00A9, 0x0404, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x0407,
+    0x00B0, 0x00B1, 0x0406, 0x0456, 0x0491, 0x00B5, 0x00B6, 0x00B7,
+    0x0451, 0x2116, 0x0454, 0x00BB, 0x0458, 0x0405, 0x0455, 0x0457,
+    0x0410, 0x0411, 0x0412, 0x0413, 0x0414, 0x0415, 0x0416, 0x0417,
+    0x0418, 0x0419, 0x041A, 0x041B, 0x041C, 0x041D, 0x041E, 0x041F,
+    0x0420, 0x0421, 0x0422, 0x0423, 0x0424, 0x0425, 0x0426, 0x0427,
+    0x0428, 0x0429, 0x042A, 0x042B, 0x042C, 0x042D, 0x042E, 0x042F,
+    0x0430, 0x0431, 0x0432, 0x0433, 0x0434, 0x0435, 0x0436, 0x0437,
+    0x0438, 0x0439, 0x043A, 0x043B, 0x043C, 0x043D, 0x043E, 0x043F,
+    0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446, 0x0447,
+    0x0448, 0x0449, 0x044A, 0x044B, 0x044C, 0x044D, 0x044E, 0x044F,
+    0x0000, 0x0000, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x0000, 0x2030, 0x0000, 0x2039, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x0000, 0x2122, 0x0000, 0x203A, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x00A0, 0x0385, 0x0386, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7,
+    0x00A8, 0x00A9, 0x0000, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x2015,
+    0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x0384, 0x00B5, 0x00B6, 0x00B7,
+    0x0388, 0x0389, 0x038A, 0x00BB, 0x038C, 0x00BD, 0x038E, 0x038F,
+    0x0390, 0x0391, 0x0392, 0x0393, 0x0394, 0x0395, 0x0396, 0x0397,
+    0x0398, 0x0399, 0x039A, 0x039B, 0x039C, 0x039D, 0x039E, 0x039F,
+    0x03A0, 0x03A1, 0x0000, 0x03A3, 0x03A4, 0x03A5, 0x03A6, 0x03A7,
+    0x03A8, 0x03A9, 0x03AA, 0x03AB, 0x03AC, 0x03AD, 0x03AE, 0x03AF,
+    0x03B0, 0x03B1, 0x03B2, 0x03B3, 0x03B4, 0x03B5, 0x03B6, 0x03B7,
+    0x03B8, 0x03B9, 0x03BA, 0x03BB, 0x03BC, 0x03BD, 0x03BE, 0x03BF,
+    0x03C0, 0x03C1, 0x03C2, 0x03C3, 0x03C4, 0x03C5, 0x03C6, 0x03C7,
+    0x03C8, 0x03C9, 0x03CA, 0x03CB, 0x03CC, 0x03CD, 0x03CE, 0x0000,
+    0x0000, 0x0000, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x0000, 0x0000, 0x0178,
+    0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7,
+    0x00A8, 0x00A9, 0x00AA, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x00AF,
+    0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6, 0x00B7,
+    0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF,
+    0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00C4, 0x00C5, 0x00C6, 0x00C7,
+    0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC, 0x00CD, 0x00CE, 0x00CF,
+    0x011E, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00D5, 0x00D6, 0x00D7,
+    0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x0130, 0x015E, 0x00DF,
+    0x00E0, 0x00E1, 0x00E2, 0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7,
+    0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED, 0x00EE, 0x00EF,
+    0x011F, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7,
+    0x00F8, 0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x0131, 0x015F, 0x00FF,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0xFF61, 0xFF62, 0xFF63, 0xFF64, 0xFF65, 0xFF66, 0xFF67,
+    0xFF68, 0xFF69, 0xFF6A, 0xFF6B, 0xFF6C, 0xFF6D, 0xFF6E, 0xFF6F,
+    0xFF70, 0xFF71, 0xFF72, 0xFF73, 0xFF74, 0xFF75, 0xFF76, 0xFF77,
+    0xFF78, 0xFF79, 0xFF7A, 0xFF7B, 0xFF7C, 0xFF7D, 0xFF7E, 0xFF7F,
+    0xFF80, 0xFF81, 0xFF82, 0xFF83, 0xFF84, 0xFF85, 0xFF86, 0xFF87,
+    0xFF88, 0xFF89, 0xFF8A, 0xFF8B, 0xFF8C, 0xFF8D, 0xFF8E, 0xFF8F,
+    0xFF90, 0xFF91, 0xFF92, 0xFF93, 0xFF94, 0xFF95, 0xFF96, 0xFF97,
+    0xFF98, 0xFF99, 0xFF9A, 0xFF9B, 0xFF9C, 0xFF9D, 0xFF9E, 0xFF9F,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000]
+
+define RTF_SYMBOL_FONT_MAP: u32[] [
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0020, 0x0021, 0x2200, 0x0023, 0x2203, 0x0025, 0x0026, 0x220B,
+    0x0028, 0x0029, 0x2217, 0x002B, 0x002C, 0x2212, 0x002E, 0x002F,
+    0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
+    0x0038, 0x0039, 0x003A, 0x003B, 0x003C, 0x003D, 0x003E, 0x003F,
+    0x2245, 0x0391, 0x0392, 0x03A7, 0x2206, 0x0395, 0x03A6, 0x0393,
+    0x0397, 0x0399, 0x03D1, 0x039A, 0x039B, 0x039C, 0x039D, 0x039F,
+    0x03A0, 0x0398, 0x03A1, 0x03A3, 0x03A4, 0x03A5, 0x03C2, 0x2126,
+    0x039E, 0x03A8, 0x0396, 0x005B, 0x2234, 0x005D, 0x22A5, 0x005F,
+    0x203E, 0x03B1, 0x03B2, 0x03C7, 0x03B4, 0x03B5, 0x03C6, 0x03B3,
+    0x03B7, 0x03B9, 0x03D5, 0x03BA, 0x03BB, 0x03BC, 0x03BD, 0x03BF,
+    0x03C0, 0x03B8, 0x03C1, 0x03C3, 0x03C4, 0x03C5, 0x03D6, 0x03C9,
+    0x03BE, 0x03C8, 0x03B6, 0x007B, 0x007C, 0x007D, 0x223C, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x03D2, 0x2032, 0x2264, 0x2215, 0x221E, 0x0192, 0x2663,
+    0x2666, 0x2665, 0x2660, 0x2194, 0x2190, 0x2191, 0x2192, 0x2193,
+    0x00B0, 0x00B1, 0x2033, 0x2265, 0x00D7, 0x221D, 0x2202, 0x2022,
+    0x00F7, 0x2260, 0x2261, 0x2248, 0x2026, 0x0000, 0x0000, 0x21B5,
+    0x2135, 0x2111, 0x211C, 0x2118, 0x2297, 0x2295, 0x2205, 0x2229,
+    0x222A, 0x2283, 0x2287, 0x2284, 0x2282, 0x2286, 0x2208, 0x2209,
+    0x2220, 0x2207, 0x00AE, 0x00A9, 0x2122, 0x220F, 0x221A, 0x22C5,
+    0x00AC, 0x2227, 0x2228, 0x21D4, 0x21D0, 0x21D1, 0x21D2, 0x21D3,
+    0x25CA, 0x2329, 0x00AE, 0x00A9, 0x2122, 0x2211, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x232A, 0x222B, 0x2320, 0x0000, 0x2321, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x2702, 0x2701, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x260E, 0x2706, 0x2709, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x2328,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x2707, 0x270D,
+    0x0000, 0x270C, 0x0000, 0x0000, 0x0000, 0x261C, 0x261E, 0x261D,
+    0x261F, 0x0000, 0x263A, 0x0000, 0x2639, 0x0000, 0x2620, 0x0000,
+    0x0000, 0x2708, 0x263C, 0x0000, 0x2744, 0x0000, 0x271E, 0x0000,
+    0x2720, 0x2721, 0x262A, 0x262F, 0x0950, 0x2638, 0x2648, 0x2649,
+    0x264A, 0x264B, 0x264C, 0x264D, 0x264E, 0x264F, 0x2650, 0x2651,
+    0x2652, 0x2653, 0x0000, 0x0000, 0x25CF, 0x274D, 0x25A0, 0x25A1,
+    0x0000, 0x2751, 0x2752, 0x0000, 0x0000, 0x25C6, 0x2756, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x2780, 0x2781, 0x2782, 0x2783, 0x2784, 0x2785, 0x2786,
+    0x2787, 0x2788, 0x2789, 0x0000, 0x278A, 0x278B, 0x278C, 0x278D,
+    0x278E, 0x278F, 0x2790, 0x2791, 0x2792, 0x2793, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x25CB, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x25AA,
+    0x0000, 0x0000, 0x2726, 0x2605, 0x2736, 0x0000, 0x2739, 0x0000,
+    0x0000, 0x0000, 0x2727, 0x0000, 0x0000, 0x272A, 0x2730, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x232B, 0x2326, 0x0000,
+    0x27A2, 0x0000, 0x0000, 0x0000, 0x27B2, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x25AB, 0x2718, 0x2714, 0x2612, 0x2611, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x2701, 0x2702, 0x2703, 0x2704, 0x260E, 0x2706, 0x2707,
+    0x2708, 0x2709, 0x261B, 0x261E, 0x270C, 0x270D, 0x270E, 0x270F,
+    0x2710, 0x2711, 0x2712, 0x2713, 0x2714, 0x2715, 0x2716, 0x2717,
+    0x2718, 0x2719, 0x271A, 0x271B, 0x271C, 0x271D, 0x271E, 0x271F,
+    0x2720, 0x2721, 0x2722, 0x2723, 0x2724, 0x2725, 0x2726, 0x2727,
+    0x2605, 0x2729, 0x272A, 0x272B, 0x272C, 0x272D, 0x272E, 0x272F,
+    0x2730, 0x2731, 0x2732, 0x2733, 0x2734, 0x2735, 0x2736, 0x2737,
+    0x2738, 0x2739, 0x273A, 0x273B, 0x273C, 0x273D, 0x273E, 0x273F,
+    0x2740, 0x2741, 0x2742, 0x2743, 0x2744, 0x2745, 0x2746, 0x2747,
+    0x2748, 0x2749, 0x274A, 0x274B, 0x0000, 0x274D, 0x25A0, 0x274F,
+    0x2750, 0x2751, 0x2752, 0x25B2, 0x25BC, 0x25C6, 0x2756, 0x0000,
+    0x2758, 0x2759, 0x275A, 0x275B, 0x275C, 0x275D, 0x275E, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x2761, 0x2762, 0x2763, 0x2764, 0x2765, 0x2766, 0x2767,
+    0x2663, 0x2666, 0x2665, 0x2660, 0x2460, 0x2461, 0x2462, 0x2463,
+    0x2464, 0x2465, 0x2466, 0x2467, 0x2468, 0x2469, 0x2776, 0x2777,
+    0x2778, 0x2779, 0x277A, 0x277B, 0x277C, 0x277D, 0x277E, 0x277F,
+    0x2780, 0x2781, 0x2782, 0x2783, 0x2784, 0x2785, 0x2786, 0x2787,
+    0x2788, 0x2789, 0x278A, 0x278B, 0x278C, 0x278D, 0x278E, 0x278F,
+    0x2790, 0x2791, 0x2792, 0x2793, 0x2794, 0x2192, 0x2194, 0x2195,
+    0x2798, 0x2799, 0x279A, 0x279B, 0x279C, 0x279D, 0x279E, 0x279F,
+    0x27A0, 0x27A1, 0x27A2, 0x27A3, 0x27A4, 0x27A5, 0x27A6, 0x27A7,
+    0x27A8, 0x27A9, 0x27AA, 0x27AB, 0x27AC, 0x27AD, 0x27AE, 0x27AF,
+    0x0000, 0x27B1, 0x27B2, 0x27B3, 0x27B4, 0x27B5, 0x27B6, 0x27B7,
+    0x27B8, 0x27B9, 0x27BA, 0x27BB, 0x27BC, 0x27BD, 0x27BE, 0x0000]
+
+define RTF_N_WIN_CHARSETS: int 7
+define RTF_JIS_CHARSET: int 5
+define RTF_N_SYMBOL_FONTS: int 3
+define RTF_CHAR_BITS: int 16
+; 1 << 31 / 1 << 30 as u32 flag masks
+define RTF_SYMBOL_FLAG: int 0x80000000
+define RTF_DB_FLAG: int 0x40000000
+define RTF_SYMBOL_FONT_PAGE: int 0xf000
+define RTF_DEFAULT_LANG: int 0x400
+define RTF_HF_PRE_SPACE: int 190
+define RTF_HF_POST_SPACE: int 50
+
+; inline states
+define RTF_INLINE_FIRST: int 0
+define RTF_INLINE_START: int 1
+define RTF_INLINE_FIELD: int 2
+define RTF_INLINE_FIELD_END: int 3
+define RTF_INLINE_MIDDLE: int 4
+define RTF_INLINE_TABLE: int 5
+
+; underline kinds
+define RTF_UL_NONE: int 0
+define RTF_UL_SINGLE: int 1
+define RTF_UL_DOUBLE: int 2
+define RTF_UL_WORDS: int 3
+
+; break kinds
+define RTF_BREAK_NONE: int 0
+define RTF_BREAK_PAGE: int 1
+define RTF_BREAK_COLUMN: int 2
+
+; current output stream (the reference osp_ pointer)
+define RTF_ST_MAIN: int 0
+define RTF_ST_HF: int 1
+define RTF_ST_FIELD: int 2
+define RTF_ST_CELL: int 3
+
+; page-number formats
+define RTF_PGN_DEC: int 0
+define RTF_PGN_UCLTR: int 1
+define RTF_PGN_LCLTR: int 2
+define RTF_PGN_UCRM: int 3
+define RTF_PGN_LCRM: int 4
+
+; border flag bits (Border::isPresent/isDouble/omitAtBreak)
+define RTF_BORDER_PRESENT: int 1
+define RTF_BORDER_DOUBLE: int 2
+define RTF_BORDER_OMIT: int 4
+
+; widow/orphan control bits
+define RTF_WIDOW_CONTROL: int 1
+define RTF_ORPHAN_CONTROL: int 2
+
+; FOTBuilder::Symbol c-values consumed here (enum order verified against
+; the reference; matches the Style.scaly SYM_* constants)
+define RSYM_FALSE: int 0
+define RSYM_TRUE: int 1
+define RSYM_MEDIUM: int 11
+define RSYM_OBLIQUE: int 21
+define RSYM_ITALIC: int 23
+define RSYM_START: int 25
+define RSYM_END: int 26
+define RSYM_CENTER: int 27
+define RSYM_JUSTIFY: int 28
+define RSYM_WRAP: int 33
+define RSYM_NONE: int 37
+define RSYM_THROUGH: int 39
+define RSYM_AFTER: int 40
+define RSYM_MATH: int 51
+define RSYM_PAGE: int 61
+define RSYM_PAGE_REGION: int 62
+define RSYM_COLUMN_SET: int 63
+define RSYM_COLUMN: int 64
+define RSYM_PRESERVE: int 77
+define RSYM_COLLAPSE: int 78
+define RSYM_IGNORE: int 79
+define RSYM_BORDER: int 83
+define RSYM_BACKGROUND: int 84
+define RSYM_BOTH: int 85
+define RSYM_HORIZONTAL: int 47
+define RSYM_VERTICAL: int 48
+define RSYM_ESCAPEMENT: int 49
+define RSYM_LINE_PROGRESSION: int 50
+
+; extension characteristic setter ids (InheritedC.ext_setter; the 12-entry
+; jade.cxx/RtfFOTBuilder extension table)
+define RTF_EXT_PAGE_NUMBER_FORMAT: int 1
+define RTF_EXT_PAGE_NUMBER_RESTART: int 2
+define RTF_EXT_PAGE_N_COLUMNS: int 3
+define RTF_EXT_PAGE_COLUMN_SEP: int 4
+define RTF_EXT_PAGE_BALANCE_COLUMNS: int 5
+define RTF_EXT_SUBSCRIPT_DEPTH: int 6
+define RTF_EXT_OVER_MARK_HEIGHT: int 7
+define RTF_EXT_UNDER_MARK_DEPTH: int 8
+define RTF_EXT_SUPERSCRIPT_HEIGHT: int 9
+define RTF_EXT_GRID_ROW_SEP: int 10
+define RTF_EXT_GRID_COLUMN_SEP: int 11
+define RTF_EXT_HEADING_LEVEL: int 12
+
+; --- format records (CommonFormat/ParaFormat/Format flattened; OutputFormat;
+; PageFormat; DisplayInfo) ---------------------------------------------------
+
+; what the RTF reader thinks the format is (OutputFormat : CommonFormat)
+define RtfOutputFmt
+(
+    is_bold: bool
+    is_italic: bool
+    is_small_caps: bool
+    underline: int
+    is_strikethrough: bool
+    font_family: int
+    font_size: int
+    color: int
+    char_background_color: int
+    position_point_shift: int
+    language: int
+    country: int
+    kern: bool
+    char_border: bool
+    char_border_color: int
+    char_border_thickness: int
+    char_border_double: bool
+    charset: int
+    lang: int
+    lang_charsets: int
+)
+
+; the specified format (Format : ParaFormat, CommonFormat — flattened)
+define RtfFormat
+(
+    ; CommonFormat
+    is_bold: bool
+    is_italic: bool
+    is_small_caps: bool
+    underline: int
+    is_strikethrough: bool
+    font_family: int
+    font_size: int
+    color: int
+    char_background_color: int
+    position_point_shift: int
+    language: int
+    country: int
+    kern: bool
+    char_border: bool
+    char_border_color: int
+    char_border_thickness: int
+    char_border_double: bool
+    ; ParaFormat
+    left_indent: int
+    right_indent: int
+    first_line_indent: int
+    line_spacing: int
+    line_spacing_at_least: bool
+    quadding: int
+    lines: int
+    widow_orphan_control: int
+    heading_level: int
+    ; Format
+    hyphenate: bool
+    field_width: int
+    field_align: int
+    input_whitespace_treatment: int
+    expand_tabs: int
+    display_alignment: int
+    line_thickness: int
+    line_double: bool
+    score_spaces: bool
+    box_has_border: bool
+    box_has_background: bool
+    background_color: int
+    border_present: bool
+    border_omit_at_break: bool
+    cell_background: bool
+    border_priority: int
+    cell_top_margin: int
+    cell_bottom_margin: int
+    cell_left_margin: int
+    cell_right_margin: int
+    cell_vertical_alignment: int
+    math_posture: bool
+    math_inline: bool
+    superscript_height: int
+    subscript_depth: int
+    over_mark_height: int
+    under_mark_depth: int
+    grid_row_sep: int
+    grid_column_sep: int
+    span: bool
+    pps_spec: LengthSpec
+    li_spec: LengthSpec
+    ri_spec: LengthSpec
+    fli_spec: LengthSpec
+    ls_spec: LengthSpec
+    fw_spec: LengthSpec
+)
+
+; the paragraph format in force (ParaFormat)
+define RtfParaFmt
+(
+    left_indent: int
+    right_indent: int
+    first_line_indent: int
+    line_spacing: int
+    line_spacing_at_least: bool
+    quadding: int
+    lines: int
+    widow_orphan_control: int
+    heading_level: int
+)
+
+define RtfPageFmt
+(
+    page_width: int
+    page_height: int
+    left_margin: int
+    right_margin: int
+    header_margin: int
+    footer_margin: int
+    top_margin: int
+    bottom_margin: int
+    page_number_restart: bool
+    page_number_format: int
+    n_columns: int
+    column_sep: int
+    balance: bool
+)
+
+define RtfDisplayInfo
+(
+    space_after: int
+    keep_with_next: bool
+    save_keep: bool
+    break_after: int
+)
+
+define RtfBorder
+(
+    priority: int
+    flags: int
+    thickness: int
+    color: int
+)
+{
+    function make(host: pointer[Page]) returns pointer[RtfBorder]
+    {
+        let b host.allocate(sizeof RtfBorder, alignof RtfBorder) as pointer[RtfBorder]
+        set b.priority: 0
+        set b.flags: 0
+        set b.thickness: 0
+        set b.color: 0
+        b
+    }
+}
+
+define RtfCell
+(
+    present: bool
+    has_background: bool
+    background_color: int
+    valign: int
+    span: int
+    vspan: int
+    content: pointer[Array[u8]]
+    ; the four borders (top/bottom/left/right) as heap records — nested
+    ; by-value border structs proved unreliable through address-of returns
+    borders: pointer[Array[pointer[RtfBorder]]]
+)
+{
+    function make(host: pointer[Page]) returns pointer[RtfCell]
+    {
+        let c host.allocate(sizeof RtfCell, alignof RtfCell) as pointer[RtfCell]
+        set c.present: false
+        set c.has_background: false
+        set c.background_color: 0
+        set c.valign: 0x74
+        set c.span: 1
+        set c.vspan: 1
+        set c.content: null
+        let bs Array[pointer[RtfBorder]]^host()
+        var k 0
+        while k < 4
+        {
+            bs.add(RtfBorder.make(host))
+            set k: k + 1
+        }
+        set c.borders: bs
+        c
+    }
+
+    function border_at(this: pointer[RtfCell], k: int) returns pointer[RtfBorder]
+    {
+        let p this.borders.get(k as size_t)
+        if p = null
+            return null
+        *p
+    }
+
+    ; whole-cell copy (the reference Cell assignment in the row-resize fill)
+    function assign_from(this: pointer[RtfCell], src: pointer[RtfCell])
+    {
+        set this.present: src.present
+        set this.has_background: src.has_background
+        set this.background_color: src.background_color
+        set this.valign: src.valign
+        set this.span: src.span
+        set this.vspan: src.vspan
+        set this.content: src.content
+        var k 0
+        while k < 4
+        {
+            let dp this.borders.get(k as size_t)
+            let sp src.borders.get(k as size_t)
+            if dp <> null
+            {
+                if sp <> null
+                {
+                    let d *dp
+                    let s *sp
+                    set d.priority: s.priority
+                    set d.flags: s.flags
+                    set d.thickness: s.thickness
+                    set d.color: s.color
+                }
+            }
+            set k: k + 1
+        }
+    }
+}
+
+define RtfColumn
+(
+    has_width: bool
+    width: LengthSpec
+    tfactor: double
+)
+{
+    function make(host: pointer[Page]) returns pointer[RtfColumn]
+    {
+        let c host.allocate(sizeof RtfColumn, alignof RtfColumn) as pointer[RtfColumn]
+        set c.has_width: false
+        set c.width: LengthSpec()
+        set c.tfactor: 0.0
+        c
+    }
+}
+
+; a fontFamilyNameTable_ item (OpenSP HashTable<StringC,int> entry)
+define RtfFontEntry (key: StringC, value: int)
+{
+    function make(host: pointer[Page], key: StringC, value: int) returns pointer[RtfFontEntry]
+    {
+        let e host.allocate(sizeof RtfFontEntry, alignof RtfFontEntry) as pointer[RtfFontEntry]
+        set e.key: StringC^host(key.data_ptr(), key.get_size())
+        set e.value: value
+        e
+    }
+}
+
+; a fontFamilyCharsetsTable_ row: the rtf font number per charset (-1 unset)
+define RtfFontCharsets
+(
+    n0: int
+    n1: int
+    n2: int
+    n3: int
+    n4: int
+    n5: int
+    n6: int
+)
+{
+    function make(host: pointer[Page]) returns pointer[RtfFontCharsets]
+    {
+        let f host.allocate(sizeof RtfFontCharsets, alignof RtfFontCharsets) as pointer[RtfFontCharsets]
+        set f.n0: 0 - 1
+        set f.n1: 0 - 1
+        set f.n2: 0 - 1
+        set f.n3: 0 - 1
+        set f.n4: 0 - 1
+        set f.n5: 0 - 1
+        set f.n6: 0 - 1
+        f
+    }
+
+    function get_at(this: pointer[RtfFontCharsets], i: int) returns int
+    {
+        if i = 0
+            return this.n0
+        if i = 1
+            return this.n1
+        if i = 2
+            return this.n2
+        if i = 3
+            return this.n3
+        if i = 4
+            return this.n4
+        if i = 5
+            return this.n5
+        this.n6
+    }
+
+    function set_at(this: pointer[RtfFontCharsets], i: int, v: int)
+    {
+        if i = 0
+        {
+            set this.n0: v
+            return
+        }
+        if i = 1
+        {
+            set this.n1: v
+            return
+        }
+        if i = 2
+        {
+            set this.n2: v
+            return
+        }
+        if i = 3
+        {
+            set this.n3: v
+            return
+        }
+        if i = 4
+        {
+            set this.n4: v
+            return
+        }
+        if i = 5
+        {
+            set this.n5: v
+            return
+        }
+        set this.n6: v
+    }
+}
+
+; --- the builder ------------------------------------------------------------
+define RtfFOTBuilder
+(
+    ; output streams: the body temp buffer, header/footer, line-field and
+    ; table-cell captures; cur_stream selects (the reference osp_ pointer),
+    ; discard models the leader null stream.
+    out: pointer[Array[u8]]
+    hfos: pointer[Array[u8]]
+    fieldos: pointer[Array[u8]]
+    cellos: pointer[Array[u8]]
+    cur_stream: int
+    discard: bool
+    conn_target: pointer[Array[u32]]
+    ; inline/paragraph state
+    inline_state: int
+    continue_par: bool
+    ; formats
+    out_fmt: RtfOutputFmt
+    save_out_fmt: RtfOutputFmt
+    leader_save_out_fmt: RtfOutputFmt
+    spec: RtfFormat
+    para: RtfParaFmt
+    page: RtfPageFmt
+    ; stacks (slot-reused pointer arrays with depth cursors)
+    spec_stack: pointer[Array[pointer[RtfFormat]]]
+    spec_depth: int
+    para_stack: pointer[Array[pointer[RtfParaFmt]]]
+    para_depth: int
+    page_stack: pointer[Array[pointer[RtfPageFmt]]]
+    page_depth: int
+    display_stack: pointer[Array[pointer[RtfDisplayInfo]]]
+    display_depth: int
+    display_box_levels: pointer[Array[int]]
+    dbl_len: int
+    box_first_para: bool
+    box_left_sep: int
+    box_right_sep: int
+    box_top_sep: int
+    accum_space_box: int
+    ; pending element bookmarks
+    pending_elements: pointer[Array[pointer[GroveNode]]]
+    pending_levels: pointer[Array[int]]
+    pending_len: int
+    n_pending_non_empty: int
+    suppress_bookmarks: bool
+    node_level: int
+    ; fonts: the OpenSP HashTable<StringC,int> (open addressing, decrementing
+    ; probe, slot-order iteration) + the per-family charset font numbers
+    font_slots: pointer[Array[pointer[RtfFontEntry]]]
+    font_used: int
+    font_used_limit: int
+    ffcs: pointer[Array[pointer[RtfFontCharsets]]]
+    next_font_number: int
+    ; spacing/keeps/breaks
+    accum_space: int
+    keep_with_next: bool
+    hyphenate_suppressed: bool
+    max_consec_hyphens: int
+    do_break: int
+    keep: bool
+    had_par_in_keep: bool
+    ; tables
+    table_level: int
+    table_width: int
+    table_alignment: int
+    table_display_size: int
+    table_left_indent: int
+    table_right_indent: int
+    add_left_indent: int
+    add_right_indent: int
+    tborders: pointer[Array[pointer[RtfBorder]]]
+    cell_index: int
+    rows: pointer[Array[pointer[Array[pointer[RtfCell]]]]]
+    in_table_header: bool
+    n_header_rows: int
+    columns: pointer[Array[pointer[RtfColumn]]]
+    ; line fields
+    field_tab_pos: int
+    ; sections/pages
+    display_size: int
+    had_section: bool
+    do_balance: bool
+    span_display_levels: int
+    current_cols: int
+    in_simple_page_sequence: int
+    hf_parts: pointer[Array[pointer[Array[u8]]]]
+    ; links
+    link_depth: int
+    pending_link: pointer[LinkNICRec]
+    have_pending_link: bool
+    ; colors
+    color_table: pointer[Array[int]]
+    ; character state
+    follow_whitespace_char: bool
+    current_column: int
+    char_table: pointer[Array[u32]]
+    ; element reference set (grove 0 only in practice; grove-indexed rows)
+    elements_refed: pointer[Array[pointer[Array[bool]]]]
+    ; leaders
+    leader_depth: int
+    pre_leader_stream: int
+    pre_leader_discard: bool
+    rtf_version: int
+    interp: pointer[Interpreter]
+    host: pointer[Page]
+)
+{
+    function make(host: pointer[Page], interp: pointer[Interpreter]) returns pointer[RtfFOTBuilder]
+    {
+        let f host.allocate(sizeof RtfFOTBuilder, alignof RtfFOTBuilder) as pointer[RtfFOTBuilder]
+        set f.out: Array[u8]^host()
+        set f.hfos: Array[u8]^host()
+        set f.fieldos: Array[u8]^host()
+        set f.cellos: Array[u8]^host()
+        set f.cur_stream: RTF_ST_MAIN
+        set f.discard: false
+        set f.conn_target: null
+        set f.inline_state: RTF_INLINE_FIRST
+        set f.continue_par: false
+        set f.out_fmt: RtfOutputFmt()
+        RtfFOTBuilder.output_fmt_defaults(&f.out_fmt)
+        set f.save_out_fmt: RtfOutputFmt()
+        RtfFOTBuilder.output_fmt_defaults(&f.save_out_fmt)
+        set f.leader_save_out_fmt: RtfOutputFmt()
+        RtfFOTBuilder.output_fmt_defaults(&f.leader_save_out_fmt)
+        set f.spec: RtfFormat()
+        RtfFOTBuilder.format_defaults(&f.spec)
+        set f.para: RtfParaFmt()
+        RtfFOTBuilder.para_defaults(&f.para)
+        set f.page: RtfPageFmt()
+        RtfFOTBuilder.page_defaults(&f.page)
+        set f.spec_stack: Array[pointer[RtfFormat]]^host()
+        set f.spec_depth: 0
+        set f.para_stack: Array[pointer[RtfParaFmt]]^host()
+        set f.para_depth: 0
+        set f.page_stack: Array[pointer[RtfPageFmt]]^host()
+        set f.page_depth: 0
+        set f.display_stack: Array[pointer[RtfDisplayInfo]]^host()
+        set f.display_depth: 0
+        set f.display_box_levels: Array[int]^host()
+        set f.dbl_len: 0
+        set f.box_first_para: false
+        set f.box_left_sep: 0
+        set f.box_right_sep: 0
+        set f.box_top_sep: 0
+        set f.accum_space_box: 0
+        set f.pending_elements: Array[pointer[GroveNode]]^host()
+        set f.pending_levels: Array[int]^host()
+        set f.pending_len: 0
+        set f.n_pending_non_empty: 0
+        set f.suppress_bookmarks: false
+        set f.node_level: 0
+        set f.font_slots: Array[pointer[RtfFontEntry]]^host()
+        set f.font_used: 0
+        set f.font_used_limit: 0
+        set f.ffcs: Array[pointer[RtfFontCharsets]]^host()
+        set f.next_font_number: 1
+        set f.accum_space: 0
+        set f.keep_with_next: false
+        set f.hyphenate_suppressed: false
+        set f.max_consec_hyphens: 0
+        set f.do_break: RTF_BREAK_NONE
+        set f.keep: false
+        set f.had_par_in_keep: false
+        set f.table_level: 0
+        set f.table_width: 0
+        set f.table_alignment: 0x6C
+        set f.table_display_size: 0
+        set f.table_left_indent: 0
+        set f.table_right_indent: 0
+        set f.add_left_indent: 0
+        set f.add_right_indent: 0
+        let tbs Array[pointer[RtfBorder]]^host()
+        var tbk 0
+        while tbk < 4
+        {
+            tbs.add(RtfBorder.make(host))
+            set tbk: tbk + 1
+        }
+        set f.tborders: tbs
+        set f.cell_index: 0
+        set f.rows: Array[pointer[Array[pointer[RtfCell]]]]^host()
+        set f.in_table_header: false
+        set f.n_header_rows: 0
+        set f.columns: Array[pointer[RtfColumn]]^host()
+        set f.field_tab_pos: 0
+        set f.display_size: 72 * 10 * 17
+        set f.had_section: false
+        set f.do_balance: false
+        set f.span_display_levels: 0
+        set f.current_cols: 1
+        set f.in_simple_page_sequence: 0
+        let hf Array[pointer[Array[u8]]]^host()
+        var k 0
+        while k < 24
+        {
+            hf.add(Array[u8]^host())
+            set k: k + 1
+        }
+        set f.hf_parts: hf
+        set f.link_depth: 0
+        set f.pending_link: null
+        set f.have_pending_link: false
+        set f.color_table: Array[int]^host()
+        set f.follow_whitespace_char: false
+        set f.current_column: 0
+        set f.elements_refed: Array[pointer[Array[bool]]]^host()
+        set f.leader_depth: 0
+        set f.pre_leader_stream: RTF_ST_MAIN
+        set f.pre_leader_discard: false
+        set f.rtf_version: 1
+        set f.interp: interp
+        set f.host: host
+        ; ctor body: fontSize 20 half-points (10pt), the initial stack levels,
+        ; "Times New Roman" as family 0, the char table from the charset and
+        ; symbol-font mappings.
+        set f.spec.font_size: 20
+        f.push_spec()
+        f.push_page()
+        ; fontFamilyCharsetsTable_(1 + nSymbolFonts) = 4 zero rows; row 0
+        ; charset 0 = font number 0.
+        var r 0
+        while r < 4
+        {
+            let row RtfFontCharsets.make(host)
+            f.ffcs.add(row)
+            set r: r + 1
+        }
+        var row0p f.ffcs.get(0 as size_t)
+        if row0p <> null
+        {
+            let row0 *row0p
+            row0.set_at(0, 0)
+        }
+        f.font_insert(StringC("Times New Roman"), 0)
+        ; charTable_: BMP-sized (chars beyond 0xFFFF stay 0 -> \uN fallback,
+        ; the reference CharMap default)
+        let ct Array[u32]^host()
+        var ci 0
+        while ci < 0x10000
+        {
+            ct.add(0 as u32)
+            set ci: ci + 1
+        }
+        set f.char_table: ct
+        var i 0
+        while i < RTF_N_WIN_CHARSETS
+        {
+            var j 0
+            while j < 128
+            {
+                let c *(RTF_WIN_CHARSET_MAP + ((i * 128) + j))
+                if c <> (0 as u32)
+                {
+                    let cur f.ct_get(c)
+                    if cur = (0 as u32)
+                        f.ct_set(c, ((j + 0x80) | (1 << (i + RTF_CHAR_BITS))) as u32)
+                    else
+                    {
+                        if (cur & (((1 << RTF_CHAR_BITS) - 1) as u32)) = ((j + 0x80) as u32)
+                            f.ct_set(c, cur | ((1 << (i + RTF_CHAR_BITS)) as u32))
+                    }
+                }
+                set j: j + 1
+            }
+            set i: i + 1
+        }
+        var sf 0
+        while sf < RTF_N_SYMBOL_FONTS
+        {
+            var j2 0
+            while j2 < 256
+            {
+                let c2 *(RTF_SYMBOL_FONT_MAP + ((sf * 256) + j2))
+                if c2 <> (0 as u32)
+                {
+                    if f.ct_get(c2) = (0 as u32)
+                        f.ct_set(c2, (j2 | (sf << RTF_CHAR_BITS) | RTF_SYMBOL_FLAG) as u32)
+                }
+                set j2: j2 + 1
+            }
+            ; the literal StringC stays frame-local; font_insert pins its copy
+            if sf = 0
+                f.font_insert(StringC("Symbol"), 1)
+            else if sf = 1
+                f.font_insert(StringC("Wingdings"), 2)
+            else
+                f.font_insert(StringC("ZapfDingbats"), 3)
+            set sf: sf + 1
+        }
+        ; initJIS deferred (design note): JIS0208 rows affect only CJK
+        ; codepoints; none of the corpus documents contain any.
+        f
+    }
+
+    ; --- format defaults (the reference default constructors) ---------------
+    function output_fmt_defaults(o: pointer[RtfOutputFmt])
+    {
+        set o.is_bold: false
+        set o.is_italic: false
+        set o.is_small_caps: false
+        set o.underline: RTF_UL_NONE
+        set o.is_strikethrough: false
+        set o.font_family: 0
+        set o.font_size: 24
+        set o.color: 0
+        set o.char_background_color: 0
+        set o.position_point_shift: 0
+        set o.language: 0
+        set o.country: 0
+        set o.kern: false
+        set o.char_border: false
+        set o.char_border_color: 0
+        set o.char_border_thickness: 0
+        set o.char_border_double: false
+        set o.charset: 0
+        set o.lang: RTF_DEFAULT_LANG
+        set o.lang_charsets: 0x1f
+    }
+
+    function format_defaults(s: pointer[RtfFormat])
+    {
+        set s.is_bold: false
+        set s.is_italic: false
+        set s.is_small_caps: false
+        set s.underline: RTF_UL_NONE
+        set s.is_strikethrough: false
+        set s.font_family: 0
+        set s.font_size: 24
+        set s.color: 0
+        set s.char_background_color: 0
+        set s.position_point_shift: 0
+        set s.language: 0
+        set s.country: 0
+        set s.kern: false
+        set s.char_border: false
+        set s.char_border_color: 0
+        set s.char_border_thickness: 0
+        set s.char_border_double: false
+        set s.left_indent: 0
+        set s.right_indent: 0
+        set s.first_line_indent: 0
+        set s.line_spacing: 240
+        set s.line_spacing_at_least: false
+        set s.quadding: 0x6C
+        set s.lines: RSYM_WRAP
+        set s.widow_orphan_control: RTF_WIDOW_CONTROL | RTF_ORPHAN_CONTROL
+        set s.heading_level: 0
+        set s.hyphenate: false
+        set s.field_width: 0
+        set s.field_align: RSYM_START
+        set s.input_whitespace_treatment: RSYM_PRESERVE
+        set s.expand_tabs: 8
+        set s.display_alignment: 0x6C
+        set s.line_thickness: 20
+        set s.line_double: false
+        set s.score_spaces: true
+        set s.box_has_border: true
+        set s.box_has_background: false
+        set s.background_color: 0
+        set s.border_present: true
+        set s.border_omit_at_break: false
+        set s.cell_background: false
+        set s.border_priority: 0
+        set s.cell_top_margin: 0
+        set s.cell_bottom_margin: 0
+        set s.cell_left_margin: 0
+        set s.cell_right_margin: 0
+        set s.cell_vertical_alignment: 0x74
+        set s.math_posture: false
+        set s.math_inline: false
+        set s.superscript_height: 5
+        set s.subscript_depth: 3
+        set s.over_mark_height: 10
+        set s.under_mark_depth: 10
+        set s.grid_row_sep: 2
+        set s.grid_column_sep: 2
+        set s.span: false
+        var ls LengthSpec()
+        set ls.length: 0
+        set ls.factor: 0.0
+        set s.pps_spec: ls
+        set s.li_spec: ls
+        set s.ri_spec: ls
+        set s.fli_spec: ls
+        var lss LengthSpec()
+        set lss.length: 240
+        set lss.factor: 0.0
+        set s.ls_spec: lss
+        set s.fw_spec: ls
+    }
+
+    function para_defaults(p: pointer[RtfParaFmt])
+    {
+        set p.left_indent: 0
+        set p.right_indent: 0
+        set p.first_line_indent: 0
+        set p.line_spacing: 240
+        set p.line_spacing_at_least: false
+        set p.quadding: 0x6C
+        set p.lines: RSYM_WRAP
+        set p.widow_orphan_control: RTF_WIDOW_CONTROL | RTF_ORPHAN_CONTROL
+        set p.heading_level: 0
+    }
+
+    function page_defaults(p: pointer[RtfPageFmt])
+    {
+        set p.page_width: 72 * 10 * 17
+        set p.page_height: 72 * 20 * 11
+        set p.left_margin: 0
+        set p.right_margin: 0
+        set p.header_margin: 0
+        set p.footer_margin: 0
+        set p.top_margin: 0
+        set p.bottom_margin: 0
+        set p.page_number_restart: false
+        set p.page_number_format: RTF_PGN_DEC
+        set p.n_columns: 1
+        set p.column_sep: 72 * 10
+        set p.balance: false
+    }
+
+    ; --- field-copy helpers --------------------------------------------------
+    function copy_format(dst: pointer[RtfFormat], src: pointer[RtfFormat])
+    {
+        set dst.is_bold: src.is_bold
+        set dst.is_italic: src.is_italic
+        set dst.is_small_caps: src.is_small_caps
+        set dst.underline: src.underline
+        set dst.is_strikethrough: src.is_strikethrough
+        set dst.font_family: src.font_family
+        set dst.font_size: src.font_size
+        set dst.color: src.color
+        set dst.char_background_color: src.char_background_color
+        set dst.position_point_shift: src.position_point_shift
+        set dst.language: src.language
+        set dst.country: src.country
+        set dst.kern: src.kern
+        set dst.char_border: src.char_border
+        set dst.char_border_color: src.char_border_color
+        set dst.char_border_thickness: src.char_border_thickness
+        set dst.char_border_double: src.char_border_double
+        set dst.left_indent: src.left_indent
+        set dst.right_indent: src.right_indent
+        set dst.first_line_indent: src.first_line_indent
+        set dst.line_spacing: src.line_spacing
+        set dst.line_spacing_at_least: src.line_spacing_at_least
+        set dst.quadding: src.quadding
+        set dst.lines: src.lines
+        set dst.widow_orphan_control: src.widow_orphan_control
+        set dst.heading_level: src.heading_level
+        set dst.hyphenate: src.hyphenate
+        set dst.field_width: src.field_width
+        set dst.field_align: src.field_align
+        set dst.input_whitespace_treatment: src.input_whitespace_treatment
+        set dst.expand_tabs: src.expand_tabs
+        set dst.display_alignment: src.display_alignment
+        set dst.line_thickness: src.line_thickness
+        set dst.line_double: src.line_double
+        set dst.score_spaces: src.score_spaces
+        set dst.box_has_border: src.box_has_border
+        set dst.box_has_background: src.box_has_background
+        set dst.background_color: src.background_color
+        set dst.border_present: src.border_present
+        set dst.border_omit_at_break: src.border_omit_at_break
+        set dst.cell_background: src.cell_background
+        set dst.border_priority: src.border_priority
+        set dst.cell_top_margin: src.cell_top_margin
+        set dst.cell_bottom_margin: src.cell_bottom_margin
+        set dst.cell_left_margin: src.cell_left_margin
+        set dst.cell_right_margin: src.cell_right_margin
+        set dst.cell_vertical_alignment: src.cell_vertical_alignment
+        set dst.math_posture: src.math_posture
+        set dst.math_inline: src.math_inline
+        set dst.superscript_height: src.superscript_height
+        set dst.subscript_depth: src.subscript_depth
+        set dst.over_mark_height: src.over_mark_height
+        set dst.under_mark_depth: src.under_mark_depth
+        set dst.grid_row_sep: src.grid_row_sep
+        set dst.grid_column_sep: src.grid_column_sep
+        set dst.span: src.span
+        set dst.pps_spec: src.pps_spec
+        set dst.li_spec: src.li_spec
+        set dst.ri_spec: src.ri_spec
+        set dst.fli_spec: src.fli_spec
+        set dst.ls_spec: src.ls_spec
+        set dst.fw_spec: src.fw_spec
+    }
+
+    function copy_para(dst: pointer[RtfParaFmt], src: pointer[RtfParaFmt])
+    {
+        set dst.left_indent: src.left_indent
+        set dst.right_indent: src.right_indent
+        set dst.first_line_indent: src.first_line_indent
+        set dst.line_spacing: src.line_spacing
+        set dst.line_spacing_at_least: src.line_spacing_at_least
+        set dst.quadding: src.quadding
+        set dst.lines: src.lines
+        set dst.widow_orphan_control: src.widow_orphan_control
+        set dst.heading_level: src.heading_level
+    }
+
+    ; paraFormat_ = specFormat_ (the C++ ParaFormat slice assignment)
+    function para_from_spec(dst: pointer[RtfParaFmt], src: pointer[RtfFormat])
+    {
+        set dst.left_indent: src.left_indent
+        set dst.right_indent: src.right_indent
+        set dst.first_line_indent: src.first_line_indent
+        set dst.line_spacing: src.line_spacing
+        set dst.line_spacing_at_least: src.line_spacing_at_least
+        set dst.quadding: src.quadding
+        set dst.lines: src.lines
+        set dst.widow_orphan_control: src.widow_orphan_control
+        set dst.heading_level: src.heading_level
+    }
+
+    function copy_page(dst: pointer[RtfPageFmt], src: pointer[RtfPageFmt])
+    {
+        set dst.page_width: src.page_width
+        set dst.page_height: src.page_height
+        set dst.left_margin: src.left_margin
+        set dst.right_margin: src.right_margin
+        set dst.header_margin: src.header_margin
+        set dst.footer_margin: src.footer_margin
+        set dst.top_margin: src.top_margin
+        set dst.bottom_margin: src.bottom_margin
+        set dst.page_number_restart: src.page_number_restart
+        set dst.page_number_format: src.page_number_format
+        set dst.n_columns: src.n_columns
+        set dst.column_sep: src.column_sep
+        set dst.balance: src.balance
+    }
+
+    function copy_output_fmt(dst: pointer[RtfOutputFmt], src: pointer[RtfOutputFmt])
+    {
+        set dst.is_bold: src.is_bold
+        set dst.is_italic: src.is_italic
+        set dst.is_small_caps: src.is_small_caps
+        set dst.underline: src.underline
+        set dst.is_strikethrough: src.is_strikethrough
+        set dst.font_family: src.font_family
+        set dst.font_size: src.font_size
+        set dst.color: src.color
+        set dst.char_background_color: src.char_background_color
+        set dst.position_point_shift: src.position_point_shift
+        set dst.language: src.language
+        set dst.country: src.country
+        set dst.kern: src.kern
+        set dst.char_border: src.char_border
+        set dst.char_border_color: src.char_border_color
+        set dst.char_border_thickness: src.char_border_thickness
+        set dst.char_border_double: src.char_border_double
+        set dst.charset: src.charset
+        set dst.lang: src.lang
+        set dst.lang_charsets: src.lang_charsets
+    }
+
+    ; --- stack machinery (slot reuse) ----------------------------------------
+    function push_spec(this: pointer[RtfFOTBuilder])
+    {
+        let d this.spec_depth as size_t
+        if d < this.spec_stack.get_length()
+        {
+            let slotp this.spec_stack.get(d)
+            if slotp <> null
+                RtfFOTBuilder.copy_format(*slotp, &this.spec)
+        }
+        else
+        {
+            let host this.host
+            let rec host.allocate(sizeof RtfFormat, alignof RtfFormat) as pointer[RtfFormat]
+            RtfFOTBuilder.copy_format(rec, &this.spec)
+            this.spec_stack.add(rec)
+        }
+        set this.spec_depth: this.spec_depth + 1
+    }
+
+    function pop_spec(this: pointer[RtfFOTBuilder])
+    {
+        set this.spec_depth: this.spec_depth - 1
+        let slotp this.spec_stack.get((this.spec_depth - 1) as size_t)
+        if slotp <> null
+            RtfFOTBuilder.copy_format(&this.spec, *slotp)
+    }
+
+    function spec_at(this: pointer[RtfFOTBuilder], i: int) returns pointer[RtfFormat]
+    {
+        let slotp this.spec_stack.get(i as size_t)
+        if slotp = null
+            return null
+        *slotp
+    }
+
+    function push_page(this: pointer[RtfFOTBuilder])
+    {
+        let d this.page_depth as size_t
+        if d < this.page_stack.get_length()
+        {
+            let slotp this.page_stack.get(d)
+            if slotp <> null
+                RtfFOTBuilder.copy_page(*slotp, &this.page)
+        }
+        else
+        {
+            let host this.host
+            let rec host.allocate(sizeof RtfPageFmt, alignof RtfPageFmt) as pointer[RtfPageFmt]
+            RtfFOTBuilder.copy_page(rec, &this.page)
+            this.page_stack.add(rec)
+        }
+        set this.page_depth: this.page_depth + 1
+    }
+
+    function pop_page(this: pointer[RtfFOTBuilder])
+    {
+        set this.page_depth: this.page_depth - 1
+        let slotp this.page_stack.get((this.page_depth - 1) as size_t)
+        if slotp <> null
+            RtfFOTBuilder.copy_page(&this.page, *slotp)
+    }
+
+    ; endSimplePageSequenceSerial: pageFormat_ = pageFormatStack_.back()
+    ; without popping.
+    function page_from_back(this: pointer[RtfFOTBuilder])
+    {
+        let slotp this.page_stack.get((this.page_depth - 1) as size_t)
+        if slotp <> null
+            RtfFOTBuilder.copy_page(&this.page, *slotp)
+    }
+
+    function push_para(this: pointer[RtfFOTBuilder])
+    {
+        let d this.para_depth as size_t
+        if d < this.para_stack.get_length()
+        {
+            let slotp this.para_stack.get(d)
+            if slotp <> null
+                RtfFOTBuilder.copy_para(*slotp, &this.para)
+        }
+        else
+        {
+            let host this.host
+            let rec host.allocate(sizeof RtfParaFmt, alignof RtfParaFmt) as pointer[RtfParaFmt]
+            RtfFOTBuilder.copy_para(rec, &this.para)
+            this.para_stack.add(rec)
+        }
+        set this.para_depth: this.para_depth + 1
+    }
+
+    function pop_para(this: pointer[RtfFOTBuilder])
+    {
+        set this.para_depth: this.para_depth - 1
+        let slotp this.para_stack.get(this.para_depth as size_t)
+        if slotp <> null
+            RtfFOTBuilder.copy_para(&this.para, *slotp)
+    }
+
+    function push_display(this: pointer[RtfFOTBuilder]) returns pointer[RtfDisplayInfo]
+    {
+        let d this.display_depth as size_t
+        var rec: pointer[RtfDisplayInfo] null
+        if d < this.display_stack.get_length()
+        {
+            let slotp this.display_stack.get(d)
+            if slotp <> null
+                set rec: *slotp
+        }
+        else
+        {
+            let host this.host
+            set rec: host.allocate(sizeof RtfDisplayInfo, alignof RtfDisplayInfo) as pointer[RtfDisplayInfo]
+            this.display_stack.add(rec)
+        }
+        set rec.space_after: 0
+        set rec.keep_with_next: false
+        set rec.save_keep: false
+        set rec.break_after: RTF_BREAK_NONE
+        set this.display_depth: this.display_depth + 1
+        rec
+    }
+
+    function display_back(this: pointer[RtfFOTBuilder]) returns pointer[RtfDisplayInfo]
+    {
+        let slotp this.display_stack.get((this.display_depth - 1) as size_t)
+        if slotp = null
+            return null
+        *slotp
+    }
+
+    ; --- char table helpers ---------------------------------------------------
+    function ct_get(this: pointer[RtfFOTBuilder], c: u32) returns u32
+    {
+        if c >= (0x10000 as u32)
+            return 0 as u32
+        let p this.char_table.get(c as size_t)
+        if p = null
+            return 0 as u32
+        *p
+    }
+
+    function ct_set(this: pointer[RtfFOTBuilder], c: u32, v: u32)
+    {
+        if c < (0x10000 as u32)
+            this.char_table.put(c as size_t, v)
+    }
+
+    ; NOTE: returning a cstring literal from a multi-branch function arrives
+    ; NULL at the caller (compiler finding, 2026-07-29 — wishlist); these
+    ; helpers therefore EMIT directly instead of returning the literal.
+    function emit_charset_suffix(this: pointer[RtfFOTBuilder], i: int)
+    {
+        if i = 1
+            this.raw(" CE")
+        else if i = 2
+            this.raw(" CYR")
+        else if i = 3
+            this.raw(" Greek")
+        else if i = 4
+            this.raw(" TUR")
+    }
+
+    ; --- font family hash table (OpenSP PointerTable semantics) --------------
+    function torek_hash(this: pointer[RtfFOTBuilder], s: StringC) returns size_t
+    {
+        var h: size_t 0
+        let n s.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            set h: (h << 5) + h + (s.get(i) as size_t)
+            set i: i + (1 as size_t)
+        }
+        h
+    }
+
+    function font_lookup(this: pointer[RtfFOTBuilder], key: StringC) returns int
+    {
+        if this.font_used = 0
+            return 0 - 1
+        let size this.font_slots.get_length()
+        var i (this.torek_hash(key) & ((size - (1 as size_t)) as size_t))
+        while true
+        {
+            let slotp this.font_slots.get(i)
+            if slotp = null
+                return 0 - 1
+            let e *slotp
+            if e = null
+                return 0 - 1
+            if e.key.equals(key)
+                return e.value
+            if i = (0 as size_t)
+                set i: size - (1 as size_t)
+            else
+                set i: i - (1 as size_t)
+        }
+        0 - 1
+    }
+
+    function font_insert(this: pointer[RtfFOTBuilder], key: StringC, value: int)
+    {
+        let host this.host
+        if this.font_slots.get_length() = (0 as size_t)
+        {
+            var z 0
+            while z < 8
+            {
+                let np null as pointer[RtfFontEntry]
+                this.font_slots.add(np)
+                set z: z + 1
+            }
+            set this.font_used_limit: 4
+        }
+        var size this.font_slots.get_length()
+        var i (this.torek_hash(key) & ((size - (1 as size_t)) as size_t))
+        while true
+        {
+            let slotp this.font_slots.get(i)
+            var e: pointer[RtfFontEntry] null
+            if slotp <> null
+                set e: *slotp
+            if e = null
+                break
+            if e.key.equals(key)
+                return
+            if i = (0 as size_t)
+                set i: size - (1 as size_t)
+            else
+                set i: i - (1 as size_t)
+        }
+        if this.font_used >= this.font_used_limit
+        {
+            ; rehash into a doubled table (PointerTable::insert)
+            let old this.font_slots
+            let old_size old.get_length()
+            let fresh Array[pointer[RtfFontEntry]]^host()
+            var z2: size_t 0
+            while z2 < (old_size * (2 as size_t))
+            {
+                let np2 null as pointer[RtfFontEntry]
+                fresh.add(np2)
+                set z2: z2 + (1 as size_t)
+            }
+            set this.font_slots: fresh
+            set size: fresh.get_length()
+            set this.font_used_limit: (size / (2 as size_t)) as int
+            var oi: size_t 0
+            while oi < old_size
+            {
+                let op old.get(oi)
+                var oe: pointer[RtfFontEntry] null
+                if op <> null
+                    set oe: *op
+                if oe <> null
+                {
+                    var j (this.torek_hash(oe.key) & ((size - (1 as size_t)) as size_t))
+                    while true
+                    {
+                        let sp fresh.get(j)
+                        var cur: pointer[RtfFontEntry] null
+                        if sp <> null
+                            set cur: *sp
+                        if cur = null
+                            break
+                        if j = (0 as size_t)
+                            set j: size - (1 as size_t)
+                        else
+                            set j: j - (1 as size_t)
+                    }
+                    fresh.put(j, oe)
+                }
+                set oi: oi + (1 as size_t)
+            }
+            set i: (this.torek_hash(key) & ((size - (1 as size_t)) as size_t))
+            while true
+            {
+                let sp2 this.font_slots.get(i)
+                var cur2: pointer[RtfFontEntry] null
+                if sp2 <> null
+                    set cur2: *sp2
+                if cur2 = null
+                    break
+                if i = (0 as size_t)
+                    set i: size - (1 as size_t)
+                else
+                    set i: i - (1 as size_t)
+            }
+        }
+        set this.font_used: this.font_used + 1
+        let entry RtfFontEntry.make(host, key, value)
+        this.font_slots.put(i, entry)
+    }
+
+    ; --- low-level output -----------------------------------------------------
+    ; one byte into the current stream. The conn_target port-capture seam
+    ; overrides (widened to the u32 buffers ProcessContext allocates); the
+    ; leader null stream discards; otherwise cur_stream selects the buffer
+    ; (the reference osp_ pointer).
+    function put(this: pointer[RtfFOTBuilder], b: u8)
+    {
+        if this.conn_target <> null
+        {
+            this.conn_target.add(b as u32)
+            return
+        }
+        if this.discard
+            return
+        if this.cur_stream = RTF_ST_MAIN
+        {
+            this.out.add(b)
+            return
+        }
+        if this.cur_stream = RTF_ST_HF
+        {
+            this.hfos.add(b)
+            return
+        }
+        if this.cur_stream = RTF_ST_FIELD
+        {
+            this.fieldos.add(b)
+            return
+        }
+        this.cellos.add(b)
+    }
+
+    procedure set_conn_target(this: pointer[RtfFOTBuilder], buf: pointer[Array[u32]])
+        set this.conn_target: buf
+
+    function get_conn_target(this: pointer[RtfFOTBuilder]) returns pointer[Array[u32]]
+        conn_target
+
+    ; byte-level replay is unsound for the delta-state RTF stream — hard-trap
+    ; LOUD on non-empty capture (design note; the gate corpus never routes
+    ; content to non-principal ports).
+    procedure emit_captured(this: pointer[RtfFOTBuilder], buf: pointer[Array[u32]])
+    {
+        if buf = null
+            return
+        if buf.get_length() = (0 as size_t)
+            return
+        this.interp.message0(InterpreterMessages.rtfPortCaptureUnsupported())
+        exit 17
+    }
+
+    function raw(this: pointer[RtfFOTBuilder], s: pointer[const_char])
+    {
+        var i: size_t 0
+        while true
+        {
+            let b *((s as pointer[u8]) + i)
+            if b = (0 as u8)
+                break
+            this.put(b)
+            set i: i + 1
+        }
+    }
+
+    function put_c(this: pointer[RtfFOTBuilder], c: int)
+        this.put(c as u8)
+
+    function raw_stringc(this: pointer[RtfFOTBuilder], s: StringC)
+    {
+        let n s.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            this.put((s.get(i) & (0xFF as u32)) as u8)
+            set i: i + 1
+        }
+    }
+
+    function raw_uint(this: pointer[RtfFOTBuilder], n_in: int)
+    {
+        var n n_in
+        if n = 0
+        {
+            this.put(0x30 as u8)
+            return
+        }
+        var digits u8[24]
+        var k 0
+        while n > 0
+        {
+            set *((digits as pointer[u8]) + k): ((n % 10) + 0x30) as u8
+            set n: n / 10
+            set k: k + 1
+        }
+        while k > 0
+        {
+            set k: k - 1
+            this.put(*((digits as pointer[u8]) + k))
+        }
+    }
+
+    function raw_int(this: pointer[RtfFOTBuilder], n: int)
+    {
+        if n < 0
+        {
+            this.put(0x2D as u8)
+            this.raw_uint(0 - n)
+        }
+        else
+            this.raw_uint(n)
+    }
+
+    ; a control word with a signed numeric parameter
+    function cw_int(this: pointer[RtfFOTBuilder], word: pointer[const_char], n: int)
+    {
+        this.raw(word)
+        this.raw_int(n)
+    }
+
+    ; \'xx — lowercase hex escape
+    function hex_char(this: pointer[RtfFOTBuilder], code: int)
+    {
+        let digits "0123456789abcdef"
+        this.raw("\\'")
+        this.put(*((digits as pointer[u8]) + ((code >> 4) & 0xF)))
+        this.put(*((digits as pointer[u8]) + (code & 0xF)))
+    }
+
+    ; big-endian 32-bit word (insertion payloads)
+    function output_word(this: pointer[RtfFOTBuilder], n: int)
+    {
+        this.put(((n >> 24) & 0xFF) as u8)
+        this.put(((n >> 16) & 0xFF) as u8)
+        this.put(((n >> 8) & 0xFF) as u8)
+        this.put((n & 0xFF) as u8)
+    }
+
+    ; --- computeLengthSpec / displaySizeChanged -------------------------------
+    function compute_length_spec(this: pointer[RtfFOTBuilder], spec: LengthSpec) returns int
+    {
+        if spec.factor = 0.0
+            return spec.length
+        let tem (this.display_size as double) * spec.factor
+        if tem >= 0.0
+            return spec.length + ((tem + 0.5) as int)
+        spec.length + ((tem - 0.5) as int)
+    }
+
+    function half_points(this: pointer[RtfFOTBuilder], n: int) returns int
+        n / 10
+
+    function points_of(this: pointer[RtfFOTBuilder], n: int) returns int
+    {
+        if n >= 0
+            return (n + 10) / 20
+        (n - 10) / 20
+    }
+
+    function display_size_changed(this: pointer[RtfFOTBuilder])
+    {
+        set this.spec.position_point_shift: this.half_points(this.compute_length_spec(this.spec.pps_spec))
+        set this.spec.left_indent: this.compute_length_spec(this.spec.li_spec)
+        set this.spec.right_indent: this.compute_length_spec(this.spec.ri_spec)
+        set this.spec.first_line_indent: this.compute_length_spec(this.spec.fli_spec)
+        set this.spec.line_spacing: this.compute_length_spec(this.spec.ls_spec)
+        set this.spec.field_width: this.compute_length_spec(this.spec.fw_spec)
+    }
+
+    ; --- language -------------------------------------------------------------
+    ; convertLanguage (RtfFOTBuilder.cxx 3922-4160). Returns the RTF lang code;
+    ; lang_charsets is returned through the out-pointer.
+    function convert_language(this: pointer[RtfFOTBuilder], language: int, country: int, lcs: pointer[int]) returns int
+    {
+        if language = 0
+        {
+            set *lcs: 0x1f
+            return RTF_DEFAULT_LANG
+        }
+        ; SP_LETTER2('X','Y') = ('X' << 8) | 'Y'
+        if language = 0x4247
+        {
+            set *lcs: 0x4
+            return 0x402
+        }
+        if language = 0x4341
+        {
+            set *lcs: 0x3
+            return 0x403
+        }
+        if language = 0x4353
+        {
+            set *lcs: 0x13
+            return 0x405
+        }
+        if language = 0x4441
+        {
+            set *lcs: 0x13
+            return 0x406
+        }
+        if language = 0x4445
+        {
+            set *lcs: 0x13
+            if country = 0x4445
+                return 0x407
+            if country = 0x4348
+                return 0x807
+            if country = 0x4154
+                return 0xc07
+            if country = 0x4C55
+                return 0x1007
+            if country = 0x4C49
+                return 0x1407
+            return 0x407
+        }
+        if language = 0x454C
+        {
+            set *lcs: 0x8
+            return 0x408
+        }
+        if language = 0x454E
+        {
+            set *lcs: 0x1f
+            if country = 0x5553
+                return 0x409
+            if country = 0x4742
+                return 0x809
+            if country = 0x4155
+                return 0xc09
+            if country = 0x4341
+                return 0x1009
+            if country = 0x4E5A
+                return 0x1409
+            if country = 0x4945
+                return 0x1809
+            if country = 0x5A41
+                return 0x1c09
+            if country = 0x4A4D
+                return 0x2009
+            if country = 0x4342
+                return 0x2409
+            if country = 0x425A
+                return 0x2809
+            if country = 0x5454
+                return 0x2c09
+            return 0x409
+        }
+        if language = 0x4553
+        {
+            set *lcs: 0x13
+            if country = 0x4553
+                return 0x40a
+            if country = 0x4D58
+                return 0x80a
+            if country = 0x4754
+                return 0x100a
+            if country = 0x4352
+                return 0x140a
+            if country = 0x5041
+                return 0x180a
+            if country = 0x444F
+                return 0x1c0a
+            if country = 0x5645
+                return 0x200a
+            if country = 0x434F
+                return 0x240a
+            if country = 0x5045
+                return 0x280a
+            if country = 0x4152
+                return 0x2c0a
+            if country = 0x4543
+                return 0x300a
+            if country = 0x434C
+                return 0x340a
+            if country = 0x5559
+                return 0x380a
+            if country = 0x5059
+                return 0x3c0a
+            if country = 0x424F
+                return 0x400a
+            if country = 0x5356
+                return 0x440a
+            if country = 0x484E
+                return 0x480a
+            if country = 0x4E49
+                return 0x4c0a
+            if country = 0x5052
+                return 0x500a
+            return 0x40a
+        }
+        if language = 0x4649
+        {
+            set *lcs: 0x13
+            return 0x40b
+        }
+        if language = 0x4652
+        {
+            set *lcs: 0x13
+            if country = 0x4652
+                return 0x40c
+            if country = 0x4245
+                return 0x80c
+            if country = 0x4341
+                return 0xc0c
+            if country = 0x4348
+                return 0x100c
+            if country = 0x4C55
+                return 0x140c
+            return 0x40c
+        }
+        if language = 0x4855
+        {
+            set *lcs: 0x12
+            return 0x40e
+        }
+        if language = 0x4953
+        {
+            set *lcs: 0x3
+            return 0x40f
+        }
+        if language = 0x4954
+        {
+            set *lcs: 0x13
+            if country = 0x4954
+                return 0x410
+            if country = 0x4348
+                return 0x810
+            return 0x410
+        }
+        if language = 0x4E4C
+        {
+            set *lcs: 0x13
+            if country = 0x4E4C
+                return 0x413
+            if country = 0x4245
+                return 0x813
+            return 0x413
+        }
+        if language = 0x4E4F
+        {
+            set *lcs: 0x13
+            return 0x414
+        }
+        if language = 0x504C
+        {
+            set *lcs: 0x12
+            return 0x415
+        }
+        if language = 0x5054
+        {
+            set *lcs: 0x13
+            if country = 0x4252
+                return 0x416
+            if country = 0x5054
+                return 0x816
+            return 0x416
+        }
+        if language = 0x524F
+        {
+            set *lcs: 0x12
+            return 0x418
+        }
+        if language = 0x5255
+        {
+            set *lcs: 0x4
+            return 0x419
+        }
+        if language = 0x4852
+        {
+            set *lcs: 0x12
+            if country = 0x4852
+                return 0x41a
+            if country = 0x5350
+                return 0x81a
+            return 0x41a
+        }
+        if language = 0x534B
+        {
+            set *lcs: 0x12
+            return 0x41b
+        }
+        if language = 0x5351
+        {
+            set *lcs: 0x12
+            return 0x41c
+        }
+        if language = 0x5356
+        {
+            set *lcs: 0x13
+            if country = 0x5345
+                return 0x41d
+            if country = 0x4649
+                return 0x81d
+            return 0x41d
+        }
+        if language = 0x5452
+        {
+            set *lcs: 0x12
+            return 0x41f
+        }
+        if language = 0x4944
+        {
+            set *lcs: 0x13
+            return 0x421
+        }
+        if language = 0x554B
+        {
+            set *lcs: 0x4
+            return 0x422
+        }
+        if language = 0x4245
+        {
+            set *lcs: 0x4
+            return 0x423
+        }
+        if language = 0x534C
+        {
+            set *lcs: 0x12
+            return 0x424
+        }
+        if language = 0x4554
+        {
+            set *lcs: 0x12
+            return 0x425
+        }
+        if language = 0x4C56
+        {
+            set *lcs: 0x12
+            return 0x426
+        }
+        if language = 0x4C54
+        {
+            set *lcs: 0x12
+            return 0x427
+        }
+        if language = 0x5649
+        {
+            set *lcs: 0x13
+            return 0x42a
+        }
+        if language = 0x4555
+        {
+            set *lcs: 0x13
+            return 0x42d
+        }
+        if language = 0x4146
+        {
+            set *lcs: 0x1f
+            return 0x436
+        }
+        if language = 0x464F
+        {
+            set *lcs: 0x13
+            return 0x438
+        }
+        if language = 0x4A41
+        {
+            set *lcs: 1 << RTF_JIS_CHARSET
+            return 0x411
+        }
+        set *lcs: 0x1f
+        return RTF_DEFAULT_LANG
+    }
+
+    ; --- character formatting -------------------------------------------------
+    function sync_char_format(this: pointer[RtfFOTBuilder])
+    {
+        var changed false
+        if this.out_fmt.is_bold <> this.spec.is_bold
+        {
+            this.raw("\\b")
+            if this.spec.is_bold = false
+                this.put_c(0x30)
+            set this.out_fmt.is_bold: this.spec.is_bold
+            set changed: true
+        }
+        if this.out_fmt.is_italic <> this.spec.is_italic
+        {
+            this.raw("\\i")
+            if this.spec.is_italic = false
+                this.put_c(0x30)
+            set this.out_fmt.is_italic: this.spec.is_italic
+            set changed: true
+        }
+        if this.out_fmt.underline <> this.spec.underline
+        {
+            if this.spec.underline = RTF_UL_NONE
+                this.raw("\\ul0")
+            else if this.spec.underline = RTF_UL_SINGLE
+                this.raw("\\ul")
+            else if this.spec.underline = RTF_UL_DOUBLE
+                this.raw("\\uldb")
+            else
+                this.raw("\\ulw")
+            set this.out_fmt.underline: this.spec.underline
+            set changed: true
+        }
+        if this.out_fmt.is_small_caps <> this.spec.is_small_caps
+        {
+            this.raw("\\scaps")
+            if this.spec.is_small_caps = false
+                this.put_c(0x30)
+            set this.out_fmt.is_small_caps: this.spec.is_small_caps
+            set changed: true
+        }
+        if this.out_fmt.is_strikethrough <> this.spec.is_strikethrough
+        {
+            this.raw("\\strike")
+            if this.spec.is_strikethrough = false
+                this.put_c(0x30)
+            set this.out_fmt.is_strikethrough: this.spec.is_strikethrough
+            set changed: true
+        }
+        if this.out_fmt.position_point_shift <> this.spec.position_point_shift
+        {
+            if this.spec.position_point_shift >= 0
+                this.cw_int("\\up", this.spec.position_point_shift)
+            else
+                this.cw_int("\\dn", 0 - this.spec.position_point_shift)
+            set this.out_fmt.position_point_shift: this.spec.position_point_shift
+            set changed: true
+        }
+        if this.out_fmt.font_size <> this.spec.font_size
+        {
+            this.cw_int("\\fs", this.spec.font_size)
+            set this.out_fmt.font_size: this.spec.font_size
+            set changed: true
+        }
+        var lang_differs false
+        if this.out_fmt.country <> this.spec.country
+            set lang_differs: true
+        if this.out_fmt.language <> this.spec.language
+            set lang_differs: true
+        if lang_differs
+        {
+            set this.out_fmt.country: this.spec.country
+            set this.out_fmt.language: this.spec.language
+            var lcs this.out_fmt.lang_charsets
+            let lang this.convert_language(this.out_fmt.language, this.out_fmt.country, &lcs)
+            set this.out_fmt.lang_charsets: lcs
+            if lang <> this.out_fmt.lang
+            {
+                set this.out_fmt.lang: lang
+                this.cw_int("\\lang", lang)
+                set changed: true
+            }
+        }
+        var charset_ok false
+        if ((1 << this.out_fmt.charset) & this.out_fmt.lang_charsets) <> 0
+            set charset_ok: true
+        var family_differs false
+        if this.out_fmt.font_family <> this.spec.font_family
+            set family_differs: true
+        if charset_ok = false
+            set family_differs: true
+        if family_differs
+        {
+            set this.out_fmt.font_family: this.spec.font_family
+            if charset_ok = false
+            {
+                var cs 0
+                while (this.out_fmt.lang_charsets & (1 << cs)) = 0
+                    set cs: cs + 1
+                set this.out_fmt.charset: cs
+            }
+            let rowp this.ffcs.get(this.out_fmt.font_family as size_t)
+            if rowp <> null
+            {
+                let row *rowp
+                var n row.get_at(this.out_fmt.charset)
+                if n < 0
+                {
+                    set n: this.next_font_number
+                    set this.next_font_number: this.next_font_number + 1
+                    row.set_at(this.out_fmt.charset, n)
+                }
+                this.cw_int("\\f", n)
+                set changed: true
+            }
+        }
+        if this.out_fmt.color <> this.spec.color
+        {
+            this.cw_int("\\cf", this.spec.color)
+            set this.out_fmt.color: this.spec.color
+            set changed: true
+        }
+        if this.out_fmt.char_background_color <> this.spec.char_background_color
+        {
+            this.cw_int("\\highlight", this.spec.char_background_color)
+            set this.out_fmt.char_background_color: this.spec.char_background_color
+            set changed: true
+        }
+        if this.spec.char_border
+        {
+            var need false
+            if this.out_fmt.char_border = false
+                set need: true
+            if this.spec.char_border_color <> this.out_fmt.char_border_color
+                set need: true
+            if this.spec.char_border_thickness <> this.out_fmt.char_border_thickness
+                set need: true
+            if this.spec.char_border_double <> this.out_fmt.char_border_double
+                set need: true
+            if need
+            {
+                set this.out_fmt.char_border: true
+                this.raw("\\chbrdr")
+                if this.spec.char_border_double
+                    this.raw("\\brdrdb")
+                else
+                    this.raw("\\brdrs")
+                this.cw_int("\\brdrw", this.spec.char_border_thickness)
+                if this.spec.char_border_color <> 0
+                    this.cw_int("\\brdrcf", this.spec.char_border_color)
+                set changed: true
+                set this.out_fmt.char_border_color: this.spec.char_border_color
+                set this.out_fmt.char_border_thickness: this.spec.char_border_thickness
+                set this.out_fmt.char_border_double: this.spec.char_border_double
+            }
+        }
+        else
+        {
+            if this.out_fmt.char_border
+            {
+                this.raw("\\chbrdr")
+                set changed: true
+                set this.out_fmt.char_border: false
+            }
+        }
+        if this.spec.hyphenate = false
+            set this.hyphenate_suppressed: true
+        if this.out_fmt.kern <> this.spec.kern
+        {
+            this.raw("\\kerning")
+            if this.spec.kern
+                this.put_c(0x31)
+            else
+                this.put_c(0x30)
+            set this.out_fmt.kern: this.spec.kern
+            set changed: true
+        }
+        if changed
+            this.put_c(0x20)
+    }
+
+    function set_charset(this: pointer[RtfFOTBuilder], cs: int)
+    {
+        set this.out_fmt.charset: cs
+        let rowp this.ffcs.get(this.out_fmt.font_family as size_t)
+        if rowp <> null
+        {
+            let row *rowp
+            var n row.get_at(cs)
+            if n < 0
+            {
+                set n: this.next_font_number
+                set this.next_font_number: this.next_font_number + 1
+                row.set_at(cs, n)
+            }
+            this.cw_int("\\f", n)
+        }
+    }
+
+    function symbol_char(this: pointer[RtfFOTBuilder], ff: int, code: int)
+    {
+        let rowp this.ffcs.get(ff as size_t)
+        if rowp <> null
+        {
+            let row *rowp
+            var n row.get_at(RTF_N_WIN_CHARSETS - 1)
+            if n < 0
+            {
+                set n: this.next_font_number
+                set this.next_font_number: this.next_font_number + 1
+                row.set_at(RTF_N_WIN_CHARSETS - 1, n)
+            }
+            this.raw("{\\f")
+            this.raw_int(n)
+            this.hex_char(code)
+            this.raw("}")
+        }
+    }
+
+    ; \uN takes the SIGNED 16-bit reading of the code unit
+    function u_signed16(this: pointer[RtfFOTBuilder], c: u32) returns int
+    {
+        var v (c & (0xFFFF as u32)) as int
+        if v >= 0x8000
+            set v: v - 65536
+        v
+    }
+
+    ; --- characters (the hot path; RtfFOTBuilder.cxx 1159-1355, math arms
+    ; omitted — the engine has no math flow-object classes) -------------------
+    function characters(this: pointer[RtfFOTBuilder], s: pointer[u32], n_in: size_t)
+    {
+        var p s
+        var n n_in
+        ; ignore record ends at the start of continuation paragraphs
+        var skip_res false
+        if this.continue_par
+        {
+            if this.inline_state = RTF_INLINE_START
+                set skip_res: true
+            if this.inline_state = RTF_INLINE_FIRST
+                set skip_res: true
+        }
+        if skip_res
+        {
+            if this.para.lines = RSYM_WRAP
+            {
+                while n > (0 as size_t)
+                {
+                    if *p <> (0x0D as u32)
+                        break
+                    set p: p + 1
+                    set n: n - (1 as size_t)
+                }
+                if n = (0 as size_t)
+                    return
+            }
+        }
+        if this.inline_state <> RTF_INLINE_MIDDLE
+            this.inline_prepare()
+        else
+            this.flush_fields()
+        this.sync_char_format()
+        while n > (0 as size_t)
+        {
+            let c *p
+            let prev_ws this.follow_whitespace_char
+            set this.follow_whitespace_char: false
+            set this.current_column: this.current_column + 1
+            if c = (0x0A as u32)
+            {
+                set this.current_column: this.current_column - 1
+                set this.follow_whitespace_char: prev_ws
+            }
+            else if c = (0x0D as u32)
+            {
+                set this.follow_whitespace_char: true
+                var wrap_like false
+                if this.para.lines = RSYM_NONE
+                    set wrap_like: true
+                if this.para.lines = RSYM_WRAP
+                    set wrap_like: true
+                if wrap_like
+                {
+                    if this.spec.input_whitespace_treatment = RSYM_IGNORE
+                        set this.current_column: this.current_column - 1
+                    else if this.spec.input_whitespace_treatment = RSYM_COLLAPSE
+                    {
+                        if prev_ws
+                            set this.current_column: this.current_column - 1
+                        else
+                            this.put_c(0x20)
+                    }
+                    else
+                        this.put_c(0x20)
+                }
+                else
+                {
+                    this.raw("\\sa0\\par\\fi0\\sb0\n")
+                    set this.current_column: 0
+                }
+            }
+            else if (c = (0x09 as u32)) or (c = (0x20 as u32))
+            {
+                var expanded false
+                if c = (0x09 as u32)
+                {
+                    var can_expand false
+                    if this.spec.expand_tabs <> 0
+                    {
+                        if this.spec.input_whitespace_treatment = RSYM_PRESERVE
+                            set can_expand: true
+                    }
+                    if can_expand
+                    {
+                        set this.current_column: this.current_column - 1
+                        var col this.current_column + this.spec.expand_tabs
+                        set col: (col / this.spec.expand_tabs) * this.spec.expand_tabs
+                        while this.current_column < col
+                        {
+                            this.put_c(0x20)
+                            set this.current_column: this.current_column + 1
+                        }
+                        set this.follow_whitespace_char: true
+                        set expanded: true
+                    }
+                }
+                if expanded = false
+                {
+                    set this.follow_whitespace_char: true
+                    if this.spec.input_whitespace_treatment = RSYM_IGNORE
+                        set this.current_column: this.current_column - 1
+                    else if this.spec.input_whitespace_treatment = RSYM_COLLAPSE
+                    {
+                        if prev_ws
+                            set this.current_column: this.current_column - 1
+                        else
+                            this.put_c(0x20)
+                    }
+                    else
+                        this.put_c(0x20)
+                }
+            }
+            else if c = (0x2002 as u32)
+                this.raw("\\u8194\\'20")
+            else if c = (0x2003 as u32)
+                this.raw("\\u8195\\'20")
+            else if c = (0x2010 as u32)
+                this.put_c(0x2D)
+            else if c = (0x2011 as u32)
+                this.raw("\\_")
+            else if c = (0x200c as u32)
+                this.raw("\\zwnj ")
+            else if c = (0x200d as u32)
+                this.raw("\\zwj ")
+            else if c = (0xa0 as u32)
+                this.raw("\\~")
+            else if c = (0xad as u32)
+                this.raw("\\-")
+            else if c = (0 as u32)
+            {
+                ; nothing
+            }
+            else if c = (0x5C as u32)
+            {
+                ; backslash: leave the JIS charset first (initJIS deferred,
+                ; the charset can never be JIS — kept for shape fidelity)
+                if this.out_fmt.charset = RTF_JIS_CHARSET
+                    this.set_charset(0)
+                this.put_c(0x5C)
+                this.put_c(0x5C)
+            }
+            else if (c = (0x7B as u32)) or (c = (0x7D as u32))
+            {
+                this.put_c(0x5C)
+                this.put((c & (0xFF as u32)) as u8)
+            }
+            else if (c = (0x7C as u32)) or (c = (0x7E as u32))
+            {
+                if this.out_fmt.charset = RTF_JIS_CHARSET
+                    this.set_charset(0)
+                this.emit_plain_char(c)
+            }
+            else if c < (0x80 as u32)
+                this.emit_plain_char(c)
+            else
+            {
+                let code this.ct_get(c)
+                if (code & (RTF_SYMBOL_FLAG as u32)) <> (0 as u32)
+                {
+                    let ff (((code & (0x7FFFFFFF as u32)) as int) >> RTF_CHAR_BITS) + 1
+                    this.symbol_char(ff, (code & (0xFF as u32)) as int)
+                }
+                else if code <> (0 as u32)
+                {
+                    if (code & ((1 << (this.out_fmt.charset + RTF_CHAR_BITS)) as u32)) = (0 as u32)
+                    {
+                        ; choose a charset compatible with the language when
+                        ; possible
+                        var code2 code
+                        if (code2 & ((this.out_fmt.lang_charsets << RTF_CHAR_BITS) as u32)) <> (0 as u32)
+                            set code2: code2 & (((this.out_fmt.lang_charsets << RTF_CHAR_BITS) | ((1 << RTF_CHAR_BITS) - 1)) as u32)
+                        var i 0
+                        var mask (1 << RTF_CHAR_BITS) as u32
+                        while (code2 & mask) = (0 as u32)
+                        {
+                            set mask: mask << (1 as u32)
+                            set i: i + 1
+                        }
+                        this.set_charset(i)
+                    }
+                    if (code & (RTF_DB_FLAG as u32)) <> (0 as u32)
+                    {
+                        ; doublebyte JIS — unreachable while initJIS is
+                        ; deferred (no table rows carry the flag)
+                        this.raw("{\\dbch\\uc2\\u")
+                        this.raw_int(this.u_signed16(c))
+                        this.hex_char(((code >> (8 as u32)) & (0xFF as u32)) as int)
+                        this.hex_char((code & (0xFF as u32)) as int)
+                        this.raw("}")
+                    }
+                    else
+                        this.hex_char((code & (0xFF as u32)) as int)
+                }
+                else
+                {
+                    var in_symbol_page false
+                    if c >= ((RTF_SYMBOL_FONT_PAGE + 0x20) as u32)
+                    {
+                        if c <= ((RTF_SYMBOL_FONT_PAGE + 0xff) as u32)
+                            set in_symbol_page: true
+                    }
+                    if in_symbol_page
+                        this.symbol_char(this.out_fmt.font_family, (c & (0xFF as u32)) as int)
+                    else
+                    {
+                        this.raw("\\u")
+                        this.raw_int(this.u_signed16(c))
+                        this.hex_char(0x3F)
+                    }
+                }
+            }
+            set p: p + 1
+            set n: n - (1 as size_t)
+        }
+    }
+
+    ; a plain ASCII char, honoring the math-posture italic wrap
+    function emit_plain_char(this: pointer[RtfFOTBuilder], c: u32)
+    {
+        if this.spec.math_posture
+        {
+            var is_letter false
+            if c >= (0x61 as u32)
+            {
+                if c <= (0x7A as u32)
+                    set is_letter: true
+            }
+            if c >= (0x41 as u32)
+            {
+                if c <= (0x5A as u32)
+                    set is_letter: true
+            }
+            if is_letter
+            {
+                this.raw("{\\i ")
+                this.put((c & (0xFF as u32)) as u8)
+                this.put_c(0x7D)
+                return
+            }
+        }
+        this.put((c & (0xFF as u32)) as u8)
+    }
+
+    function characters_from_node(this: pointer[RtfFOTBuilder], node: pointer[GroveNode], s: pointer[u32], n: size_t)
+        this.characters(s, n)
+
+    ; --- colors ---------------------------------------------------------------
+    function make_color(this: pointer[RtfFOTBuilder], rgb: int) returns int
+    {
+        let n this.color_table.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let p this.color_table.get(i)
+            if p <> null
+            {
+                if *p = rgb
+                    return (i as int) + 1
+            }
+            set i: i + (1 as size_t)
+        }
+        this.color_table.add(rgb)
+        this.color_table.get_length() as int
+    }
+
+    ; --- the characteristic dispatch (the reference's ~66 virtual setters,
+    ; keyed by the STABLE registry index; extension characteristics ride on
+    ; InheritedC.ext_setter) ---------------------------------------------------
+    function set_ic(this: pointer[RtfFOTBuilder], ic: pointer[InheritedC])
+    {
+        let ext ic.ext_setter
+        if ext <> 0
+        {
+            this.set_extension_ic(ext, ic)
+            return
+        }
+        let index ic.get_index()
+        if index = 0
+            set this.spec.font_size: this.half_points(ic.lval)
+        else if index = 1
+            this.set_font_family_name(ic.sval)
+        else if index = 2
+        {
+            if ic.sym.code > RSYM_MEDIUM
+                set this.spec.is_bold: true
+            else
+                set this.spec.is_bold: false
+        }
+        else if index = 3
+        {
+            let c ic.sym.code
+            if (c = RSYM_OBLIQUE) or (c = RSYM_ITALIC)
+            {
+                set this.spec.is_italic: true
+                set this.spec.math_posture: false
+            }
+            else if c = RSYM_MATH
+            {
+                set this.spec.is_italic: false
+                set this.spec.math_posture: true
+            }
+            else
+            {
+                set this.spec.is_italic: false
+                set this.spec.math_posture: false
+            }
+        }
+        else if index = 4
+        {
+            let c ic.sym.code
+            if c = RSYM_END
+                set this.spec.quadding: 0x72
+            else if c = RSYM_CENTER
+                set this.spec.quadding: 0x63
+            else if c = RSYM_JUSTIFY
+                set this.spec.quadding: 0x6A
+            else
+                set this.spec.quadding: 0x6C
+        }
+        else if index = 5
+        {
+            let c ic.sym.code
+            if c = RSYM_END
+                set this.spec.display_alignment: 0x72
+            else if c = RSYM_CENTER
+                set this.spec.display_alignment: 0x63
+            else
+                set this.spec.display_alignment: 0x6C
+        }
+        else if index = 6
+            set this.spec.field_align: ic.sym.code
+        else if index = 7
+            set this.spec.lines: ic.sym.code
+        else if index = 8
+        {
+            set this.spec.li_spec: ic.ls
+            set this.spec.left_indent: this.compute_length_spec(ic.ls)
+        }
+        else if index = 9
+        {
+            set this.spec.fli_spec: ic.ls
+            set this.spec.first_line_indent: this.compute_length_spec(ic.ls)
+        }
+        else if index = 10
+        {
+            set this.spec.ri_spec: ic.ls
+            set this.spec.right_indent: this.compute_length_spec(ic.ls)
+        }
+        else if index = 12
+        {
+            set this.spec.ls_spec: ic.ls
+            set this.spec.line_spacing: this.compute_length_spec(ic.ls)
+        }
+        else if index = 13
+        {
+            set this.spec.fw_spec: ic.ls
+            set this.spec.field_width: this.compute_length_spec(ic.ls)
+        }
+        else if index = 14
+        {
+            if this.in_simple_page_sequence = 0
+                set this.page.left_margin: ic.lval
+        }
+        else if index = 15
+        {
+            if this.in_simple_page_sequence = 0
+                set this.page.right_margin: ic.lval
+        }
+        else if index = 16
+        {
+            if this.in_simple_page_sequence = 0
+                set this.page.top_margin: ic.lval
+        }
+        else if index = 17
+        {
+            if this.in_simple_page_sequence = 0
+                set this.page.bottom_margin: ic.lval
+        }
+        else if index = 18
+        {
+            if this.in_simple_page_sequence = 0
+                set this.page.header_margin: ic.lval
+        }
+        else if index = 19
+        {
+            if this.in_simple_page_sequence = 0
+                set this.page.footer_margin: ic.lval
+        }
+        else if index = 20
+        {
+            if this.in_simple_page_sequence = 0
+                set this.page.page_width: ic.lval
+        }
+        else if index = 21
+        {
+            if this.in_simple_page_sequence = 0
+                set this.page.page_height: ic.lval
+        }
+        else if index = 22
+            set this.spec.border_present: ic.bval
+        else if index = 23
+        {
+            if ic.lval > 150
+                set this.spec.line_thickness: 150
+            else
+                set this.spec.line_thickness: ic.lval
+        }
+        else if index = 24
+            set this.spec.cell_top_margin: ic.lval
+        else if index = 25
+            set this.spec.cell_bottom_margin: ic.lval
+        else if index = 26
+            set this.spec.cell_left_margin: ic.lval
+        else if index = 27
+            set this.spec.cell_right_margin: ic.lval
+        else if index = 31
+        {
+            set this.spec.pps_spec: ic.ls
+            set this.spec.position_point_shift: this.half_points(this.compute_length_spec(ic.ls))
+        }
+        else if index = 44
+            set this.spec.hyphenate: ic.bval
+        else if index = 45
+            set this.spec.kern: ic.bval
+        else if index = 47
+            set this.spec.score_spaces: ic.bval
+        else if index = 51
+            set this.spec.cell_background: ic.bval
+        else if index = 61
+            set this.spec.border_omit_at_break: ic.bval
+        else if index = 70
+            set this.spec.input_whitespace_treatment: ic.sym.code
+        else if index = 84
+        {
+            let c ic.sym.code
+            if c = RSYM_BORDER
+            {
+                set this.spec.box_has_border: true
+                set this.spec.box_has_background: false
+            }
+            else if c = RSYM_BACKGROUND
+            {
+                set this.spec.box_has_border: false
+                set this.spec.box_has_background: true
+            }
+            else if c = RSYM_BOTH
+            {
+                set this.spec.box_has_border: true
+                set this.spec.box_has_background: true
+            }
+        }
+        else if index = 87
+        {
+            let c ic.sym.code
+            if c = RSYM_START
+                set this.spec.cell_vertical_alignment: 0x74
+            else if c = RSYM_CENTER
+                set this.spec.cell_vertical_alignment: 0x63
+            else if c = RSYM_END
+                set this.spec.cell_vertical_alignment: 0x62
+        }
+        else if index = 97
+            set this.spec.border_priority: ic.lval
+        else if index = 98
+        {
+            if ic.lval > 1
+                set this.spec.line_double: true
+            else
+                set this.spec.line_double: false
+        }
+        else if index = 99
+        {
+            if ic.lval > 1
+                set this.spec.span: true
+            else
+                set this.spec.span: false
+        }
+        else if index = 103
+        {
+            if ic.lval > 1
+                set this.spec.widow_orphan_control: this.spec.widow_orphan_control | RTF_WIDOW_CONTROL
+            else
+                set this.spec.widow_orphan_control: this.spec.widow_orphan_control & RTF_ORPHAN_CONTROL
+        }
+        else if index = 104
+        {
+            if ic.lval > 1
+                set this.spec.widow_orphan_control: this.spec.widow_orphan_control | RTF_ORPHAN_CONTROL
+            else
+                set this.spec.widow_orphan_control: this.spec.widow_orphan_control & RTF_WIDOW_CONTROL
+        }
+        else if index = 132
+            set this.spec.language: this.letter2_of(ic)
+        else if index = 133
+            set this.spec.country: this.letter2_of(ic)
+        else if index = 134
+            set this.spec.expand_tabs: ic.lval
+        else if index = 135
+        {
+            let nn ic.lval
+            if nn > 0
+            {
+                var takes false
+                if this.max_consec_hyphens = 0
+                    set takes: true
+                if nn < this.max_consec_hyphens
+                    set takes: true
+                if takes
+                    set this.max_consec_hyphens: nn
+            }
+        }
+        else if index = 155
+        {
+            if ic.obj <> null
+                set this.spec.color: this.make_color(ic.obj.color_rgb())
+        }
+        else if index = 156
+        {
+            if ic.obj = null
+                set this.spec.background_color: 0
+            else
+                set this.spec.background_color: this.make_color(ic.obj.color_rgb())
+        }
+        else if index = 159
+        {
+            ; setMinLeading: hasLength = the non-#f arm (bval marks #f)
+            if ic.bval
+                set this.spec.line_spacing_at_least: false
+            else
+                set this.spec.line_spacing_at_least: true
+        }
+        else if index = 164
+            this.set_glyph_subst_table(ic.gst)
+    }
+
+    function letter2_of(this: pointer[RtfFOTBuilder], ic: pointer[InheritedC]) returns int
+    {
+        if ic.bval
+            return 0
+        if ic.sval.get_size() < (2 as size_t)
+            return 0
+        let c0 ic.sval.get(0 as size_t) as int
+        let c1 ic.sval.get(1 as size_t) as int
+        (c0 << 8) | c1
+    }
+
+    function set_font_family_name(this: pointer[RtfFOTBuilder], name: StringC)
+    {
+        let existing this.font_lookup(name)
+        if existing >= 0
+        {
+            set this.spec.font_family: existing
+            return
+        }
+        let host this.host
+        let idx this.ffcs.get_length() as int
+        set this.spec.font_family: idx
+        this.font_insert(name, idx)
+        let row RtfFontCharsets.make(host)
+        this.ffcs.add(row)
+    }
+
+    ; setGlyphSubstTable: detect the small-caps signature (a..z mapped to
+    ; suffix + 0375<<8 under ISO/IEC 10036/RA//Glyphs)
+    function set_glyph_subst_table(this: pointer[RtfFOTBuilder], tabs: pointer[Array[pointer[GlyphSubstTableRec]]])
+    {
+        set this.spec.is_small_caps: false
+        if tabs = null
+            return
+        let n tabs.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let tp tabs.get(i)
+            if tp <> null
+            {
+                let t *tp
+                let pairs t.get_pairs()
+                let np pairs.get_length()
+                var j: size_t 0
+                while (j + (1 as size_t)) < np
+                {
+                    let op pairs.get(j)
+                    let vp pairs.get(j + (1 as size_t))
+                    var hit false
+                    if op <> null
+                    {
+                        if vp <> null
+                        {
+                            let o *op
+                            let v *vp
+                            let osuf o.glyph_suffix()
+                            let vsuf v.glyph_suffix()
+                            if osuf + (0xFD << 8) = vsuf
+                            {
+                                if osuf >= 0x61
+                                {
+                                    if osuf <= 0x7A
+                                    {
+                                        let opub o.glyph_pubid()
+                                        let vpub v.glyph_pubid()
+                                        if opub.equals(vpub)
+                                        {
+                                            if opub.equals(StringC("ISO/IEC 10036/RA//Glyphs"))
+                                                set hit: true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if hit
+                    {
+                        set this.spec.is_small_caps: true
+                        return
+                    }
+                    set j: j + (2 as size_t)
+                }
+            }
+            set i: i + (1 as size_t)
+        }
+    }
+
+    ; the 12-entry extension characteristic table (jade.cxx)
+    function set_extension_ic(this: pointer[RtfFOTBuilder], ext: int, ic: pointer[InheritedC])
+    {
+        if ext = RTF_EXT_PAGE_NUMBER_FORMAT
+        {
+            if this.in_simple_page_sequence = 0
+            {
+                set this.page.page_number_format: RTF_PGN_DEC
+                if ic.sval.get_size() = (1 as size_t)
+                {
+                    let c ic.sval.get(0 as size_t)
+                    if c = (0x41 as u32)
+                        set this.page.page_number_format: RTF_PGN_UCLTR
+                    else if c = (0x61 as u32)
+                        set this.page.page_number_format: RTF_PGN_LCLTR
+                    else if c = (0x49 as u32)
+                        set this.page.page_number_format: RTF_PGN_UCRM
+                    else if c = (0x69 as u32)
+                        set this.page.page_number_format: RTF_PGN_LCRM
+                }
+            }
+        }
+        else if ext = RTF_EXT_PAGE_NUMBER_RESTART
+        {
+            if this.in_simple_page_sequence = 0
+                set this.page.page_number_restart: ic.bval
+        }
+        else if ext = RTF_EXT_PAGE_N_COLUMNS
+        {
+            if this.in_simple_page_sequence = 0
+            {
+                if ic.lval > 0
+                    set this.page.n_columns: ic.lval
+                else
+                    set this.page.n_columns: 1
+            }
+        }
+        else if ext = RTF_EXT_PAGE_COLUMN_SEP
+        {
+            if this.in_simple_page_sequence = 0
+            {
+                if ic.lval >= 0
+                    set this.page.column_sep: ic.lval
+                else
+                    set this.page.column_sep: 0
+            }
+        }
+        else if ext = RTF_EXT_PAGE_BALANCE_COLUMNS
+        {
+            if this.in_simple_page_sequence = 0
+                set this.page.balance: ic.bval
+        }
+        else if ext = RTF_EXT_SUBSCRIPT_DEPTH
+            set this.spec.subscript_depth: this.points_of(ic.lval)
+        else if ext = RTF_EXT_OVER_MARK_HEIGHT
+            set this.spec.over_mark_height: this.points_of(ic.lval)
+        else if ext = RTF_EXT_UNDER_MARK_DEPTH
+            set this.spec.under_mark_depth: this.points_of(ic.lval)
+        else if ext = RTF_EXT_SUPERSCRIPT_HEIGHT
+            set this.spec.superscript_height: this.points_of(ic.lval)
+        else if ext = RTF_EXT_GRID_ROW_SEP
+            set this.spec.grid_row_sep: this.points_of(ic.lval)
+        else if ext = RTF_EXT_GRID_COLUMN_SEP
+            set this.spec.grid_column_sep: this.points_of(ic.lval)
+        else if ext = RTF_EXT_HEADING_LEVEL
+        {
+            if (ic.lval >= 1) and (ic.lval <= 9)
+                set this.spec.heading_level: ic.lval
+            else
+                set this.spec.heading_level: 0
+        }
+    }
+
+    ; --- start/end/atomic (the FOTBuilder bracket) ----------------------------
+    function fo_start(this: pointer[RtfFOTBuilder])
+    {
+        set this.n_pending_non_empty: this.pending_len
+        this.push_spec()
+        if this.in_simple_page_sequence = 0
+            this.push_page()
+    }
+
+    function fo_end(this: pointer[RtfFOTBuilder])
+    {
+        this.pop_spec()
+        if this.in_simple_page_sequence = 0
+            this.pop_page()
+    }
+
+    function fo_atomic(this: pointer[RtfFOTBuilder])
+    {
+        set this.n_pending_non_empty: this.pending_len
+        let slotp this.spec_stack.get((this.spec_depth - 1) as size_t)
+        if slotp <> null
+            RtfFOTBuilder.copy_format(&this.spec, *slotp)
+    }
+
+    ; --- bookmarks / pending elements ----------------------------------------
+    function elements_refed_add(this: pointer[RtfFOTBuilder], grove_index: int, n: int)
+    {
+        let host this.host
+        while this.elements_refed.get_length() <= (grove_index as size_t)
+            this.elements_refed.add(Array[bool]^host())
+        let rowp this.elements_refed.get(grove_index as size_t)
+        if rowp <> null
+        {
+            let row *rowp
+            while row.get_length() <= (n as size_t)
+                row.add(false)
+            row.put(n as size_t, true)
+        }
+    }
+
+    function elements_refed_contains(this: pointer[RtfFOTBuilder], grove_index: int, n: int) returns bool
+    {
+        if (grove_index as size_t) >= this.elements_refed.get_length()
+            return false
+        let rowp this.elements_refed.get(grove_index as size_t)
+        if rowp = null
+            return false
+        let row *rowp
+        if (n as size_t) >= row.get_length()
+            return false
+        let p row.get(n as size_t)
+        if p = null
+            return false
+        *p
+    }
+
+    ; outputBookmarkName(groveIndex, chars): "ID[g]_" + alnum verbatim,
+    ; everything else "_<code>_"
+    function output_bookmark_name_id(this: pointer[RtfFOTBuilder], grove_index: int, id: StringC)
+    {
+        this.raw("ID")
+        if grove_index <> 0
+            this.raw_int(grove_index)
+        this.put_c(0x5F)
+        let n id.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            let c id.get(i)
+            var ok false
+            if c >= (0x30 as u32)
+            {
+                if c <= (0x39 as u32)
+                    set ok: true
+            }
+            if c >= (0x61 as u32)
+            {
+                if c <= (0x7A as u32)
+                    set ok: true
+            }
+            if c >= (0x41 as u32)
+            {
+                if c <= (0x5A as u32)
+                    set ok: true
+            }
+            if ok
+                this.put((c & (0xFF as u32)) as u8)
+            else
+            {
+                this.put_c(0x5F)
+                this.raw_uint(c as int)
+                this.put_c(0x5F)
+            }
+            set i: i + (1 as size_t)
+        }
+    }
+
+    ; outputBookmarkName(groveIndex, elementIndex): "_" [g "_"] n  (word97)
+    function output_bookmark_name_index(this: pointer[RtfFOTBuilder], grove_index: int, n: int)
+    {
+        this.raw("_")
+        if grove_index <> 0
+        {
+            this.raw_int(grove_index)
+            this.put_c(0x5F)
+        }
+        this.raw_int(n)
+    }
+
+    function flush_pending_elements(this: pointer[RtfFOTBuilder])
+    {
+        var i 0
+        while i < this.pending_len
+        {
+            let np this.pending_elements.get(i as size_t)
+            if np <> null
+            {
+                let node *np
+                let id node.get_id()
+                if id.get_size() > (0 as size_t)
+                {
+                    this.raw("{\\*\\bkmkstart ")
+                    this.output_bookmark_name_id(0, id)
+                    this.put_c(0x7D)
+                    this.raw("{\\*\\bkmkend ")
+                    this.output_bookmark_name_id(0, id)
+                    this.put_c(0x7D)
+                }
+                else
+                {
+                    let ei node.element_index
+                    if ei >= 0
+                    {
+                        ; INSERTION_CHAR 'b' groveIndex elementIndex — patched
+                        ; in finish() against elements_refed
+                        this.put(0 as u8)
+                        this.put_c(0x62)
+                        this.output_word(0)
+                        this.output_word(ei)
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        set this.n_pending_non_empty: 0
+        set this.pending_len: 0
+    }
+
+    function flush_fields(this: pointer[RtfFOTBuilder])
+    {
+        if this.suppress_bookmarks = false
+            this.flush_pending_elements()
+        if this.have_pending_link
+        {
+            set this.have_pending_link: false
+            this.do_start_link(this.pending_link)
+        }
+    }
+
+    function start_node(this: pointer[RtfFOTBuilder], node: pointer[GroveNode], mode_name: StringC)
+    {
+        set this.node_level: this.node_level + 1
+        if mode_name.get_size() = (0 as size_t)
+        {
+            let d this.pending_len as size_t
+            if d < this.pending_elements.get_length()
+            {
+                this.pending_elements.put(d, node)
+                this.pending_levels.put(d, this.node_level)
+            }
+            else
+            {
+                this.pending_elements.add(node)
+                this.pending_levels.add(this.node_level)
+            }
+            set this.pending_len: this.pending_len + 1
+        }
+    }
+
+    function end_node(this: pointer[RtfFOTBuilder])
+    {
+        if this.pending_len > 0
+        {
+            let lp this.pending_levels.get((this.pending_len - 1) as size_t)
+            if lp <> null
+            {
+                if *lp = this.node_level
+                {
+                    if this.n_pending_non_empty < this.pending_len
+                        set this.pending_len: this.pending_len - 1
+                }
+            }
+        }
+        set this.node_level: this.node_level - 1
+    }
+
+    ; --- paragraph machinery --------------------------------------------------
+    function new_par(this: pointer[RtfFOTBuilder], allow_space_before: bool)
+    {
+        if this.box_first_para
+        {
+            set this.box_first_para: false
+            set this.box_left_sep: this.para.left_indent
+            set this.box_right_sep: this.para.right_indent
+            var i 1
+            while i < this.dbl_len
+            {
+                let lp this.display_box_levels.get(i as size_t)
+                if lp <> null
+                {
+                    let f this.spec_at(*lp)
+                    if f <> null
+                    {
+                        set this.box_left_sep: this.box_left_sep + f.left_indent
+                        set this.box_right_sep: this.box_right_sep + f.right_indent
+                    }
+                }
+                set i: i + 1
+            }
+            set this.box_top_sep: this.accum_space
+            set this.accum_space: this.accum_space_box
+            set this.accum_space_box: 0
+        }
+        if this.inline_state <> RTF_INLINE_FIRST
+        {
+            if allow_space_before = false
+            {
+                this.cw_int("\\sa", this.accum_space)
+                set this.accum_space: 0
+            }
+            if this.keep
+            {
+                if this.had_par_in_keep or this.continue_par
+                    set this.keep_with_next: true
+                set this.had_par_in_keep: true
+            }
+            if this.do_break = RTF_BREAK_NONE
+            {
+                if this.keep_with_next
+                    this.raw("\\keepn")
+            }
+            set this.keep_with_next: false
+            if this.hyphenate_suppressed
+            {
+                this.raw("\\hyphpar0")
+                set this.hyphenate_suppressed: false
+            }
+            this.raw("\\par")
+        }
+        if this.do_break = RTF_BREAK_PAGE
+        {
+            this.raw("\\page")
+            set this.do_break: RTF_BREAK_NONE
+        }
+        else if this.do_break = RTF_BREAK_COLUMN
+        {
+            this.raw("\\column")
+            set this.do_break: RTF_BREAK_NONE
+        }
+        if this.current_cols > 1
+        {
+            if this.span_display_levels <> 0
+            {
+                this.raw("\\sect\\sbknone\\cols1")
+                set this.current_cols: 1
+            }
+        }
+        else
+        {
+            var enter_cols false
+            if this.span_display_levels = 0
+            {
+                if this.current_cols = 1
+                {
+                    if this.page.n_columns > 1
+                        set enter_cols: true
+                }
+            }
+            if enter_cols
+            {
+                if this.inline_state <> RTF_INLINE_FIRST
+                    this.raw("\\sect\\sbknone")
+                this.cw_int("\\cols", this.page.n_columns)
+                this.cw_int("\\colsx", this.page.column_sep)
+                set this.current_cols: this.page.n_columns
+            }
+        }
+        this.raw("\\pard")
+        if this.table_level <> 0
+            this.raw("\\intbl")
+        if this.accum_space <> 0
+        {
+            this.cw_int("\\sb", this.accum_space)
+            set this.accum_space: 0
+        }
+        if this.keep
+            this.raw("\\keep")
+        if this.para.widow_orphan_control = 0
+            this.raw("\\nowidctlpar")
+        if this.para.heading_level <> 0
+            this.cw_int("\\s", this.para.heading_level)
+        if this.dbl_len > 0
+        {
+            var box_fmt: pointer[RtfFormat] null
+            let bl0 this.display_box_levels.get(0 as size_t)
+            if bl0 <> null
+                set box_fmt: this.spec_at(*bl0)
+            if box_fmt <> null
+            {
+                ; the four \brdr<t l b r> sides (the reference iterates "tlbr")
+                var side 0
+                while side < 4
+                {
+                    this.raw("\\brdr")
+                    if side = 0
+                        this.put_c(0x74)
+                    else if side = 1
+                        this.put_c(0x6C)
+                    else if side = 2
+                        this.put_c(0x62)
+                    else
+                        this.put_c(0x72)
+                    if box_fmt.line_thickness > 75
+                    {
+                        this.raw("\\brdrth\\brdrw")
+                        this.raw_int(box_fmt.line_thickness / 2)
+                    }
+                    else
+                    {
+                        if box_fmt.line_double
+                            this.raw("\\brdrdb")
+                        else
+                            this.raw("\\brdrs")
+                        this.cw_int("\\brdrw", box_fmt.line_thickness)
+                    }
+                    var sep 0
+                    if side = 0
+                        set sep: this.box_top_sep
+                    else if side = 1
+                        set sep: this.box_left_sep
+                    else if side = 3
+                        set sep: this.box_right_sep
+                    this.cw_int("\\brsp", sep)
+                    if box_fmt.color <> 0
+                        this.cw_int("\\brdrcf", box_fmt.color)
+                    let li this.box_left_sep + box_fmt.left_indent + this.add_left_indent
+                    if li <> 0
+                        this.cw_int("\\li", li)
+                    let ri this.box_right_sep + box_fmt.right_indent + this.add_right_indent
+                    if ri <> 0
+                        this.cw_int("\\ri", ri)
+                    set side: side + 1
+                }
+            }
+        }
+        else
+        {
+            var need_li false
+            if this.para.left_indent <> 0
+                set need_li: true
+            if this.add_left_indent <> 0
+                set need_li: true
+            if need_li
+                this.cw_int("\\li", this.para.left_indent + this.add_left_indent)
+            var need_ri false
+            if this.para.right_indent <> 0
+                set need_ri: true
+            if this.add_right_indent <> 0
+                set need_ri: true
+            if need_ri
+                this.cw_int("\\ri", this.para.right_indent + this.add_right_indent)
+        }
+    }
+
+    ; must be called before any inline flow object
+    function inline_prepare(this: pointer[RtfFOTBuilder])
+    {
+        set this.follow_whitespace_char: false
+        var mid false
+        if this.inline_state = RTF_INLINE_MIDDLE
+            set mid: true
+        if this.inline_state = RTF_INLINE_FIELD
+            set mid: true
+        if this.inline_state = RTF_INLINE_FIELD_END
+            set mid: true
+        if mid
+        {
+            this.flush_fields()
+            return
+        }
+        this.new_par(true)
+        if this.para.line_spacing_at_least
+            this.cw_int("\\sl", this.para.line_spacing)
+        else
+            this.cw_int("\\sl", 0 - this.para.line_spacing)
+        var fli 0
+        if this.continue_par = false
+            set fli: this.para.first_line_indent
+        if fli <> 0
+            this.cw_int("\\fi", fli)
+        if this.para.quadding <> 0x6C
+        {
+            this.raw("\\q")
+            this.put(this.para.quadding as u8)
+        }
+        set this.inline_state: RTF_INLINE_MIDDLE
+        this.put_c(0x20)
+        this.flush_fields()
+    }
+
+    ; --- displayed flow objects ------------------------------------------------
+    function start_display(this: pointer[RtfFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        if this.span_display_levels <> 0
+            set this.span_display_levels: this.span_display_levels + 1
+        else
+        {
+            var spans false
+            if this.spec.span
+            {
+                if this.page.n_columns > 1
+                {
+                    if this.table_level = 0
+                        set spans: true
+                }
+            }
+            if spans
+            {
+                set this.span_display_levels: 1
+                set this.display_size: this.page.page_width - this.page.left_margin - this.page.right_margin
+                this.display_size_changed()
+            }
+        }
+        var space_before 0
+        var keep_with_previous false
+        var keep_sym 0
+        var break_before 0
+        var break_after 0
+        var space_after 0
+        var keep_with_next false
+        if nic <> null
+        {
+            set space_before: this.compute_length_spec(nic.space_before.nominal)
+            set keep_with_previous: nic.keep_with_previous
+            set keep_sym: nic.keep.code
+            set break_before: nic.break_before.code
+            set break_after: nic.break_after.code
+            set space_after: this.compute_length_spec(nic.space_after.nominal)
+            set keep_with_next: nic.keep_with_next
+        }
+        if space_before > this.accum_space
+            set this.accum_space: space_before
+        if keep_with_previous
+            set this.keep_with_next: true
+        if this.inline_state <> RTF_INLINE_FIRST
+        {
+            if this.inline_state <> RTF_INLINE_TABLE
+                set this.inline_state: RTF_INLINE_START
+        }
+        set this.continue_par: false
+        var bb_page false
+        if break_before = RSYM_PAGE
+            set bb_page: true
+        if break_before = RSYM_PAGE_REGION
+            set bb_page: true
+        if break_before = RSYM_COLUMN_SET
+            set bb_page: true
+        if bb_page
+            set this.do_break: RTF_BREAK_PAGE
+        else if break_before = RSYM_COLUMN
+        {
+            if this.do_break <> RTF_BREAK_PAGE
+                set this.do_break: RTF_BREAK_COLUMN
+        }
+        let info this.push_display()
+        set info.space_after: space_after
+        set info.keep_with_next: keep_with_next
+        set info.save_keep: this.keep
+        var keeps false
+        if keep_sym = RSYM_TRUE
+            set keeps: true
+        if keep_sym = RSYM_PAGE
+            set keeps: true
+        if keep_sym = RSYM_COLUMN_SET
+            set keeps: true
+        if keep_sym = RSYM_COLUMN
+            set keeps: true
+        if keeps
+        {
+            if this.keep = false
+            {
+                set this.had_par_in_keep: false
+                set this.keep: true
+            }
+        }
+        var ba_page false
+        if break_after = RSYM_PAGE
+            set ba_page: true
+        if break_after = RSYM_PAGE_REGION
+            set ba_page: true
+        if break_after = RSYM_COLUMN_SET
+            set ba_page: true
+        if ba_page
+            set info.break_after: RTF_BREAK_PAGE
+        else if break_after = RSYM_COLUMN
+            set info.break_after: RTF_BREAK_COLUMN
+        else
+            set info.break_after: RTF_BREAK_NONE
+    }
+
+    function end_display(this: pointer[RtfFOTBuilder])
+    {
+        let info this.display_back()
+        if info <> null
+        {
+            set this.do_break: info.break_after
+            set this.keep: info.save_keep
+            if this.inline_state <> RTF_INLINE_TABLE
+            {
+                if this.inline_state <> RTF_INLINE_FIRST
+                    set this.inline_state: RTF_INLINE_START
+                set this.continue_par: true
+            }
+            if info.space_after > this.accum_space
+                set this.accum_space: info.space_after
+            if info.keep_with_next
+                set this.keep_with_next: true
+        }
+        set this.display_depth: this.display_depth - 1
+        if this.span_display_levels <> 0
+        {
+            set this.span_display_levels: this.span_display_levels - 1
+            if this.span_display_levels = 0
+            {
+                var ds this.page.page_width - this.page.left_margin - this.page.right_margin
+                set ds: ds - (this.page.column_sep * (this.page.n_columns - 1))
+                set ds: ds / this.page.n_columns
+                set this.display_size: ds
+                this.display_size_changed()
+            }
+        }
+    }
+
+    function start_paragraph(this: pointer[RtfFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        this.start_display(nic)
+        this.fo_start()
+        this.push_para()
+        RtfFOTBuilder.para_from_spec(&this.para, &this.spec)
+    }
+
+    function end_paragraph(this: pointer[RtfFOTBuilder])
+    {
+        this.pop_para()
+        this.end_display_group()
+    }
+
+    function paragraph_break(this: pointer[RtfFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        if this.para_depth > 0
+        {
+            this.end_display()
+            this.start_display(nic)
+            RtfFOTBuilder.para_from_spec(&this.para, &this.spec)
+        }
+        this.fo_atomic()
+    }
+
+    function start_display_group(this: pointer[RtfFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        this.start_display(nic)
+        this.fo_start()
+    }
+
+    function end_display_group(this: pointer[RtfFOTBuilder])
+    {
+        this.fo_end()
+        this.end_display()
+    }
+
+    function start_sequence(this: pointer[RtfFOTBuilder])
+        this.fo_start()
+
+    function end_sequence(this: pointer[RtfFOTBuilder])
+        this.fo_end()
+
+    ; --- boxes ------------------------------------------------------------------
+    function start_box(this: pointer[RtfFOTBuilder], nic: pointer[BoxNICRec], dnic: pointer[DisplayNIC])
+    {
+        var is_display false
+        if nic <> null
+            set is_display: nic.is_display
+        if is_display
+        {
+            this.start_display(dnic)
+            if this.dbl_len = 0
+            {
+                set this.accum_space_box: this.accum_space
+                set this.accum_space: 0
+                set this.box_first_para: true
+            }
+            let d this.dbl_len as size_t
+            if d < this.display_box_levels.get_length()
+                this.display_box_levels.put(d, this.spec_depth)
+            else
+                this.display_box_levels.add(this.spec_depth)
+            set this.dbl_len: this.dbl_len + 1
+        }
+        else
+        {
+            if this.spec.box_has_background
+            {
+                if this.spec.background_color <> 0
+                    set this.spec.char_background_color: this.spec.background_color
+            }
+            if this.spec.box_has_border
+            {
+                if this.spec.char_border = false
+                {
+                    set this.spec.char_border: true
+                    set this.spec.char_border_color: this.spec.color
+                    set this.spec.char_border_thickness: this.spec.line_thickness
+                    set this.spec.char_border_double: this.spec.line_double
+                }
+            }
+            this.inline_prepare()
+        }
+        this.fo_start()
+    }
+
+    function end_box(this: pointer[RtfFOTBuilder])
+    {
+        var ending_display_box false
+        if this.dbl_len > 0
+        {
+            let lp this.display_box_levels.get((this.dbl_len - 1) as size_t)
+            if lp <> null
+            {
+                if (*lp) + 1 = this.spec_depth
+                    set ending_display_box: true
+            }
+        }
+        if ending_display_box
+        {
+            if this.dbl_len = 1
+            {
+                if this.box_first_para
+                {
+                    set this.box_first_para: false
+                    set this.box_left_sep: 0
+                    set this.box_right_sep: 0
+                    set this.box_top_sep: 0
+                    var box_height this.accum_space
+                    if box_height <= 0
+                        set box_height: 1
+                    set this.accum_space: this.accum_space_box
+                    this.new_par(true)
+                    this.raw("\\sl-")
+                    this.raw_uint(box_height)
+                }
+                else if this.accum_space <> 0
+                {
+                    let extra this.accum_space
+                    set this.accum_space: 0
+                    set this.keep_with_next: true
+                    this.new_par(true)
+                    this.raw("\\sl-")
+                    this.raw_uint(extra)
+                }
+                else
+                    set this.accum_space: 0
+                set this.dbl_len: this.dbl_len - 1
+                this.raw("\\keepn\\par\\pard\\sl-1")
+                if this.table_level <> 0
+                    this.raw("\\intbl")
+            }
+            else
+                set this.dbl_len: this.dbl_len - 1
+            this.fo_end()
+            this.end_display()
+        }
+        else
+            this.fo_end()
+    }
+
+    ; --- line fields -------------------------------------------------------------
+    function start_line_field(this: pointer[RtfFOTBuilder])
+    {
+        this.fo_start()
+        var opens false
+        if this.inline_state = RTF_INLINE_START
+            set opens: true
+        if this.inline_state = RTF_INLINE_FIRST
+            set opens: true
+        if opens
+        {
+            set this.field_tab_pos: this.spec.field_width + this.para.left_indent
+            if this.continue_par = false
+                set this.field_tab_pos: this.field_tab_pos + this.para.first_line_indent
+            this.inline_prepare()
+            set this.inline_state: RTF_INLINE_FIELD
+            if this.spec.field_align = RSYM_END
+            {
+                set this.cur_stream: RTF_ST_FIELD
+                set this.inline_state: RTF_INLINE_FIELD_END
+            }
+            else if this.spec.field_align = RSYM_CENTER
+            {
+                var sep this.spec.field_width / 2
+                if sep < 26
+                    set sep: 26
+                this.raw("\\tqc\\tx")
+                this.raw_int(this.field_tab_pos - sep)
+                this.cw_int("\\tx", this.field_tab_pos)
+                this.raw("\\tab ")
+            }
+            else
+            {
+                this.cw_int("\\tx", this.field_tab_pos)
+                this.put_c(0x20)
+            }
+        }
+    }
+
+    function end_line_field(this: pointer[RtfFOTBuilder])
+    {
+        if this.inline_state = RTF_INLINE_FIELD_END
+        {
+            ; extract the captured field, strip trailing spaces, place the
+            ; right tab (the reference sets osp_ back to the MAIN stream
+            ; unconditionally — mirrored)
+            let host this.host
+            let captured this.fieldos
+            set this.fieldos: Array[u8]^host()
+            set this.cur_stream: RTF_ST_MAIN
+            var len captured.get_length()
+            var stripped 0
+            while len > (0 as size_t)
+            {
+                let bp captured.get(len - (1 as size_t))
+                var is_space false
+                if bp <> null
+                {
+                    if *bp = (0x20 as u8)
+                        set is_space: true
+                }
+                if is_space = false
+                    break
+                set len: len - (1 as size_t)
+                set stripped: stripped + 1
+            }
+            ; each stripped space is assumed .25 em
+            var sep stripped * this.out_fmt.font_size * 5 / 2
+            if sep < 26
+                set sep: 26
+            this.raw("\\tqr\\tx")
+            this.raw_int(this.field_tab_pos - sep)
+            this.cw_int("\\tx", this.field_tab_pos)
+            this.raw("\\tab ")
+            var i: size_t 0
+            while i < len
+            {
+                let bp2 captured.get(i)
+                if bp2 <> null
+                    this.put(*bp2)
+                set i: i + (1 as size_t)
+            }
+            this.raw("\\tab ")
+        }
+        else if this.inline_state = RTF_INLINE_FIELD
+        {
+            this.raw("\\tab ")
+            set this.inline_state: RTF_INLINE_MIDDLE
+        }
+        this.fo_end()
+    }
+
+    ; --- leaders -------------------------------------------------------------------
+    function start_leader(this: pointer[RtfFOTBuilder], nic: pointer[LeaderNICRec])
+    {
+        this.fo_start()
+        this.inline_prepare()
+        this.sync_char_format()
+        if this.leader_depth = 0
+        {
+            RtfFOTBuilder.copy_output_fmt(&this.leader_save_out_fmt, &this.out_fmt)
+            set this.pre_leader_stream: this.cur_stream
+            set this.pre_leader_discard: this.discard
+            set this.discard: true
+        }
+        set this.leader_depth: this.leader_depth + 1
+    }
+
+    function end_leader(this: pointer[RtfFOTBuilder])
+    {
+        set this.leader_depth: this.leader_depth - 1
+        if this.leader_depth = 0
+        {
+            RtfFOTBuilder.copy_output_fmt(&this.out_fmt, &this.leader_save_out_fmt)
+            set this.cur_stream: this.pre_leader_stream
+            set this.discard: this.pre_leader_discard
+            this.raw("\\tqr\\tldot\\tx")
+            this.raw_int(this.display_size - this.para.right_indent)
+            this.raw("\\tab ")
+        }
+        this.fo_end()
+    }
+
+    ; --- links -----------------------------------------------------------------------
+    function start_link(this: pointer[RtfFOTBuilder], nic: pointer[LinkNICRec])
+    {
+        this.fo_start()
+        if this.link_depth = 0
+        {
+            if this.inline_state = RTF_INLINE_MIDDLE
+                this.do_start_link(nic)
+            else
+            {
+                set this.pending_link: nic
+                set this.have_pending_link: true
+            }
+        }
+        set this.link_depth: this.link_depth + 1
+    }
+
+    function do_start_link(this: pointer[RtfFOTBuilder], nic: pointer[LinkNICRec])
+    {
+        var handled false
+        if nic <> null
+        {
+            if nic.addr_type = 1
+            {
+                let node nic.node as pointer[GroveNode]
+                if node <> null
+                {
+                    let id node.get_id()
+                    if id.get_size() > (0 as size_t)
+                    {
+                        this.raw("{\\field")
+                        this.raw("{\\*\\fldinst   ")
+                        this.raw("HYPERLINK  \\\\l ")
+                        this.output_bookmark_name_id(0, id)
+                        this.raw("}{\\fldrslt")
+                        this.put_c(0x20)
+                        set handled: true
+                    }
+                    else
+                    {
+                        let ei node.element_index
+                        if ei >= 0
+                        {
+                            this.raw("{\\field")
+                            this.raw("{\\*\\fldinst   ")
+                            this.raw("HYPERLINK  \\\\l ")
+                            this.output_bookmark_name_index(0, ei)
+                            this.put_c(0x20)
+                            this.raw("}{\\fldrslt ")
+                            this.elements_refed_add(0, ei)
+                            set handled: true
+                        }
+                    }
+                }
+            }
+        }
+        if handled = false
+            this.raw("{{")
+        RtfFOTBuilder.copy_output_fmt(&this.save_out_fmt, &this.out_fmt)
+    }
+
+    function end_link(this: pointer[RtfFOTBuilder])
+    {
+        set this.link_depth: this.link_depth - 1
+        if this.link_depth = 0
+        {
+            if this.have_pending_link
+                set this.have_pending_link: false
+            else
+            {
+                this.raw("}}")
+                RtfFOTBuilder.copy_output_fmt(&this.out_fmt, &this.save_out_fmt)
+            }
+        }
+        this.fo_end()
+    }
+
+    ; --- score ------------------------------------------------------------------------
+    function start_score(this: pointer[RtfFOTBuilder], nic: pointer[ScoreNICRec])
+    {
+        if nic <> null
+        {
+            if nic.kind = 3
+            {
+                if nic.sym.code = RSYM_AFTER
+                {
+                    if this.spec.line_double
+                        set this.spec.underline: RTF_UL_DOUBLE
+                    else if this.spec.score_spaces = false
+                        set this.spec.underline: RTF_UL_WORDS
+                    else
+                        set this.spec.underline: RTF_UL_SINGLE
+                }
+                else if nic.sym.code = RSYM_THROUGH
+                    set this.spec.is_strikethrough: true
+            }
+        }
+        this.fo_start()
+    }
+
+    function end_score(this: pointer[RtfFOTBuilder])
+        this.fo_end()
+
+    ; --- rule ---------------------------------------------------------------------------
+    function rule(this: pointer[RtfFOTBuilder], nic: pointer[RuleNICRec], dnic: pointer[DisplayNIC])
+    {
+        var orientation RSYM_HORIZONTAL
+        if nic <> null
+            set orientation: nic.orientation.code
+        if orientation = RSYM_HORIZONTAL
+        {
+            var line_offset 0
+            var line_length 0 - 1
+            var has_explicit false
+            if nic <> null
+            {
+                if nic.has_length
+                {
+                    set line_length: this.compute_length_spec(nic.length)
+                    if line_length >= 0
+                        set has_explicit: true
+                }
+            }
+            if has_explicit
+            {
+                if this.spec.display_alignment = 0x63
+                    set line_offset: (this.display_size + this.spec.left_indent - this.spec.right_indent - line_length) / 2
+                else if this.spec.display_alignment = 0x72
+                    set line_offset: this.display_size - this.spec.right_indent - line_length
+                else
+                    set line_offset: this.spec.left_indent
+            }
+            else
+            {
+                set line_offset: this.spec.left_indent
+                set line_length: this.display_size - this.spec.left_indent - this.spec.right_indent
+            }
+            this.start_display(dnic)
+            this.new_par(false)
+            this.raw("\\sl-1{\\*\\do\\dobxcolumn\\dobypara\\dodhgt0\\dpline\\dpptx0\\dppty0")
+            this.cw_int("\\dpptx", line_length)
+            this.raw("\\dppty0")
+            this.cw_int("\\dpx", line_offset)
+            this.raw("\\dpy0")
+            this.cw_int("\\dpxsize", line_length)
+            this.raw("\\dpysize0")
+            if this.spec.color <> 0
+            {
+                let cp this.color_table.get((this.spec.color - 1) as size_t)
+                if cp <> null
+                {
+                    let n *cp
+                    this.cw_int("\\dplinecor", (n >> 16) & 0xFF)
+                    this.cw_int("\\dplinecog", (n >> 8) & 0xFF)
+                    this.cw_int("\\dplinecob", n & 0xFF)
+                }
+            }
+            this.cw_int("\\dplinew", this.spec.line_thickness)
+            this.raw("}")
+            this.end_display()
+        }
+        else if orientation = RSYM_VERTICAL
+        {
+            this.start_display(dnic)
+            this.new_par(true)
+            if nic <> null
+            {
+                if nic.has_length
+                {
+                    let line_length this.compute_length_spec(nic.length)
+                    if line_length > 0
+                    {
+                        this.raw("\\sl-")
+                        this.raw_uint(line_length)
+                    }
+                }
+            }
+            this.end_display()
+        }
+        else
+            this.inline_prepare()
+        this.fo_atomic()
+    }
+
+    ; --- external graphic ------------------------------------------------------------------
+    function external_graphic(this: pointer[RtfFOTBuilder], nic: pointer[GraphicNICRec], dnic: pointer[DisplayNIC])
+    {
+        var is_display false
+        if nic <> null
+            set is_display: nic.is_display
+        if is_display
+        {
+            this.start_display(dnic)
+            this.new_par(true)
+            if this.spec.display_alignment <> 0x6C
+            {
+                this.raw("\\q")
+                this.put(this.spec.display_alignment as u8)
+            }
+            this.flush_fields()
+        }
+        else
+            this.inline_prepare()
+        this.include_picture(nic)
+        if is_display
+            this.end_display()
+        this.fo_atomic()
+    }
+
+    ; includePicture: the OSFILE storage id becomes an INCLUDEPICTURE field.
+    ; (Design-note deviation: the reference round-trips the system id through
+    ; the entity manager — for the corpus the id IS the OSFILE spec id; a
+    ; missing file's "cannot open" stderr is not reproduced here.)
+    function include_picture(this: pointer[RtfFOTBuilder], nic: pointer[GraphicNICRec])
+    {
+        if nic = null
+            return
+        var sysid nic.entity_system_id
+        if sysid.get_size() = (0 as size_t)
+        {
+            this.interp.message1(InterpreterMessages.systemIdNotFilename(), sysid)
+            return
+        }
+        ; strip a leading <OSFILE> storage-spec prefix
+        if sysid.get_size() > (8 as size_t)
+        {
+            let prefix sysid.substr(0 as size_t, 8 as size_t)
+            if prefix.equals(StringC("<OSFILE>"))
+                set sysid: sysid.substr(8 as size_t, sysid.get_size() - (8 as size_t))
+        }
+        this.raw("{\\field\\flddirty{\\*\\fldinst INCLUDEPICTURE \"")
+        let n sysid.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            let c sysid.get(i)
+            if c = (0x5C as u32)
+                this.raw("\\\\\\\\")
+            else
+                this.put((c & (0xFF as u32)) as u8)
+            set i: i + (1 as size_t)
+        }
+        this.raw("\" }{\\fldrslt }}")
+    }
+
+    ; --- page numbers -----------------------------------------------------------------------
+    function page_number(this: pointer[RtfFOTBuilder])
+    {
+        this.inline_prepare()
+        this.sync_char_format()
+        this.raw("\\chpgn ")
+    }
+
+    function current_node_page_number(this: pointer[RtfFOTBuilder], node: pointer[GroveNode])
+    {
+        this.inline_prepare()
+        this.sync_char_format()
+        if node = null
+            return
+        let id node.get_id()
+        if id.get_size() > (0 as size_t)
+        {
+            this.raw("{\\field\\flddirty{\\*\\fldinst PAGEREF ")
+            this.output_bookmark_name_id(0, id)
+            this.raw("}{\\fldrslt 000}}")
+        }
+        else
+        {
+            let ei node.element_index
+            if ei >= 0
+            {
+                this.raw("{\\field\\flddirty{\\*\\fldinst PAGEREF ")
+                this.output_bookmark_name_index(0, ei)
+                this.elements_refed_add(0, ei)
+                this.raw("}{\\fldrslt 000}}")
+            }
+        }
+    }
+
+    ; --- simple page sequence + header/footer ---------------------------------
+    ; ProcessContext protocol: start_simple_page_sequence, then per page type
+    ; i (0..3) and HF sosofo j (0..5) the part content processes against the
+    ; sink followed by end_simple_page_sequence_header_footer(i | j*4), then
+    ; end_all_..., the content, end_simple_page_sequence. The reference
+    ; brackets each part with startSimplePageSequenceHeaderFooter /
+    ; endSimplePageSequenceHeaderFooter(k); the fused equivalent arms the HF
+    ; capture after the serial body and re-arms after each extraction.
+    function arm_hf_capture(this: pointer[RtfFOTBuilder])
+    {
+        set this.inline_state: RTF_INLINE_MIDDLE
+        RtfFOTBuilder.output_fmt_defaults(&this.out_fmt)
+        set this.cur_stream: RTF_ST_HF
+    }
+
+    function start_simple_page_sequence(this: pointer[RtfFOTBuilder])
+    {
+        set this.in_simple_page_sequence: this.in_simple_page_sequence + 1
+        this.fo_start()
+        if this.do_balance
+        {
+            this.raw("\\sect\\sbknone")
+            set this.do_balance: false
+        }
+        if this.had_section
+            this.raw("\\sect")
+        else
+            set this.had_section: true
+        if this.page.header_margin < RTF_HF_PRE_SPACE
+            set this.page.header_margin: RTF_HF_PRE_SPACE
+        if this.page.footer_margin < RTF_HF_POST_SPACE
+            set this.page.footer_margin: RTF_HF_POST_SPACE
+        ; Word 97 gets confused by top/bottom margins less than 12pt
+        if this.page.top_margin < 240
+            set this.page.top_margin: 240
+        if this.page.bottom_margin < 240
+            set this.page.bottom_margin: 240
+        this.raw("\\sectd\\plain")
+        if this.page.page_width > this.page.page_height
+            this.raw("\\lndscpsxn")
+        this.cw_int("\\pgwsxn", this.page.page_width)
+        this.cw_int("\\pghsxn", this.page.page_height)
+        this.cw_int("\\marglsxn", this.page.left_margin)
+        this.cw_int("\\margrsxn", this.page.right_margin)
+        this.cw_int("\\margtsxn", this.page.top_margin)
+        this.cw_int("\\margbsxn", this.page.bottom_margin)
+        this.raw("\\headery0\\footery0\\pgn")
+        this.emit_pgn_name(this.page.page_number_format)
+        if this.page.page_number_restart
+            this.raw("\\pgnrestart")
+        set this.display_size: this.page.page_width - this.page.left_margin - this.page.right_margin
+        set this.current_cols: 1
+        if this.page.n_columns > 1
+        {
+            set this.display_size: this.display_size - (this.page.column_sep * (this.page.n_columns - 1))
+            set this.display_size: this.display_size / this.page.n_columns
+        }
+        if this.page.balance
+            set this.do_balance: true
+        this.display_size_changed()
+        RtfFOTBuilder.output_fmt_defaults(&this.out_fmt)
+        set this.do_break: RTF_BREAK_NONE
+        set this.suppress_bookmarks: true
+        set this.accum_space: 0
+        ; save the output format once; the reference start/end HF brackets
+        ; round-trip it per part
+        RtfFOTBuilder.copy_output_fmt(&this.save_out_fmt, &this.out_fmt)
+        this.arm_hf_capture()
+    }
+
+    function emit_pgn_name(this: pointer[RtfFOTBuilder], fmt: int)
+    {
+        if fmt = RTF_PGN_UCLTR
+            this.raw("ucltr")
+        else if fmt = RTF_PGN_LCLTR
+            this.raw("lcltr")
+        else if fmt = RTF_PGN_UCRM
+            this.raw("ucrm")
+        else if fmt = RTF_PGN_LCRM
+            this.raw("lcrm")
+        else
+            this.raw("dec")
+    }
+
+    function end_simple_page_sequence_header_footer(this: pointer[RtfFOTBuilder], flags: int)
+    {
+        RtfFOTBuilder.copy_output_fmt(&this.out_fmt, &this.save_out_fmt)
+        let host this.host
+        let captured this.hfos
+        set this.hfos: Array[u8]^host()
+        set this.cur_stream: RTF_ST_MAIN
+        this.hf_parts.put(flags as size_t, captured)
+        this.arm_hf_capture()
+    }
+
+    function hf_equal(this: pointer[RtfFOTBuilder], a: int, b: int) returns bool
+    {
+        let ap this.hf_parts.get(a as size_t)
+        let bp this.hf_parts.get(b as size_t)
+        if ap = null
+            return bp = null
+        if bp = null
+            return false
+        let av *ap
+        let bv *bp
+        let n av.get_length()
+        if n <> bv.get_length()
+            return false
+        var i: size_t 0
+        while i < n
+        {
+            let x av.get(i)
+            let y bv.get(i)
+            if x <> null
+            {
+                if y <> null
+                {
+                    if *x <> *y
+                        return false
+                }
+            }
+            set i: i + (1 as size_t)
+        }
+        true
+    }
+
+    function end_all_simple_page_sequence_header_footer(this: pointer[RtfFOTBuilder])
+    {
+        ; undo the last arm
+        set this.cur_stream: RTF_ST_MAIN
+        RtfFOTBuilder.copy_output_fmt(&this.out_fmt, &this.save_out_fmt)
+        ; firstHF=1 frontHF=2 headerHF=4 centerHF=8 rightHF=16; nHF=24
+        var title_page false
+        var i 0
+        while i < 24
+        {
+            if this.hf_equal(i | 2 | 1, i | 2) = false
+                set title_page: true
+            if this.hf_equal(i | 1, i) = false
+                set title_page: true
+            if title_page
+                break
+            set i: i + 4
+        }
+        if title_page
+        {
+            this.raw("\\titlepg")
+            this.output_header_footer("f", 2 | 1)
+        }
+        this.output_header_footer("l", 0)
+        this.output_header_footer("r", 2)
+        var k 0
+        while k < 24
+        {
+            let host this.host
+            this.hf_parts.put(k as size_t, Array[u8]^host())
+            set k: k + 1
+        }
+        set this.inline_state: RTF_INLINE_FIRST
+        set this.continue_par: false
+        set this.suppress_bookmarks: false
+    }
+
+    function emit_hf_part(this: pointer[RtfFOTBuilder], k: int)
+    {
+        let pp this.hf_parts.get(k as size_t)
+        if pp = null
+            return
+        let part *pp
+        let n part.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let bp part.get(i)
+            if bp <> null
+                this.put(*bp)
+            set i: i + (1 as size_t)
+        }
+    }
+
+    ; headerHF=4, footerHF=0; leftHF=0, centerHF=8, rightHF=16
+    function output_header_footer(this: pointer[RtfFOTBuilder], suffix: pointer[const_char], flags: int)
+    {
+        let hspan this.page.page_width - this.page.left_margin - this.page.right_margin
+        this.raw("{\\header")
+        this.raw(suffix)
+        this.raw("\\pard\\sl")
+        this.raw_int(0 - (RTF_HF_PRE_SPACE + RTF_HF_POST_SPACE))
+        this.cw_int("\\sb", this.page.header_margin - RTF_HF_PRE_SPACE)
+        this.cw_int("\\sa", this.page.top_margin - RTF_HF_POST_SPACE - this.page.header_margin)
+        this.raw("\\plain\\tqc\\tx")
+        this.raw_int(hspan / 2)
+        this.cw_int("\\tqr\\tx", hspan)
+        this.put_c(0x20)
+        this.put_c(0x7B)
+        this.emit_hf_part(flags | 4)
+        this.put_c(0x7D)
+        this.raw("\\tab ")
+        this.put_c(0x7B)
+        this.emit_hf_part(flags | 4 | 8)
+        this.put_c(0x7D)
+        this.raw("\\tab ")
+        this.put_c(0x7B)
+        this.emit_hf_part(flags | 4 | 16)
+        this.put_c(0x7D)
+        this.raw("\\par}")
+        this.raw("{\\footer")
+        this.raw(suffix)
+        this.raw("\\pard\\sl")
+        this.raw_int(0 - (RTF_HF_PRE_SPACE + RTF_HF_POST_SPACE))
+        this.cw_int("\\sb", this.page.bottom_margin - RTF_HF_PRE_SPACE - this.page.footer_margin)
+        this.cw_int("\\sa", this.page.footer_margin - RTF_HF_POST_SPACE)
+        this.raw("\\plain\\tqc\\tx")
+        this.raw_int(hspan / 2)
+        this.cw_int("\\tqr\\tx", hspan)
+        this.put_c(0x20)
+        this.put_c(0x7B)
+        this.emit_hf_part(flags)
+        this.put_c(0x7D)
+        this.raw("\\tab ")
+        this.put_c(0x7B)
+        this.emit_hf_part(flags | 8)
+        this.put_c(0x7D)
+        this.raw("\\tab ")
+        this.put_c(0x7B)
+        this.emit_hf_part(flags | 16)
+        this.put_c(0x7D)
+        this.raw("\\par}")
+    }
+
+    function end_simple_page_sequence(this: pointer[RtfFOTBuilder])
+    {
+        if this.inline_state <> RTF_INLINE_FIRST
+        {
+            if this.hyphenate_suppressed
+            {
+                this.raw("\\hyphpar0")
+                set this.hyphenate_suppressed: false
+            }
+            this.raw("\\par")
+        }
+        set this.inline_state: RTF_INLINE_FIRST
+        set this.continue_par: false
+        this.fo_end()
+        set this.in_simple_page_sequence: this.in_simple_page_sequence - 1
+        if this.in_simple_page_sequence = 0
+            this.page_from_back()
+        set this.do_break: RTF_BREAK_NONE
+    }
+
+    ; --- tables ------------------------------------------------------------------
+    function start_table(this: pointer[RtfFOTBuilder], tnic: pointer[TableNICRec], dnic: pointer[DisplayNIC])
+    {
+        this.start_display(dnic)
+        this.fo_start()
+        if this.table_level <> 0
+        {
+            set this.table_level: this.table_level + 1
+            this.interp.message0(InterpreterMessages.nestedTable())
+            return
+        }
+        set this.table_level: 1
+        var explicit_width false
+        if tnic <> null
+        {
+            if tnic.width_type = 2
+                set explicit_width: true
+        }
+        if explicit_width
+            set this.table_width: this.compute_length_spec(tnic.width)
+        else
+            set this.table_width: this.display_size - this.spec.left_indent - this.spec.right_indent
+        set this.table_display_size: this.display_size
+        set this.table_left_indent: this.spec.left_indent
+        set this.table_right_indent: this.spec.right_indent
+        set this.table_alignment: this.spec.display_alignment
+        if this.table_alignment = 0x72
+        {
+            if this.table_right_indent <> 0
+            {
+                set this.table_alignment: 0x6C
+                set this.table_left_indent: this.table_display_size - this.table_width - this.table_right_indent
+            }
+        }
+        else if this.table_alignment = 0x63
+        {
+            var off_center false
+            if this.table_left_indent <> 0
+                set off_center: true
+            if this.table_right_indent <> 0
+                set off_center: true
+            if off_center
+            {
+                set this.table_alignment: 0x6C
+                set this.table_left_indent: (this.table_display_size - this.table_width + this.table_left_indent - this.table_right_indent) / 2
+            }
+        }
+    }
+
+    function end_table(this: pointer[RtfFOTBuilder])
+    {
+        set this.table_level: this.table_level - 1
+        if this.table_level = 0
+        {
+            if this.rows.get_length() > (0 as size_t)
+                this.output_table()
+            if this.inline_state = RTF_INLINE_TABLE
+            {
+                RtfFOTBuilder.output_fmt_defaults(&this.out_fmt)
+                this.raw("\\pard\\plain\\sl-1")
+                set this.inline_state: RTF_INLINE_START
+            }
+            set this.display_size: this.table_display_size
+        }
+        this.fo_end()
+        this.end_display()
+    }
+
+    function start_table_part_serial(this: pointer[RtfFOTBuilder], dnic: pointer[DisplayNIC])
+    {
+        this.start_display(dnic)
+        this.fo_start()
+    }
+
+    function end_table_part_serial(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level = 1
+        {
+            if this.rows.get_length() > (0 as size_t)
+            {
+                this.output_table()
+                set this.n_header_rows: 0
+            }
+        }
+        this.fo_end()
+        this.end_display()
+    }
+
+    function start_table_part_header(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level = 1
+            set this.in_table_header: true
+    }
+
+    function end_table_part_header(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level = 1
+            set this.in_table_header: false
+    }
+
+    function start_table_part_footer(this: pointer[RtfFOTBuilder])
+    {
+    }
+
+    function end_table_part_footer(this: pointer[RtfFOTBuilder])
+    {
+    }
+
+    function ensure_columns(this: pointer[RtfFOTBuilder], n: int)
+    {
+        let host this.host
+        while this.columns.get_length() < (n as size_t)
+            this.columns.add(RtfColumn.make(host))
+    }
+
+    function table_column(this: pointer[RtfFOTBuilder], nic: pointer[TableColumnNICRec])
+    {
+        if this.table_level = 1
+        {
+            if nic.n_columns_spanned = 1
+            {
+                this.ensure_columns(nic.column_index + 1)
+                let cp this.columns.get(nic.column_index as size_t)
+                if cp <> null
+                {
+                    let col *cp
+                    set col.has_width: nic.has_width
+                    if nic.has_width
+                    {
+                        set col.width: nic.width
+                        set col.tfactor: nic.width_tfactor
+                    }
+                }
+            }
+        }
+        this.fo_atomic()
+    }
+
+    function current_row(this: pointer[RtfFOTBuilder]) returns pointer[Array[pointer[RtfCell]]]
+    {
+        let rp this.rows.get(this.rows.get_length() - (1 as size_t))
+        if rp = null
+            return null
+        *rp
+    }
+
+    function row_cell(this: pointer[RtfFOTBuilder], row: pointer[Array[pointer[RtfCell]]], j: int) returns pointer[RtfCell]
+    {
+        let cp row.get(j as size_t)
+        if cp = null
+            return null
+        *cp
+    }
+
+    function ensure_row_cells(this: pointer[RtfFOTBuilder], row: pointer[Array[pointer[RtfCell]]], n: int)
+    {
+        let host this.host
+        while row.get_length() < (n as size_t)
+            row.add(RtfCell.make(host))
+    }
+
+    function start_table_row(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level <> 1
+        {
+            this.fo_start()
+            return
+        }
+        if this.inline_state = RTF_INLINE_START
+        {
+            if this.accum_space <> 0
+                this.cw_int("\\sa", this.accum_space)
+            if this.keep_with_next
+                this.raw("\\keepn")
+            this.raw("\\par")
+        }
+        set this.keep_with_next: false
+        set this.accum_space: 0
+        let host this.host
+        this.rows.add(Array[pointer[RtfCell]]^host())
+        this.fo_start()
+    }
+
+    function end_table_row(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level <> 1
+        {
+            this.fo_end()
+            return
+        }
+        if this.in_table_header
+        {
+            ; move the just-finished row up to the header block
+            let n this.rows.get_length()
+            let hp this.rows.get(n - (1 as size_t))
+            if hp <> null
+            {
+                let header_row *hp
+                var i (n as int) - 1
+                while i > this.n_header_rows
+                {
+                    let pp this.rows.get((i - 1) as size_t)
+                    if pp <> null
+                        this.rows.put(i as size_t, *pp)
+                    set i: i - 1
+                }
+                this.rows.put(this.n_header_rows as size_t, header_row)
+                set this.n_header_rows: this.n_header_rows + 1
+            }
+        }
+        this.fo_end()
+        set this.inline_state: RTF_INLINE_TABLE
+    }
+
+    function start_table_cell(this: pointer[RtfFOTBuilder], nic: pointer[TableCellNICRec])
+    {
+        if this.table_level <> 1
+        {
+            this.fo_start()
+            return
+        }
+        let row this.current_row()
+        if row = null
+        {
+            this.fo_start()
+            return
+        }
+        this.ensure_row_cells(row, nic.column_index + 1)
+        set this.cell_index: nic.column_index
+        let cell this.row_cell(row, this.cell_index)
+        if cell <> null
+        {
+            if nic.missing
+                set cell.present: false
+            else
+                set cell.present: true
+            set cell.span: nic.n_columns_spanned
+            set cell.vspan: nic.n_rows_spanned
+            set cell.has_background: this.spec.cell_background
+            if this.spec.cell_background
+                set cell.background_color: this.spec.background_color
+            set cell.valign: this.spec.cell_vertical_alignment
+        }
+        ; guess the display size for the cell content
+        var has_width true
+        var new_display_size 0
+        set this.display_size: this.table_display_size
+        var i this.cell_index
+        while i < (this.cell_index + nic.n_columns_spanned)
+        {
+            var col: pointer[RtfColumn] null
+            if (i as size_t) < this.columns.get_length()
+            {
+                let cp2 this.columns.get(i as size_t)
+                if cp2 <> null
+                    set col: *cp2
+            }
+            var this_has false
+            if col <> null
+                set this_has: col.has_width
+            if this_has = false
+            {
+                set has_width: false
+                break
+            }
+            set new_display_size: new_display_size + this.compute_length_spec(col.width)
+            set i: i + 1
+        }
+        if has_width = false
+        {
+            var ncols this.columns.get_length() as int
+            if ncols = 0
+                set ncols: 2
+            set new_display_size: (this.table_width * nic.n_columns_spanned) / ncols
+        }
+        set this.cur_stream: RTF_ST_CELL
+        set this.inline_state: RTF_INLINE_FIRST
+        set this.continue_par: false
+        set this.add_left_indent: this.spec.cell_left_margin
+        set this.add_right_indent: this.spec.cell_right_margin
+        set this.accum_space: this.spec.cell_top_margin
+        set this.display_size: new_display_size
+        this.display_size_changed()
+        this.fo_start()
+        this.raw("\\plain ")
+        RtfFOTBuilder.output_fmt_defaults(&this.out_fmt)
+    }
+
+    function end_table_cell(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level <> 1
+        {
+            this.fo_end()
+            return
+        }
+        set this.accum_space: this.accum_space + this.spec.cell_bottom_margin
+        if this.accum_space > 0
+        {
+            if this.inline_state = RTF_INLINE_FIRST
+            {
+                this.raw("\\pard\\intbl\\sl-")
+                this.raw_uint(this.accum_space)
+                this.raw("\\par")
+            }
+            else
+                this.cw_int("\\sa", this.accum_space)
+        }
+        else
+        {
+            if this.inline_state = RTF_INLINE_FIRST
+                this.raw("\\intbl")
+        }
+        set this.accum_space: 0
+        ; extract the captured cell content
+        let host this.host
+        let captured this.cellos
+        set this.cellos: Array[u8]^host()
+        let row this.current_row()
+        if row <> null
+        {
+            let cell this.row_cell(row, this.cell_index)
+            if cell <> null
+                set cell.content: captured
+        }
+        this.fo_end()
+        set this.cur_stream: RTF_ST_MAIN
+        set this.accum_space: 0
+        set this.add_left_indent: 0
+        set this.add_right_indent: 0
+        set this.keep_with_next: false
+    }
+
+    ; --- table borders ----------------------------------------------------------
+    function store_border(this: pointer[RtfFOTBuilder], b: pointer[RtfBorder])
+    {
+        set b.flags: 0
+        if this.spec.border_present
+        {
+            set b.flags: RTF_BORDER_PRESENT
+            set b.thickness: this.spec.line_thickness
+            set b.color: this.spec.color
+            if this.spec.line_double
+                set b.flags: b.flags | RTF_BORDER_DOUBLE
+        }
+        if this.spec.border_omit_at_break
+            set b.flags: b.flags | RTF_BORDER_OMIT
+        set b.priority: this.spec.border_priority
+        this.fo_atomic()
+    }
+
+    function table_before_row_border(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level = 1
+        {
+            let tb0 this.table_border_at(0)
+            this.store_border(tb0)
+        }
+    }
+
+    function table_after_row_border(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level = 1
+        {
+            let tb1 this.table_border_at(1)
+            this.store_border(tb1)
+        }
+    }
+
+    function table_before_column_border(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level = 1
+        {
+            let tb2 this.table_border_at(2)
+            this.store_border(tb2)
+        }
+    }
+
+    function table_after_column_border(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level = 1
+        {
+            let tb3 this.table_border_at(3)
+            this.store_border(tb3)
+        }
+    }
+
+    function cell_border_at(this: pointer[RtfFOTBuilder], cell: pointer[RtfCell], k: int) returns pointer[RtfBorder]
+        cell.border_at(k)
+
+    function table_border_at(this: pointer[RtfFOTBuilder], k: int) returns pointer[RtfBorder]
+    {
+        let p this.tborders.get(k as size_t)
+        if p = null
+            return null
+        *p
+    }
+
+    function table_cell_before_row_border(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level = 1
+            this.store_cell_border(0)
+    }
+
+    function table_cell_after_row_border(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level = 1
+            this.store_cell_border(1)
+    }
+
+    function table_cell_before_column_border(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level = 1
+            this.store_cell_border(2)
+    }
+
+    function table_cell_after_column_border(this: pointer[RtfFOTBuilder])
+    {
+        if this.table_level = 1
+            this.store_cell_border(3)
+    }
+
+    function store_cell_border(this: pointer[RtfFOTBuilder], k: int)
+    {
+        let row this.current_row()
+        if row = null
+            return
+        let cell this.row_cell(row, this.cell_index)
+        if cell = null
+            return
+        let cbk this.cell_border_at(cell, k)
+        this.store_border(cbk)
+    }
+
+    function border_assign(this: pointer[RtfFOTBuilder], dst: pointer[RtfBorder], src: pointer[RtfBorder])
+    {
+        set dst.priority: src.priority
+        set dst.flags: src.flags
+        set dst.thickness: src.thickness
+        set dst.color: src.color
+    }
+
+    function resolve_border(this: pointer[RtfFOTBuilder], b1: pointer[RtfBorder], b2: pointer[RtfBorder])
+    {
+        if b1.priority <> b2.priority
+        {
+            if b1.priority > b2.priority
+                this.border_assign(b2, b1)
+            else
+                this.border_assign(b1, b2)
+        }
+        else
+        {
+            ; bitwise XOR is the word operator (`^` is the lifetime sigil)
+            if ((b1.flags xor b2.flags) & RTF_BORDER_PRESENT) <> 0
+            {
+                if (b1.flags & RTF_BORDER_PRESENT) <> 0
+                    this.border_assign(b2, b1)
+                else
+                    this.border_assign(b1, b2)
+            }
+        }
+    }
+
+    function resolve_outside_border(this: pointer[RtfFOTBuilder], cell_border: pointer[RtfBorder], table_border: pointer[RtfBorder])
+    {
+        var wins false
+        if table_border.priority > cell_border.priority
+            set wins: true
+        if table_border.priority = cell_border.priority
+        {
+            if (table_border.flags & RTF_BORDER_PRESENT) <> 0
+                set wins: true
+        }
+        if wins
+            this.border_assign(cell_border, table_border)
+    }
+
+    function output_table_border(this: pointer[RtfFOTBuilder], b: pointer[RtfBorder])
+    {
+        if b.thickness > 75
+        {
+            this.raw("\\brdrth\\brdrw")
+            this.raw_int(b.thickness / 2)
+        }
+        else if (b.flags & RTF_BORDER_DOUBLE) <> 0
+            this.cw_int("\\brdrdb\\brdrw", b.thickness)
+        else
+            this.cw_int("\\brdrs\\brdrw", b.thickness)
+        if b.color <> 0
+            this.cw_int("\\brdrcf", b.color)
+    }
+
+    ; outputTable (RtfFOTBuilder.cxx 2740-2906)
+    function output_table(this: pointer[RtfFOTBuilder])
+    {
+        let host this.host
+        let n_rows this.rows.get_length()
+        ; ensure columns_ spans every row (the trailing cell is a dummy)
+        var i: size_t 0
+        while i < n_rows
+        {
+            let rp this.rows.get(i)
+            if rp <> null
+            {
+                let row *rp
+                var last_is_dummy false
+                var j 0
+                while (j as size_t) < row.get_length()
+                {
+                    let cell this.row_cell(row, j)
+                    if cell = null
+                        break
+                    if cell.present
+                        set last_is_dummy: false
+                    else
+                        set last_is_dummy: true
+                    set j: j + cell.span
+                }
+                if last_is_dummy
+                    set j: j - 1
+                if (j as size_t) > this.columns.get_length()
+                    this.ensure_columns(j)
+            }
+            set i: i + (1 as size_t)
+        }
+        ; resize every row to the column count (the reference resize SHRINKS
+        ; rows carrying the trailing dummy cell and GROWS short rows,
+        ; replicating a trailing non-present cell)
+        let n_cols this.columns.get_length() as int
+        set i: 0
+        while i < n_rows
+        {
+            let rp2 this.rows.get(i)
+            if rp2 <> null
+            {
+                let row *rp2
+                let old_size row.get_length() as int
+                if old_size > n_cols
+                {
+                    ; truncate (Array cannot shrink — rebuild)
+                    let host2 this.host
+                    let fresh Array[pointer[RtfCell]]^host2()
+                    var t 0
+                    while t < n_cols
+                    {
+                        let cpt row.get(t as size_t)
+                        if cpt <> null
+                            fresh.add(*cpt)
+                        set t: t + 1
+                    }
+                    this.rows.put(i, fresh)
+                }
+                else if old_size < n_cols
+                {
+                    this.ensure_row_cells(row, n_cols)
+                    if old_size > 0
+                    {
+                        let last this.row_cell(row, old_size - 1)
+                        if last <> null
+                        {
+                            if last.present = false
+                            {
+                                var j2 old_size
+                                while j2 < n_cols
+                                {
+                                    let c2 this.row_cell(row, j2)
+                                    if c2 <> null
+                                        c2.assign_from(last)
+                                    set j2: j2 + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            set i: i + (1 as size_t)
+        }
+        ; vertical spanning: mark continuation cells, push the bottom border
+        set i: 0
+        while i < n_rows
+        {
+            let rp3 this.rows.get(i)
+            if rp3 <> null
+            {
+                let row *rp3
+                var j 0
+                while (j as size_t) < row.get_length()
+                {
+                    let cell this.row_cell(row, j)
+                    if cell = null
+                        break
+                    if cell.vspan > 1
+                    {
+                        if (i as int) + cell.vspan > (n_rows as int)
+                            set cell.vspan: (n_rows as int) - (i as int)
+                        var k 1
+                        while k < cell.vspan
+                        {
+                            let rpk this.rows.get(i + (k as size_t))
+                            var below: pointer[RtfCell] null
+                            if rpk <> null
+                                set below: this.row_cell(*rpk, j)
+                            if below <> null
+                            {
+                                if below.present
+                                {
+                                    set cell.vspan: k
+                                    break
+                                }
+                                set below.vspan: 0
+                                set below.present: true
+                                set below.span: cell.span
+                                let vb1 this.cell_border_at(below, 2)
+                                let vb2 this.cell_border_at(cell, 2)
+                                this.border_assign(vb1, vb2)
+                                let vb3 this.cell_border_at(below, 3)
+                                let vb4 this.cell_border_at(cell, 3)
+                                this.border_assign(vb3, vb4)
+                            }
+                            set k: k + 1
+                        }
+                        let rpl this.rows.get(i + ((cell.vspan - 1) as size_t))
+                        if rpl <> null
+                        {
+                            let bottom this.row_cell(*rpl, j)
+                            if bottom <> null
+                            {
+                                let vb5 this.cell_border_at(bottom, 1)
+                                let vb6 this.cell_border_at(cell, 1)
+                                this.border_assign(vb5, vb6)
+                            }
+                        }
+                        let cbb this.cell_border_at(cell, 1)
+                        set cbb.flags: 0
+                    }
+                    set j: j + cell.span
+                }
+            }
+            set i: i + (1 as size_t)
+        }
+        ; column widths
+        let widths Array[int]^host()
+        var wi 0
+        while wi < n_cols
+        {
+            widths.add(0)
+            set wi: wi + 1
+        }
+        var n_explicit 0
+        var total_explicit 0
+        var total_table_units 0.0
+        set this.display_size: this.table_display_size
+        var ci 0
+        while ci < n_cols
+        {
+            let cp this.columns.get(ci as size_t)
+            if cp <> null
+            {
+                let col *cp
+                if col.has_width
+                {
+                    let w this.compute_length_spec(col.width)
+                    widths.put(ci as size_t, w)
+                    set n_explicit: n_explicit + 1
+                    set total_explicit: total_explicit + w
+                    set total_table_units: total_table_units + col.tfactor
+                }
+            }
+            set ci: ci + 1
+        }
+        var table_unit_width 0.0
+        set total_table_units: total_table_units + ((n_cols - n_explicit) as double)
+        if total_table_units <> 0.0
+            set table_unit_width: ((this.table_width - total_explicit) as double) / total_table_units
+        set ci: 0
+        while ci < n_cols
+        {
+            let cp2 this.columns.get(ci as size_t)
+            if cp2 <> null
+            {
+                let col *cp2
+                if col.has_width = false
+                    widths.put(ci as size_t, table_unit_width as int)
+                else
+                {
+                    if col.tfactor > 0.0
+                    {
+                        let wp widths.get(ci as size_t)
+                        if wp <> null
+                            widths.put(ci as size_t, *wp + ((col.tfactor * table_unit_width) as int))
+                    }
+                }
+            }
+            set ci: ci + 1
+        }
+        ; outside borders on the first/last row
+        if n_rows > (0 as size_t)
+        {
+            let frp this.rows.get(0 as size_t)
+            if frp <> null
+            {
+                let frow *frp
+                var j3 0
+                while (j3 as size_t) < frow.get_length()
+                {
+                    let c3 this.row_cell(frow, j3)
+                    if c3 = null
+                        break
+                    let rb1 this.cell_border_at(c3, 0)
+                    let rb2 this.table_border_at(0)
+                    this.resolve_outside_border(rb1, rb2)
+                    set j3: j3 + c3.span
+                }
+            }
+            let lrp this.rows.get(n_rows - (1 as size_t))
+            if lrp <> null
+            {
+                let lrow *lrp
+                var j4 0
+                while (j4 as size_t) < lrow.get_length()
+                {
+                    let c4 this.row_cell(lrow, j4)
+                    if c4 = null
+                        break
+                    let rb3 this.cell_border_at(c4, 1)
+                    let rb4 this.table_border_at(1)
+                    this.resolve_outside_border(rb3, rb4)
+                    set j4: j4 + c4.span
+                }
+            }
+        }
+        ; per-row: resolve column borders, then adjacent-row borders, then emit
+        set i: 0
+        while i < n_rows
+        {
+            let rp4 this.rows.get(i)
+            if rp4 = null
+            {
+                set i: i + (1 as size_t)
+                continue
+            }
+            let row *rp4
+            if row.get_length() > (0 as size_t)
+            {
+                let first this.row_cell(row, 0)
+                if first <> null
+                {
+                    let rb5 this.cell_border_at(first, 2)
+                    let rb6 this.table_border_at(2)
+                    this.resolve_outside_border(rb5, rb6)
+                    var prev 0
+                    var j5 first.span
+                    while (j5 as size_t) < row.get_length()
+                    {
+                        let cj this.row_cell(row, j5)
+                        if cj = null
+                            break
+                        let cprev this.row_cell(row, prev)
+                        if cprev <> null
+                        {
+                            let rb7 this.cell_border_at(cprev, 3)
+                            let rb8 this.cell_border_at(cj, 2)
+                            this.resolve_border(rb7, rb8)
+                        }
+                        set prev: j5
+                        set j5: j5 + cj.span
+                    }
+                    if j5 = n_cols
+                    {
+                        let cprev2 this.row_cell(row, prev)
+                        if cprev2 <> null
+                        {
+                            let rb9 this.cell_border_at(cprev2, 3)
+                            let rb10 this.table_border_at(3)
+                            this.resolve_outside_border(rb9, rb10)
+                        }
+                    }
+                }
+            }
+            if (i + (1 as size_t)) < n_rows
+            {
+                let nrp this.rows.get(i + (1 as size_t))
+                if nrp <> null
+                {
+                    let nrow *nrp
+                    var j2b 0
+                    var j1 0
+                    while (j1 as size_t) < row.get_length()
+                    {
+                        let c1 this.row_cell(row, j1)
+                        if c1 = null
+                            break
+                        while j2b < j1
+                        {
+                            if (j2b as size_t) >= nrow.get_length()
+                                break
+                            let cb this.row_cell(nrow, j2b)
+                            if cb = null
+                                break
+                            set j2b: j2b + cb.span
+                        }
+                        if j1 = j2b
+                        {
+                            if (j2b as size_t) < nrow.get_length()
+                            {
+                                let cb2 this.row_cell(nrow, j2b)
+                                if cb2 <> null
+                                {
+                                    if c1.span = cb2.span
+                                    {
+                                        let rb11 this.cell_border_at(c1, 1)
+                                        let rb12 this.cell_border_at(cb2, 0)
+                                        this.resolve_border(rb11, rb12)
+                                    }
+                                }
+                            }
+                        }
+                        set j1: j1 + c1.span
+                    }
+                }
+            }
+            this.raw("\\trowd")
+            var trleft false
+            if this.table_alignment = 0x6C
+            {
+                if this.table_left_indent <> 0
+                    set trleft: true
+            }
+            if trleft
+                this.cw_int("\\trleft", this.table_left_indent)
+            else
+            {
+                this.raw("\\trq")
+                this.put(this.table_alignment as u8)
+            }
+            if this.keep
+                this.raw("\\trkeep")
+            if (i as int) < this.n_header_rows
+                this.raw("\\trhdr")
+            this.put_c(0x20)
+            var pos this.table_left_indent
+            var j6 0
+            while (j6 as size_t) < row.get_length()
+            {
+                let cell this.row_cell(row, j6)
+                if cell = null
+                    break
+                if cell.vspan = 0
+                    this.raw("\\clvmrg")
+                else
+                {
+                    if cell.vspan > 1
+                        this.raw("\\clvmgf")
+                    this.raw("\\clvertal")
+                    this.put(cell.valign as u8)
+                }
+                var k2 0
+                while k2 < 4
+                {
+                    let b this.cell_border_at(cell, k2)
+                    if (b.flags & RTF_BORDER_PRESENT) <> 0
+                    {
+                        this.raw("\\clbrdr")
+                        if k2 = 0
+                            this.put_c(0x74)
+                        else if k2 = 1
+                            this.put_c(0x62)
+                        else if k2 = 2
+                            this.put_c(0x6C)
+                        else
+                            this.put_c(0x72)
+                        this.output_table_border(b)
+                    }
+                    set k2: k2 + 1
+                }
+                if cell.has_background
+                {
+                    if cell.background_color <> 0
+                        this.cw_int("\\clshdng10000\\clcfpat", cell.background_color)
+                }
+                var k3 0
+                while k3 < cell.span
+                {
+                    let wp2 widths.get((j6 + k3) as size_t)
+                    if wp2 <> null
+                        set pos: pos + *wp2
+                    set k3: k3 + 1
+                }
+                this.cw_int("\\cellx", pos)
+                set j6: j6 + cell.span
+            }
+            this.put_c(0x20)
+            var j7 0
+            while (j7 as size_t) < row.get_length()
+            {
+                let cell2 this.row_cell(row, j7)
+                if cell2 = null
+                    break
+                var content_len: size_t 0
+                if cell2.content <> null
+                    set content_len: cell2.content.get_length()
+                if content_len = (0 as size_t)
+                {
+                    if j7 = 0
+                        this.raw("\\intbl")
+                }
+                else
+                {
+                    var bi: size_t 0
+                    while bi < content_len
+                    {
+                        let bp cell2.content.get(bi)
+                        if bp <> null
+                            this.put(*bp)
+                        set bi: bi + (1 as size_t)
+                    }
+                    if this.keep
+                        this.raw("\\keepn")
+                }
+                this.raw("\\cell ")
+                set j7: j7 + cell2.span
+            }
+            this.raw("\\row ")
+            set i: i + (1 as size_t)
+        }
+        set this.columns: Array[pointer[RtfColumn]]^host()
+        set this.rows: Array[pointer[Array[pointer[RtfCell]]]]^host()
+    }
+
+    ; --- finish: prolog + patched body ------------------------------------------
+    ; The reference destructor. Returns the complete RTF document as a byte
+    ; String for the CLI to write.
+    function finish(this: pointer[RtfFOTBuilder]) returns String
+    {
+        ; tail of the body (still the temp stream)
+        if this.do_balance
+        {
+            this.raw("\\sect\\sbknone\\par")
+            set this.do_balance: false
+        }
+        this.raw("}\n")
+        let host this.host
+        let body this.out
+        set this.out: Array[u8]^host()
+        set this.cur_stream: RTF_ST_MAIN
+        ; prolog
+        this.raw("{\\rtf1\\ansi\\deff0\n")
+        this.raw("{\\fonttbl")
+        ; fonttbl in HashTable iteration order (slot order)
+        let n_slots this.font_slots.get_length()
+        var si: size_t 0
+        while si < n_slots
+        {
+            let sp this.font_slots.get(si)
+            var e: pointer[RtfFontEntry] null
+            if sp <> null
+                set e: *sp
+            if e <> null
+            {
+                let rowp this.ffcs.get(e.value as size_t)
+                if rowp <> null
+                {
+                    let row *rowp
+                    var cs 0
+                    while cs < RTF_N_WIN_CHARSETS
+                    {
+                        let fn row.get_at(cs)
+                        if fn >= 0
+                        {
+                            this.raw("{\\f")
+                            this.raw_int(fn)
+                            this.raw("\\fnil\\fcharset")
+                            this.raw_int(*(RTF_WIN_CHARSET_CODES + cs))
+                            this.put_c(0x20)
+                            this.raw_stringc(e.key)
+                            this.emit_charset_suffix(cs)
+                            this.raw(";}\n")
+                        }
+                        set cs: cs + 1
+                    }
+                }
+            }
+            set si: si + (1 as size_t)
+        }
+        this.raw("}\n")
+        this.raw("{\\colortbl;")
+        let n_colors this.color_table.get_length()
+        var ki: size_t 0
+        while ki < n_colors
+        {
+            let cp this.color_table.get(ki)
+            if cp <> null
+            {
+                let n *cp
+                this.cw_int("\\red", (n >> 16) & 0xFF)
+                this.cw_int("\\green", (n >> 8) & 0xFF)
+                this.cw_int("\\blue", n & 0xFF)
+                this.put_c(0x3B)
+            }
+            set ki: ki + (1 as size_t)
+        }
+        this.raw("}{\\stylesheet")
+        this.raw("{\\s0 Normal;}")
+        var hi 1
+        while hi <= 9
+        {
+            this.raw("{\\s")
+            this.raw_int(hi)
+            this.raw(" Heading ")
+            this.raw_int(hi)
+            this.raw(";}")
+            set hi: hi + 1
+        }
+        this.raw("}\n")
+        if this.max_consec_hyphens > 0
+            this.cw_int("\\hyphconsec", this.max_consec_hyphens)
+        this.raw("\\deflang")
+        this.raw_int(RTF_DEFAULT_LANG)
+        this.raw("\\notabind\\facingp\\hyphauto1\\widowctrl\n")
+        ; body copy with INSERTION_CHAR patching
+        let blen body.get_length()
+        var bi2: size_t 0
+        while bi2 < blen
+        {
+            let bp2 body.get(bi2)
+            var b 0 as u8
+            if bp2 <> null
+                set b: *bp2
+            if b = (0 as u8)
+            {
+                ; kind byte + payload
+                set bi2: bi2 + (1 as size_t)
+                let kp body.get(bi2)
+                var kind 0 as u8
+                if kp <> null
+                    set kind: *kp
+                if kind = (0x62 as u8)
+                {
+                    var grovei 0
+                    var ei 0
+                    var w 0
+                    while w < 4
+                    {
+                        set bi2: bi2 + (1 as size_t)
+                        let wp3 body.get(bi2)
+                        if wp3 <> null
+                            set grovei: (grovei << 8) | ((*wp3) as int)
+                        set w: w + 1
+                    }
+                    set w: 0
+                    while w < 4
+                    {
+                        set bi2: bi2 + (1 as size_t)
+                        let wp4 body.get(bi2)
+                        if wp4 <> null
+                            set ei: (ei << 8) | ((*wp4) as int)
+                        set w: w + 1
+                    }
+                    if this.elements_refed_contains(grovei, ei)
+                    {
+                        this.raw("{\\*\\bkmkstart ")
+                        this.output_bookmark_name_index(grovei, ei)
+                        this.put_c(0x7D)
+                        this.raw("{\\*\\bkmkend ")
+                        this.output_bookmark_name_index(grovei, ei)
+                        this.put_c(0x7D)
+                    }
+                }
+            }
+            else
+                this.put(b)
+            set bi2: bi2 + (1 as size_t)
+        }
+        ; the assembled document
+        let result this.out
+        String(result.get_buffer() as pointer[const_char], result.get_length())
+    }
+}

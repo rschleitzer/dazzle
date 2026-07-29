@@ -278,3 +278,58 @@ eval scratch (they are popped inside the same bracket; inner→outer
 pointers only). The lazy-NIC resolve copy, its fresh VM and every
 converted NIC record live on the eval scratch too — their bytes reach the
 sink inside the same bracket.
+
+## RtfFOTBuilder (`-t rtf`) — design note (2026-07-29)
+
+Reference: `~/repos/dazzle/jade/RtfFOTBuilder.cxx` (4391 LOC; C# mirror
+`openjade-net/src/OpenJade/Jade/RtfFOTBuilder.cs`). Gate: dazzledoc
+`dazzle -t rtf -d print/docbook.dsl dsssl.xml` → 1039007 bytes, stderr
+empty, rc 0 (minted fresh from the reference binary; figures must be
+present in the workdir — includePicture stats them). The reference RTF
+uses only 75 distinct control words: NO borders, colors (colortbl empty),
+underline/strike/smallcaps, math, grids, boxes, scores, cell backgrounds
+or table headers (`\trhdr` absent — 27 trivial cells). Exercised: font +
+char-format deltas, paragraph machinery, line-fields with tab leaders
+(TOC), HYPERLINK/PAGEREF/INCLUDEPICTURE fields, bookmarks with
+insertion-patching, 4 sections with the header/footer machinery, heading
+styles, and the 12-entry EXTENSION characteristic table (page-number-
+format/-restart?/-n-columns/-column-sep/-balance-columns?, sub/superscript
++ mark depths/heights, grid seps, heading-level) — active under rtf,
+IgnoredC under fot (jade.cxx wires exts per backend).
+
+Decisions:
+- **Sink dispatch:** ProcessContext gains an `rtf_fotb` slot beside
+  `sgml_fotb`; the ~53 styled-sink call sites go through per-method
+  `sink_*` forwarders that branch once (fot vs rtf). The fot suites +
+  dsssl.fot oracle gate the refactor (must stay byte-identical).
+- **set_ic:** RtfFOTBuilder.set_ic dispatches on the STABLE registry
+  index (0..164, reference install order) to the semantic setter bodies
+  (specFormat_ field updates). Extension ICs: declare-characteristic on
+  the rtf path matches the 12 reference pubids and installs a typed IC
+  (bool/string/long/length conversions) carrying an ext-setter id;
+  set_ic routes it. fot keeps the IgnoredC fallback.
+- **unitsPerInch:** rtf runs the engine at 1440 (twips), per JadeApp.
+  Interpreter length-typed IC initial values were transcribed at 72000
+  — they become `upi*pt/72` computed (reference InheritedC.cxx shape:
+  `(unitsPerInch()*10)/72`); byte-identical at 72000.
+- **Capture:** the byte-level conn_target seam carries over to the rtf
+  sink; port/connection replay with a NON-EMPTY buffer hard-traps LOUD —
+  RTF output is delta-state (syncCharFormat) and first-use-numbered
+  (fonts/colors), so spliced bytes are unsound in general. The gate
+  corpus never routes content to non-principal ports (no thead). When a
+  real document does, the capture medium becomes a recorded-call queue
+  (SaveFOTBuilder port) — deferred, documented here.
+- **Two-stream architecture:** body accumulates in a temp buffer (the
+  reference TmpOutputByteStream block list collapses to one Array[u8] —
+  no output-observable blocking); finish() writes the prolog (fonttbl in
+  OpenSP HashTable ITERATION order — Torek hash h*33+c over Char, 8
+  slots initial, doubling at used>=size/2, DECREMENTING probe, slot-order
+  iteration, ported exactly — empty colortbl, stylesheet block) then
+  copies the body patching INSERTION_CHAR ('\0') escapes: 'b' + two
+  4-byte words = bookmark start/end pair emitted iff elementsRefed_
+  contains (grove,element). WIN32 OLE arm not ported (mac reference
+  binary has it compiled out).
+- **JIS/doublebyte:** initJIS ports with CharsetRegistry JIS0208 if
+  cheap at need; until a corpus doc contains CJK it is a LOUD stub
+  (charTable rows only affect CJK codepoints).
+- RBMM: all builder state on the sink's own page, per the S67 rule.
