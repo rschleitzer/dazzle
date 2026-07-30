@@ -76,8 +76,24 @@ run_case() { # name expected [expected_err] [document]
 # starts in the middle of, follow from a mid-chunk position, and descendants
 # order across the boundaries (including the reference's double `inner` — the
 # em element contributes its content AND its own character nodes follow).
+# props1 (props.sgml): the CLASS METADATA and the intrinsic node properties.
+# One report per node class — grove root, prolog PI, epilog PI, document
+# element, nested element, EMPTY element, CONREF element, an INCLUDED element,
+# a data-char node — of every property the four ported classes declare, with
+# null: and default: BOTH supplied so each line discriminates accessOK from
+# accessNull from accessNotInClass. It pins: the ClassDef tables
+# (children/data/data-sep-property-name, subnode- and all-property-names in
+# reference ORDER), that `rcs?: #t` switches every component-name result to the
+# short RCS spelling and that an RCS name resolves as a property name,
+# case-insensitive lookup, the three-way
+# origin-to-subnode-rel-property-name (content / document-element / prolog /
+# epilog) and the rsiblings that reads it, `content` being element-only and
+# accessOK-even-when-empty, gi/id/included?/must-omit-end-tag?, prolog/epilog,
+# the EMPTY children axis of the grove root (kids/desc/data) — and
+# select-by-class over both spellings of a class name.
 run_case axis1 "$HERE/axis1.expected"
 run_case chars1 "$HERE/chars1.expected"
 run_case chars2 "$HERE/chars2.expected"
+run_case props1 "$HERE/props1.expected" "" props.sgml
 
 echo "dazzle-grove: PASS"
