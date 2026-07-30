@@ -196,4 +196,136 @@ if [ "$rc13" -ne 1 ] || [ "$got13" != "$want13" ] || [ "$err13" != "$wanterr13" 
   exit 1
 fi
 
+# --- 14: the getopt clone surface (S85) -------------------------------------
+# Options.scaly wired into the CLI: clustered shorts, attached option args,
+# unique-prefix long names, `--`, the ?/-/= error renderings, -h/-v, -t
+# prefix matching + unknownType, empty -o, -d SYSID#ID selection, default
+# output type fot + <docbase>.fot naming. Every shape reference-verified
+# against the reference dazzle 2026-07-30 (probe battery).
+base14="$(cd "$HERE" && SCALY_HOME="$ROOT" "$OUT" -t sgml -d map.dsl doc.sgml 2>/dev/null)"
+for form in "-tsgml -d map.dsl doc.sgml" "-t s -d map.dsl doc.sgml" \
+            "-dmap.dsl -t sgml doc.sgml" "-t sgml -d map.dsl -- doc.sgml"; do
+  # shellcheck disable=SC2086
+  got14="$(cd "$HERE" && SCALY_HOME="$ROOT" "$OUT" $form 2>/dev/null)"
+  if [ "$got14" != "$base14" ]; then
+    echo "dazzle-cli: FAIL getopt form ($form)"
+    echo "  want: $(printf '%s' "$base14" | cat -v)"
+    echo "  got:  $(printf '%s' "$got14" | cat -v)"
+    exit 1
+  fi
+done
+
+check_err() { # name rc want-rc errfile expected-lines...
+  local name="$1" rc="$2" wantrc="$3" errf="$4"; shift 4
+  local err; err="$(sed "s|^$OUT|PROG|" "$errf")"
+  local want; want="$(printf '%s\n' "$@")"
+  if [ "$rc" -ne "$wantrc" ] || [ "$err" != "$want" ]; then
+    echo "dazzle-cli: FAIL $name (rc=$rc)"
+    echo "  want: $(printf '%s' "$want" | cat -v)"
+    echo "  err:  $(printf '%s' "$err" | cat -v)"
+    exit 1
+  fi
+}
+
+"$OUT" -Q 2>"$OUT.qerr" >/dev/null </dev/null; rc14=$?
+check_err "getopt invalid option" "$rc14" 1 "$OUT.qerr" \
+  'PROG:E: invalid option "Q"' \
+  'PROG:I: Try the "--help" option for more information.'
+
+"$OUT" --cat x 2>"$OUT.aerr" >/dev/null </dev/null; rc14=$?
+check_err "getopt ambiguous long" "$rc14" 1 "$OUT.aerr" \
+  'PROG:E: option "cat" is ambiguous' \
+  'PROG:I: Try the "--help" option for more information.'
+
+"$OUT" --version=x 2>"$OUT.eerr" >/dev/null </dev/null; rc14=$?
+check_err "getopt erroneous arg" "$rc14" 1 "$OUT.eerr" \
+  'PROG:E: option "version" doesn'"'"'t allow an argument' \
+  'PROG:I: Try the "--help" option for more information.'
+
+"$OUT" -d map.dsl -t 2>"$OUT.merr" >/dev/null </dev/null; rc14=$?
+check_err "getopt missing option arg" "$rc14" 1 "$OUT.merr" \
+  'PROG:E: invalid option "t"' \
+  'PROG:I: Try the "--help" option for more information.'
+
+got14="$("$OUT" --help </dev/null | sed "s|$OUT|PROG|")"
+rc14=$?
+want14="$(cat "$HERE/getopt-help.expected")"
+if [ "$rc14" -ne 0 ] || [ "$got14" != "$want14" ]; then
+  echo "dazzle-cli: FAIL getopt --help (rc=$rc14)"
+  diff <(printf '%s\n' "$want14") <(printf '%s\n' "$got14") | head -6
+  exit 1
+fi
+
+# -v: the openjade + OpenSP banners on stderr, the run continues.
+got14="$(cd "$HERE" && SCALY_HOME="$ROOT" "$OUT" -v -t sgml -d map.dsl doc.sgml 2>"$OUT.verr")"
+rc14=$?
+err14="$(sed "s|^$OUT|PROG|" "$OUT.verr")"
+wanterr14="$(printf '%s\n' 'PROG:I: "openjade" version "1.3.3-pre1"' 'PROG:I: "OpenSP" version "1.5.2"')"
+if [ "$rc14" -ne 0 ] || [ "$got14" != "$base14" ] || [ "$err14" != "$wanterr14" ]; then
+  echo "dazzle-cli: FAIL getopt -v (rc=$rc14)"
+  echo "  err:  $(printf '%s' "$err14" | cat -v)"
+  exit 1
+fi
+
+# file-creating shapes run in a scratch workdir: default type is fot with
+# <docbase>.fot naming; an unknown -t reports and falls back to the default;
+# an empty -o reports and the default name applies.
+W14="$(mktemp -d)"
+cp "$HERE/map.dsl" "$HERE/doc.sgml" "$W14/"
+( cd "$W14" && SCALY_HOME="$ROOT" "$OUT" -d map.dsl doc.sgml >/dev/null 2>defterr </dev/null; echo $? > rc )
+if [ "$(cat "$W14/rc")" -ne 0 ] || [ ! -s "$W14/doc.fot" ]; then
+  echo "dazzle-cli: FAIL getopt default type fot"
+  ls "$W14"; exit 1
+fi
+rm -f "$W14/doc.fot"
+( cd "$W14" && SCALY_HOME="$ROOT" "$OUT" -t bogus -d map.dsl doc.sgml >/dev/null 2>bogerr </dev/null; echo $? > rc )
+err14="$(sed "s|^$OUT|PROG|" "$W14/bogerr" | head -1)"
+if [ "$(cat "$W14/rc")" -ne 0 ] || [ ! -s "$W14/doc.fot" ] \
+   || [ "$err14" != 'PROG:E: unknown output type "bogus"' ]; then
+  echo "dazzle-cli: FAIL getopt unknown type (err: $err14)"
+  exit 1
+fi
+rm -f "$W14/doc.fot"
+( cd "$W14" && SCALY_HOME="$ROOT" "$OUT" -t fot -d map.dsl -o '' doc.sgml >/dev/null 2>emperr </dev/null; echo $? > rc )
+err14="$(sed "s|^$OUT|PROG|" "$W14/emperr" | head -1)"
+if [ "$(cat "$W14/rc")" -ne 0 ] || [ ! -s "$W14/doc.fot" ] \
+   || [ "$err14" != 'PROG:E: empty output filename' ]; then
+  echo "dazzle-cli: FAIL getopt empty -o (err: $err14)"
+  exit 1
+fi
+rm -rf "$W14"
+
+# -d SYSID#ID: selects the style-specification with that (upcased) ID; a
+# missing ID reports noStyleSpec and processes with no rules (rc 0).
+got14="$(cd "$HERE" && SCALY_HOME="$ROOT" "$OUT" -t sgml -d wrapped.dsl#main suite.sgml 2>/dev/null)"
+rc14=$?
+if [ "$rc14" -ne 0 ] || [ "$got14" != "$want3" ]; then
+  echo "dazzle-cli: FAIL getopt -d#ID (rc=$rc14, got: $got14)"
+  exit 1
+fi
+got14="$(cd "$HERE" && SCALY_HOME="$ROOT" "$OUT" -t sgml -d wrapped.dsl#nosuch suite.sgml 2>"$OUT.iderr")"
+rc14=$?
+err14="$(sed "s|^$OUT|PROG|" "$OUT.iderr")"
+if [ "$rc14" -ne 0 ] || [ "$got14" != "abc" ] \
+   || [ "$err14" != 'PROG:E: no style-specification or external-specification with ID "NOSUCH"' ]; then
+  echo "dazzle-cli: FAIL getopt -d#ID notfound (rc=$rc14, err: $err14)"
+  exit 1
+fi
+
+# a multi-file document merges into ONE entity (the last file names the
+# default output base — covered by the reference probes; here: same stdout).
+W14="$(mktemp -d)"
+cp "$HERE/map.dsl" "$W14/"
+head -c 60 "$HERE/doc.sgml" > "$W14/d1.part"
+tail -c +61 "$HERE/doc.sgml" > "$W14/d2.part"
+got14="$(cd "$W14" && SCALY_HOME="$ROOT" "$OUT" -t sgml -d map.dsl d1.part d2.part 2>/dev/null)"
+rc14=$?
+if [ "$rc14" -ne 0 ] || [ "$got14" != "$base14" ]; then
+  echo "dazzle-cli: FAIL getopt multi-file merge (rc=$rc14)"
+  echo "  want: $(printf '%s' "$base14" | cat -v)"
+  echo "  got:  $(printf '%s' "$got14" | cat -v)"
+  exit 1
+fi
+rm -rf "$W14"
+
 echo "dazzle-cli: PASS"
