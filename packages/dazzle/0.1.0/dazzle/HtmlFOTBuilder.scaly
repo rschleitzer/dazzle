@@ -1,0 +1,2125 @@
+; HtmlFOTBuilder — the `-t html` backend: CSS-classed HTML, one file per
+; `scroll` flow object plus one stylesheet. Ported from
+; ~/repos/dazzle/jade/HtmlFOTBuilder.cxx (C++ oracle, openjade 1.3.3-pre1,
+; built WITH -DJADE_HTML — the reference binary has it). No C# mirror.
+;
+; Shape: the builder does NOT stream. It buffers an ITEM TREE (containers,
+; blocks, pcdata, markup, anchors, refs, documents) while collecting every
+; distinct character/paragraph style in two OpenSP PointerTables, and emits
+; everything in finish() (the reference destructor): first the stylesheet
+; (`<base>.css`), then the tree — where only `Document` items open a file
+; (`<base>`, `<base>1`, `<base>2`, …); everything outside a scroll is written
+; to a DISCARD stream, exactly like the reference. A stylesheet without
+; `scroll` therefore produces the .css only.
+;
+; Style tables: `CharProps::hash`/`ParaProps::hash` are the constant 17 in the
+; reference, so the tables degenerate to one probe chain and the ITERATION
+; ORDER (slot order over the open-addressing vector, decrementing probe,
+; 8 slots doubling at used >= size/2) decides the CSS rule order. Ported
+; exactly (same machinery as the RTF fonttbl). Class names come from the GI
+; stack; a prefix carrying more than one character or paragraph class gets the
+; construction-time index appended.
+;
+; Everything the builder does not override inherits FOTBuilder/SerialFOTBuilder
+; behaviour, which for the sink surface means the start()/end() flow-object
+; bracket over `flowObjectStack_` (and atomic() = "reset next from top") —
+; ported here as fo_start/fo_end/fo_atomic and wired per FotSink method
+; exactly as the reference base classes do.
+;
+; RBMM: items, styles and buffers live on the builder's page (the run arena).
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String.String
+use scaly.containers.StringBuilder.StringBuilder
+use scaly.io.File.File
+use opensp.StringC.StringC
+use opensp.CodingSystem.CodingSystem
+use dazzle.Grove.GroveNode
+use dazzle.ELObj.ELObj
+use dazzle.Style.InheritedC
+use dazzle.Style.LengthSpec
+use dazzle.Style.FotSym
+use dazzle.Style.DisplaySpace
+use dazzle.Style.DisplayNIC
+use dazzle.Style.RuleNICRec
+use dazzle.Style.LinkNICRec
+use dazzle.Style.GraphicNICRec
+use dazzle.Style.LeaderNICRec
+use dazzle.Style.BoxNICRec
+use dazzle.Style.ScoreNICRec
+use dazzle.Style.LineFieldNICRec
+use dazzle.Style.TableNICRec
+use dazzle.Style.TableColumnNICRec
+use dazzle.Style.TableCellNICRec
+use dazzle.Style.PageFloatNICRec
+
+; --- item tags ---------------------------------------------------------------
+define HTM_ADDRESSABLE: int 0
+define HTM_MARKUP: int 1
+define HTM_PCDATA: int 2
+define HTM_CONTAINER: int 3
+define HTM_REF: int 4
+define HTM_BLOCK: int 5
+define HTM_DOCUMENT: int 6
+
+; ParaProps::align
+define HTM_ALIGN_LEFT: int 0
+define HTM_ALIGN_CENTER: int 1
+define HTM_ALIGN_RIGHT: int 2
+define HTM_ALIGN_JUSTIFY: int 3
+
+; CharProps::fontStyle
+define HTM_STYLE_NORMAL: int 0
+define HTM_STYLE_ITALIC: int 1
+define HTM_STYLE_OBLIQUE: int 2
+
+; --- a CSS class prefix (one per GI) -----------------------------------------
+define HtmlClassPrefix (prefix: StringC, n_char_classes: int, n_para_classes: int)
+{
+    function make(host: pointer[Page], prefix: StringC) returns pointer[HtmlClassPrefix]
+    {
+        let p host.allocate(sizeof HtmlClassPrefix, alignof HtmlClassPrefix) as pointer[HtmlClassPrefix]
+        set p.prefix: prefix
+        set p.n_char_classes: 0
+        set p.n_para_classes: 0
+        p
+    }
+}
+
+; --- a style class (one GI within one style) — an IList node ------------------
+define HtmlStyleClass (gi: StringC, prefix: pointer[HtmlClassPrefix], prefix_index: int, next: pointer[HtmlStyleClass])
+{
+    function make(host: pointer[Page], gi: StringC, prefix: pointer[HtmlClassPrefix]) returns pointer[HtmlStyleClass]
+    {
+        let c host.allocate(sizeof HtmlStyleClass, alignof HtmlStyleClass) as pointer[HtmlStyleClass]
+        set c.gi: gi
+        set c.prefix: prefix
+        set c.prefix_index: prefix.n_char_classes + prefix.n_para_classes + 1
+        set c.next: null
+        c
+    }
+}
+
+; --- one distinct style (character or paragraph) ------------------------------
+; is_para picks which property half is live; `classes` is the reference IList
+; (insert-at-head, iterated head-first).
+define HtmlStyle
+(
+    is_para: bool
+    ; CharProps
+    font_weight: int
+    font_style: int
+    color: int
+    font_size: int
+    font_family: StringC
+    ; ParaProps
+    left_margin: int
+    right_margin: int
+    line_height: int
+    text_indent: int
+    align: int
+    top_margin: int
+    classes: pointer[HtmlStyleClass]
+)
+{
+    function make(host: pointer[Page], is_para: bool) returns pointer[HtmlStyle]
+    {
+        let s host.allocate(sizeof HtmlStyle, alignof HtmlStyle) as pointer[HtmlStyle]
+        set s.is_para: is_para
+        set s.font_weight: 5
+        set s.font_style: HTM_STYLE_NORMAL
+        set s.color: 0
+        set s.font_size: 10 * 1000
+        set s.font_family: StringC()
+        set s.left_margin: 0
+        set s.right_margin: 0
+        set s.line_height: 12 * 1000
+        set s.text_indent: 0
+        set s.align: HTM_ALIGN_LEFT
+        set s.top_margin: 0
+        set s.classes: null
+        s
+    }
+}
+
+; --- FlowObjectInfo: the inherited-characteristic snapshot -------------------
+define HtmlFoInfo
+(
+    ; CharProps
+    font_weight: int
+    font_style: int
+    color: int
+    font_size: int
+    font_family: StringC
+    ; InheritParaProps
+    left_margin: int
+    right_margin: int
+    line_height: int
+    text_indent: int
+    align: int
+    ; FlowObjectInfo proper
+    doc_index: int
+    has_scroll_title: bool
+    scroll_title: StringC
+    parent_left_margin: int
+    parent_right_margin: int
+)
+{
+    ; CharProps() + InheritParaProps() + FlowObjectInfo() ctor defaults
+    init()
+    {
+        set this.font_weight: 5
+        set this.font_style: HTM_STYLE_NORMAL
+        set this.color: 0
+        set this.font_size: 10 * 1000
+        set this.font_family: StringC()
+        set this.left_margin: 0
+        set this.right_margin: 0
+        set this.line_height: 12 * 1000
+        set this.text_indent: 0
+        set this.align: HTM_ALIGN_LEFT
+        set this.doc_index: 0 - 1
+        set this.has_scroll_title: false
+        set this.scroll_title: StringC()
+        set this.parent_left_margin: 0
+        set this.parent_right_margin: 0
+    }
+}
+
+; --- one item of the buffered tree -------------------------------------------
+define HtmlItem
+(
+    tag: int
+    next: pointer[HtmlItem]
+    ; container/ref/block/document content (head of the child IList)
+    content: pointer[HtmlItem]
+    ; block / pcdata style class
+    style_class: pointer[HtmlStyleClass]
+    ; pcdata payload (immediate copies, node-backed keeps the grove pointer)
+    data: pointer[u32]
+    n: size_t
+    ; markup payload
+    str: StringC
+    ; ref target (an addressable item, or null)
+    aref: pointer[HtmlItem]
+    ; document
+    doc_index: int
+    has_title: bool
+    title: StringC
+    ; addressable
+    grove_index: int
+    ; -1 = the whole document
+    element_index: int
+    ; -1 = not defined
+    a_doc_index: int
+    referenced: bool
+)
+{
+    function make(host: pointer[Page], tag: int) returns pointer[HtmlItem]
+    {
+        let it host.allocate(sizeof HtmlItem, alignof HtmlItem) as pointer[HtmlItem]
+        set it.tag: tag
+        set it.next: null
+        set it.content: null
+        set it.style_class: null
+        set it.data: null
+        set it.n: 0 as size_t
+        set it.str: StringC()
+        set it.aref: null
+        set it.doc_index: 0
+        set it.has_title: false
+        set it.title: StringC()
+        set it.grove_index: 0
+        set it.element_index: 0
+        set it.a_doc_index: 0 - 1
+        set it.referenced: false
+        it
+    }
+
+    function defined(this: pointer[HtmlItem]) returns bool
+        a_doc_index <> (0 - 1)
+}
+
+; libc + shim externs (prototypes type-match the other roots').
+procedure scaly_eputs(s: pointer[const_char]) extern
+procedure scaly_eputnl() extern
+function strerror(code: i32) returns pointer[const_char] extern
+function scaly_eio_errno() returns i32 extern
+
+; argv0 for the HtmlMessages prefix (`<argv0>:E: …`), like tfb_prog.
+shared html_prog: pointer[const_char] null
+
+define HtmlFOTBuilder
+(
+    ; the item tree: `root` is the reference's root_ Container, `dest_` the
+    ; current insertion owner (its content list), with the DestInfo stack.
+    root: pointer[HtmlItem]
+    dest: pointer[HtmlItem]
+    dest_stack: pointer[Array[pointer[HtmlItem]]]
+    dest_depth: int
+    ; the flow-object info stack + NextFlowObject
+    fo_stack: pointer[Array[pointer[HtmlFoInfo]]]
+    fo_depth: int
+    next_fo: HtmlFoInfo
+    ; the two style tables (open addressing, hash = 17, decrementing probe)
+    char_slots: pointer[Array[pointer[HtmlStyle]]]
+    char_used: int
+    char_limit: int
+    para_slots: pointer[Array[pointer[HtmlStyle]]]
+    para_used: int
+    para_limit: int
+    ; the GI-keyed prefix table (OpenSP Hash = Torek)
+    prefix_slots: pointer[Array[pointer[HtmlClassPrefix]]]
+    prefix_used: int
+    prefix_limit: int
+    ; per-grove element anchors: elements_[g][e]
+    elements: pointer[Array[pointer[Array[pointer[HtmlItem]]]]]
+    ; pendingAddr_ — a stack of (grove, element) pair vectors
+    pending: pointer[Array[pointer[Array[int]]]]
+    pending_depth: int
+    ; giStack_
+    gi_stack: pointer[Array[StringC]]
+    gi_depth: int
+    n_documents: int
+    top_margin: int
+    space_after_stack: pointer[Array[int]]
+    space_after_depth: int
+    ; the output file name (the reference's outputFilename_, already
+    ; defaulted by the CLI) + the stylesheet name once written
+    out_name: String
+    css_name: String
+    have_css: bool
+    ; output state (OutputState) — one live emission at a time
+    out_doc_index: int
+    cur_aref: pointer[HtmlItem]
+    spec_aref: pointer[HtmlItem]
+    cur_char_class: pointer[HtmlStyleClass]
+    ; the byte sink of the current emission (null = discard)
+    os: pointer[Array[u32]]
+    host: pointer[Page]
+)
+{
+    function make(host: pointer[Page], out_name: String) returns pointer[HtmlFOTBuilder]
+    {
+        let f host.allocate(sizeof HtmlFOTBuilder, alignof HtmlFOTBuilder) as pointer[HtmlFOTBuilder]
+        set f.root: HtmlItem.make(host, HTM_CONTAINER)
+        set f.dest: f.root
+        set f.dest_stack: Array[pointer[HtmlItem]]^host()
+        set f.dest_depth: 0
+        set f.fo_stack: Array[pointer[HtmlFoInfo]]^host()
+        set f.fo_depth: 0
+        set f.next_fo: HtmlFoInfo()
+        ; CharProps() seeds the family name
+        set f.next_fo.font_family: StringC("Times New Roman,serif")
+        set f.char_slots: Array[pointer[HtmlStyle]]^host()
+        set f.char_used: 0
+        set f.char_limit: 0
+        set f.para_slots: Array[pointer[HtmlStyle]]^host()
+        set f.para_used: 0
+        set f.para_limit: 0
+        set f.prefix_slots: Array[pointer[HtmlClassPrefix]]^host()
+        set f.prefix_used: 0
+        set f.prefix_limit: 0
+        set f.elements: Array[pointer[Array[pointer[HtmlItem]]]]^host()
+        set f.pending: Array[pointer[Array[int]]]^host()
+        set f.pending_depth: 0
+        set f.gi_stack: Array[StringC]^host()
+        set f.gi_depth: 0
+        set f.n_documents: 0
+        set f.top_margin: 0
+        set f.space_after_stack: Array[int]^host()
+        set f.space_after_depth: 0
+        set f.out_name: out_name
+        set f.css_name: String()
+        set f.have_css: false
+        set f.out_doc_index: 0 - 1
+        set f.cur_aref: null
+        set f.spec_aref: null
+        set f.cur_char_class: null
+        set f.os: null
+        set f.host: host
+        ; ctor: one flow-object level, giStack_(1) with "S"
+        f.fo_push()
+        f.gi_push(StringC("S"))
+        f
+    }
+
+    ; --- messages ------------------------------------------------------------
+    function msg_cannot_open(this: pointer[HtmlFOTBuilder], name: String, err: i32)
+    {
+        if html_prog <> null
+            scaly_eputs(html_prog)
+        scaly_eputs ":E: cannot open output file \""
+        let c name.to_c_string()
+        scaly_eputs(c)
+        scaly_eputs "\" ("
+        scaly_eputs(strerror(err))
+        scaly_eputs ")"
+        scaly_eputnl()
+    }
+
+    procedure set_prog_name(prog: pointer[const_char])
+        set html_prog: prog
+
+    ; --- the flow-object bracket (FOTBuilder start/end/atomic) ---------------
+    function copy_fo(dst: pointer[HtmlFoInfo], src: pointer[HtmlFoInfo])
+    {
+        set dst.font_weight: src.font_weight
+        set dst.font_style: src.font_style
+        set dst.color: src.color
+        set dst.font_size: src.font_size
+        set dst.font_family: src.font_family
+        set dst.left_margin: src.left_margin
+        set dst.right_margin: src.right_margin
+        set dst.line_height: src.line_height
+        set dst.text_indent: src.text_indent
+        set dst.align: src.align
+        set dst.doc_index: src.doc_index
+        set dst.has_scroll_title: src.has_scroll_title
+        set dst.scroll_title: src.scroll_title
+        set dst.parent_left_margin: src.parent_left_margin
+        set dst.parent_right_margin: src.parent_right_margin
+    }
+
+    function fo_push(this: pointer[HtmlFOTBuilder])
+    {
+        let d this.fo_depth as size_t
+        if d < this.fo_stack.get_length()
+        {
+            let slotp this.fo_stack.get(d)
+            if slotp <> null
+                HtmlFOTBuilder.copy_fo(*slotp, &this.next_fo)
+        }
+        else
+        {
+            let host this.host
+            let rec host.allocate(sizeof HtmlFoInfo, alignof HtmlFoInfo) as pointer[HtmlFoInfo]
+            HtmlFOTBuilder.copy_fo(rec, &this.next_fo)
+            this.fo_stack.add(rec)
+        }
+        set this.fo_depth: this.fo_depth + 1
+    }
+
+    function fo_start(this: pointer[HtmlFOTBuilder])
+        this.fo_push()
+
+    function fo_end(this: pointer[HtmlFOTBuilder])
+    {
+        if this.fo_depth <= 1
+            return
+        set this.fo_depth: this.fo_depth - 1
+        let slotp this.fo_stack.get((this.fo_depth - 1) as size_t)
+        HtmlFOTBuilder.copy_fo(&this.next_fo, *slotp)
+    }
+
+    ; atomic(): nextFlowObject_ = flowObjectStack_.back()
+    function fo_atomic(this: pointer[HtmlFOTBuilder])
+    {
+        if this.fo_depth <= 0
+            return
+        let slotp this.fo_stack.get((this.fo_depth - 1) as size_t)
+        HtmlFOTBuilder.copy_fo(&this.next_fo, *slotp)
+    }
+
+    ; --- gi stack -------------------------------------------------------------
+    function gi_push(this: pointer[HtmlFOTBuilder], gi: StringC)
+    {
+        let d this.gi_depth as size_t
+        if d < this.gi_stack.get_length()
+            this.gi_stack.put(d, gi)
+        else
+            this.gi_stack.add(gi)
+        set this.gi_depth: this.gi_depth + 1
+    }
+
+    function gi_top(this: pointer[HtmlFOTBuilder]) returns StringC
+    {
+        if this.gi_depth <= 0
+            return StringC()
+        let p this.gi_stack.get((this.gi_depth - 1) as size_t)
+        *p
+    }
+
+    function gi_at(this: pointer[HtmlFOTBuilder], i: int) returns StringC
+    {
+        let p this.gi_stack.get(i as size_t)
+        *p
+    }
+
+    ; --- item list handling (IList insert-at-head + reverse) -----------------
+    procedure insert_item(this: pointer[HtmlFOTBuilder], it: pointer[HtmlItem])
+    {
+        let d this.dest
+        set it.next: d.content
+        set d.content: it
+    }
+
+    procedure reverse_content(owner: pointer[HtmlItem])
+    {
+        var head: pointer[HtmlItem] null
+        var cur owner.content
+        while cur <> null
+        {
+            let nx cur.next
+            set cur.next: head
+            set head: cur
+            set cur: nx
+        }
+        set owner.content: head
+    }
+
+    procedure dest_push(this: pointer[HtmlFOTBuilder], owner: pointer[HtmlItem])
+    {
+        let d this.dest_depth as size_t
+        if d < this.dest_stack.get_length()
+            this.dest_stack.put(d, this.dest)
+        else
+            this.dest_stack.add(this.dest)
+        set this.dest_depth: this.dest_depth + 1
+        set this.dest: owner
+    }
+
+    procedure dest_pop(this: pointer[HtmlFOTBuilder])
+    {
+        HtmlFOTBuilder.reverse_content(this.dest)
+        if this.dest_depth <= 0
+            return
+        set this.dest_depth: this.dest_depth - 1
+        let p this.dest_stack.get(this.dest_depth as size_t)
+        set this.dest: *p
+    }
+
+    ; --- style tables ---------------------------------------------------------
+    ; CharProps/ParaProps equality (the reference operator==)
+    function char_props_equal(a: pointer[HtmlStyle], b: pointer[HtmlFoInfo]) returns bool
+    {
+        if a.font_weight <> b.font_weight
+            return false
+        if a.font_style <> b.font_style
+            return false
+        if a.font_size <> b.font_size
+            return false
+        if a.font_family.equals(b.font_family) = false
+            return false
+        if a.color <> b.color
+            return false
+        true
+    }
+
+    function para_props_equal(a: pointer[HtmlStyle], b: pointer[HtmlFoInfo], top_margin: int) returns bool
+    {
+        if a.left_margin <> b.left_margin
+            return false
+        if a.right_margin <> b.right_margin
+            return false
+        if a.line_height <> b.line_height
+            return false
+        if a.text_indent <> b.text_indent
+            return false
+        if a.top_margin <> top_margin
+            return false
+        if a.align <> b.align
+            return false
+        true
+    }
+
+    ; hash() is the constant 17 for both prop classes
+    function props_start_index(size: size_t) returns size_t
+        (17 as size_t) & (size - (1 as size_t))
+
+    function torek_hash(s: StringC) returns size_t
+    {
+        var h: size_t 0
+        let n s.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            set h: (h << 5) + h + (s.get(i) as size_t)
+            set i: i + (1 as size_t)
+        }
+        h
+    }
+
+    ; grow an empty table to 8 null slots
+    procedure table_init(this: pointer[HtmlFOTBuilder], slots: pointer[Array[pointer[HtmlStyle]]])
+    {
+        var z 0
+        while z < 8
+        {
+            let np null as pointer[HtmlStyle]
+            slots.add(np)
+            set z: z + 1
+        }
+    }
+
+    ; PointerTable::insert for the character-style table; returns the entry
+    ; already present, else null after inserting `s`.
+    function char_table_lookup(this: pointer[HtmlFOTBuilder]) returns pointer[HtmlStyle]
+    {
+        if this.char_used = 0
+            return null
+        let size this.char_slots.get_length()
+        var i HtmlFOTBuilder.props_start_index(size)
+        while true
+        {
+            let slotp this.char_slots.get(i)
+            if slotp = null
+                return null
+            let e *slotp
+            if e = null
+                return null
+            if HtmlFOTBuilder.char_props_equal(e, &this.next_fo)
+                return e
+            if i = (0 as size_t)
+                set i: size - (1 as size_t)
+            else
+                set i: i - (1 as size_t)
+        }
+        null
+    }
+
+    procedure char_table_insert(this: pointer[HtmlFOTBuilder], s: pointer[HtmlStyle])
+    {
+        let host this.host
+        if this.char_slots.get_length() = (0 as size_t)
+        {
+            this.table_init(this.char_slots)
+            set this.char_limit: 4
+        }
+        var size this.char_slots.get_length()
+        if this.char_used >= this.char_limit
+        {
+            let old this.char_slots
+            let old_size old.get_length()
+            let fresh Array[pointer[HtmlStyle]]^host()
+            var z: size_t 0
+            while z < (old_size * (2 as size_t))
+            {
+                let np null as pointer[HtmlStyle]
+                fresh.add(np)
+                set z: z + (1 as size_t)
+            }
+            set this.char_slots: fresh
+            set size: fresh.get_length()
+            set this.char_limit: (size / (2 as size_t)) as int
+            var oi: size_t 0
+            while oi < old_size
+            {
+                let op old.get(oi)
+                var oe: pointer[HtmlStyle] null
+                if op <> null
+                    set oe: *op
+                if oe <> null
+                {
+                    var j HtmlFOTBuilder.props_start_index(size)
+                    while true
+                    {
+                        let sp fresh.get(j)
+                        var cur: pointer[HtmlStyle] null
+                        if sp <> null
+                            set cur: *sp
+                        if cur = null
+                            break
+                        if j = (0 as size_t)
+                            set j: size - (1 as size_t)
+                        else
+                            set j: j - (1 as size_t)
+                    }
+                    fresh.put(j, oe)
+                }
+                set oi: oi + (1 as size_t)
+            }
+        }
+        var i HtmlFOTBuilder.props_start_index(size)
+        while true
+        {
+            let sp this.char_slots.get(i)
+            var cur: pointer[HtmlStyle] null
+            if sp <> null
+                set cur: *sp
+            if cur = null
+                break
+            if i = (0 as size_t)
+                set i: size - (1 as size_t)
+            else
+                set i: i - (1 as size_t)
+        }
+        set this.char_used: this.char_used + 1
+        this.char_slots.put(i, s)
+    }
+
+    function para_table_lookup(this: pointer[HtmlFOTBuilder], top_margin: int) returns pointer[HtmlStyle]
+    {
+        if this.para_used = 0
+            return null
+        let size this.para_slots.get_length()
+        var i HtmlFOTBuilder.props_start_index(size)
+        while true
+        {
+            let slotp this.para_slots.get(i)
+            if slotp = null
+                return null
+            let e *slotp
+            if e = null
+                return null
+            if HtmlFOTBuilder.para_props_equal(e, &this.next_fo, top_margin)
+                return e
+            if i = (0 as size_t)
+                set i: size - (1 as size_t)
+            else
+                set i: i - (1 as size_t)
+        }
+        null
+    }
+
+    procedure para_table_insert(this: pointer[HtmlFOTBuilder], s: pointer[HtmlStyle])
+    {
+        let host this.host
+        if this.para_slots.get_length() = (0 as size_t)
+        {
+            this.table_init(this.para_slots)
+            set this.para_limit: 4
+        }
+        var size this.para_slots.get_length()
+        if this.para_used >= this.para_limit
+        {
+            let old this.para_slots
+            let old_size old.get_length()
+            let fresh Array[pointer[HtmlStyle]]^host()
+            var z: size_t 0
+            while z < (old_size * (2 as size_t))
+            {
+                let np null as pointer[HtmlStyle]
+                fresh.add(np)
+                set z: z + (1 as size_t)
+            }
+            set this.para_slots: fresh
+            set size: fresh.get_length()
+            set this.para_limit: (size / (2 as size_t)) as int
+            var oi: size_t 0
+            while oi < old_size
+            {
+                let op old.get(oi)
+                var oe: pointer[HtmlStyle] null
+                if op <> null
+                    set oe: *op
+                if oe <> null
+                {
+                    var j HtmlFOTBuilder.props_start_index(size)
+                    while true
+                    {
+                        let sp fresh.get(j)
+                        var cur: pointer[HtmlStyle] null
+                        if sp <> null
+                            set cur: *sp
+                        if cur = null
+                            break
+                        if j = (0 as size_t)
+                            set j: size - (1 as size_t)
+                        else
+                            set j: j - (1 as size_t)
+                    }
+                    fresh.put(j, oe)
+                }
+                set oi: oi + (1 as size_t)
+            }
+        }
+        var i HtmlFOTBuilder.props_start_index(size)
+        while true
+        {
+            let sp this.para_slots.get(i)
+            var cur: pointer[HtmlStyle] null
+            if sp <> null
+                set cur: *sp
+            if cur = null
+                break
+            if i = (0 as size_t)
+                set i: size - (1 as size_t)
+            else
+                set i: i - (1 as size_t)
+        }
+        set this.para_used: this.para_used + 1
+        this.para_slots.put(i, s)
+    }
+
+    ; the GI-keyed prefix table
+    function make_class_prefix(this: pointer[HtmlFOTBuilder], gi: StringC) returns pointer[HtmlClassPrefix]
+    {
+        let host this.host
+        if this.prefix_slots.get_length() = (0 as size_t)
+        {
+            var z 0
+            while z < 8
+            {
+                let np null as pointer[HtmlClassPrefix]
+                this.prefix_slots.add(np)
+                set z: z + 1
+            }
+            set this.prefix_limit: 4
+        }
+        var size this.prefix_slots.get_length()
+        var i (HtmlFOTBuilder.torek_hash(gi) & (size - (1 as size_t)))
+        while true
+        {
+            let sp this.prefix_slots.get(i)
+            var cur: pointer[HtmlClassPrefix] null
+            if sp <> null
+                set cur: *sp
+            if cur = null
+                break
+            if cur.prefix.equals(gi)
+                return cur
+            if i = (0 as size_t)
+                set i: size - (1 as size_t)
+            else
+                set i: i - (1 as size_t)
+        }
+        if this.prefix_used >= this.prefix_limit
+        {
+            let old this.prefix_slots
+            let old_size old.get_length()
+            let fresh Array[pointer[HtmlClassPrefix]]^host()
+            var z2: size_t 0
+            while z2 < (old_size * (2 as size_t))
+            {
+                let np2 null as pointer[HtmlClassPrefix]
+                fresh.add(np2)
+                set z2: z2 + (1 as size_t)
+            }
+            set this.prefix_slots: fresh
+            set size: fresh.get_length()
+            set this.prefix_limit: (size / (2 as size_t)) as int
+            var oi: size_t 0
+            while oi < old_size
+            {
+                let op old.get(oi)
+                var oe: pointer[HtmlClassPrefix] null
+                if op <> null
+                    set oe: *op
+                if oe <> null
+                {
+                    var j (HtmlFOTBuilder.torek_hash(oe.prefix) & (size - (1 as size_t)))
+                    while true
+                    {
+                        let sp2 fresh.get(j)
+                        var cur2: pointer[HtmlClassPrefix] null
+                        if sp2 <> null
+                            set cur2: *sp2
+                        if cur2 = null
+                            break
+                        if j = (0 as size_t)
+                            set j: size - (1 as size_t)
+                        else
+                            set j: j - (1 as size_t)
+                    }
+                    fresh.put(j, oe)
+                }
+                set oi: oi + (1 as size_t)
+            }
+            set i: (HtmlFOTBuilder.torek_hash(gi) & (size - (1 as size_t)))
+            while true
+            {
+                let sp3 this.prefix_slots.get(i)
+                var cur3: pointer[HtmlClassPrefix] null
+                if sp3 <> null
+                    set cur3: *sp3
+                if cur3 = null
+                    break
+                if i = (0 as size_t)
+                    set i: size - (1 as size_t)
+                else
+                    set i: i - (1 as size_t)
+            }
+        }
+        set this.prefix_used: this.prefix_used + 1
+        let p HtmlClassPrefix.make(host, gi)
+        this.prefix_slots.put(i, p)
+        p
+    }
+
+    ; makeCharStyleClass / makeParaStyleClass
+    function make_char_style_class(this: pointer[HtmlFOTBuilder]) returns pointer[HtmlStyleClass]
+    {
+        let host this.host
+        var style this.char_table_lookup()
+        if style = null
+        {
+            let s HtmlStyle.make(host, false)
+            set s.font_weight: this.next_fo.font_weight
+            set s.font_style: this.next_fo.font_style
+            set s.color: this.next_fo.color
+            set s.font_size: this.next_fo.font_size
+            set s.font_family: this.next_fo.font_family
+            this.char_table_insert(s)
+            set style: s
+        }
+        let gi this.gi_top()
+        var c style.classes
+        while c <> null
+        {
+            if c.gi.equals(gi)
+                return c
+            set c: c.next
+        }
+        let prefix this.make_class_prefix(gi)
+        let sc HtmlStyleClass.make(host, gi, prefix)
+        set prefix.n_char_classes: prefix.n_char_classes + 1
+        set sc.next: style.classes
+        set style.classes: sc
+        sc
+    }
+
+    function make_para_style_class(this: pointer[HtmlFOTBuilder]) returns pointer[HtmlStyleClass]
+    {
+        let host this.host
+        let tm this.top_margin
+        set this.top_margin: 0
+        var style this.para_table_lookup(tm)
+        if style = null
+        {
+            let s HtmlStyle.make(host, true)
+            set s.left_margin: this.next_fo.left_margin
+            set s.right_margin: this.next_fo.right_margin
+            set s.line_height: this.next_fo.line_height
+            set s.text_indent: this.next_fo.text_indent
+            set s.align: this.next_fo.align
+            set s.top_margin: tm
+            this.para_table_insert(s)
+            set style: s
+        }
+        let gi this.gi_top()
+        var c style.classes
+        while c <> null
+        {
+            if c.gi.equals(gi)
+                return c
+            set c: c.next
+        }
+        let prefix this.make_class_prefix(gi)
+        let sc HtmlStyleClass.make(host, gi, prefix)
+        set prefix.n_para_classes: prefix.n_para_classes + 1
+        set sc.next: style.classes
+        set style.classes: sc
+        sc
+    }
+
+    ; --- characteristics (the eleven the reference overrides) -----------------
+    function set_ic(this: pointer[HtmlFOTBuilder], ic: pointer[InheritedC])
+    {
+        let ext ic.ext_setter
+        if ext <> 0
+        {
+            ; the html extension table: scroll-title
+            if ext = 1
+            {
+                set this.next_fo.has_scroll_title: true
+                set this.next_fo.scroll_title: ic.sval
+            }
+            return
+        }
+        let index ic.get_index()
+        if index = 0
+            set this.next_fo.font_size: ic.lval
+        else if index = 1
+            set this.next_fo.font_family: ic.sval
+        else if index = 2
+        {
+            ; setFontWeight: the nine weight symbols map to 1..9, everything
+            ; else leaves the value alone (reference default: break)
+            let c ic.sym.code
+            if c = 7
+                set this.next_fo.font_weight: 1
+            else if c = 8
+                set this.next_fo.font_weight: 2
+            else if c = 9
+                set this.next_fo.font_weight: 3
+            else if c = 10
+                set this.next_fo.font_weight: 4
+            else if c = 11
+                set this.next_fo.font_weight: 5
+            else if c = 16
+                set this.next_fo.font_weight: 6
+            else if c = 17
+                set this.next_fo.font_weight: 7
+            else if c = 18
+                set this.next_fo.font_weight: 8
+            else if c = 19
+                set this.next_fo.font_weight: 9
+        }
+        else if index = 3
+        {
+            ; setFontPosture: oblique/italic, everything else normal
+            let c ic.sym.code
+            if c = 21
+                set this.next_fo.font_style: HTM_STYLE_OBLIQUE
+            else if c = 23
+                set this.next_fo.font_style: HTM_STYLE_ITALIC
+            else
+                set this.next_fo.font_style: HTM_STYLE_NORMAL
+        }
+        else if index = 4
+        {
+            ; setQuadding: start/end/center/justify; others unchanged
+            let c ic.sym.code
+            if c = 25
+                set this.next_fo.align: HTM_ALIGN_LEFT
+            else if c = 26
+                set this.next_fo.align: HTM_ALIGN_RIGHT
+            else if c = 27
+                set this.next_fo.align: HTM_ALIGN_CENTER
+            else if c = 28
+                set this.next_fo.align: HTM_ALIGN_JUSTIFY
+        }
+        else if index = 8
+            set this.next_fo.left_margin: ic.ls.length - this.next_fo.parent_left_margin
+        else if index = 9
+            set this.next_fo.text_indent: ic.ls.length
+        else if index = 10
+            set this.next_fo.right_margin: ic.ls.length - this.next_fo.parent_right_margin
+        else if index = 12
+            set this.next_fo.line_height: ic.ls.length
+        else if index = 155
+        {
+            if ic.obj <> null
+            {
+                let rgb ic.obj.color_rgb()
+                if rgb >= 0
+                    set this.next_fo.color: rgb
+            }
+        }
+    }
+
+    ; --- pending addresses / element anchors ----------------------------------
+    function element_address(this: pointer[HtmlFOTBuilder], g: int, e: int) returns pointer[HtmlItem]
+    {
+        let host this.host
+        while (this.elements.get_length() as int) <= g
+        {
+            let row Array[pointer[HtmlItem]]^host()
+            this.elements.add(row)
+        }
+        let rowp this.elements.get(g as size_t)
+        let row *rowp
+        while (row.get_length() as int) <= e
+        {
+            let np null as pointer[HtmlItem]
+            row.add(np)
+        }
+        let slotp row.get(e as size_t)
+        var it *slotp
+        if it = null
+        {
+            set it: HtmlItem.make(host, HTM_ADDRESSABLE)
+            set it.grove_index: g
+            set it.element_index: e
+            set it.a_doc_index: 0 - 1
+            row.put(e as size_t, it)
+        }
+        it
+    }
+
+    function pending_top(this: pointer[HtmlFOTBuilder]) returns pointer[Array[int]]
+    {
+        if this.pending_depth <= 0
+            return null
+        let p this.pending.get((this.pending_depth - 1) as size_t)
+        *p
+    }
+
+    procedure pending_push(this: pointer[HtmlFOTBuilder])
+    {
+        let host this.host
+        let d this.pending_depth as size_t
+        if d < this.pending.get_length()
+        {
+            let p this.pending.get(d)
+            let v *p
+            ; Vector<size_t>::resize(0) semantics: reuse the slot, empty
+            let fresh Array[int]^host()
+            this.pending.put(d, fresh)
+        }
+        else
+            this.pending.add(Array[int]^host())
+        set this.pending_depth: this.pending_depth + 1
+    }
+
+    procedure insert_addr(this: pointer[HtmlFOTBuilder], g: int, e: int)
+    {
+        let it this.element_address(g, e)
+        if it.defined()
+            return
+        if this.next_fo.doc_index = (0 - 1)
+            return
+        this.insert_item(it)
+        set it.a_doc_index: this.next_fo.doc_index
+    }
+
+    procedure flush_pending_addresses(this: pointer[HtmlFOTBuilder])
+    {
+        let v this.pending_top()
+        if v = null
+            return
+        let n v.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let gp v.get(i)
+            let ep v.get(i + (1 as size_t))
+            if (gp <> null) and (ep <> null)
+                this.insert_addr(*gp, *ep)
+            set i: i + (2 as size_t)
+        }
+        let host this.host
+        this.pending.put((this.pending_depth - 1) as size_t, Array[int]^host())
+    }
+
+    ; --- characters -----------------------------------------------------------
+    function characters(this: pointer[HtmlFOTBuilder], s: pointer[u32], n: size_t)
+    {
+        let host this.host
+        this.flush_pending_addresses()
+        let it HtmlItem.make(host, HTM_PCDATA)
+        set it.style_class: this.make_char_style_class()
+        ; ImmediatePcdata copies its StringC
+        if n > (0 as size_t)
+        {
+            let buf host.allocate(n * (4 as size_t), 4) as pointer[u32]
+            var i: size_t 0
+            while i < n
+            {
+                set *(buf + i): *(s + i)
+                set i: i + (1 as size_t)
+            }
+            set it.data: buf
+        }
+        set it.n: n
+        this.insert_item(it)
+    }
+
+    ; NodePcdata keeps the RAW grove pointer (reference shape)
+    function characters_from_node(this: pointer[HtmlFOTBuilder], node: pointer[GroveNode], s: pointer[u32], n: size_t)
+    {
+        let host this.host
+        this.flush_pending_addresses()
+        let it HtmlItem.make(host, HTM_PCDATA)
+        set it.style_class: this.make_char_style_class()
+        set it.data: s
+        set it.n: n
+        this.insert_item(it)
+    }
+
+    function formatting_instruction(this: pointer[HtmlFOTBuilder], instr: StringC)
+    {
+        let host this.host
+        let it HtmlItem.make(host, HTM_MARKUP)
+        set it.str: instr
+        this.insert_item(it)
+        this.fo_atomic()
+    }
+
+    ; --- node bracket ---------------------------------------------------------
+    function start_node(this: pointer[HtmlFOTBuilder], node: pointer[GroveNode], mode_name: StringC)
+    {
+        let host this.host
+        ; pendingAddr_.resize(+1): the new vector inherits the previous one's
+        ; pairs when the mode is empty (reference copy-assignment)
+        let prev this.pending_top()
+        this.pending_push()
+        if mode_name.get_size() = (0 as size_t)
+        {
+            let cur this.pending_top()
+            if prev <> null
+            {
+                let pn prev.get_length()
+                var i: size_t 0
+                while i < pn
+                {
+                    let vp prev.get(i)
+                    if vp <> null
+                        cur.add(*vp)
+                    set i: i + (1 as size_t)
+                }
+            }
+            if node <> null
+            {
+                let ei node.element_index
+                if ei >= 0
+                {
+                    cur.add(0)
+                    cur.add(ei)
+                }
+            }
+        }
+        ; giStack_: the node's gi, else a copy of the parent entry
+        var gi StringC()
+        var have false
+        if node <> null
+        {
+            let g node.get_gi()
+            if g.get_size() > (0 as size_t)
+            {
+                set gi: g
+                set have: true
+            }
+        }
+        if have = false
+        {
+            if this.gi_depth >= 1
+                set gi: this.gi_at(this.gi_depth - 1)
+        }
+        this.gi_push(gi)
+    }
+
+    function end_node(this: pointer[HtmlFOTBuilder])
+    {
+        if this.pending_depth > 0
+            set this.pending_depth: this.pending_depth - 1
+        if this.gi_depth > 0
+            set this.gi_depth: this.gi_depth - 1
+    }
+
+    ; --- display bracket (only paragraphs reach it, like the reference) -------
+    procedure start_display(this: pointer[HtmlFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        var before 0
+        var after 0
+        if nic <> null
+        {
+            set before: nic.space_before.nominal.length
+            set after: nic.space_after.nominal.length
+        }
+        if before > this.top_margin
+            set this.top_margin: before
+        let d this.space_after_depth as size_t
+        if d < this.space_after_stack.get_length()
+            this.space_after_stack.put(d, after)
+        else
+            this.space_after_stack.add(after)
+        set this.space_after_depth: this.space_after_depth + 1
+    }
+
+    procedure end_display(this: pointer[HtmlFOTBuilder])
+    {
+        if this.space_after_depth <= 0
+            return
+        let p this.space_after_stack.get((this.space_after_depth - 1) as size_t)
+        let after *p
+        if after > this.top_margin
+            set this.top_margin: after
+        set this.space_after_depth: this.space_after_depth - 1
+    }
+
+    ; --- paragraph ------------------------------------------------------------
+    function start_paragraph(this: pointer[HtmlFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        let host this.host
+        this.start_display(nic)
+        let block HtmlItem.make(host, HTM_BLOCK)
+        set block.style_class: this.make_para_style_class()
+        set this.next_fo.parent_left_margin: this.next_fo.parent_left_margin + this.next_fo.left_margin
+        set this.next_fo.parent_right_margin: this.next_fo.parent_right_margin + this.next_fo.right_margin
+        set this.next_fo.left_margin: 0
+        set this.next_fo.right_margin: 0
+        this.insert_item(block)
+        this.dest_push(block)
+        this.fo_start()
+    }
+
+    function end_paragraph(this: pointer[HtmlFOTBuilder])
+    {
+        this.dest_pop()
+        this.fo_end()
+        this.end_display()
+    }
+
+    ; --- link -----------------------------------------------------------------
+    function start_link(this: pointer[HtmlFOTBuilder], nic: pointer[LinkNICRec])
+    {
+        let host this.host
+        this.fo_start()
+        var aref: pointer[HtmlItem] null
+        if nic <> null
+        {
+            if nic.addr_type = 1
+            {
+                let node nic.node as pointer[GroveNode]
+                if node <> null
+                {
+                    let ei node.element_index
+                    if ei >= 0
+                    {
+                        let tem this.element_address(0, ei)
+                        set tem.referenced: true
+                        set aref: tem
+                    }
+                }
+            }
+        }
+        let ref HtmlItem.make(host, HTM_REF)
+        set ref.aref: aref
+        this.insert_item(ref)
+        this.dest_push(ref)
+    }
+
+    function end_link(this: pointer[HtmlFOTBuilder])
+    {
+        this.dest_pop()
+        this.fo_end()
+    }
+
+    ; --- scroll ---------------------------------------------------------------
+    function start_scroll(this: pointer[HtmlFOTBuilder])
+    {
+        let host this.host
+        set this.next_fo.doc_index: this.n_documents
+        set this.n_documents: this.n_documents + 1
+        this.fo_start()
+        let doc HtmlItem.make(host, HTM_DOCUMENT)
+        set doc.doc_index: this.next_fo.doc_index
+        set doc.has_title: this.next_fo.has_scroll_title
+        set doc.title: this.next_fo.scroll_title
+        this.insert_item(doc)
+        this.dest_push(doc)
+        let v this.pending_top()
+        if v <> null
+        {
+            let n v.get_length()
+            var i: size_t 0
+            while i < n
+            {
+                let gp v.get(i)
+                let ep v.get(i + (1 as size_t))
+                if (gp <> null) and (ep <> null)
+                {
+                    let tem this.element_address(*gp, *ep)
+                    if tem.defined() = false
+                    {
+                        this.insert_item(tem)
+                        set tem.a_doc_index: this.next_fo.doc_index
+                        ; setDefined(docIndex, wholeDocument = 1)
+                        set tem.element_index: 0 - 1
+                    }
+                }
+                set i: i + (2 as size_t)
+            }
+            this.pending.put((this.pending_depth - 1) as size_t, Array[int]^host())
+        }
+    }
+
+    function end_scroll(this: pointer[HtmlFOTBuilder])
+    {
+        this.dest_pop()
+        this.fo_end()
+    }
+
+    ; --- low-level output (the current emission buffer; null = discard) -------
+    procedure put(this: pointer[HtmlFOTBuilder], c: u32)
+    {
+        if this.os = null
+            return
+        this.os.add(c)
+    }
+
+    procedure raw(this: pointer[HtmlFOTBuilder], s: pointer[const_char])
+    {
+        var i: size_t 0
+        while true
+        {
+            let b *((s as pointer[u8]) + i)
+            if b = (0 as u8)
+                break
+            this.put(b as u32)
+            set i: i + (1 as size_t)
+        }
+    }
+
+    procedure raw_stringc(this: pointer[HtmlFOTBuilder], s: StringC)
+    {
+        let n s.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            this.put(s.get(i))
+            set i: i + (1 as size_t)
+        }
+    }
+
+    procedure re(this: pointer[HtmlFOTBuilder])
+        this.put(0x0D as u32)
+
+    procedure raw_ulong(this: pointer[HtmlFOTBuilder], n_in: int)
+    {
+        var n n_in
+        if n = 0
+        {
+            this.put(0x30 as u32)
+            return
+        }
+        var digits u8[24]
+        var k 0
+        while n > 0
+        {
+            set *((digits as pointer[u8]) + k): ((n % 10) + 0x30) as u8
+            set n: n / 10
+            set k: k + 1
+        }
+        while k > 0
+        {
+            set k: k - 1
+            this.put((*((digits as pointer[u8]) + k)) as u32)
+        }
+    }
+
+    ; outputLength: "%04ld", then the last three digits shift right and a '.'
+    ; lands three from the end; trailing zeros (then a bare point) are cut,
+    ; then "pt". Quirks intact (-300 -> "-.3pt").
+    procedure out_length(this: pointer[HtmlFOTBuilder], n: int)
+    {
+        var buf u8[40]
+        var len 0
+        var m n
+        if m < 0
+        {
+            set *((buf as pointer[u8])): 0x2D as u8
+            set len: 1
+            set m: 0 - m
+        }
+        var tmp u8[24]
+        var k 0
+        if m = 0
+        {
+            set *((tmp as pointer[u8])): 0x30 as u8
+            set k: 1
+        }
+        else
+        {
+            while m > 0
+            {
+                set *((tmp as pointer[u8]) + k): ((m % 10) + 0x30) as u8
+                set m: m / 10
+                set k: k + 1
+            }
+        }
+        while k > 0
+        {
+            set k: k - 1
+            set *((buf as pointer[u8]) + len): *((tmp as pointer[u8]) + k)
+            set len: len + 1
+        }
+        ; zero-pad to width 4 ON THE LEFT (printf "%04ld" — the sign counts)
+        while len < 4
+        {
+            var j len
+            while j > 0
+            {
+                set *((buf as pointer[u8]) + j): *((buf as pointer[u8]) + (j - 1))
+                set j: j - 1
+            }
+            set *((buf as pointer[u8])): 0x30 as u8
+            set len: len + 1
+        }
+        ; shift the last three digits right by one and insert the point
+        set *((buf as pointer[u8]) + len): *((buf as pointer[u8]) + (len - 1))
+        set *((buf as pointer[u8]) + (len - 1)): *((buf as pointer[u8]) + (len - 2))
+        set *((buf as pointer[u8]) + (len - 2)): *((buf as pointer[u8]) + (len - 3))
+        set *((buf as pointer[u8]) + (len - 3)): 0x2E as u8
+        set len: len + 1
+        ; strip trailing zeros, then a bare point
+        var e len - 1
+        while (*((buf as pointer[u8]) + e)) = (0x30 as u8)
+            set e: e - 1
+        if (*((buf as pointer[u8]) + e)) = (0x2E as u8)
+            set e: e - 1
+        var i 0
+        while i <= e
+        {
+            this.put((*((buf as pointer[u8]) + i)) as u32)
+            set i: i + 1
+        }
+        this.raw("pt")
+    }
+
+    ; StyleClass::outputName
+    procedure out_class_name(this: pointer[HtmlFOTBuilder], sc: pointer[HtmlStyleClass])
+    {
+        let p sc.prefix
+        this.raw_stringc(p.prefix)
+        var many false
+        if p.n_char_classes > 1
+            set many: true
+        if p.n_para_classes > 1
+            set many: true
+        if many
+            this.raw_ulong(sc.prefix_index)
+    }
+
+    ; outputCdata
+    procedure out_cdata(this: pointer[HtmlFOTBuilder], s: pointer[u32], n: size_t)
+    {
+        var i: size_t 0
+        while i < n
+        {
+            let c *(s + i)
+            if c = (0x0A as u32)
+                0
+            else if c = (0x26 as u32)
+                this.raw("&amp;")
+            else if c = (0x3C as u32)
+                this.raw("&lt;")
+            else if c = (0x3E as u32)
+                this.raw("&gt;")
+            else if c = (0x0D as u32)
+                this.re()
+            else if c >= (255 as u32)
+            {
+                this.raw("&#")
+                this.raw_ulong(c as int)
+                this.put(0x3B as u32)
+            }
+            else
+                this.put(c)
+            set i: i + (1 as size_t)
+        }
+    }
+
+    procedure out_cdata_stringc(this: pointer[HtmlFOTBuilder], s: StringC)
+        this.out_cdata(s.data_ptr(), s.get_size())
+
+    ; --- the stylesheet -------------------------------------------------------
+    ; CharStyle::output
+    procedure out_char_style(this: pointer[HtmlFOTBuilder], st: pointer[HtmlStyle])
+    {
+        var first true
+        var c st.classes
+        while c <> null
+        {
+            if first
+                set first: false
+            else
+                this.raw(", ")
+            this.raw("SPAN.")
+            this.out_class_name(c)
+            set c: c.next
+        }
+        if first
+            return
+        this.raw(" {")
+        this.re()
+        this.raw("  font-family: ")
+        this.raw_stringc(st.font_family)
+        this.put(0x3B as u32)
+        this.re()
+        this.raw("  font-weight: ")
+        this.raw_ulong(st.font_weight)
+        this.raw("00;")
+        this.re()
+        this.raw("  font-style: ")
+        if st.font_style = HTM_STYLE_ITALIC
+            this.raw("italic")
+        else if st.font_style = HTM_STYLE_OBLIQUE
+            this.raw("oblique")
+        else
+            this.raw("normal")
+        this.put(0x3B as u32)
+        this.re()
+        this.raw("  font-size: ")
+        this.out_length(st.font_size)
+        this.put(0x3B as u32)
+        this.re()
+        this.raw("  color: #")
+        var sh 20
+        while sh >= 0
+        {
+            let nib (st.color >> sh) & 0xF
+            let hexd "0123456789abcdef"
+            this.put((*((hexd as pointer[u8]) + nib)) as u32)
+            set sh: sh - 4
+        }
+        this.put(0x3B as u32)
+        this.re()
+        this.put(0x7D as u32)
+        this.re()
+    }
+
+    ; ParaStyle::output
+    procedure out_para_style(this: pointer[HtmlFOTBuilder], st: pointer[HtmlStyle])
+    {
+        var first true
+        var c st.classes
+        while c <> null
+        {
+            if first
+                set first: false
+            else
+                this.raw(", ")
+            this.raw("DIV.")
+            this.out_class_name(c)
+            set c: c.next
+        }
+        if first
+            return
+        this.raw(" {")
+        this.re()
+        if st.left_margin <> 0
+        {
+            this.raw("  margin-left: ")
+            this.out_length(st.left_margin)
+            this.put(0x3B as u32)
+            this.re()
+        }
+        if st.right_margin <> 0
+        {
+            this.raw("  margin-right: ")
+            this.out_length(st.right_margin)
+            this.put(0x3B as u32)
+            this.re()
+        }
+        if st.top_margin <> 0
+        {
+            this.raw("  margin-top: ")
+            this.out_length(st.top_margin)
+            this.put(0x3B as u32)
+            this.re()
+        }
+        this.raw("  text-align: ")
+        if st.align = HTM_ALIGN_CENTER
+            this.raw("center")
+        else if st.align = HTM_ALIGN_RIGHT
+            this.raw("right")
+        else if st.align = HTM_ALIGN_JUSTIFY
+            this.raw("justify")
+        else
+            this.raw("left")
+        this.put(0x3B as u32)
+        this.re()
+        this.raw("  line-height: ")
+        this.out_length(st.line_height)
+        this.put(0x3B as u32)
+        this.re()
+        this.raw("  text-indent: ")
+        this.out_length(st.text_indent)
+        this.put(0x3B as u32)
+        this.re()
+        this.put(0x7D as u32)
+        this.re()
+    }
+
+    ; the filename helpers: strip an extension within the last five characters
+    function strip_ext(name: String) returns String
+    {
+        let n name.get_length()
+        var cut n
+        var j: size_t 0
+        while j < (5 as size_t)
+        {
+            if n < (j + (1 as size_t))
+                break
+            let c (name.get(n - j - (1 as size_t))) as u32
+            if (c = (0x2F as u32)) or (c = (0x5C as u32))
+                break
+            if c = (0x2E as u32)
+            {
+                set cut: n - j - (1 as size_t)
+                break
+            }
+            set j: j + (1 as size_t)
+        }
+        if cut = n
+            return name
+        name.substring(0 as size_t, cut)
+    }
+
+    function ext_of(name: String) returns String
+    {
+        let n name.get_length()
+        var j: size_t 0
+        while j < (5 as size_t)
+        {
+            if n < (j + (1 as size_t))
+                break
+            let c (name.get(n - j - (1 as size_t))) as u32
+            if (c = (0x2F as u32)) or (c = (0x5C as u32))
+                break
+            if c = (0x2E as u32)
+                return name.substring(n - j - (1 as size_t), j + (1 as size_t))
+            set j: j + (1 as size_t)
+        }
+        String()
+    }
+
+    ; OutputState::outputFilename(index): base + index + ext (index 0 = as-is)
+    function doc_filename(this: pointer[HtmlFOTBuilder], index: int) returns String
+    {
+        if index = 0
+            return this.out_name
+        let host this.host
+        let base HtmlFOTBuilder.strip_ext(this.out_name)
+        let ext HtmlFOTBuilder.ext_of(this.out_name)
+        let sb StringBuilder^host(base)
+        sb.append(index)
+        sb.append(ext)
+        let nm sb.to_string()
+        String^host(nm.get_buffer() as pointer[const_char], nm.get_length())
+    }
+
+    ; the basename after the last slash/backslash
+    function basename(name: String) returns String
+    {
+        let n name.get_length()
+        var i n
+        while i > (0 as size_t)
+        {
+            let c (name.get(i - (1 as size_t))) as u32
+            if (c = (0x5C as u32)) or (c = (0x2F as u32))
+                break
+            set i: i - (1 as size_t)
+        }
+        name.substring(i, n - i)
+    }
+
+    ; encode the record buffer (RE -> LF) as UTF-8, like the transform sink
+    function encode(this: pointer[HtmlFOTBuilder], buf: pointer[Array[u32]]) returns String
+    {
+        let host this.host
+        let n buf.get_length()
+        let src host.allocate(n * (4 as size_t) + (4 as size_t), 4) as pointer[u32]
+        var m: size_t 0
+        var i: size_t 0
+        let p buf.get_buffer()
+        while i < n
+        {
+            let c *(p + i)
+            if c = (0x0D as u32)
+            {
+                set *(src + m): 0x0A as u32
+                set m: m + (1 as size_t)
+            }
+            else
+            {
+                set *(src + m): c
+                set m: m + (1 as size_t)
+            }
+            set i: i + (1 as size_t)
+        }
+        let cap m * (4 as size_t) + (1 as size_t)
+        let bytes host.allocate(cap, 1) as pointer[u8]
+        let cs CodingSystem.UTF8()
+        let blen cs.encode(src, m, bytes, cap)
+        String(bytes as pointer[const_char], blen)
+    }
+
+    ; --- the emission pass (the reference destructor) --------------------------
+    function finish(this: pointer[HtmlFOTBuilder])
+    {
+        let host this.host
+        ; reverse the still-open destinations, outermost last (dtor order)
+        HtmlFOTBuilder.reverse_content(this.dest)
+        while this.dest_depth > 0
+        {
+            set this.dest_depth: this.dest_depth - 1
+            let p this.dest_stack.get(this.dest_depth as size_t)
+            HtmlFOTBuilder.reverse_content(*p)
+        }
+        this.output_stylesheet()
+        ; the tree: everything outside a Document goes to the discard stream
+        set this.os: null
+        set this.out_doc_index: 0 - 1
+        set this.cur_aref: null
+        set this.spec_aref: null
+        set this.cur_char_class: null
+        this.out_container(this.root)
+    }
+
+    procedure output_stylesheet(this: pointer[HtmlFOTBuilder])
+    {
+        let host this.host
+        let base HtmlFOTBuilder.strip_ext(this.out_name)
+        let sb StringBuilder^host(base)
+        sb.append(".css")
+        let nm sb.to_string()
+        ; the name outlives this frame (it is stored as css_name and used by
+        ; every document's LINK element) — pin it on the builder's page.
+        let name String^host(nm.get_buffer() as pointer[const_char], nm.get_length())
+        let buf Array[u32]^host()
+        set this.os: buf
+        var i: size_t 0
+        let cn this.char_slots.get_length()
+        while i < cn
+        {
+            let sp this.char_slots.get(i)
+            if sp <> null
+            {
+                let st *sp
+                if st <> null
+                    this.out_char_style(st)
+            }
+            set i: i + (1 as size_t)
+        }
+        this.raw("DIV { margin-top: 0pt; margin-bottom: 0pt; margin-left: 0pt; margin-right: 0pt }")
+        this.re()
+        set i: 0
+        let pn this.para_slots.get_length()
+        while i < pn
+        {
+            let sp this.para_slots.get(i)
+            if sp <> null
+            {
+                let st *sp
+                if st <> null
+                    this.out_para_style(st)
+            }
+            set i: i + (1 as size_t)
+        }
+        set this.os: null
+        let content this.encode(buf)
+        if File.write_from_string(name, content) = false
+        {
+            this.msg_cannot_open(name, scaly_eio_errno())
+            return
+        }
+        set this.css_name: name
+        set this.have_css: true
+    }
+
+    ; Container::output
+    procedure out_container(this: pointer[HtmlFOTBuilder], owner: pointer[HtmlItem])
+    {
+        var it owner.content
+        while it <> null
+        {
+            this.out_item(it)
+            set it: it.next
+        }
+    }
+
+    procedure out_item(this: pointer[HtmlFOTBuilder], it: pointer[HtmlItem])
+    {
+        let tag it.tag
+        if tag = HTM_CONTAINER
+        {
+            this.out_container(it)
+            return
+        }
+        if tag = HTM_PCDATA
+        {
+            this.sync_char(it.style_class)
+            this.out_cdata(it.data, it.n)
+            return
+        }
+        if tag = HTM_MARKUP
+        {
+            this.sync_char(null)
+            this.raw_stringc(it.str)
+            return
+        }
+        if tag = HTM_ADDRESSABLE
+        {
+            if it.referenced
+            {
+                if it.element_index <> (0 - 1)
+                {
+                    this.raw("<A NAME=")
+                    if it.grove_index <> 0
+                    {
+                        this.raw_ulong(it.grove_index)
+                        this.put(0x2E as u32)
+                    }
+                    this.raw_ulong(it.element_index)
+                    this.raw("></A>")
+                }
+            }
+            return
+        }
+        if tag = HTM_REF
+        {
+            let old this.spec_aref
+            set this.spec_aref: it.aref
+            this.out_container(it)
+            set this.spec_aref: old
+            return
+        }
+        if tag = HTM_BLOCK
+        {
+            let addr this.spec_aref
+            set this.spec_aref: null
+            this.sync_char(null)
+            this.raw("<DIV CLASS=")
+            this.out_class_name(it.style_class)
+            this.re()
+            this.put(0x3E as u32)
+            set this.spec_aref: addr
+            this.out_container(it)
+            set this.spec_aref: null
+            this.sync_char(null)
+            this.raw("</DIV>")
+            set this.spec_aref: addr
+            return
+        }
+        ; HTM_DOCUMENT — its own file and its own output state
+        let host this.host
+        let save_os this.os
+        let save_doc this.out_doc_index
+        let save_cur this.cur_aref
+        let save_spec this.spec_aref
+        let save_cls this.cur_char_class
+        let buf Array[u32]^host()
+        set this.os: buf
+        set this.out_doc_index: it.doc_index
+        set this.cur_aref: null
+        set this.spec_aref: null
+        set this.cur_char_class: null
+        this.raw("<HTML>")
+        this.re()
+        if this.have_css
+        {
+            this.raw("<LINK REL=STYLESHEET TYPE=\"text/css\" HREF=\"")
+            let bn HtmlFOTBuilder.basename(this.css_name)
+            var bi: size_t 0
+            while bi < bn.get_length()
+            {
+                this.put((bn.get(bi)) as u32)
+                set bi: bi + (1 as size_t)
+            }
+            this.raw("\">")
+            this.re()
+        }
+        if it.has_title
+        {
+            this.raw("<TITLE>")
+            this.out_cdata_stringc(it.title)
+            this.raw("</TITLE>")
+        }
+        this.raw("<BODY>")
+        this.re()
+        this.out_container(it)
+        this.raw("</BODY>")
+        this.re()
+        this.raw("</HTML>")
+        this.re()
+        let fname this.doc_filename(it.doc_index)
+        let content this.encode(buf)
+        if File.write_from_string(fname, content) = false
+            this.msg_cannot_open(fname, scaly_eio_errno())
+        set this.os: save_os
+        set this.out_doc_index: save_doc
+        set this.cur_aref: save_cur
+        set this.spec_aref: save_spec
+        set this.cur_char_class: save_cls
+    }
+
+    ; Addressable::outputRef
+    procedure out_ref(this: pointer[HtmlFOTBuilder], aref: pointer[HtmlItem], is_end: bool)
+    {
+        if aref.defined() = false
+            return
+        if is_end
+        {
+            this.raw("</A>")
+            return
+        }
+        this.raw("<A HREF=\"")
+        var need_file false
+        if this.out_doc_index <> aref.a_doc_index
+            set need_file: true
+        if aref.element_index = (0 - 1)
+            set need_file: true
+        if need_file
+        {
+            let fn this.doc_filename(aref.a_doc_index)
+            let bn HtmlFOTBuilder.basename(fn)
+            var i: size_t 0
+            while i < bn.get_length()
+            {
+                this.put((bn.get(i)) as u32)
+                set i: i + (1 as size_t)
+            }
+        }
+        if aref.element_index <> (0 - 1)
+        {
+            this.raw("#")
+            if aref.grove_index <> 0
+            {
+                this.raw_ulong(aref.grove_index)
+                this.put(0x2E as u32)
+            }
+            this.raw_ulong(aref.element_index)
+        }
+        this.raw("\">")
+    }
+
+    ; OutputState::syncChar — <A><SPAN>…</SPAN></A> transitions
+    procedure sync_char(this: pointer[HtmlFOTBuilder], sc: pointer[HtmlStyleClass])
+    {
+        if this.cur_aref <> this.spec_aref
+        {
+            if this.cur_char_class <> null
+            {
+                this.raw("</SPAN>")
+                set this.cur_char_class: null
+            }
+            if this.cur_aref <> null
+                this.out_ref(this.cur_aref, true)
+            if this.spec_aref <> null
+                this.out_ref(this.spec_aref, false)
+            set this.cur_aref: this.spec_aref
+        }
+        if this.cur_char_class <> sc
+        {
+            if this.cur_char_class <> null
+                this.raw("</SPAN>")
+            if sc <> null
+            {
+                this.raw("<SPAN CLASS=")
+                this.out_class_name(sc)
+                this.put(0x3E as u32)
+            }
+            set this.cur_char_class: sc
+        }
+    }
+
+    ; --- the rest of the sink surface: the inherited FOTBuilder brackets ------
+    function start_sequence(this: pointer[HtmlFOTBuilder])
+        this.fo_start()
+
+    function end_sequence(this: pointer[HtmlFOTBuilder])
+        this.fo_end()
+
+    function start_display_group(this: pointer[HtmlFOTBuilder], nic: pointer[DisplayNIC])
+        this.fo_start()
+
+    function end_display_group(this: pointer[HtmlFOTBuilder])
+        this.fo_end()
+
+    function start_line_field(this: pointer[HtmlFOTBuilder], nic: pointer[LineFieldNICRec])
+        this.fo_start()
+
+    function end_line_field(this: pointer[HtmlFOTBuilder])
+        this.fo_end()
+
+    function start_leader(this: pointer[HtmlFOTBuilder], nic: pointer[LeaderNICRec])
+        this.fo_start()
+
+    function end_leader(this: pointer[HtmlFOTBuilder])
+        this.fo_end()
+
+    function start_score(this: pointer[HtmlFOTBuilder], nic: pointer[ScoreNICRec])
+        this.fo_start()
+
+    function end_score(this: pointer[HtmlFOTBuilder])
+        this.fo_end()
+
+    function start_box(this: pointer[HtmlFOTBuilder], nic: pointer[BoxNICRec], dnic: pointer[DisplayNIC])
+        this.fo_start()
+
+    function end_box(this: pointer[HtmlFOTBuilder])
+        this.fo_end()
+
+    function paragraph_break(this: pointer[HtmlFOTBuilder], nic: pointer[DisplayNIC])
+        this.fo_atomic()
+
+    function rule(this: pointer[HtmlFOTBuilder], nic: pointer[RuleNICRec], dnic: pointer[DisplayNIC])
+        this.fo_atomic()
+
+    function external_graphic(this: pointer[HtmlFOTBuilder], nic: pointer[GraphicNICRec], dnic: pointer[DisplayNIC])
+        this.fo_atomic()
+
+    ; FOTBuilder::pageNumber / currentNodePageNumber are EMPTY (no atomic)
+    function page_number(this: pointer[HtmlFOTBuilder])
+        0
+
+    function current_node_page_number(this: pointer[HtmlFOTBuilder], node: pointer[GroveNode])
+        0
+
+    function start_simple_page_sequence(this: pointer[HtmlFOTBuilder])
+        this.fo_start()
+
+    function start_simple_page_sequence_header_footer(this: pointer[HtmlFOTBuilder], flags: int)
+        this.fo_start()
+
+    function end_simple_page_sequence_header_footer(this: pointer[HtmlFOTBuilder], flags: int)
+        this.fo_end()
+
+    function end_all_simple_page_sequence_header_footer(this: pointer[HtmlFOTBuilder])
+        0
+
+    function end_simple_page_sequence(this: pointer[HtmlFOTBuilder])
+        this.fo_end()
+
+    function start_table(this: pointer[HtmlFOTBuilder], tnic: pointer[TableNICRec], dnic: pointer[DisplayNIC])
+        this.fo_start()
+
+    function end_table(this: pointer[HtmlFOTBuilder])
+        this.fo_end()
+
+    function start_table_part_serial(this: pointer[HtmlFOTBuilder], dnic: pointer[DisplayNIC])
+        this.fo_start()
+
+    function end_table_part_serial(this: pointer[HtmlFOTBuilder])
+        this.fo_end()
+
+    function start_table_part_header(this: pointer[HtmlFOTBuilder])
+        0
+
+    function end_table_part_header(this: pointer[HtmlFOTBuilder])
+        0
+
+    function start_table_part_footer(this: pointer[HtmlFOTBuilder])
+        0
+
+    function end_table_part_footer(this: pointer[HtmlFOTBuilder])
+        0
+
+    function table_column(this: pointer[HtmlFOTBuilder], nic: pointer[TableColumnNICRec])
+        this.fo_atomic()
+
+    function start_table_row(this: pointer[HtmlFOTBuilder])
+        this.fo_start()
+
+    function end_table_row(this: pointer[HtmlFOTBuilder])
+        this.fo_end()
+
+    function start_table_cell(this: pointer[HtmlFOTBuilder], nic: pointer[TableCellNICRec])
+        this.fo_start()
+
+    function end_table_cell(this: pointer[HtmlFOTBuilder])
+        this.fo_end()
+
+    function table_before_row_border(this: pointer[HtmlFOTBuilder])
+        this.fo_atomic()
+
+    function table_after_row_border(this: pointer[HtmlFOTBuilder])
+        this.fo_atomic()
+
+    function table_before_column_border(this: pointer[HtmlFOTBuilder])
+        this.fo_atomic()
+
+    function table_after_column_border(this: pointer[HtmlFOTBuilder])
+        this.fo_atomic()
+
+    function table_cell_before_row_border(this: pointer[HtmlFOTBuilder])
+        this.fo_atomic()
+
+    function table_cell_after_row_border(this: pointer[HtmlFOTBuilder])
+        this.fo_atomic()
+
+    function table_cell_before_column_border(this: pointer[HtmlFOTBuilder])
+        this.fo_atomic()
+
+    function table_cell_after_column_border(this: pointer[HtmlFOTBuilder])
+        this.fo_atomic()
+
+    ; the TeX extension flow objects never reach this backend (their classes
+    ; bind as FOC_UNKNOWN unless -t tex), but the sink surface is shared.
+    function start_page_float(this: pointer[HtmlFOTBuilder], nic: pointer[PageFloatNICRec])
+        0
+
+    function end_page_float(this: pointer[HtmlFOTBuilder])
+        0
+
+    function start_page_footnote(this: pointer[HtmlFOTBuilder])
+        0
+
+    function end_page_footnote(this: pointer[HtmlFOTBuilder])
+        0
+}
