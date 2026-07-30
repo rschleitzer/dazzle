@@ -1,0 +1,4083 @@
+; TeXFOTBuilder — the `-t tex` backend: David Megginson's generic TeX macro
+; stream (jadetex input). Ported from ~/repos/dazzle/jade/TeXFOTBuilder.cxx
+; (C++ oracle, openjade 1.3.3-pre1; the build defines OUTLINES and leaves
+; TEXDEBUG/NDEBUG undefined — reference asserts are live and port as loud
+; exit-17 traps). The C# mirror has no TeX backend; the C++ is the only
+; source.
+;
+; Output model: byte streams. Every characteristic setter renders
+; "\def\Name%\n{value}" into the pending string stream (stringout_); the
+; next flow-object group start dumps it inside its brace group. Groups are
+; "\Name%\n{...}" ... "\endName{}"; atomic flow objects are
+; "\insertName%\n{...}". Numbers print in printf %g form; setlength values
+; pass through FLOAT precision (the reference casts to float before
+; streaming — port via the f32 round-trip). Chars stream as single bytes
+; (C++ char truncation); chars > 255 become \Character{N}.
+;
+; Tables buffer into a FotElement tree (Table/TablePart/Row/Cell/Border
+; records with prolog/characteristics/content byte buffers) and emit at
+; endTable after border resolution and column processing — a faithful port
+; of the Marszalek table machinery including its quirks (the row-separator
+; "&" emission clears `first` even for suppressed cells; the trailing dummy
+; cell; LengthInPoints losing the sign of -0.x values).
+;
+; The simple-page-sequence header/footer parts arrive live from
+; ProcessContext (part content, then end_simple_page_sequence_header_footer
+; with the reference's k = pageType | (part << 2) flags); the sink captures
+; each part in a reused buffer and wraps it retroactively in the
+; "\n\SpS<First|Other><Front|Back><Left|Center|Right><Header|Footer>%\n{...}"
+; bracket — byte-equivalent to the reference SerialFOTBuilder replay.
+;
+; RBMM: everything lives on the builder's page (the run arena); the pending
+; stream, HF capture and heading-text buffers are cursor-reused (TexBuf),
+; stacks are slot-reused pointer arrays with depth cursors. Table trees
+; allocate fresh per table (few, bounded by the document).
+
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use dazzle.Grove.GroveNode
+use dazzle.ELObj.ELObj
+use dazzle.Style.InheritedC
+use dazzle.Style.LengthSpec
+use dazzle.Style.DisplaySpace
+use dazzle.Style.InlineSpace
+use dazzle.Style.FotSym
+use dazzle.Style.DisplayNIC
+use dazzle.Style.RuleNICRec
+use dazzle.Style.LinkNICRec
+use dazzle.Style.GraphicNICRec
+use dazzle.Style.LeaderNICRec
+use dazzle.Style.BoxNICRec
+use dazzle.Style.ScoreNICRec
+use dazzle.Style.TableNICRec
+use dazzle.Style.TableColumnNICRec
+use dazzle.Style.TableCellNICRec
+use dazzle.Style.PageFloatNICRec
+use dazzle.Style.LineFieldNICRec
+
+; --- constants ---------------------------------------------------------------
+; FotObjectClassType
+define TEX_OC_UNKNOWN: int 0
+define TEX_OC_CELL: int 1
+
+; lengthUnspecified = LONG_MAX (LP64)
+define TEX_LEN_UNSPEC: int 0x7FFFFFFFFFFFFFFF
+
+; FotElement tags
+define TEX_EL_BORDER: int 0
+define TEX_EL_CELL: int 1
+define TEX_EL_ROW: int 2
+define TEX_EL_PART: int 3
+define TEX_EL_TABLE: int 4
+
+; border kinds (0-3 cell borders, 4-7 table borders)
+define TEX_B_CELL_BEFORE_ROW: int 0
+define TEX_B_CELL_AFTER_ROW: int 1
+define TEX_B_CELL_BEFORE_COL: int 2
+define TEX_B_CELL_AFTER_COL: int 3
+define TEX_B_TABLE_BEFORE_ROW: int 4
+define TEX_B_TABLE_AFTER_ROW: int 5
+define TEX_B_TABLE_BEFORE_COL: int 6
+define TEX_B_TABLE_AFTER_COL: int 7
+
+; --- TexBuf: a cursor-reused byte buffer (StrOutputByteStream/String<char>) --
+define TexBuf (arr: pointer[Array[u8]], len: size_t)
+{
+    function make(host: pointer[Page]) returns pointer[TexBuf]
+    {
+        let b host.allocate(sizeof TexBuf, alignof TexBuf) as pointer[TexBuf]
+        set b.arr: Array[u8]^host()
+        set b.len: 0 as size_t
+        b
+    }
+
+    function put(this: pointer[TexBuf], c: u8)
+    {
+        if this.len < this.arr.get_length()
+            this.arr.put(this.len, c)
+        else
+            this.arr.add(c)
+        set this.len: this.len + (1 as size_t)
+    }
+
+    procedure clear(this: pointer[TexBuf])
+        set this.len: 0 as size_t
+
+    function data(this: pointer[TexBuf]) returns pointer[u8]
+        arr.get_buffer()
+
+    function size(this: pointer[TexBuf]) returns size_t
+        len
+}
+
+; --- Format: the inherited-characteristic snapshot the table/page machinery
+; consults (reference struct Format; ctor defaults preserved) ----------------
+define TexFormat
+(
+    cur_display_size: int
+    line_thickness: int
+    line_cap: int
+    border_priority: int
+    border_present: bool
+    line_repeat: int
+    line_sep: int
+    lines_sym: int
+    display_alignment: int
+    cell_row_alignment: int
+    start_indent_spec: LengthSpec
+    end_indent_spec: LengthSpec
+    left_margin: int
+    right_margin: int
+    page_width: int
+    page_n_columns: int
+    page_column_sep: int
+    span_count: int
+    cell_background: bool
+    bg_r: int
+    bg_g: int
+    bg_b: int
+    cell_before_col_margin: int
+    cell_after_col_margin: int
+    object_class: int
+)
+{
+    init()
+    {
+        set this.cur_display_size: 0
+        set this.line_thickness: 1000
+        ; symbolButt = 70
+        set this.line_cap: 70
+        set this.border_priority: 0
+        set this.border_present: true
+        set this.line_repeat: 1
+        set this.line_sep: 1000
+        ; symbolWrap = 33
+        set this.lines_sym: 33
+        ; symbolNotApplicable = 2
+        set this.display_alignment: 2
+        set this.cell_row_alignment: 2
+        set this.start_indent_spec: LengthSpec()
+        set this.end_indent_spec: LengthSpec()
+        set this.left_margin: 1
+        set this.right_margin: 1
+        set this.page_width: 72000 * 8
+        set this.page_n_columns: 1
+        set this.page_column_sep: 72000 / 2
+        set this.span_count: 1
+        set this.cell_background: false
+        set this.bg_r: 0
+        set this.bg_g: 0
+        set this.bg_b: 0
+        set this.cell_before_col_margin: TEX_LEN_UNSPEC
+        set this.cell_after_col_margin: TEX_LEN_UNSPEC
+        set this.object_class: TEX_OC_UNKNOWN
+    }
+}
+
+; --- FotElementState ---------------------------------------------------------
+define TexFoState (enforcing: bool, is_open: bool, ni_prolog: pointer[TexBuf])
+{
+}
+
+; --- OUTLINES ParHead --------------------------------------------------------
+define TexParHead (is_headed: bool, level: int, heading_text: pointer[TexBuf], previous: int)
+{
+}
+
+; --- Column ------------------------------------------------------------------
+define TexColumn
+(
+    is_explicit: bool
+    has_width: bool
+    width: LengthSpec
+    width_tuf: double
+    computed_width: int
+    display_size: int
+    display_alignment: int
+    default_left_border: int
+    default_right_border: int
+    default_before_margin: int
+    default_after_margin: int
+)
+{
+    function make(host: pointer[Page]) returns pointer[TexColumn]
+    {
+        let c host.allocate(sizeof TexColumn, alignof TexColumn) as pointer[TexColumn]
+        set c.is_explicit: false
+        set c.has_width: false
+        set c.width: LengthSpec()
+        set c.width_tuf: 0.0
+        set c.computed_width: 0
+        set c.display_size: 0
+        ; symbolStart = 25
+        set c.display_alignment: 25
+        set c.default_left_border: 0
+        set c.default_right_border: 0
+        set c.default_before_margin: 0
+        set c.default_after_margin: 0
+        c
+    }
+}
+
+; --- FotElement: one tagged record covers Border/Cell/Row/TablePart/Table ----
+define TexFotEl
+(
+    tag: int
+    parent: pointer[TexFotEl]
+    sibling_idx: int
+    characteristics: pointer[TexBuf]
+    ni_prolog: pointer[TexBuf]
+    ni_epilog: pointer[TexBuf]
+    ; compound state
+    cur_open_child: int
+    last_closed_child: int
+    pre_content: pointer[TexBuf]
+    ; border payload
+    border_kind: int
+    b_priority: int
+    b_thickness: int
+    b_present: bool
+    b_repeat: int
+    b_sep: int
+    ; cell payload
+    missing: bool
+    tex_row_idx: int
+    tex_col_idx: int
+    n_cols_spanned: int
+    n_rows_spanned: int
+    br_border: pointer[TexFotEl]
+    ar_border: pointer[TexFotEl]
+    bc_border: pointer[TexFotEl]
+    ac_border: pointer[TexFotEl]
+    needs_override: bool
+    before_col_margin: int
+    eff_before_col_margin: int
+    after_col_margin: int
+    eff_after_col_margin: int
+    row_alignment: int
+    eff_alignment: int
+    display_size: int
+    cell_background: bool
+    bg_r: int
+    bg_g: int
+    bg_b: int
+    overlapping: pointer[TexFotEl]
+    content: pointer[TexBuf]
+    ; row payload
+    cells: pointer[Array[pointer[TexFotEl]]]
+    ; table-part payload
+    columns: pointer[Array[pointer[TexColumn]]]
+    header_rows: pointer[Array[pointer[TexFotEl]]]
+    body_rows: pointer[Array[pointer[TexFotEl]]]
+    footer_rows: pointer[Array[pointer[TexFotEl]]]
+    header_prolog: pointer[TexBuf]
+    header_epilog: pointer[TexBuf]
+    footer_prolog: pointer[TexBuf]
+    footer_epilog: pointer[TexBuf]
+    columns_processed: bool
+    needs_col_reproc: bool
+    is_explicit: bool
+    ; table payload
+    parts: pointer[Array[pointer[TexFotEl]]]
+    t_br_border: pointer[TexFotEl]
+    t_ar_border: pointer[TexFotEl]
+    t_bc_border: pointer[TexFotEl]
+    t_ac_border: pointer[TexFotEl]
+    table_width: int
+    t_display_alignment: int
+    start_indent: int
+    cur_part: pointer[TexFotEl]
+    cur_cell: pointer[TexFotEl]
+    ; which row vector CurRows points at: 0 header, 1 body, 2 footer
+    cur_rows_sel: int
+    no_parts_seen: bool
+)
+{
+    ; every field explicit — define-header defaults do NOT apply (S79 trap).
+    function make(host: pointer[Page], tag: int) returns pointer[TexFotEl]
+    {
+        let e host.allocate(sizeof TexFotEl, alignof TexFotEl) as pointer[TexFotEl]
+        set e.tag: tag
+        set e.parent: null
+        set e.sibling_idx: 0 - 1
+        set e.characteristics: TexBuf.make(host)
+        set e.ni_prolog: TexBuf.make(host)
+        set e.ni_epilog: TexBuf.make(host)
+        set e.cur_open_child: 0 - 1
+        set e.last_closed_child: 0 - 1
+        set e.pre_content: null
+        set e.border_kind: 0
+        set e.b_priority: 0
+        set e.b_thickness: 0
+        set e.b_present: false
+        set e.b_repeat: 0
+        set e.b_sep: 0
+        set e.missing: false
+        set e.tex_row_idx: 0 - 1
+        set e.tex_col_idx: 0 - 1
+        set e.n_cols_spanned: 1
+        set e.n_rows_spanned: 1
+        set e.br_border: null
+        set e.ar_border: null
+        set e.bc_border: null
+        set e.ac_border: null
+        set e.needs_override: false
+        set e.before_col_margin: TEX_LEN_UNSPEC
+        set e.eff_before_col_margin: TEX_LEN_UNSPEC
+        set e.after_col_margin: TEX_LEN_UNSPEC
+        set e.eff_after_col_margin: TEX_LEN_UNSPEC
+        ; symbolNotApplicable = 2 / symbolStart = 25
+        set e.row_alignment: 2
+        set e.eff_alignment: 25
+        set e.display_size: 0
+        set e.cell_background: false
+        set e.bg_r: 0
+        set e.bg_g: 0
+        set e.bg_b: 0
+        set e.overlapping: null
+        set e.content: null
+        set e.cells: null
+        set e.columns: null
+        set e.header_rows: null
+        set e.body_rows: null
+        set e.footer_rows: null
+        set e.header_prolog: null
+        set e.header_epilog: null
+        set e.footer_prolog: null
+        set e.footer_epilog: null
+        set e.columns_processed: false
+        set e.needs_col_reproc: false
+        set e.is_explicit: true
+        set e.parts: null
+        set e.t_br_border: null
+        set e.t_ar_border: null
+        set e.t_bc_border: null
+        set e.t_ac_border: null
+        set e.table_width: 0
+        set e.t_display_alignment: 25
+        set e.start_indent: 0
+        set e.cur_part: null
+        set e.cur_cell: null
+        set e.cur_rows_sel: 1
+        set e.no_parts_seen: true
+        e
+    }
+
+    function make_border(host: pointer[Page], kind: int) returns pointer[TexFotEl]
+    {
+        let e TexFotEl.make(host, TEX_EL_BORDER)
+        set e.border_kind: kind
+        e
+    }
+
+    function make_cell(host: pointer[Page]) returns pointer[TexFotEl]
+    {
+        let e TexFotEl.make(host, TEX_EL_CELL)
+        set e.pre_content: TexBuf.make(host)
+        set e.content: TexBuf.make(host)
+        set e.br_border: TexFotEl.make_border(host, TEX_B_CELL_BEFORE_ROW)
+        set e.ar_border: TexFotEl.make_border(host, TEX_B_CELL_AFTER_ROW)
+        set e.bc_border: TexFotEl.make_border(host, TEX_B_CELL_BEFORE_COL)
+        set e.ac_border: TexFotEl.make_border(host, TEX_B_CELL_AFTER_COL)
+        e
+    }
+
+    function make_row(host: pointer[Page]) returns pointer[TexFotEl]
+    {
+        let e TexFotEl.make(host, TEX_EL_ROW)
+        set e.pre_content: TexBuf.make(host)
+        set e.cells: Array[pointer[TexFotEl]]^host()
+        e
+    }
+
+    function make_part(host: pointer[Page]) returns pointer[TexFotEl]
+    {
+        let e TexFotEl.make(host, TEX_EL_PART)
+        set e.pre_content: TexBuf.make(host)
+        set e.columns: Array[pointer[TexColumn]]^host()
+        set e.header_rows: Array[pointer[TexFotEl]]^host()
+        set e.body_rows: Array[pointer[TexFotEl]]^host()
+        set e.footer_rows: Array[pointer[TexFotEl]]^host()
+        set e.header_prolog: TexBuf.make(host)
+        set e.header_epilog: TexBuf.make(host)
+        set e.footer_prolog: TexBuf.make(host)
+        set e.footer_epilog: TexBuf.make(host)
+        e
+    }
+
+    function make_table(host: pointer[Page]) returns pointer[TexFotEl]
+    {
+        let e TexFotEl.make(host, TEX_EL_TABLE)
+        set e.pre_content: TexBuf.make(host)
+        set e.parts: Array[pointer[TexFotEl]]^host()
+        set e.t_br_border: TexFotEl.make_border(host, TEX_B_TABLE_BEFORE_ROW)
+        set e.t_ar_border: TexFotEl.make_border(host, TEX_B_TABLE_AFTER_ROW)
+        set e.t_bc_border: TexFotEl.make_border(host, TEX_B_TABLE_BEFORE_COL)
+        set e.t_ac_border: TexFotEl.make_border(host, TEX_B_TABLE_AFTER_COL)
+        e
+    }
+
+    ; the macro name of this element
+    function el_name(this: pointer[TexFotEl]) returns pointer[const_char]
+    {
+        if tag = TEX_EL_CELL
+            return "TableCell"
+        if tag = TEX_EL_ROW
+            return "TableRow"
+        if tag = TEX_EL_PART
+            return "TablePart"
+        if tag = TEX_EL_TABLE
+            return "Table"
+        if border_kind = TEX_B_CELL_BEFORE_ROW
+            return "TableCellBeforeRowBorder"
+        if border_kind = TEX_B_CELL_AFTER_ROW
+            return "TableCellAfterRowBorder"
+        if border_kind = TEX_B_CELL_BEFORE_COL
+            return "TableCellBeforeColumnBorder"
+        if border_kind = TEX_B_CELL_AFTER_COL
+            return "TableCellAfterColumnBorder"
+        if border_kind = TEX_B_TABLE_BEFORE_ROW
+            return "TableBeforeRowBorder"
+        if border_kind = TEX_B_TABLE_AFTER_ROW
+            return "TableAfterRowBorder"
+        if border_kind = TEX_B_TABLE_BEFORE_COL
+            return "TableBeforeColumnBorder"
+        "TableAfterColumnBorder"
+    }
+
+    function is_cell_border(this: pointer[TexFotEl]) returns bool
+        border_kind < TEX_B_TABLE_BEFORE_ROW
+
+    ; Cell::isOverlapped — NULL OverlappingCell counts as overlapped (the
+    ; reference's `OverlappingCell == this ? false : true`).
+    function is_overlapped(this: pointer[TexFotEl]) returns bool
+    {
+        if overlapping = (this as pointer[TexFotEl])
+            return false
+        true
+    }
+
+    ; TablePart child(): header rows, then body, then footer — with the
+    ; reference's missing body-size subtraction quirk preserved (idx into the
+    ; footer is offset by the body size only, after subtracting the header).
+    function part_child(this: pointer[TexFotEl], idx_in: int) returns pointer[TexFotEl]
+    {
+        var idx idx_in
+        let hn header_rows.get_length() as int
+        if idx < hn
+            return *(header_rows.get_buffer() + idx)
+        set idx: idx - hn
+        let bn body_rows.get_length() as int
+        if idx < bn
+            return *(body_rows.get_buffer() + idx)
+        set idx: idx - bn
+        *(footer_rows.get_buffer() + idx)
+    }
+
+    function child(this: pointer[TexFotEl], idx: int) returns pointer[TexFotEl]
+    {
+        if tag = TEX_EL_TABLE
+            return *(parts.get_buffer() + idx)
+        if tag = TEX_EL_PART
+            return this.part_child(idx)
+        if tag = TEX_EL_ROW
+            return *(cells.get_buffer() + idx)
+        ; Cell::child asserts in the reference
+        TeXFOTBuilder.trap("TexFotEl.child on a leaf")
+        null
+    }
+
+    ; CompoundFotElement::currentlyOpen_ / lastClosed_
+    function currently_open(this: pointer[TexFotEl]) returns pointer[TexFotEl]
+    {
+        if tag = TEX_EL_BORDER
+            return this as pointer[TexFotEl]
+        if cur_open_child > (0 - 1)
+        {
+            let c this.child(cur_open_child)
+            return c.currently_open()
+        }
+        this as pointer[TexFotEl]
+    }
+
+    function last_closed(this: pointer[TexFotEl]) returns pointer[TexFotEl]
+    {
+        if tag = TEX_EL_BORDER
+        {
+            if parent <> null
+                return parent.last_closed()
+            return null
+        }
+        if last_closed_child > (0 - 1)
+            return this.child(last_closed_child)
+        if parent <> null
+            return parent.last_closed()
+        null
+    }
+
+    procedure child_just_opened(this: pointer[TexFotEl], c: pointer[TexFotEl])
+        set this.cur_open_child: c.sibling_idx
+
+    procedure child_just_closed(this: pointer[TexFotEl], c: pointer[TexFotEl])
+    {
+        set this.cur_open_child: 0 - 1
+        set this.last_closed_child: c.sibling_idx
+    }
+
+    ; the row vector CurRows selects
+    function cur_rows(this: pointer[TexFotEl]) returns pointer[Array[pointer[TexFotEl]]]
+    {
+        let part cur_part
+        if cur_rows_sel = 0
+            return part.header_rows
+        if cur_rows_sel = 2
+            return part.footer_rows
+        part.body_rows
+    }
+}
+
+; libc + shim externs (prototypes type-match the other roots').
+function log10(x: double) returns double extern
+function pow(x: double, y: double) returns double extern
+function floor(x: double) returns double extern
+function exit(code: int) extern
+procedure scaly_eputs(s: pointer[const_char]) extern
+procedure scaly_eputnl() extern
+
+; argv0 for backend messages (TeXMessages warnings, W0 severity: the
+; reference renders `<argv0>:W: <text>` through CmdLineApp::message). The CLI
+; driver sets it once; a `shared` module global, like tfb_prog.
+shared tex_prog: pointer[const_char] null
+
+; --- the builder -------------------------------------------------------------
+define TeXFOTBuilder
+(
+    ; fileout_ + the osStack_ (top = current output target)
+    out: pointer[TexBuf]
+    os_stack: pointer[Array[pointer[TexBuf]]]
+    os_depth: int
+    ; stringout_ (the pending \def stream)
+    sout: pointer[TexBuf]
+    ; FormatStack + NextFormat
+    fmt_stack: pointer[Array[pointer[TexFormat]]]
+    fmt_depth: int
+    next_format: TexFormat
+    ; FotElementStateStack_
+    state_stack: pointer[Array[pointer[TexFoState]]]
+    state_depth: int
+    ; TableStack
+    table_stack: pointer[Array[pointer[TexFotEl]]]
+    table_depth: int
+    ; DisplayBoxLevels
+    dbl: pointer[Array[int]]
+    dbl_len: int
+    preserve_sdata: bool
+    in_math: int
+    ; OUTLINES machinery
+    heading_set: bool
+    in_heading: bool
+    last_headed: int
+    par_stack: pointer[Array[pointer[TexParHead]]]
+    par_depth: int
+    ; simple-page-sequence header/footer part capture
+    hf_capture: pointer[TexBuf]
+    in_hf: bool
+    host: pointer[Page]
+)
+{
+    function make(host: pointer[Page]) returns pointer[TeXFOTBuilder]
+    {
+        let f host.allocate(sizeof TeXFOTBuilder, alignof TeXFOTBuilder) as pointer[TeXFOTBuilder]
+        set f.out: TexBuf.make(host)
+        set f.os_stack: Array[pointer[TexBuf]]^host()
+        set f.os_depth: 0
+        set f.sout: TexBuf.make(host)
+        set f.fmt_stack: Array[pointer[TexFormat]]^host()
+        set f.fmt_depth: 0
+        set f.next_format: TexFormat()
+        set f.state_stack: Array[pointer[TexFoState]]^host()
+        set f.state_depth: 0
+        set f.table_stack: Array[pointer[TexFotEl]]^host()
+        set f.table_depth: 0
+        set f.dbl: Array[int]^host()
+        set f.dbl_len: 0
+        set f.preserve_sdata: true
+        set f.in_math: 0
+        set f.heading_set: false
+        set f.in_heading: false
+        set f.last_headed: 0
+        set f.par_stack: Array[pointer[TexParHead]]^host()
+        set f.par_depth: 0
+        set f.hf_capture: TexBuf.make(host)
+        set f.in_hf: false
+        set f.host: host
+        ; ctor: NextFormat.FotCurDisplaySize = INITIAL_PAGE_SIZE, one base
+        ; format level, one base FotElementState, fileout on the os stack,
+        ; then the FOT prolog.
+        set f.next_format.cur_display_size: 72000 * 8
+        f.fmt_push()
+        f.state_push()
+        f.os_push(f.out)
+        f.w_raw("\\FOT{3}")
+        f
+    }
+
+    ; the reference destructor
+    function finish(this: pointer[TeXFOTBuilder])
+        this.w_raw("\\endFOT{}")
+
+    function output(this: pointer[TeXFOTBuilder]) returns pointer[TexBuf]
+        out
+
+    ; --- loud assert (reference asserts are live) -----------------------------
+    function trap(what: pointer[const_char])
+    {
+        if tex_prog <> null
+            scaly_eputs(tex_prog)
+        scaly_eputs ":E: TeXFOTBuilder invariant violated: "
+        scaly_eputs what
+        scaly_eputnl()
+        exit(17)
+    }
+
+    procedure set_prog_name(prog: pointer[const_char])
+        set tex_prog: prog
+
+    ; TeXMessages warnings (W0 severity, no location): `<prog>:W: <text>`.
+    function msg_w(this: pointer[TeXFOTBuilder], text: pointer[const_char])
+    {
+        if tex_prog <> null
+            scaly_eputs(tex_prog)
+        scaly_eputs ":W: "
+        scaly_eputs text
+        scaly_eputnl()
+    }
+
+    ; --- stacks ---------------------------------------------------------------
+    function os_push(this: pointer[TeXFOTBuilder], b: pointer[TexBuf])
+    {
+        let d this.os_depth as size_t
+        if d < this.os_stack.get_length()
+            this.os_stack.put(d, b)
+        else
+            this.os_stack.add(b)
+        set this.os_depth: this.os_depth + 1
+    }
+
+    function os_pop(this: pointer[TeXFOTBuilder])
+    {
+        if this.os_depth <= 0
+            TeXFOTBuilder.trap("popOs on empty stack")
+        set this.os_depth: this.os_depth - 1
+    }
+
+    function cur_os(this: pointer[TeXFOTBuilder]) returns pointer[TexBuf]
+    {
+        let slotp this.os_stack.get((this.os_depth - 1) as size_t)
+        *slotp
+    }
+
+    function copy_fmt(dst: pointer[TexFormat], src: pointer[TexFormat])
+    {
+        set dst.cur_display_size: src.cur_display_size
+        set dst.line_thickness: src.line_thickness
+        set dst.line_cap: src.line_cap
+        set dst.border_priority: src.border_priority
+        set dst.border_present: src.border_present
+        set dst.line_repeat: src.line_repeat
+        set dst.line_sep: src.line_sep
+        set dst.lines_sym: src.lines_sym
+        set dst.display_alignment: src.display_alignment
+        set dst.cell_row_alignment: src.cell_row_alignment
+        set dst.start_indent_spec: src.start_indent_spec
+        set dst.end_indent_spec: src.end_indent_spec
+        set dst.left_margin: src.left_margin
+        set dst.right_margin: src.right_margin
+        set dst.page_width: src.page_width
+        set dst.page_n_columns: src.page_n_columns
+        set dst.page_column_sep: src.page_column_sep
+        set dst.span_count: src.span_count
+        set dst.cell_background: src.cell_background
+        set dst.bg_r: src.bg_r
+        set dst.bg_g: src.bg_g
+        set dst.bg_b: src.bg_b
+        set dst.cell_before_col_margin: src.cell_before_col_margin
+        set dst.cell_after_col_margin: src.cell_after_col_margin
+        set dst.object_class: src.object_class
+    }
+
+    ; FormatStack.push_back(NextFormat)
+    function fmt_push(this: pointer[TeXFOTBuilder])
+    {
+        let d this.fmt_depth as size_t
+        if d < this.fmt_stack.get_length()
+        {
+            let slotp this.fmt_stack.get(d)
+            if slotp <> null
+                TeXFOTBuilder.copy_fmt(*slotp, &this.next_format)
+        }
+        else
+        {
+            let host this.host
+            let rec host.allocate(sizeof TexFormat, alignof TexFormat) as pointer[TexFormat]
+            TeXFOTBuilder.copy_fmt(rec, &this.next_format)
+            this.fmt_stack.add(rec)
+        }
+        set this.fmt_depth: this.fmt_depth + 1
+    }
+
+    function cur_format(this: pointer[TeXFOTBuilder]) returns pointer[TexFormat]
+    {
+        if this.fmt_depth <= 0
+            TeXFOTBuilder.trap("curFormat on empty FormatStack")
+        let slotp this.fmt_stack.get((this.fmt_depth - 1) as size_t)
+        *slotp
+    }
+
+    ; start()/elementStart()/end() — the FOTBuilder format bracket
+    function fo_start(this: pointer[TeXFOTBuilder])
+    {
+        set this.next_format.object_class: TEX_OC_UNKNOWN
+        this.fmt_push()
+    }
+
+    function element_start(this: pointer[TeXFOTBuilder], oc: int)
+    {
+        set this.next_format.object_class: oc
+        this.fmt_push()
+    }
+
+    function fo_end(this: pointer[TeXFOTBuilder])
+    {
+        if this.fmt_depth <= 1
+            TeXFOTBuilder.trap("end() underflow")
+        set this.fmt_depth: this.fmt_depth - 1
+        let slotp this.fmt_stack.get((this.fmt_depth - 1) as size_t)
+        TeXFOTBuilder.copy_fmt(&this.next_format, *slotp)
+    }
+
+    ; FotElementState stack
+    function state_push(this: pointer[TeXFOTBuilder])
+    {
+        let d this.state_depth as size_t
+        if d < this.state_stack.get_length()
+        {
+            let slotp this.state_stack.get(d)
+            let st *slotp
+            set st.enforcing: true
+            set st.is_open: false
+            st.ni_prolog.clear()
+        }
+        else
+        {
+            let host this.host
+            let st host.allocate(sizeof TexFoState, alignof TexFoState) as pointer[TexFoState]
+            set st.enforcing: true
+            set st.is_open: false
+            set st.ni_prolog: TexBuf.make(host)
+            this.state_stack.add(st)
+        }
+        set this.state_depth: this.state_depth + 1
+    }
+
+    function state_pop(this: pointer[TeXFOTBuilder])
+    {
+        if this.state_depth <= 0
+            TeXFOTBuilder.trap("popFotElementState underflow")
+        set this.state_depth: this.state_depth - 1
+    }
+
+    function cur_state(this: pointer[TeXFOTBuilder]) returns pointer[TexFoState]
+    {
+        if this.state_depth <= 0
+            TeXFOTBuilder.trap("curFotElementState on empty stack")
+        let slotp this.state_stack.get((this.state_depth - 1) as size_t)
+        *slotp
+    }
+
+    function enforcing_structure(this: pointer[TeXFOTBuilder]) returns bool
+    {
+        let st this.cur_state()
+        if st.is_open
+            return st.enforcing
+        false
+    }
+
+    ; TableStack
+    function table_push(this: pointer[TeXFOTBuilder]) returns pointer[TexFotEl]
+    {
+        let host this.host
+        let t TexFotEl.make_table(host)
+        let d this.table_depth as size_t
+        if d < this.table_stack.get_length()
+            this.table_stack.put(d, t)
+        else
+            this.table_stack.add(t)
+        set this.table_depth: this.table_depth + 1
+        t
+    }
+
+    function cur_table(this: pointer[TeXFOTBuilder]) returns pointer[TexFotEl]
+    {
+        if this.table_depth <= 0
+            TeXFOTBuilder.trap("curTable on empty TableStack")
+        let slotp this.table_stack.get((this.table_depth - 1) as size_t)
+        *slotp
+    }
+
+    ; ParHead stack (OUTLINES)
+    function par_push(this: pointer[TeXFOTBuilder], is_headed: bool, level: int)
+    {
+        let d this.par_depth as size_t
+        if d < this.par_stack.get_length()
+        {
+            let slotp this.par_stack.get(d)
+            let p *slotp
+            set p.is_headed: is_headed
+            set p.level: level
+            p.heading_text.clear()
+            set p.previous: 0
+        }
+        else
+        {
+            let host this.host
+            let p host.allocate(sizeof TexParHead, alignof TexParHead) as pointer[TexParHead]
+            set p.is_headed: is_headed
+            set p.level: level
+            set p.heading_text: TexBuf.make(host)
+            set p.previous: 0
+            this.par_stack.add(p)
+        }
+        set this.par_depth: this.par_depth + 1
+    }
+
+    function par_pop(this: pointer[TeXFOTBuilder])
+    {
+        if this.par_depth <= 0
+            TeXFOTBuilder.trap("pop on empty parStack")
+        set this.par_depth: this.par_depth - 1
+    }
+
+    function par_top(this: pointer[TeXFOTBuilder]) returns pointer[TexParHead]
+    {
+        if this.par_depth <= 0
+            TeXFOTBuilder.trap("top on empty parStack")
+        let slotp this.par_stack.get((this.par_depth - 1) as size_t)
+        *slotp
+    }
+
+    function par_at(this: pointer[TeXFOTBuilder], i: int) returns pointer[TexParHead]
+    {
+        let slotp this.par_stack.get(i as size_t)
+        *slotp
+    }
+
+    ; --- low-level writers (current os) ---------------------------------------
+    function w_byte(this: pointer[TeXFOTBuilder], c: u8)
+    {
+        let b this.cur_os()
+        b.put(c)
+    }
+
+    function w_raw(this: pointer[TeXFOTBuilder], s: pointer[const_char])
+    {
+        let b this.cur_os()
+        TeXFOTBuilder.b_raw(b, s)
+    }
+
+    ; --- low-level writers (explicit buffer) -----------------------------------
+    function b_raw(b: pointer[TexBuf], s: pointer[const_char])
+    {
+        var i: size_t 0
+        while true
+        {
+            let c *((s as pointer[u8]) + i)
+            if c = (0 as u8)
+                break
+            b.put(c)
+            set i: i + (1 as size_t)
+        }
+    }
+
+    ; StringC -> bytes (C++ char truncation)
+    function b_stringc(b: pointer[TexBuf], s: StringC)
+    {
+        let n s.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            let c s.get(i)
+            b.put((c & (0xFF as u32)) as u8)
+            set i: i + (1 as size_t)
+        }
+    }
+
+    ; unsigned decimal (n >= 0)
+    function b_udec(b: pointer[TexBuf], n_in: int)
+    {
+        var n n_in
+        if n = 0
+        {
+            b.put(0x30 as u8)
+            return
+        }
+        var digits u8[24]
+        var k 0
+        while n > 0
+        {
+            set *((digits as pointer[u8]) + k): ((n % 10) + 0x30) as u8
+            set n: n / 10
+            set k: k + 1
+        }
+        while k > 0
+        {
+            set k: k - 1
+            b.put(*((digits as pointer[u8]) + k))
+        }
+    }
+
+    ; signed long decimal
+    function b_long(b: pointer[TexBuf], n: int)
+    {
+        if n < 0
+        {
+            b.put(0x2D as u8)
+            TeXFOTBuilder.b_udec(b, 0 - n)
+            return
+        }
+        TeXFOTBuilder.b_udec(b, n)
+    }
+
+    ; printf %g (6 significant digits, trailing zeros stripped, e-form with
+    ; signed two-digit exponent outside [1e-4, 1e6))
+    function b_g(b: pointer[TexBuf], x_in: double)
+    {
+        var x x_in
+        if x < 0.0
+        {
+            b.put(0x2D as u8)
+            set x: 0.0 - x
+        }
+        if x = 0.0
+        {
+            b.put(0x30 as u8)
+            return
+        }
+        var e (floor(log10(x))) as int
+        var m (floor((x / pow(10.0, (e - 5) as double)) + 0.5)) as int
+        if m >= 1000000
+        {
+            set m: m / 10
+            set e: e + 1
+        }
+        var digits u8[6]
+        var i 6
+        while i > 0
+        {
+            set i: i - 1
+            set *((digits as pointer[u8]) + i): (0x30 + (m % 10)) as u8
+            set m: m / 10
+        }
+        var k 6
+        while k > 1
+        {
+            if (*((digits as pointer[u8]) + (k - 1))) <> (0x30 as u8)
+                break
+            set k: k - 1
+        }
+        var use_sci false
+        if e < (0 - 4)
+            set use_sci: true
+        if e >= 6
+            set use_sci: true
+        if use_sci
+        {
+            b.put(*(digits as pointer[u8]))
+            if k > 1
+            {
+                b.put(0x2E as u8)
+                var j 1
+                while j < k
+                {
+                    b.put(*((digits as pointer[u8]) + j))
+                    set j: j + 1
+                }
+            }
+            b.put(0x65 as u8)
+            var ea e
+            if ea < 0
+            {
+                b.put(0x2D as u8)
+                set ea: 0 - ea
+            }
+            else
+                b.put(0x2B as u8)
+            if ea < 10
+                b.put(0x30 as u8)
+            TeXFOTBuilder.b_udec(b, ea)
+            return
+        }
+        if e >= 0
+        {
+            ; digits before the point: e+1
+            var j 0
+            while j <= e
+            {
+                if j < k
+                    b.put(*((digits as pointer[u8]) + j))
+                else
+                    b.put(0x30 as u8)
+                set j: j + 1
+            }
+            if k > (e + 1)
+            {
+                b.put(0x2E as u8)
+                while j < k
+                {
+                    b.put(*((digits as pointer[u8]) + j))
+                    set j: j + 1
+                }
+            }
+            return
+        }
+        ; 0.<zeros><digits>
+        b.put(0x30 as u8)
+        b.put(0x2E as u8)
+        var z 0 - (e + 1)
+        while z > 0
+        {
+            b.put(0x30 as u8)
+            set z: z - 1
+        }
+        var j 0
+        while j < k
+        {
+            b.put(*((digits as pointer[u8]) + j))
+            set j: j + 1
+        }
+    }
+
+    ; %g of a value squeezed through FLOAT precision (the reference streams
+    ; `float(...)` through operator<<(double))
+    function b_gf(b: pointer[TexBuf], x: double)
+    {
+        let xf ((x as f32) as double)
+        TeXFOTBuilder.b_g(b, xf)
+    }
+
+    ; LengthInPoints: "%li.%.3i" of l/1000 and |l%1000|, trailing zeros (and a
+    ; bare point) stripped, then "\p@". Sign of -0.x values is lost (faithful).
+    function b_pts(b: pointer[TexBuf], l: int)
+    {
+        var buf u8[40]
+        var len 0
+        let whole l / 1000
+        var rem l % 1000
+        if rem < 0
+            set rem: 0 - rem
+        if whole < 0
+        {
+            set *((buf as pointer[u8]) + len): 0x2D as u8
+            set len: len + 1
+        }
+        var wmag whole
+        if wmag < 0
+            set wmag: 0 - wmag
+        ; whole magnitude digits
+        var tmp u8[24]
+        var k 0
+        if wmag = 0
+        {
+            set *((tmp as pointer[u8])): 0x30 as u8
+            set k: 1
+        }
+        else
+        {
+            while wmag > 0
+            {
+                set *((tmp as pointer[u8]) + k): ((wmag % 10) + 0x30) as u8
+                set wmag: wmag / 10
+                set k: k + 1
+            }
+        }
+        while k > 0
+        {
+            set k: k - 1
+            set *((buf as pointer[u8]) + len): *((tmp as pointer[u8]) + k)
+            set len: len + 1
+        }
+        set *((buf as pointer[u8]) + len): 0x2E as u8
+        set len: len + 1
+        set *((buf as pointer[u8]) + len): ((rem / 100) + 0x30) as u8
+        set len: len + 1
+        set *((buf as pointer[u8]) + len): (((rem / 10) % 10) + 0x30) as u8
+        set len: len + 1
+        set *((buf as pointer[u8]) + len): ((rem % 10) + 0x30) as u8
+        set len: len + 1
+        ; strip trailing zeros, then a bare point
+        var i len - 1
+        while (*((buf as pointer[u8]) + i)) = (0x30 as u8)
+            set i: i - 1
+        if (*((buf as pointer[u8]) + i)) = (0x2E as u8)
+            set i: i - 1
+        var m 0
+        while m <= i
+        {
+            b.put(*((buf as pointer[u8]) + m))
+            set m: m + 1
+        }
+        TeXFOTBuilder.b_raw(b, "\\p@")
+    }
+
+    ; append buffer to buffer (TmpOutputByteStream::commit)
+    function b_buf(dst: pointer[TexBuf], src: pointer[TexBuf])
+    {
+        let n src.size()
+        let p src.data()
+        var i: size_t 0
+        while i < n
+        {
+            dst.put(*(p + i))
+            set i: i + (1 as size_t)
+        }
+    }
+
+    ; --- the Symbol -> TeX name table (reference switch; enum order codes) ----
+    function sym_name(code: int) returns pointer[const_char]
+    {
+        if code = 0
+            return "false"
+        if code = 1
+            return "true"
+        if code = 2
+            return "notapplicable"
+        if code = 3
+            return "ultracondensed"
+        if code = 4
+            return "extracondensed"
+        if code = 5
+            return "condensed"
+        if code = 6
+            return "semicondensed"
+        if code = 7
+            return "ultralight"
+        if code = 8
+            return "extralight"
+        if code = 9
+            return "light"
+        if code = 10
+            return "semilight"
+        if code = 11
+            return "medium"
+        if code = 12
+            return "semiexpanded"
+        if code = 13
+            return "expanded"
+        if code = 14
+            return "extraexpanded"
+        if code = 15
+            return "ultraexpanded"
+        if code = 16
+            return "semibold"
+        if code = 17
+            return "bold"
+        if code = 18
+            return "extrabold"
+        if code = 19
+            return "ultrabold"
+        if code = 20
+            return "upright"
+        if code = 21
+            return "oblique"
+        if code = 22
+            return "backslantedoblique"
+        if code = 23
+            return "italic"
+        if code = 24
+            return "backslanteditalic"
+        if code = 25
+            return "start"
+        if code = 26
+            return "end"
+        if code = 27
+            return "center"
+        if code = 28
+            return "justify"
+        if code = 29
+            return "spreadinside"
+        if code = 30
+            return "spreadoutside"
+        if code = 31
+            return "pageinside"
+        if code = 32
+            return "pageoutside"
+        if code = 33
+            return "wrap"
+        if code = 34
+            return "asis"
+        if code = 35
+            return "asiswrap"
+        if code = 36
+            return "asistruncate"
+        if code = 37
+            return "none"
+        if code = 38
+            return "before"
+        if code = 39
+            return "through"
+        if code = 40
+            return "after"
+        if code = 41
+            return "toptobottom"
+        if code = 42
+            return "lefttoright"
+        if code = 43
+            return "bottomtotop"
+        if code = 44
+            return "righttoleft"
+        if code = 45
+            return "inside"
+        if code = 46
+            return "outside"
+        if code = 47
+            return "horizontal"
+        if code = 48
+            return "vertical"
+        if code = 49
+            return "escapement"
+        if code = 50
+            return "lineprogression"
+        if code = 51
+            return "math"
+        if code = 52
+            return "ordinary"
+        if code = 53
+            return "operator"
+        if code = 54
+            return "binary"
+        if code = 55
+            return "relation"
+        if code = 56
+            return "opening"
+        if code = 57
+            return "closing"
+        if code = 58
+            return "punctuation"
+        if code = 59
+            return "inner"
+        if code = 60
+            return "space"
+        if code = 61
+            return "page"
+        if code = 62
+            return "pageregion"
+        if code = 63
+            return "columnset"
+        if code = 64
+            return "column"
+        if code = 65
+            return "max"
+        if code = 66
+            return "maxuniform"
+        if code = 67
+            return "miter"
+        if code = 68
+            return "round"
+        if code = 69
+            return "bevel"
+        if code = 70
+            return "butt"
+        if code = 71
+            return "square"
+        if code = 72
+            return "loose"
+        if code = 73
+            return "normal"
+        if code = 74
+            return "kern"
+        if code = 75
+            return "tight"
+        if code = 76
+            return "touch"
+        if code = 77
+            return "preserve"
+        if code = 78
+            return "collapse"
+        if code = 79
+            return "ignore"
+        if code = 80
+            return "relative"
+        if code = 81
+            return "display"
+        if code = 82
+            return "inline"
+        if code = 83
+            return "border"
+        if code = 84
+            return "background"
+        if code = 85
+            return "both"
+        if code = 86
+            return "base"
+        if code = 87
+            return "font"
+        if code = 88
+            return "top"
+        if code = 89
+            return "bottom"
+        if code = 90
+            return "spread"
+        if code = 91
+            return "solid"
+        if code = 92
+            return "outline"
+        if code = 93
+            return "with"
+        if code = 94
+            return "against"
+        if code = 95
+            return "force"
+        if code = 96
+            return "independent"
+        if code = 97
+            return "pile"
+        if code = 98
+            return "supout"
+        if code = 99
+            return "subout"
+        if code = 100
+            return "leadedge"
+        if code = 101
+            return "trailedge"
+        if code = 102
+            return "explicit"
+        if code = 103
+            return "rowmajor"
+        if code = 104
+            return "columnmajor"
+        ""
+    }
+
+    ; --- characteristic set helpers (all render into stringout_) --------------
+    function def_open(this: pointer[TeXFOTBuilder], name: pointer[const_char])
+    {
+        let b this.sout
+        TeXFOTBuilder.b_raw(b, "\\def\\")
+        TeXFOTBuilder.b_raw(b, name)
+        TeXFOTBuilder.b_raw(b, "%\n{")
+    }
+
+    function def_close(this: pointer[TeXFOTBuilder])
+    {
+        let b this.sout
+        b.put(0x7D as u8)
+    }
+
+    ; setlength — float(size/1000.0) + \p@
+    function set_len(this: pointer[TeXFOTBuilder], name: pointer[const_char], l: int)
+    {
+        this.def_open(name)
+        let b this.sout
+        TeXFOTBuilder.b_gf(b, (l as double) / 1000.0)
+        TeXFOTBuilder.b_raw(b, "\\p@")
+        this.def_close()
+    }
+
+    function set_sym(this: pointer[TeXFOTBuilder], name: pointer[const_char], code: int)
+    {
+        this.def_open(name)
+        let b this.sout
+        let nm TeXFOTBuilder.sym_name(code)
+        TeXFOTBuilder.b_raw(b, nm)
+        this.def_close()
+    }
+
+    function set_stringc(this: pointer[TeXFOTBuilder], name: pointer[const_char], s: StringC)
+    {
+        this.def_open(name)
+        let b this.sout
+        TeXFOTBuilder.b_stringc(b, s)
+        this.def_close()
+    }
+
+    ; set(name, PublicId) — the id bytes. A #f id is a NULL const char* in the
+    ; reference, and its operator<<(const char *) dereferences unguarded: the
+    ; reference SIGSEGVs. We render an empty value (documented divergence; no
+    ; corpus stylesheet sets a public-id characteristic to #f).
+    function set_pubid(this: pointer[TeXFOTBuilder], name: pointer[const_char], ic: pointer[InheritedC])
+    {
+        this.def_open(name)
+        if ic.bval = false
+        {
+            let b this.sout
+            TeXFOTBuilder.b_stringc(b, ic.sval)
+        }
+        this.def_close()
+    }
+
+    ; set(name, LengthSpec) — float length + \p@, then the Factor def (%g)
+    function set_lenspec(this: pointer[TeXFOTBuilder], name: pointer[const_char], ls: LengthSpec)
+    {
+        this.def_open(name)
+        let b this.sout
+        TeXFOTBuilder.b_gf(b, (ls.length as double) / 1000.0)
+        TeXFOTBuilder.b_raw(b, "\\p@")
+        this.def_close()
+        TeXFOTBuilder.b_raw(b, "\\def\\")
+        TeXFOTBuilder.b_raw(b, name)
+        TeXFOTBuilder.b_raw(b, "Factor%\n{")
+        TeXFOTBuilder.b_g(b, ls.factor)
+        this.def_close()
+    }
+
+    function set_double(this: pointer[TeXFOTBuilder], name: pointer[const_char], d: double)
+    {
+        this.def_open(name)
+        let b this.sout
+        TeXFOTBuilder.b_g(b, d)
+        this.def_close()
+    }
+
+    function set_long(this: pointer[TeXFOTBuilder], name: pointer[const_char], n: int)
+    {
+        this.def_open(name)
+        let b this.sout
+        TeXFOTBuilder.b_long(b, n)
+        this.def_close()
+    }
+
+    function set_bool(this: pointer[TeXFOTBuilder], name: pointer[const_char], f: bool)
+    {
+        this.def_open(name)
+        let b this.sout
+        if f
+            b.put(0x31 as u8)
+        else
+            b.put(0x30 as u8)
+        this.def_close()
+    }
+
+    ; setletter2 — the two code bytes verbatim; a #f characteristic is
+    ; Letter2 0, i.e. TWO NUL BYTES in the stream (reference-verified).
+    function set_letter2(this: pointer[TeXFOTBuilder], name: pointer[const_char], ic: pointer[InheritedC])
+    {
+        this.def_open(name)
+        let b this.sout
+        if ic.bval or (ic.sval.get_size() < (2 as size_t))
+        {
+            b.put(0 as u8)
+            b.put(0 as u8)
+        }
+        else
+        {
+            b.put((ic.sval.get(0 as size_t) & (0xFF as u32)) as u8)
+            b.put((ic.sval.get(1 as size_t) & (0xFF as u32)) as u8)
+        }
+        this.def_close()
+    }
+
+    ; set(name, DeviceRGBColor) — Red/Green/Blue defs
+    function set_color(this: pointer[TeXFOTBuilder], name: pointer[const_char], r: int, g: int, b_in: int)
+    {
+        let b this.sout
+        TeXFOTBuilder.b_raw(b, "\\def\\")
+        TeXFOTBuilder.b_raw(b, name)
+        TeXFOTBuilder.b_raw(b, "Red%\n{")
+        TeXFOTBuilder.b_long(b, r)
+        b.put(0x7D as u8)
+        TeXFOTBuilder.b_raw(b, "\\def\\")
+        TeXFOTBuilder.b_raw(b, name)
+        TeXFOTBuilder.b_raw(b, "Green%\n{")
+        TeXFOTBuilder.b_long(b, g)
+        b.put(0x7D as u8)
+        TeXFOTBuilder.b_raw(b, "\\def\\")
+        TeXFOTBuilder.b_raw(b, name)
+        TeXFOTBuilder.b_raw(b, "Blue%\n{")
+        TeXFOTBuilder.b_long(b, b_in)
+        b.put(0x7D as u8)
+    }
+
+    ; one member of the DisplaySpace/InlineSpace family: NAME+suffix def with a
+    ; PLAIN double length (no float squeeze — reference streams the division)
+    function set_space_part(this: pointer[TeXFOTBuilder], name: pointer[const_char], suffix: pointer[const_char], v: double, pts: bool)
+    {
+        let b this.sout
+        TeXFOTBuilder.b_raw(b, "\\def\\")
+        TeXFOTBuilder.b_raw(b, name)
+        TeXFOTBuilder.b_raw(b, suffix)
+        TeXFOTBuilder.b_raw(b, "%\n{")
+        TeXFOTBuilder.b_g(b, v)
+        if pts
+            TeXFOTBuilder.b_raw(b, "\\p@")
+        b.put(0x7D as u8)
+    }
+
+    function set_display_space(this: pointer[TeXFOTBuilder], name: pointer[const_char], ds: DisplaySpace)
+    {
+        var any false
+        if ds.nominal.length <> 0
+            set any: true
+        if ds.min.length <> 0
+            set any: true
+        if ds.max.length <> 0
+            set any: true
+        if any = false
+            return
+        this.set_space_part(name, "Nom", (ds.nominal.length as double) / 1000.0, true)
+        if ds.nominal.factor <> 0.0
+            this.set_space_part(name, "NomFactor", ds.nominal.factor, false)
+        if ds.min.length <> 0
+            this.set_space_part(name, "Min", (ds.min.length as double) / 1000.0, true)
+        if ds.min.factor <> 0.0
+            this.set_space_part(name, "MinFactor", ds.min.factor, false)
+        if ds.max.length <> 0
+            this.set_space_part(name, "Max", (ds.max.length as double) / 1000.0, true)
+        if ds.max.factor <> 0.0
+            this.set_space_part(name, "MaxFactor", ds.max.factor, false)
+        if ds.priority <> 0
+        {
+            let b this.sout
+            TeXFOTBuilder.b_raw(b, "\\def\\")
+            TeXFOTBuilder.b_raw(b, name)
+            TeXFOTBuilder.b_raw(b, "Priority%\n{")
+            TeXFOTBuilder.b_long(b, ds.priority)
+            b.put(0x7D as u8)
+        }
+        if ds.conditional
+        {
+            let b this.sout
+            TeXFOTBuilder.b_raw(b, "\\def\\")
+            TeXFOTBuilder.b_raw(b, name)
+            TeXFOTBuilder.b_raw(b, "Conditional%\n{1}")
+        }
+        if ds.force
+        {
+            let b this.sout
+            TeXFOTBuilder.b_raw(b, "\\def\\")
+            TeXFOTBuilder.b_raw(b, name)
+            TeXFOTBuilder.b_raw(b, "Force%\n{1}")
+        }
+    }
+
+    function set_inline_space(this: pointer[TeXFOTBuilder], name: pointer[const_char], sp: pointer[InlineSpace])
+    {
+        var any false
+        if sp.nominal.length <> 0
+            set any: true
+        if sp.min.length <> 0
+            set any: true
+        if sp.max.length <> 0
+            set any: true
+        if any = false
+            return
+        this.set_space_part(name, "Nom", (sp.nominal.length as double) / 1000.0, true)
+        if sp.nominal.factor <> 0.0
+            this.set_space_part(name, "NomFactor", sp.nominal.factor, false)
+        if sp.min.length <> 0
+            this.set_space_part(name, "Min", (sp.min.length as double) / 1000.0, true)
+        if sp.min.factor <> 0.0
+            this.set_space_part(name, "MinFactor", sp.min.factor, false)
+        if sp.max.length <> 0
+            this.set_space_part(name, "Max", (sp.max.length as double) / 1000.0, true)
+        if sp.max.factor <> 0.0
+            this.set_space_part(name, "MaxFactor", sp.max.factor, false)
+    }
+
+    ; dumpInherited — flush the pending defs into the current os
+    function dump_inherited(this: pointer[TeXFOTBuilder])
+    {
+        let b this.cur_os()
+        TeXFOTBuilder.b_buf(b, this.sout)
+        this.sout.clear()
+    }
+
+    ; stringout_.extractString(target) — REPLACES the target
+    function extract_into(this: pointer[TeXFOTBuilder], dst: pointer[TexBuf])
+    {
+        dst.clear()
+        TeXFOTBuilder.b_buf(dst, this.sout)
+        this.sout.clear()
+    }
+
+    ; --- group scaffolding -----------------------------------------------------
+    function group_start(this: pointer[TeXFOTBuilder], name: pointer[const_char])
+    {
+        let b this.cur_os()
+        b.put(0x5C as u8)
+        TeXFOTBuilder.b_raw(b, name)
+        TeXFOTBuilder.b_raw(b, "%\n{")
+        this.dump_inherited()
+        let b2 this.cur_os()
+        b2.put(0x7D as u8)
+    }
+
+    ; startGroup(name, output) — "\Name%\n{<extract>}" APPENDED to output
+    function group_start_out(this: pointer[TeXFOTBuilder], name: pointer[const_char], dst: pointer[TexBuf])
+    {
+        dst.put(0x5C as u8)
+        TeXFOTBuilder.b_raw(dst, name)
+        TeXFOTBuilder.b_raw(dst, "%\n{")
+        TeXFOTBuilder.b_buf(dst, this.sout)
+        this.sout.clear()
+        dst.put(0x7D as u8)
+    }
+
+    function group_end(this: pointer[TeXFOTBuilder], name: pointer[const_char])
+    {
+        let b this.cur_os()
+        TeXFOTBuilder.b_raw(b, "\\end")
+        TeXFOTBuilder.b_raw(b, name)
+        TeXFOTBuilder.b_raw(b, "{}")
+    }
+
+    function group_end_out(this: pointer[TeXFOTBuilder], name: pointer[const_char], dst: pointer[TexBuf])
+    {
+        TeXFOTBuilder.b_raw(dst, "\\end")
+        TeXFOTBuilder.b_raw(dst, name)
+        TeXFOTBuilder.b_raw(dst, "{}")
+    }
+
+    function simple_group_start(this: pointer[TeXFOTBuilder])
+    {
+        let b this.cur_os()
+        TeXFOTBuilder.b_raw(b, "%\n{")
+        this.dump_inherited()
+    }
+
+    function simple_group_end(this: pointer[TeXFOTBuilder])
+    {
+        let b this.cur_os()
+        b.put(0x7D as u8)
+    }
+
+    function closeopen_brace(this: pointer[TeXFOTBuilder])
+    {
+        let b this.cur_os()
+        TeXFOTBuilder.b_raw(b, "}{")
+        this.dump_inherited()
+    }
+
+    function brace_start(this: pointer[TeXFOTBuilder], name: pointer[const_char])
+    {
+        let b this.cur_os()
+        b.put(0x5C as u8)
+        TeXFOTBuilder.b_raw(b, name)
+        TeXFOTBuilder.b_raw(b, "%\n{")
+        this.dump_inherited()
+        let b2 this.cur_os()
+        TeXFOTBuilder.b_raw(b2, "}{")
+    }
+
+    function brace_end(this: pointer[TeXFOTBuilder])
+    {
+        let b this.cur_os()
+        b.put(0x7D as u8)
+    }
+
+    function insert_atomic(this: pointer[TeXFOTBuilder], name: pointer[const_char])
+    {
+        let b this.cur_os()
+        TeXFOTBuilder.b_raw(b, "\\insert")
+        TeXFOTBuilder.b_raw(b, name)
+        TeXFOTBuilder.b_raw(b, "%\n{")
+        this.dump_inherited()
+        let b2 this.cur_os()
+        b2.put(0x7D as u8)
+    }
+
+    ; startGroup(FotElement&)/insertAtomic(FotElement&) — capture the pending
+    ; defs as the element's characteristics
+    function capture_into(this: pointer[TeXFOTBuilder], el: pointer[TexFotEl])
+        this.extract_into(el.characteristics)
+
+    ; --- the characteristic dispatch (reference setters by registry index) ----
+    function set_ic(this: pointer[TeXFOTBuilder], ic: pointer[InheritedC])
+    {
+        let ext ic.ext_setter
+        if ext <> 0
+        {
+            this.set_extension_ic(ext, ic)
+            return
+        }
+        let index ic.get_index()
+        if index = 0
+            this.set_len("fSize", ic.lval)
+        else if index = 1
+            this.set_font_family_name(ic.sval)
+        else if index = 2
+            this.set_sym("fWeight", ic.sym.code)
+        else if index = 3
+            this.set_sym("fPosture", ic.sym.code)
+        else if index = 4
+            this.set_sym("Quadding", ic.sym.code)
+        else if index = 5
+        {
+            set this.next_format.display_alignment: ic.sym.code
+            this.set_sym("DisplayAlignment", ic.sym.code)
+        }
+        else if index = 6
+            this.set_sym("FieldAlign", ic.sym.code)
+        else if index = 7
+        {
+            set this.next_format.lines_sym: ic.sym.code
+            this.set_sym("Lines", ic.sym.code)
+        }
+        else if index = 8
+        {
+            set this.next_format.start_indent_spec: ic.ls
+            this.set_lenspec("StartIndent", ic.ls)
+        }
+        else if index = 9
+            this.set_lenspec("FirstLineStartIndent", ic.ls)
+        else if index = 10
+        {
+            set this.next_format.end_indent_spec: ic.ls
+            this.set_lenspec("EndIndent", ic.ls)
+        }
+        else if index = 11
+            this.set_lenspec("LastLineEndIndent", ic.ls)
+        else if index = 12
+            this.set_lenspec("LineSpacing", ic.ls)
+        else if index = 13
+            this.set_lenspec("FieldWidth", ic.ls)
+        else if index = 14
+        {
+            set this.next_format.left_margin: ic.lval
+            this.set_len("LeftMargin", ic.lval)
+        }
+        else if index = 15
+        {
+            set this.next_format.right_margin: ic.lval
+            this.set_len("RightMargin", ic.lval)
+        }
+        else if index = 16
+            this.set_len("TopMargin", ic.lval)
+        else if index = 17
+            this.set_len("BottomMargin", ic.lval)
+        else if index = 18
+            this.set_len("HeaderMargin", ic.lval)
+        else if index = 19
+            this.set_len("FooterMargin", ic.lval)
+        else if index = 20
+        {
+            set this.next_format.page_width: ic.lval
+            this.set_len("PageWidth", ic.lval)
+        }
+        else if index = 21
+            this.set_len("PageHeight", ic.lval)
+        else if index = 22
+        {
+            set this.next_format.border_present: ic.bval
+            this.set_bool("BorderPresent", ic.bval)
+        }
+        else if index = 23
+        {
+            set this.next_format.line_thickness: ic.lval
+            this.set_len("LineThickness", ic.lval)
+        }
+        else if index = 24
+            this.set_len("CellBeforeRowMargin", ic.lval)
+        else if index = 25
+            this.set_len("CellAfterRowMargin", ic.lval)
+        else if index = 26
+        {
+            set this.next_format.cell_before_col_margin: ic.lval
+            this.set_len("CellBeforeColumnMargin", ic.lval)
+        }
+        else if index = 27
+        {
+            set this.next_format.cell_after_col_margin: ic.lval
+            this.set_len("CellAfterColumnMargin", ic.lval)
+        }
+        else if index = 28
+        {
+            set this.next_format.line_sep: ic.lval
+            this.set_len("LineSep", ic.lval)
+        }
+        else if index = 29
+            this.set_len("BoxSizeBefore", ic.lval)
+        else if index = 30
+            this.set_len("BoxSizeAfter", ic.lval)
+        else if index = 31
+            this.set_lenspec("PositionPointShift", ic.ls)
+        else if index = 32
+            this.set_lenspec("StartMargin", ic.ls)
+        else if index = 33
+            this.set_lenspec("EndMargin", ic.ls)
+        else if index = 34
+            this.set_lenspec("SidelineSep", ic.ls)
+        else if index = 35
+            this.set_lenspec("AsisWrapIndent", ic.ls)
+        else if index = 36
+            this.set_lenspec("LineNumberSep", ic.ls)
+        else if index = 37
+            this.set_lenspec("LastLineJustifyLimit", ic.ls)
+        else if index = 38
+            this.set_lenspec("JustifyGlyphSpaceMaxAdd", ic.ls)
+        else if index = 39
+            this.set_lenspec("JustifyGlyphSpaceMaxRemove", ic.ls)
+        else if index = 40
+            this.set_lenspec("TableCornerRadius", ic.ls)
+        else if index = 41
+            this.set_lenspec("BoxCornerRadius", ic.ls)
+        else if index = 42
+            this.set_lenspec("MarginaliaSep", ic.ls)
+        else if index = 43
+            this.set_bool("InhibitLineBreaks", ic.bval)
+        else if index = 44
+            this.set_bool("Hyphenate", ic.bval)
+        else if index = 45
+            this.set_bool("Kern", ic.bval)
+        else if index = 46
+            this.set_bool("Ligature", ic.bval)
+        else if index = 47
+            this.set_bool("ScoreSpaces", ic.bval)
+        else if index = 48
+            this.set_bool("FloatOutSidelines", ic.bval)
+        else if index = 49
+            this.set_bool("FloatOutMarginalia", ic.bval)
+        else if index = 50
+            this.set_bool("FloatOutLineNumbers", ic.bval)
+        else if index = 51
+        {
+            set this.next_format.cell_background: ic.bval
+            this.set_bool("CellBackground", ic.bval)
+        }
+        else if index = 52
+            this.set_bool("SpanWeak", ic.bval)
+        else if index = 53
+            this.set_bool("IgnoreRecordEnd", ic.bval)
+        else if index = 54
+            this.set_bool("NumberedLines", ic.bval)
+        else if index = 55
+            this.set_bool("HangingPunct", ic.bval)
+        else if index = 56
+            this.set_bool("BoxOpenEnd", ic.bval)
+        else if index = 57
+            this.set_bool("TruncateLeader", ic.bval)
+        else if index = 58
+            this.set_bool("AlignLeader", ic.bval)
+        else if index = 59
+            this.set_bool("TablePartOmitMiddleHeader", ic.bval)
+        else if index = 60
+            this.set_bool("TablePartOmitMiddleFooter", ic.bval)
+        else if index = 61
+            this.set_bool("BorderOmitAtBreak", ic.bval)
+        else if index = 62
+            this.set_bool("PrincipalModeSimultaneous", ic.bval)
+        else if index = 63
+            this.set_bool("MarginaliaKeepWithPrevious", ic.bval)
+        else if index = 64
+            this.set_bool("GridEquidistantRows", ic.bval)
+        else if index = 65
+            this.set_bool("GridEquidistantColumns", ic.bval)
+        else if index = 66
+            this.set_sym("LineJoin", ic.sym.code)
+        else if index = 67
+        {
+            set this.next_format.line_cap: ic.sym.code
+            this.set_sym("LineCap", ic.sym.code)
+        }
+        else if index = 68
+            this.set_sym("LineNumberSide", ic.sym.code)
+        else if index = 69
+            this.set_sym("KernMode", ic.sym.code)
+        else if index = 70
+            this.set_sym("InputWhitespaceTreatment", ic.sym.code)
+        else if index = 71
+            this.set_sym("FillingDirection", ic.sym.code)
+        else if index = 72
+            this.set_sym("WritingMode", ic.sym.code)
+        else if index = 73
+            this.set_sym("LastLineQuadding", ic.sym.code)
+        else if index = 74
+            this.set_sym("MathDisplayMode", ic.sym.code)
+        else if index = 75
+            this.set_sym("ScriptPreAlign", ic.sym.code)
+        else if index = 76
+            this.set_sym("ScriptPostAlign", ic.sym.code)
+        else if index = 77
+            this.set_sym("ScriptMidSupAlign", ic.sym.code)
+        else if index = 78
+            this.set_sym("ScriptMidSubAlign", ic.sym.code)
+        else if index = 79
+            this.set_sym("NumeratorAlign", ic.sym.code)
+        else if index = 80
+            this.set_sym("DenominatorAlign", ic.sym.code)
+        else if index = 81
+            this.set_sym("GridPositionCellType", ic.sym.code)
+        else if index = 82
+            this.set_sym("GridColumnAlignment", ic.sym.code)
+        else if index = 83
+            this.set_sym("GridRowAlignment", ic.sym.code)
+        else if index = 84
+            this.set_sym("BoxType", ic.sym.code)
+        else if index = 85
+            this.set_sym("GlyphAlignmentMode", ic.sym.code)
+        else if index = 86
+            this.set_sym("BoxBorderAlignment", ic.sym.code)
+        else if index = 87
+        {
+            set this.next_format.cell_row_alignment: ic.sym.code
+            this.set_sym("CellRowAlignment", ic.sym.code)
+        }
+        else if index = 88
+            this.set_sym("BorderAlignment", ic.sym.code)
+        else if index = 89
+            this.set_sym("SidelineSide", ic.sym.code)
+        else if index = 90
+            this.set_sym("HyphenationKeep", ic.sym.code)
+        else if index = 91
+            this.set_sym("fStructure", ic.sym.code)
+        else if index = 92
+            this.set_sym("fProportionateWidth", ic.sym.code)
+        else if index = 93
+            this.set_sym("CellCrossed", ic.sym.code)
+        else if index = 94
+            this.set_sym("MarginaliaSide", ic.sym.code)
+        else if index = 95
+            this.set_long("Layer", ic.lval)
+        else if index = 96
+            this.set_long("BackgroundLayer", ic.lval)
+        else if index = 97
+        {
+            set this.next_format.border_priority: ic.lval
+            this.set_long("BorderPriority", ic.lval)
+        }
+        else if index = 98
+        {
+            set this.next_format.line_repeat: ic.lval
+            this.set_long("LineRepeat", ic.lval)
+        }
+        else if index = 99
+        {
+            set this.next_format.span_count: ic.lval
+            set this.next_format.cur_display_size: this.next_format.page_width - this.next_format.left_margin - this.next_format.right_margin
+            this.set_long("Span", ic.lval)
+        }
+        else if index = 100
+            this.set_long("MinLeaderRepeat", ic.lval)
+        else if index = 101
+            this.set_long("HyphenationRemainCharCount", ic.lval)
+        else if index = 102
+            this.set_long("HyphenationPushCharCount", ic.lval)
+        else if index = 103
+            this.set_long("WidowCount", ic.lval)
+        else if index = 104
+            this.set_long("OrphanCount", ic.lval)
+        else if index = 105
+            this.set_pubid("BackgroundTile", ic)
+        else if index = 106
+            this.set_pubid("LineBreakingMethod", ic)
+        else if index = 107
+            this.set_pubid("LineCompositionMethod", ic)
+        else if index = 108
+            this.set_pubid("ImplicitBidiMethod", ic)
+        else if index = 109
+            this.set_pubid("GlyphSubstMethod", ic)
+        else if index = 110
+            this.set_pubid("GlyphReorderMethod", ic)
+        else if index = 111
+            this.set_pubid("HyphenationMethod", ic)
+        else if index = 112
+            this.set_pubid("TableAutoWidthMethod", ic)
+        else if index = 113
+            this.set_pubid("fName", ic)
+        else if index = 132
+            this.set_letter2("Language", ic)
+        else if index = 133
+            this.set_letter2("Country", ic)
+        else if index = 134
+            this.set_long("ExpandTabs", ic.lval)
+        else if index = 135
+            this.set_long("HyphenationLadderCount", ic.lval)
+        else if index = 155
+        {
+            let rgb ic.obj.color_rgb()
+            this.set_color("Color", (rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF)
+        }
+        else if index = 156
+        {
+            if ic.obj = null
+                this.set_sym("BackgroundColor", 0)
+            else
+            {
+                let rgb ic.obj.color_rgb()
+                let r (rgb >> 16) & 0xFF
+                let g (rgb >> 8) & 0xFF
+                let bb rgb & 0xFF
+                set this.next_format.bg_r: r
+                set this.next_format.bg_g: g
+                set this.next_format.bg_b: bb
+                this.set_color("BackgroundColor", r, g, bb)
+            }
+        }
+        else if index = 157
+        {
+            if ic.bval = false
+                this.set_lenspec("MinPreLineSpacing", ic.ls)
+        }
+        else if index = 158
+        {
+            if ic.bval = false
+                this.set_lenspec("MinPostLineSpacing", ic.ls)
+        }
+        else if index = 159
+        {
+            if ic.bval = false
+                this.set_lenspec("MinLeading", ic.ls)
+        }
+        else if index = 160
+        {
+            let sp ic.obj.as_inline_space() as pointer[InlineSpace]
+            if sp <> null
+                this.set_inline_space("EscapementSpaceBefore", sp)
+        }
+        else if index = 161
+        {
+            let sp ic.obj.as_inline_space() as pointer[InlineSpace]
+            if sp <> null
+                this.set_inline_space("EscapementSpaceAfter", sp)
+        }
+        else if index = 162
+        {
+            if ic.obj <> null
+            {
+                let sp ic.obj.as_inline_space() as pointer[InlineSpace]
+                if sp <> null
+                    this.set_inline_space("InlineSpaceSpace", sp)
+            }
+        }
+        else if index = 164
+            this.msg_w("TeX backend does not currently support glyph substitution tables")
+        ; 114-131, 136-154, 163: no reference TeXFOTBuilder override — no-ops.
+    }
+
+    ; setFontFamilyName — spaces become '-'
+    function set_font_family_name(this: pointer[TeXFOTBuilder], name: StringC)
+    {
+        let b this.sout
+        TeXFOTBuilder.b_raw(b, "\\def\\fFamName{")
+        let n name.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            let c name.get(i)
+            if c = (0x20 as u32)
+                b.put(0x2D as u8)
+            else
+                b.put((c & (0xFF as u32)) as u8)
+            set i: i + (1 as size_t)
+        }
+        b.put(0x7D as u8)
+    }
+
+    ; the jade.cxx TeX extension characteristics (makeTeXFOTBuilder table)
+    function set_extension_ic(this: pointer[TeXFOTBuilder], ext: int, ic: pointer[InheritedC])
+    {
+        if ext = 1
+            this.set_stringc("PageNumberFormat", ic.sval)
+        else if ext = 2
+            this.set_bool("PageNumberRestart", ic.bval)
+        else if ext = 3
+        {
+            set this.next_format.page_n_columns: ic.lval
+            this.set_long("PageNColumns", ic.lval)
+        }
+        else if ext = 4
+        {
+            set this.next_format.page_column_sep: ic.lval
+            this.set_len("PageColumnSep", ic.lval)
+        }
+        else if ext = 5
+            this.set_bool("PageBalanceColumns", ic.bval)
+        else if ext = 6
+            this.set_len("SubScriptDepth", ic.lval)
+        else if ext = 7
+            this.set_len("OverMarkHeight", ic.lval)
+        else if ext = 8
+            this.set_len("UnderMarkDepth", ic.lval)
+        else if ext = 9
+            this.set_len("SuperscriptHeight", ic.lval)
+        else if ext = 10
+            this.set_len("GridRowsep", ic.lval)
+        else if ext = 11
+            this.set_len("GridColumnSep", ic.lval)
+        else if ext = 12
+            this.set_heading_level(ic.lval)
+        else if ext = 13
+            this.set_bool("PageTwoSide", ic.bval)
+        else if ext = 14
+            this.set_bool("TwoSideStartOnRight", ic.bval)
+        else if ext = 15
+            set this.preserve_sdata: ic.bval
+    }
+
+    ; setHeadingLevel (OUTLINES): 1..9 arms the next paragraph as a heading
+    function set_heading_level(this: pointer[TeXFOTBuilder], n: int)
+    {
+        if n >= 1
+        {
+            if n <= 9
+            {
+                this.par_push(true, n)
+                set this.heading_set: true
+                this.set_long("HeadingLevel", n)
+            }
+        }
+    }
+
+    ; --- computeLengthSpec -----------------------------------------------------
+    function compute_length_spec(this: pointer[TeXFOTBuilder], ls: LengthSpec) returns int
+    {
+        if ls.factor = 0.0
+            return ls.length
+        let f this.cur_format()
+        let tem (f.cur_display_size as double) * ls.factor
+        if tem >= 0.0
+            return ls.length + ((tem + 0.5) as int)
+        ls.length + ((tem - 0.5) as int)
+    }
+
+    ; --- characters ------------------------------------------------------------
+    procedure add_headed_byte(this: pointer[TeXFOTBuilder], c: u8)
+    {
+        let top this.par_top()
+        if top.is_headed
+        {
+            top.heading_text.put(c)
+            return
+        }
+        let ph this.par_at(top.previous)
+        ph.heading_text.put(c)
+    }
+
+    function characters(this: pointer[TeXFOTBuilder], s: pointer[u32], n: size_t)
+    {
+        var i: size_t 0
+        while i < n
+        {
+            let c *(s + i)
+            if c > (255 as u32)
+            {
+                let b this.cur_os()
+                TeXFOTBuilder.b_raw(b, "\\Character{")
+                TeXFOTBuilder.b_udec(b, c as int)
+                b.put(0x7D as u8)
+            }
+            else if (c = (0x20 as u32)) or (c = (0x09 as u32))
+            {
+                let b this.cur_os()
+                ; symbolAsis = 34
+                if this.next_format.lines_sym = 34
+                    b.put(0x7E as u8)
+                else
+                    b.put(c as u8)
+                if this.in_heading
+                    this.add_headed_byte(c as u8)
+            }
+            else if (c = (0x5C as u32)) or (c = (0x5E as u32)) or (c = (0x5F as u32)) or (c = (0x7E as u32))
+            {
+                let b this.cur_os()
+                TeXFOTBuilder.b_raw(b, "\\char")
+                TeXFOTBuilder.b_udec(b, c as int)
+                TeXFOTBuilder.b_raw(b, "{}")
+                if this.in_heading
+                    this.add_headed_byte(c as u8)
+            }
+            else if (c = (0x7B as u32)) or (c = (0x7D as u32)) or (c = (0x24 as u32)) or (c = (0x26 as u32)) or (c = (0x23 as u32)) or (c = (0x25 as u32))
+            {
+                let b this.cur_os()
+                b.put(0x5C as u8)
+                b.put(c as u8)
+                if this.in_heading
+                {
+                    ; protectedChar_: "\<c>"
+                    this.add_headed_byte(0x5C as u8)
+                    this.add_headed_byte(c as u8)
+                }
+            }
+            else if c = (0x0D as u32)
+            {
+                let b this.cur_os()
+                b.put(0x0A as u8)
+                if this.in_heading
+                    this.add_headed_byte(0x0A as u8)
+            }
+            else if c = (0x0A as u32)
+            {
+                ; dropped
+            }
+            else if (c = (0x2D as u32)) or (c = (0x3C as u32)) or (c = (0x3E as u32))
+            {
+                let b this.cur_os()
+                b.put(c as u8)
+                if this.in_math = 0
+                    TeXFOTBuilder.b_raw(b, "\\/")
+            }
+            else
+            {
+                let b this.cur_os()
+                b.put(c as u8)
+                if this.in_heading
+                    this.add_headed_byte(c as u8)
+            }
+            set i: i + (1 as size_t)
+        }
+    }
+
+    ; charactersFromNode — the reference emits \Entity{name} for a preserved
+    ; single-char SDATA entity node; our grove carries no entity-name axis on
+    ; data nodes (the documented SDATA=data-char gap, S78), so every call
+    ; falls through to characters().
+    function characters_from_node(this: pointer[TeXFOTBuilder], node: pointer[GroveNode], s: pointer[u32], n: size_t)
+        this.characters(s, n)
+
+    ; formattingInstruction — raw pass-through
+    function formatting_instruction(this: pointer[TeXFOTBuilder], instr: StringC)
+    {
+        let b this.cur_os()
+        TeXFOTBuilder.b_stringc(b, instr)
+    }
+
+    ; --- node bracket ----------------------------------------------------------
+    function start_node(this: pointer[TeXFOTBuilder], node: pointer[GroveNode], mode_name: StringC)
+    {
+        if node <> null
+        {
+            let id node.get_id()
+            if id.get_size() > (0 as size_t)
+                this.set_stringc("Label", id)
+            else
+            {
+                let ei node.element_index
+                if ei >= 0
+                {
+                    this.def_open("Element")
+                    let b this.sout
+                    TeXFOTBuilder.b_udec(b, ei)
+                    this.def_close()
+                }
+            }
+        }
+        ; groveIndex is always 0 (single grove) — the GroveIndex def never fires.
+        if mode_name.get_size() > (0 as size_t)
+            this.set_stringc("ProcessingMode", mode_name)
+        if this.enforcing_structure()
+        {
+            let st this.cur_state()
+            this.group_start_out("Node", st.ni_prolog)
+        }
+        else
+            this.group_start("Node")
+    }
+
+    function end_node(this: pointer[TeXFOTBuilder])
+    {
+        if this.enforcing_structure()
+        {
+            let st this.cur_state()
+            st.ni_prolog.clear()
+            let t this.cur_table()
+            let open_el t.currently_open()
+            let lc open_el.last_closed()
+            if lc <> null
+                this.group_end_out("Node", lc.ni_epilog)
+        }
+        else
+            this.group_end("Node")
+    }
+
+    ; --- link ------------------------------------------------------------------
+    function start_link(this: pointer[TeXFOTBuilder], nic: pointer[LinkNICRec])
+    {
+        if nic <> null
+        {
+            if nic.addr_type = 1
+            {
+                let node nic.node as pointer[GroveNode]
+                if node <> null
+                {
+                    let id node.get_id()
+                    if id.get_size() > (0 as size_t)
+                        this.set_stringc("Label", id)
+                    else
+                    {
+                        let ei node.element_index
+                        if ei >= 0
+                        {
+                            this.def_open("Element")
+                            let b this.sout
+                            TeXFOTBuilder.b_udec(b, ei)
+                            this.def_close()
+                        }
+                        else
+                            this.msg_w("TeX backend does not currently support links to nodes other than elements")
+                    }
+                }
+            }
+        }
+        this.group_start("Link")
+    }
+
+    function end_link(this: pointer[TeXFOTBuilder])
+        this.group_end("Link")
+
+    ; --- sequence --------------------------------------------------------------
+    function start_sequence(this: pointer[TeXFOTBuilder])
+    {
+        this.fo_start()
+        if this.enforcing_structure() = false
+            this.group_start("Seq")
+    }
+
+    function end_sequence(this: pointer[TeXFOTBuilder])
+    {
+        if this.enforcing_structure() = false
+            this.group_end("Seq")
+        this.fo_end()
+    }
+
+    ; --- line field ------------------------------------------------------------
+    function start_line_field(this: pointer[TeXFOTBuilder], nic: pointer[LineFieldNICRec])
+    {
+        this.fo_start()
+        if nic <> null
+            this.set_inline_nic(nic.break_before_priority, nic.break_after_priority)
+        this.group_start("LineField")
+    }
+
+    function end_line_field(this: pointer[TeXFOTBuilder])
+    {
+        this.group_end("LineField")
+        this.fo_end()
+    }
+
+    ; --- NIC renderers ----------------------------------------------------------
+    function set_display_nic(this: pointer[TeXFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        var r nic
+        if r = null
+            return
+        this.set_display_space("sb", r.space_before)
+        this.set_display_space("sa", r.space_after)
+        if r.position_preference.code <> 0
+            this.set_sym("PositionPreference", r.position_preference.code)
+        if r.keep.code <> 0
+            this.set_sym("Keep", r.keep.code)
+        if r.break_before.code <> 0
+            this.set_sym("BreakBefore", r.break_before.code)
+        if r.break_after.code <> 0
+            this.set_sym("BreakAfter", r.break_after.code)
+        if r.keep_with_previous
+            this.set_bool("KeepWithPrevious", true)
+        if r.keep_with_next
+            this.set_bool("KeepWithNext", true)
+        if r.may_violate_keep_before
+            this.set_bool("MayViolateKeepBefore", true)
+        if r.may_violate_keep_after
+            this.set_bool("MayViolateKeepAfter", true)
+    }
+
+    function set_inline_nic(this: pointer[TeXFOTBuilder], bbp: int, bap: int)
+    {
+        if bbp <> 0
+            this.set_long("BreakBeforePriority", bbp)
+        if bap <> 0
+            this.set_long("BreakAfterPriority", bap)
+    }
+
+    ; --- paragraph (OUTLINES) ----------------------------------------------------
+    function start_paragraph(this: pointer[TeXFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        this.fo_start()
+        this.set_display_nic(nic)
+        if this.heading_set
+        {
+            this.group_start("HeadPar")
+            set this.heading_set: false
+            set this.in_heading: true
+            let top this.par_top()
+            set top.previous: this.last_headed
+            set this.last_headed: this.par_depth - 1
+        }
+        else
+        {
+            this.group_start("Par")
+            this.par_push(false, 0)
+            let top this.par_top()
+            set top.previous: this.last_headed
+        }
+    }
+
+    function end_paragraph(this: pointer[TeXFOTBuilder])
+    {
+        let top this.par_top()
+        if top.is_headed
+        {
+            let b this.cur_os()
+            TeXFOTBuilder.b_raw(b, "\\def\\HeadingText{%\n")
+            TeXFOTBuilder.b_buf(b, top.heading_text)
+            TeXFOTBuilder.b_raw(b, "}%\n")
+            this.group_end("HeadPar")
+            set this.in_heading: false
+        }
+        else
+            this.group_end("Par")
+        set this.last_headed: top.previous
+        this.par_pop()
+        this.fo_end()
+    }
+
+    function paragraph_break(this: pointer[TeXFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        this.set_display_nic(nic)
+        this.insert_atomic("ParagraphBreak")
+    }
+
+    ; --- display group ------------------------------------------------------------
+    function start_display_group(this: pointer[TeXFOTBuilder], nic: pointer[DisplayNIC])
+    {
+        this.fo_start()
+        this.set_display_nic(nic)
+        if nic <> null
+        {
+            if nic.has_coalesce_id
+                this.set_stringc("CoalesceId", nic.coalesce_id)
+        }
+        this.group_start("DisplayGroup")
+    }
+
+    function end_display_group(this: pointer[TeXFOTBuilder])
+    {
+        this.group_end("DisplayGroup")
+        this.fo_end()
+    }
+
+    ; --- scroll ------------------------------------------------------------------
+    function start_scroll(this: pointer[TeXFOTBuilder])
+    {
+        this.fo_start()
+        this.group_start("Scroll")
+    }
+
+    function end_scroll(this: pointer[TeXFOTBuilder])
+    {
+        this.group_end("Scroll")
+        this.fo_end()
+    }
+
+    ; --- score ---------------------------------------------------------------------
+    function start_score(this: pointer[TeXFOTBuilder], nic: pointer[ScoreNICRec])
+    {
+        this.fo_start()
+        if nic <> null
+        {
+            if nic.kind = 1
+            {
+                this.def_open("ScoreCharacter")
+                let b this.sout
+                TeXFOTBuilder.b_udec(b, nic.ch as int)
+                this.def_close()
+            }
+            else if nic.kind = 2
+                this.set_lenspec("ScoreLength", nic.length)
+            else if nic.kind = 3
+                this.set_sym("ScoreType", nic.sym.code)
+        }
+        this.group_start("Score")
+    }
+
+    function end_score(this: pointer[TeXFOTBuilder])
+    {
+        this.group_end("Score")
+        this.fo_end()
+    }
+
+    ; --- leader ---------------------------------------------------------------------
+    function start_leader(this: pointer[TeXFOTBuilder], nic: pointer[LeaderNICRec])
+    {
+        this.fo_start()
+        if nic <> null
+        {
+            this.set_inline_nic(nic.break_before_priority, nic.break_after_priority)
+            if nic.has_length
+                this.set_lenspec("Length", nic.length)
+        }
+        this.group_start("Leader")
+    }
+
+    function end_leader(this: pointer[TeXFOTBuilder])
+    {
+        this.group_end("Leader")
+        this.fo_end()
+    }
+
+    ; --- box -------------------------------------------------------------------------
+    function start_box(this: pointer[TeXFOTBuilder], nic: pointer[BoxNICRec], dnic: pointer[DisplayNIC])
+    {
+        var is_display false
+        if nic <> null
+            set is_display: nic.is_display
+        if is_display
+        {
+            let d this.dbl_len as size_t
+            if d < this.dbl.get_length()
+                this.dbl.put(d, this.fmt_depth)
+            else
+                this.dbl.add(this.fmt_depth)
+            set this.dbl_len: this.dbl_len + 1
+        }
+        this.fo_start()
+        this.set_display_nic(dnic)
+        if nic <> null
+        {
+            this.set_inline_nic(nic.break_before_priority, nic.break_after_priority)
+            if nic.is_display
+                this.set_bool("IsDisplay", true)
+        }
+        this.group_start("BOX")
+    }
+
+    function end_box(this: pointer[TeXFOTBuilder])
+    {
+        this.group_end("BOX")
+        this.fo_end()
+        if this.dbl_len > 0
+        {
+            let slotp this.dbl.get((this.dbl_len - 1) as size_t)
+            if *slotp = this.fmt_depth
+                set this.dbl_len: this.dbl_len - 1
+        }
+    }
+
+    ; --- rule / external graphic / page numbers ------------------------------------
+    function rule(this: pointer[TeXFOTBuilder], nic: pointer[RuleNICRec], dnic: pointer[DisplayNIC])
+    {
+        this.set_display_nic(dnic)
+        if nic <> null
+        {
+            this.set_inline_nic(nic.break_before_priority, nic.break_after_priority)
+            this.set_sym("Orientation", nic.orientation.code)
+            if nic.has_length
+                this.set_lenspec("Length", nic.length)
+        }
+        this.insert_atomic("Rule")
+    }
+
+    function external_graphic(this: pointer[TeXFOTBuilder], nic: pointer[GraphicNICRec], dnic: pointer[DisplayNIC])
+    {
+        this.set_display_nic(dnic)
+        if nic <> null
+        {
+            this.set_inline_nic(nic.break_before_priority, nic.break_after_priority)
+            if nic.is_display
+                this.set_bool("IsDisplay", true)
+            ; symbolMaxUniform = 66 is the NIC default
+            if nic.scale_type.code <> 66
+                this.set_sym("ScaleType", nic.scale_type.code)
+            if nic.scale_type.code = 0
+            {
+                this.set_double("ScaleX", nic.scale_x)
+                this.set_double("ScaleY", nic.scale_y)
+            }
+            this.set_stringc("EntitySystemId", nic.entity_system_id)
+            this.set_stringc("NotationSystemId", nic.notation_system_id)
+            if nic.has_max_width
+                this.set_lenspec("MaxWidth", nic.max_width)
+            if nic.has_max_height
+                this.set_lenspec("MaxHeight", nic.max_height)
+            if nic.is_display = false
+            {
+                this.set_sym("EscapementDirection", nic.escapement_direction.code)
+                this.set_lenspec("PositionPointX", nic.position_point_x)
+                this.set_lenspec("PositionPointY", nic.position_point_y)
+            }
+        }
+        this.insert_atomic("ExternalGraphic")
+    }
+
+    function page_number(this: pointer[TeXFOTBuilder])
+        this.insert_atomic("PageNumber")
+
+    function current_node_page_number(this: pointer[TeXFOTBuilder], node: pointer[GroveNode])
+    {
+        if node = null
+        {
+            this.msg_w("TeX backend does not currently support references to page numbers of nodes other than elements")
+            return
+        }
+        let id node.get_id()
+        if id.get_size() > (0 as size_t)
+            this.set_stringc("Label", id)
+        else
+        {
+            let ei node.element_index
+            if ei >= 0
+            {
+                this.def_open("Element")
+                let b this.sout
+                TeXFOTBuilder.b_udec(b, ei)
+                this.def_close()
+            }
+            else
+            {
+                this.msg_w("TeX backend does not currently support references to page numbers of nodes other than elements")
+                return
+            }
+        }
+        this.insert_atomic("CurrentNodePageNumber")
+    }
+
+    ; --- page-float / page-footnote (extension flow objects) -----------------------
+    function start_page_float(this: pointer[TeXFOTBuilder], nic: pointer[PageFloatNICRec])
+    {
+        if nic <> null
+            this.set_stringc("placement", nic.placement)
+        else
+            this.set_stringc("placement", StringC())
+        this.group_start("PageFloat")
+    }
+
+    function end_page_float(this: pointer[TeXFOTBuilder])
+        this.group_end("PageFloat")
+
+    function start_page_footnote(this: pointer[TeXFOTBuilder])
+        this.brace_start("PageFootnote")
+
+    function end_page_footnote(this: pointer[TeXFOTBuilder])
+        this.brace_end()
+
+    ; --- simple page sequence -------------------------------------------------------
+    function start_simple_page_sequence(this: pointer[TeXFOTBuilder])
+    {
+        let ncols this.next_format.page_n_columns
+        set this.next_format.cur_display_size: (this.next_format.page_width - this.next_format.left_margin - this.next_format.right_margin - (this.next_format.page_column_sep * (ncols - 1))) / ncols
+        this.fo_start()
+        this.group_start("SpS")
+        ; capture the header/footer parts (they stream live from
+        ; ProcessContext; the reference collects them in SaveFOTBuilders and
+        ; replays at the same point in the byte stream)
+        this.hf_capture.clear()
+        this.os_push(this.hf_capture)
+        set this.in_hf: true
+    }
+
+    function end_simple_page_sequence_header_footer(this: pointer[TeXFOTBuilder], flags: int)
+    {
+        this.os_pop()
+        let b this.cur_os()
+        TeXFOTBuilder.b_raw(b, "\n\\SpS")
+        if (flags & 1) <> 0
+            TeXFOTBuilder.b_raw(b, "First")
+        else
+            TeXFOTBuilder.b_raw(b, "Other")
+        if (flags & 2) <> 0
+            TeXFOTBuilder.b_raw(b, "Front")
+        else
+            TeXFOTBuilder.b_raw(b, "Back")
+        let lcr flags & 24
+        if lcr = 0
+            TeXFOTBuilder.b_raw(b, "Left")
+        else if lcr = 8
+            TeXFOTBuilder.b_raw(b, "Center")
+        else if lcr = 16
+            TeXFOTBuilder.b_raw(b, "Right")
+        if (flags & 4) <> 0
+            TeXFOTBuilder.b_raw(b, "Header")
+        else
+            TeXFOTBuilder.b_raw(b, "Footer")
+        TeXFOTBuilder.b_raw(b, "%\n{")
+        TeXFOTBuilder.b_buf(b, this.hf_capture)
+        b.put(0x7D as u8)
+        this.hf_capture.clear()
+        this.os_push(this.hf_capture)
+    }
+
+    function end_all_simple_page_sequence_header_footer(this: pointer[TeXFOTBuilder])
+    {
+        this.os_pop()
+        set this.in_hf: false
+    }
+
+    function end_simple_page_sequence(this: pointer[TeXFOTBuilder])
+    {
+        this.group_end("SpS")
+        this.fo_end()
+    }
+
+    ; --- FotElement open/close (the os + state bracket) -------------------------
+    procedure el_open(this: pointer[TeXFOTBuilder], el: pointer[TexFotEl])
+    {
+        ; Cell/Table push their own FotElementState first
+        if el.tag = TEX_EL_CELL
+            this.state_push()
+        if el.tag = TEX_EL_TABLE
+            this.state_push()
+        ; FotElement::open
+        let st this.cur_state()
+        set st.is_open: true
+        if el.parent <> null
+            el.parent.child_just_opened(el)
+        if st.ni_prolog.size() > (0 as size_t)
+        {
+            el.ni_prolog.clear()
+            TeXFOTBuilder.b_buf(el.ni_prolog, st.ni_prolog)
+            st.ni_prolog.clear()
+        }
+        ; CompoundFotElement::open — the content stream
+        this.os_push(el.pre_content)
+        if el.tag = TEX_EL_CELL
+        {
+            this.os_push(el.content)
+            set st.enforcing: false
+        }
+        if el.tag = TEX_EL_TABLE
+            set st.enforcing: true
+    }
+
+    procedure el_close(this: pointer[TeXFOTBuilder], el: pointer[TexFotEl])
+    {
+        if el.tag = TEX_EL_CELL
+            this.os_pop()
+        ; CompoundFotElement::close
+        this.os_pop()
+        if el.parent <> null
+            el.parent.child_just_closed(el)
+        else
+        {
+            let st this.cur_state()
+            set st.is_open: false
+        }
+        if el.tag = TEX_EL_CELL
+            this.state_pop()
+        if el.tag = TEX_EL_TABLE
+            this.state_pop()
+    }
+
+    ; --- Border ------------------------------------------------------------------
+    procedure border_from_fot(this: pointer[TeXFOTBuilder], b: pointer[TexFotEl])
+    {
+        let f this.cur_format()
+        set b.b_priority: f.border_priority
+        set b.b_present: f.border_present
+        set b.b_thickness: f.line_thickness
+        set b.b_repeat: f.line_repeat
+        set b.b_sep: f.line_sep
+    }
+
+    ; Border::resolve(adjacent)
+    procedure border_resolve(b: pointer[TexFotEl], adj: pointer[TexFotEl])
+    {
+        var take false
+        if adj.b_priority > b.b_priority
+            set take: true
+        else if adj.b_priority = b.b_priority
+        {
+            if adj.is_cell_border() = false
+            {
+                if adj.b_present
+                    set take: true
+            }
+        }
+        if take = false
+            return
+        set b.b_thickness: adj.b_thickness
+        set b.b_present: adj.b_present
+        set b.b_repeat: adj.b_repeat
+        set b.b_sep: adj.b_sep
+        if adj.is_cell_border()
+            set adj.b_present: false
+    }
+
+    ; --- the four single*BorderPresent predicates --------------------------------
+    function cell_single_row_before(c: pointer[TexFotEl]) returns bool
+    {
+        let oc c.overlapping
+        if oc = null
+            TeXFOTBuilder.trap("singleRowBeforeRowBorderPresent: no overlapping cell")
+        if oc.tex_row_idx = c.tex_row_idx
+            return oc.br_border.b_present
+        false
+    }
+
+    function cell_single_row_after(c: pointer[TexFotEl]) returns bool
+    {
+        let oc c.overlapping
+        if oc = null
+            TeXFOTBuilder.trap("singleRowAfterRowBorderPresent: no overlapping cell")
+        if (oc.tex_row_idx + oc.n_rows_spanned) = (c.tex_row_idx + 1)
+            return oc.ar_border.b_present
+        false
+    }
+
+    function cell_single_col_before(c: pointer[TexFotEl]) returns bool
+    {
+        let oc c.overlapping
+        if oc = null
+            TeXFOTBuilder.trap("singleColumnBeforeColumnBorderPresent: no overlapping cell")
+        if oc.tex_col_idx = c.tex_col_idx
+            return oc.bc_border.b_present
+        false
+    }
+
+    function cell_single_col_after(c: pointer[TexFotEl]) returns bool
+    {
+        let oc c.overlapping
+        if oc = null
+            TeXFOTBuilder.trap("singleColumnAfterColumnBorderPresent: no overlapping cell")
+        if (oc.tex_col_idx + oc.n_cols_spanned) = (c.tex_col_idx + 1)
+            return oc.ac_border.b_present
+        false
+    }
+
+    ; --- row-vector helpers --------------------------------------------------------
+    function rows_at(rows: pointer[Array[pointer[TexFotEl]]], i: int) returns pointer[TexFotEl]
+        *(rows.get_buffer() + i)
+
+    function cells_at(row: pointer[TexFotEl], i: int) returns pointer[TexFotEl]
+        *(row.cells.get_buffer() + i)
+
+    function cols_at(part: pointer[TexFotEl], i: int) returns pointer[TexColumn]
+        *(part.columns.get_buffer() + i)
+
+    ; Vector<Cell>::resize — fresh default cells with their sibling index
+    procedure cells_resize(this: pointer[TeXFOTBuilder], row: pointer[TexFotEl], n: int)
+    {
+        let host this.host
+        var cur row.cells.get_length() as int
+        while cur < n
+        {
+            let c TexFotEl.make_cell(host)
+            set c.sibling_idx: cur
+            row.cells.add(c)
+            set cur: cur + 1
+        }
+    }
+
+    procedure cols_resize(this: pointer[TeXFOTBuilder], part: pointer[TexFotEl], n: int)
+    {
+        let host this.host
+        var cur part.columns.get_length() as int
+        while cur < n
+        {
+            part.columns.add(TexColumn.make(host))
+            set cur: cur + 1
+        }
+    }
+
+    ; --- TablePart::processColumns -------------------------------------------------
+    procedure part_process_columns(this: pointer[TeXFOTBuilder], part: pointer[TexFotEl])
+    {
+        let table part.parent
+        var total_nonprop 0
+        var total_prop 0.0
+        var n_nowidth 0
+        let ncols part.columns.get_length() as int
+        var i 0
+        while i < ncols
+        {
+            let col TeXFOTBuilder.cols_at(part, i)
+            if col.has_width
+            {
+                if col.width_tuf <> 0.0
+                    set total_prop: total_prop + col.width_tuf
+                else
+                {
+                    set col.computed_width: this.compute_length_spec(col.width)
+                    set total_nonprop: total_nonprop + col.computed_width
+                }
+            }
+            else
+                set n_nowidth: n_nowidth + 1
+            set i: i + 1
+        }
+        if total_prop > 0.0
+            set total_prop: total_prop + (n_nowidth as double)
+        var prop_unit 0.0
+        if total_prop <> 0.0
+            set prop_unit: ((table.table_width - total_nonprop) as double) / total_prop
+        set i: 0
+        while i < ncols
+        {
+            let col TeXFOTBuilder.cols_at(part, i)
+            if col.has_width
+            {
+                if col.width_tuf <> 0.0
+                    set col.computed_width: (prop_unit * col.width_tuf) as int
+            }
+            else if total_prop > 0.0
+                set col.computed_width: prop_unit as int
+            set i: i + 1
+        }
+        set i: 0
+        while i < ncols
+        {
+            let col TeXFOTBuilder.cols_at(part, i)
+            if col.computed_width > 0
+            {
+                set col.display_size: col.computed_width
+                if col.default_before_margin <> TEX_LEN_UNSPEC
+                    set col.display_size: col.display_size - col.default_before_margin
+                if col.default_after_margin <> TEX_LEN_UNSPEC
+                    set col.display_size: col.display_size - col.default_after_margin
+            }
+            set i: i + 1
+        }
+        set part.columns_processed: true
+    }
+
+    ; --- Cell computations ----------------------------------------------------------
+    procedure cell_effective_margins(c: pointer[TexFotEl], part: pointer[TexFotEl])
+    {
+        let col TeXFOTBuilder.cols_at(part, c.tex_col_idx)
+        if c.before_col_margin <> TEX_LEN_UNSPEC
+            set c.eff_before_col_margin: c.before_col_margin
+        else
+            set c.eff_before_col_margin: col.default_before_margin
+        if c.eff_before_col_margin <> TEX_LEN_UNSPEC
+        {
+            if (col.default_before_margin <> c.eff_before_col_margin) or (c.n_cols_spanned > 1)
+                set c.needs_override: true
+        }
+        if c.after_col_margin <> TEX_LEN_UNSPEC
+            set c.eff_after_col_margin: c.after_col_margin
+        else
+            set c.eff_after_col_margin: col.default_after_margin
+        if c.eff_after_col_margin <> TEX_LEN_UNSPEC
+        {
+            if (col.default_after_margin <> c.eff_after_col_margin) or (c.n_cols_spanned > 1)
+                set c.needs_override: true
+        }
+    }
+
+    procedure cell_effective_width(c: pointer[TexFotEl], part: pointer[TexFotEl])
+    {
+        set c.display_size: 0
+        let ncols part.columns.get_length() as int
+        var i 0
+        while i < c.n_cols_spanned
+        {
+            let idx c.tex_col_idx + i
+            if idx < ncols
+            {
+                let col TeXFOTBuilder.cols_at(part, idx)
+                set c.display_size: c.display_size + col.computed_width
+            }
+            set i: i + 1
+        }
+        if c.display_size <> 0
+            set c.display_size: c.display_size - (c.eff_before_col_margin + c.eff_after_col_margin)
+    }
+
+    ; computeOverridingTeXColumnBorders — appends to the cell characteristics
+    procedure cell_override_borders(c: pointer[TexFotEl], part: pointer[TexFotEl])
+    {
+        let lcol TeXFOTBuilder.cols_at(part, c.tex_col_idx)
+        let b c.characteristics
+        var lb 0
+        if c.bc_border.b_present
+            set lb: 1
+        if lcol.default_left_border <> lb
+        {
+            TeXFOTBuilder.b_raw(b, "\\def\\TeXTableCellBeforeColumnBorder{")
+            TeXFOTBuilder.b_udec(b, lb)
+            b.put(0x7D as u8)
+        }
+        let ridx c.tex_col_idx + c.n_cols_spanned - 1
+        let rcol TeXFOTBuilder.cols_at(part, ridx)
+        var rb 0
+        if c.ac_border.b_present
+            set rb: 1
+        if rcol.default_right_border <> rb
+        {
+            TeXFOTBuilder.b_raw(b, "\\def\\TeXTableCellAfterColumnBorder{")
+            TeXFOTBuilder.b_udec(b, rb)
+            b.put(0x7D as u8)
+        }
+    }
+
+    procedure cell_row_span_filler(c: pointer[TexFotEl])
+    {
+        if c.is_overlapped() = false
+            return
+        let oc c.overlapping
+        if oc = null
+            return
+        if oc.n_rows_spanned <= 1
+            return
+        let b c.characteristics
+        TeXFOTBuilder.b_raw(b, "\\def\\ColumnIndex{")
+        TeXFOTBuilder.b_long(b, c.tex_col_idx)
+        b.put(0x7D as u8)
+        TeXFOTBuilder.b_raw(b, "\\def\\TeXRowSpanFiller{1}")
+    }
+
+    ; --- Table::resolveBorders ------------------------------------------------------
+    procedure table_resolve_borders(t: pointer[TexFotEl], preceding: pointer[Array[pointer[TexFotEl]]], rows: pointer[Array[pointer[TexFotEl]]], starting_row_idx: int, has_first_table_row: bool, has_last_table_row: bool)
+    {
+        let nrows rows.get_length() as int
+        var r 0
+        while r < nrows
+        {
+            let row TeXFOTBuilder.rows_at(rows, r)
+            let ncells (row.cells.get_length() as int) - 1
+            var c 0
+            while c < ncells
+            {
+                let cell TeXFOTBuilder.cells_at(row, c)
+                if cell.overlapping = null
+                {
+                    var rr r
+                    while rr < (r + cell.n_rows_spanned)
+                    {
+                        if rr < nrows
+                        {
+                            let row2 TeXFOTBuilder.rows_at(rows, rr)
+                            let n2 row2.cells.get_length() as int
+                            var cc c
+                            while cc < (c + cell.n_cols_spanned)
+                            {
+                                if cc < n2
+                                {
+                                    let cell2 TeXFOTBuilder.cells_at(row2, cc)
+                                    set cell2.overlapping: cell
+                                    set cell2.tex_row_idx: rr + starting_row_idx
+                                    set cell2.tex_col_idx: cc
+                                }
+                                set cc: cc + 1
+                            }
+                        }
+                        set rr: rr + 1
+                    }
+                }
+                set c: c + 1
+            }
+            set r: r + 1
+        }
+        set r: 0
+        while r < nrows
+        {
+            let row TeXFOTBuilder.rows_at(rows, r)
+            let ncells (row.cells.get_length() as int) - 1
+            var c 0
+            while c < ncells
+            {
+                let cell TeXFOTBuilder.cells_at(row, c)
+                if cell.overlapping = cell
+                {
+                    var rr r
+                    var top_edge true
+                    while rr < (r + cell.n_rows_spanned)
+                    {
+                        var is_first_row false
+                        if rr = 0
+                            set is_first_row: true
+                        var is_last_row false
+                        if rr = (nrows - 1)
+                            set is_last_row: true
+                        var row2 row
+                        if rr < nrows
+                            set row2: TeXFOTBuilder.rows_at(rows, rr)
+                        let n2 row2.cells.get_length() as int
+                        var cc c
+                        var left_edge true
+                        while cc < (c + cell.n_cols_spanned)
+                        {
+                            var is_first_col false
+                            if cc = 0
+                                set is_first_col: true
+                            var is_last_col false
+                            if cc = (n2 - 2)
+                                set is_last_col: true
+                            if left_edge
+                            {
+                                if is_first_col
+                                    TeXFOTBuilder.border_resolve(cell.bc_border, t.t_bc_border)
+                                else
+                                {
+                                    if (cc - 1) < n2
+                                    {
+                                        let left TeXFOTBuilder.cells_at(row2, cc - 1)
+                                        if left.overlapping <> null
+                                            TeXFOTBuilder.border_resolve(cell.bc_border, left.overlapping.ac_border)
+                                    }
+                                }
+                            }
+                            if top_edge
+                            {
+                                if is_first_row and has_first_table_row
+                                    TeXFOTBuilder.border_resolve(cell.br_border, t.t_br_border)
+                                else if is_first_row = false
+                                {
+                                    let up TeXFOTBuilder.rows_at(rows, rr - 1)
+                                    if cc < (up.cells.get_length() as int)
+                                    {
+                                        let upc TeXFOTBuilder.cells_at(up, cc)
+                                        if upc.overlapping <> null
+                                            TeXFOTBuilder.border_resolve(cell.br_border, upc.overlapping.ar_border)
+                                    }
+                                }
+                                else if preceding <> null
+                                {
+                                    let pn preceding.get_length() as int
+                                    if pn <= 0
+                                        TeXFOTBuilder.trap("resolveBorders: empty preceding rows")
+                                    let last TeXFOTBuilder.rows_at(preceding, pn - 1)
+                                    if cc < (last.cells.get_length() as int)
+                                    {
+                                        let lc TeXFOTBuilder.cells_at(last, cc)
+                                        if lc.overlapping <> null
+                                            TeXFOTBuilder.border_resolve(cell.br_border, lc.overlapping.ar_border)
+                                    }
+                                }
+                            }
+                            if is_last_col
+                                TeXFOTBuilder.border_resolve(cell.ac_border, t.t_ac_border)
+                            if is_last_row and has_last_table_row
+                                TeXFOTBuilder.border_resolve(cell.ar_border, t.t_ar_border)
+                            set left_edge: false
+                            set cc: cc + 1
+                        }
+                        set top_edge: false
+                        set rr: rr + 1
+                    }
+                }
+                set c: c + 1
+            }
+            set r: r + 1
+        }
+    }
+
+    ; --- TablePart::normalizeRows ----------------------------------------------------
+    procedure part_normalize_rows(this: pointer[TeXFOTBuilder], part: pointer[TexFotEl])
+    {
+        var max_cells (part.columns.get_length() as int) + 1
+        var step 0
+        while step < 2
+        {
+            var rt 0
+            while rt < 3
+            {
+                var rows part.body_rows
+                if rt = 0
+                    set rows: part.header_rows
+                if rt = 2
+                    set rows: part.footer_rows
+                let nrows rows.get_length() as int
+                var r 0
+                while r < nrows
+                {
+                    let row TeXFOTBuilder.rows_at(rows, r)
+                    if step = 0
+                    {
+                        if (row.cells.get_length() as int) > 1
+                        {
+                            let last_idx (row.cells.get_length() as int) - 2
+                            let last TeXFOTBuilder.cells_at(row, last_idx)
+                            if last.missing = false
+                            {
+                                if (last_idx + last.n_cols_spanned + 1) > max_cells
+                                    set max_cells: last_idx + last.n_cols_spanned + 1
+                            }
+                        }
+                    }
+                    else if (row.cells.get_length() as int) < max_cells
+                        this.cells_resize(row, max_cells)
+                    set r: r + 1
+                }
+                set rt: rt + 1
+            }
+            set step: step + 1
+        }
+    }
+
+    ; --- TablePart::computeOverridingTeXCharacteristics ------------------------------
+    procedure part_compute_overriding(this: pointer[TeXFOTBuilder], part: pointer[TexFotEl])
+    {
+        var step 0
+        while step < 3
+        {
+            var rows part.body_rows
+            if step = 0
+                set rows: part.header_rows
+            if step = 2
+                set rows: part.footer_rows
+            let nrows rows.get_length() as int
+            var r 0
+            while r < nrows
+            {
+                let row TeXFOTBuilder.rows_at(rows, r)
+                let ncells (row.cells.get_length() as int) - 1
+                if ncells > (part.columns.get_length() as int)
+                    this.cols_resize(part, ncells)
+                var c 0
+                while c < ncells
+                {
+                    let cell TeXFOTBuilder.cells_at(row, c)
+                    let col TeXFOTBuilder.cols_at(part, c)
+                    if TeXFOTBuilder.cell_single_col_before(cell)
+                        set col.default_left_border: col.default_left_border + 1
+                    if TeXFOTBuilder.cell_single_col_after(cell)
+                        set col.default_right_border: col.default_right_border + 1
+                    set c: c + 1
+                }
+                set r: r + 1
+            }
+            set step: step + 1
+        }
+        let n_tex_rows (part.header_rows.get_length() + part.body_rows.get_length() + part.footer_rows.get_length()) as int
+        let ncols part.columns.get_length() as int
+        var i 0
+        while i < ncols
+        {
+            let col TeXFOTBuilder.cols_at(part, i)
+            if (col.default_left_border * 2) >= n_tex_rows
+                set col.default_left_border: 1
+            else
+                set col.default_left_border: 0
+            if (col.default_right_border * 2) >= n_tex_rows
+                set col.default_right_border: 1
+            else
+                set col.default_right_border: 0
+            set i: i + 1
+        }
+        set step: 0
+        while step < 3
+        {
+            var rows part.body_rows
+            if step = 0
+                set rows: part.header_rows
+            if step = 2
+                set rows: part.footer_rows
+            let nrows rows.get_length() as int
+            var r 0
+            while r < nrows
+            {
+                let row TeXFOTBuilder.rows_at(rows, r)
+                let ncells (row.cells.get_length() as int) - 1
+                var c 0
+                while c < ncells
+                {
+                    let cell TeXFOTBuilder.cells_at(row, c)
+                    if cell.is_overlapped() = false
+                        TeXFOTBuilder.cell_override_borders(cell, part)
+                    else
+                        TeXFOTBuilder.cell_row_span_filler(cell)
+                    set c: c + 1
+                }
+                set r: r + 1
+            }
+            set step: step + 1
+        }
+    }
+
+    ; --- Table::end -------------------------------------------------------------------
+    procedure table_end_compute(this: pointer[TeXFOTBuilder], t: pointer[TexFotEl])
+    {
+        let nparts t.parts.get_length() as int
+        var i 0
+        while i < nparts
+        {
+            var first_part false
+            if i = 0
+                set first_part: true
+            var last_part false
+            if i = (nparts - 1)
+                set last_part: true
+            let part *(t.parts.get_buffer() + i)
+            this.part_normalize_rows(part)
+            var has_header false
+            if part.header_rows.get_length() > (0 as size_t)
+                set has_header: true
+            var has_body false
+            if part.body_rows.get_length() > (0 as size_t)
+                set has_body: true
+            var has_footer false
+            if part.footer_rows.get_length() > (0 as size_t)
+                set has_footer: true
+            if has_header
+                TeXFOTBuilder.table_resolve_borders(t, null, part.header_rows, 0, first_part, false)
+            var pre_body: pointer[Array[pointer[TexFotEl]]] null
+            if has_header
+                set pre_body: part.header_rows
+            var body_first false
+            if has_header = false
+                set body_first: true
+            var body_last false
+            if has_footer = false
+                set body_last: true
+            TeXFOTBuilder.table_resolve_borders(t, pre_body, part.body_rows, part.header_rows.get_length() as int, body_first, body_last)
+            if has_footer
+            {
+                var pre_footer: pointer[Array[pointer[TexFotEl]]] null
+                if has_body
+                    set pre_footer: part.body_rows
+                let start (part.header_rows.get_length() + part.body_rows.get_length()) as int
+                TeXFOTBuilder.table_resolve_borders(t, pre_footer, part.footer_rows, start, false, last_part)
+            }
+            if part.needs_col_reproc
+                this.part_process_columns(part)
+            this.part_compute_overriding(part)
+            set i: i + 1
+        }
+    }
+
+    ; --- emission ---------------------------------------------------------------------
+    ; "%.2f" of a 0..1 colour component
+    function b_f2(b: pointer[TexBuf], x: double)
+    {
+        var v ((x * 100.0) + 0.5) as int
+        if v < 0
+            set v: 0
+        TeXFOTBuilder.b_udec(b, v / 100)
+        b.put(0x2E as u8)
+        TeXFOTBuilder.b_udec(b, (v / 10) % 10)
+        TeXFOTBuilder.b_udec(b, v % 10)
+    }
+
+    ; CompoundFotElement::outProlog / outEpilog
+    procedure el_out_prolog(el: pointer[TexFotEl], s: pointer[TexBuf])
+    {
+        TeXFOTBuilder.b_buf(s, el.ni_prolog)
+        s.put(0x5C as u8)
+        TeXFOTBuilder.b_raw(s, el.el_name())
+        TeXFOTBuilder.b_raw(s, "%\n{")
+        TeXFOTBuilder.b_buf(s, el.characteristics)
+        s.put(0x7D as u8)
+        TeXFOTBuilder.b_buf(s, el.pre_content)
+    }
+
+    procedure el_out_epilog(el: pointer[TexFotEl], s: pointer[TexBuf])
+    {
+        TeXFOTBuilder.b_raw(s, "\\end")
+        TeXFOTBuilder.b_raw(s, el.el_name())
+        TeXFOTBuilder.b_raw(s, "{}")
+        TeXFOTBuilder.b_buf(s, el.ni_epilog)
+        TeXFOTBuilder.b_raw(s, "%\n")
+    }
+
+    ; Cell::outProlog — the \TeXTableCell column override, then the compound
+    ; prolog
+    procedure cell_out(c: pointer[TexFotEl], s: pointer[TexBuf])
+    {
+        var wrap false
+        if c.n_cols_spanned > 1
+            set wrap: true
+        if c.needs_override
+            set wrap: true
+        if c.row_alignment <> 2
+        {
+            if c.row_alignment <> 25
+                set wrap: true
+        }
+        if c.cell_background
+            set wrap: true
+        if wrap
+        {
+            TeXFOTBuilder.b_raw(s, "\\TeXTableCell{")
+            TeXFOTBuilder.b_udec(s, c.n_cols_spanned)
+            TeXFOTBuilder.b_raw(s, "}{")
+            if c.bc_border.b_present
+                s.put(0x7C as u8)
+            if c.display_size <> 0
+            {
+                let al TeXFOTBuilder.cell_alignment_char(c)
+                s.put(al)
+                s.put(0x7B as u8)
+                TeXFOTBuilder.b_pts(s, c.eff_before_col_margin)
+                TeXFOTBuilder.b_raw(s, "}{")
+                TeXFOTBuilder.b_pts(s, c.display_size)
+                TeXFOTBuilder.b_raw(s, "}{")
+                TeXFOTBuilder.b_pts(s, c.eff_after_col_margin)
+                s.put(0x7D as u8)
+                if c.cell_background
+                    TeXFOTBuilder.cell_color_buf(c, s)
+            }
+            else
+            {
+                TeXFOTBuilder.b_raw(s, "@{\\hspace{")
+                TeXFOTBuilder.b_pts(s, c.eff_before_col_margin)
+                TeXFOTBuilder.b_raw(s, "}}")
+                if c.cell_background
+                {
+                    TeXFOTBuilder.b_raw(s, ">{\\columncolor[rgb]")
+                    TeXFOTBuilder.cell_color_buf(c, s)
+                    s.put(0x7D as u8)
+                }
+                if (c.row_alignment = 46) or (c.row_alignment = 26)
+                    s.put(0x72 as u8)
+                else if c.row_alignment = 27
+                    s.put(0x63 as u8)
+                else
+                    s.put(0x6C as u8)
+                TeXFOTBuilder.b_raw(s, "@{\\hspace{")
+                TeXFOTBuilder.b_pts(s, c.eff_after_col_margin)
+                TeXFOTBuilder.b_raw(s, "}}")
+            }
+            if c.ac_border.b_present
+                s.put(0x7C as u8)
+            TeXFOTBuilder.b_raw(s, "}%\n{%\n")
+        }
+        TeXFOTBuilder.el_out_prolog(c, s)
+        ; Cell::outContent — the buffered content, unless overlapped
+        if c.is_overlapped() = false
+            TeXFOTBuilder.b_buf(s, c.content)
+        TeXFOTBuilder.el_out_epilog(c, s)
+        if wrap
+            TeXFOTBuilder.b_raw(s, "}%\n")
+    }
+
+    ; "{%.2f, %.2f, %.2f}" of the cell background colour
+    procedure cell_color_buf(c: pointer[TexFotEl], s: pointer[TexBuf])
+    {
+        s.put(0x7B as u8)
+        TeXFOTBuilder.b_f2(s, (c.bg_r as double) / 255.0)
+        TeXFOTBuilder.b_raw(s, ", ")
+        TeXFOTBuilder.b_f2(s, (c.bg_g as double) / 255.0)
+        TeXFOTBuilder.b_raw(s, ", ")
+        TeXFOTBuilder.b_f2(s, (c.bg_b as double) / 255.0)
+        s.put(0x7D as u8)
+    }
+
+    ; the effective/row alignment matrix (background variants are digits)
+    function cell_alignment_char(c: pointer[TexFotEl]) returns u8
+    {
+        let ea c.eff_alignment
+        let ra c.row_alignment
+        var ra_class 2
+        if (ra = 46) or (ra = 26)
+            set ra_class: 0
+        else if ra = 27
+            set ra_class: 1
+        if (ea = 46) or (ea = 26)
+        {
+            if ra_class = 0
+            {
+                if c.cell_background
+                    return 0x33 as u8
+                return 0x4D as u8
+            }
+            if ra_class = 1
+            {
+                if c.cell_background
+                    return 0x36 as u8
+                return 0x4A as u8
+            }
+            if c.cell_background
+                return 0x39 as u8
+            return 0x55 as u8
+        }
+        if ea = 27
+        {
+            if ra_class = 0
+            {
+                if c.cell_background
+                    return 0x32 as u8
+                return 0x4E as u8
+            }
+            if ra_class = 1
+            {
+                if c.cell_background
+                    return 0x35 as u8
+                return 0x48 as u8
+            }
+            if c.cell_background
+                return 0x38 as u8
+            return 0x59 as u8
+        }
+        if ra_class = 0
+        {
+            if c.cell_background
+                return 0x31 as u8
+            return 0x42 as u8
+        }
+        if ra_class = 1
+        {
+            if c.cell_background
+                return 0x34 as u8
+            return 0x47 as u8
+        }
+        if c.cell_background
+            return 0x37 as u8
+        0x54 as u8
+    }
+
+    ; Row::outContent + the compound bracket
+    procedure row_out(row: pointer[TexFotEl], s: pointer[TexBuf])
+    {
+        TeXFOTBuilder.el_out_prolog(row, s)
+        var first true
+        let n row.cells.get_length() as int
+        var i 0
+        while (i + 1) < n
+        {
+            let cell TeXFOTBuilder.cells_at(row, i)
+            var output_cell false
+            if cell.is_overlapped() = false
+                set output_cell: true
+            else
+            {
+                let oc cell.overlapping
+                if oc <> null
+                {
+                    if oc.n_rows_spanned > 1
+                    {
+                        if oc.tex_col_idx = i
+                            set output_cell: true
+                    }
+                }
+            }
+            if first = false
+            {
+                if output_cell
+                    s.put(0x26 as u8)
+            }
+            else
+                set first: false
+            if output_cell
+                TeXFOTBuilder.cell_out(cell, s)
+            set i: i + 1
+        }
+        TeXFOTBuilder.el_out_epilog(row, s)
+    }
+
+    ; Row::outVerticalBorders — \Hline / \Cline runs between two rows
+    procedure row_vertical_borders(upper: pointer[TexFotEl], lower: pointer[TexFotEl], s: pointer[TexBuf])
+    {
+        if (upper = null) and (lower = null)
+            TeXFOTBuilder.trap("outVerticalBorders with no rows")
+        var col_num 0
+        if upper <> null
+            set col_num: (upper.cells.get_length() as int) - 1
+        else
+            set col_num: (lower.cells.get_length() as int) - 1
+        var border_start 0 - 1
+        var border_end 0
+        var i 0
+        while i < col_num
+        {
+            var present false
+            if upper <> null
+            {
+                if i < ((upper.cells.get_length() as int) - 1)
+                {
+                    if TeXFOTBuilder.cell_single_row_after(TeXFOTBuilder.cells_at(upper, i))
+                        set present: true
+                }
+            }
+            if lower <> null
+            {
+                if i < ((lower.cells.get_length() as int) - 1)
+                {
+                    if TeXFOTBuilder.cell_single_row_before(TeXFOTBuilder.cells_at(lower, i))
+                        set present: true
+                }
+            }
+            var emit false
+            if present
+            {
+                if border_start < 0
+                    set border_start: i
+                if i = (col_num - 1)
+                {
+                    set border_end: i
+                    set emit: true
+                }
+            }
+            else if border_start > (0 - 1)
+            {
+                set border_end: i - 1
+                set emit: true
+            }
+            if emit
+            {
+                if (border_start = 0) and (i = (col_num - 1))
+                    TeXFOTBuilder.b_raw(s, "\\Hline%\n")
+                else
+                {
+                    TeXFOTBuilder.b_raw(s, "\\Cline{")
+                    TeXFOTBuilder.b_long(s, border_start + 1)
+                    s.put(0x2D as u8)
+                    TeXFOTBuilder.b_long(s, border_end + 1)
+                    TeXFOTBuilder.b_raw(s, "}%\n")
+                }
+                set border_start: 0 - 1
+            }
+            set i: i + 1
+        }
+    }
+
+    ; TablePart::outContent — the \TeXTable preamble, then header/body/footer
+    procedure part_out(part: pointer[TexFotEl], s: pointer[TexBuf])
+    {
+        if part.is_explicit
+            TeXFOTBuilder.el_out_prolog(part, s)
+        let t part.parent
+        TeXFOTBuilder.b_raw(s, "\\TeXTable%\n{")
+        TeXFOTBuilder.b_pts(s, t.table_width)
+        TeXFOTBuilder.b_raw(s, "}{")
+        TeXFOTBuilder.b_udec(s, part.columns.get_length() as int)
+        TeXFOTBuilder.b_raw(s, "}{")
+        let ncols part.columns.get_length() as int
+        var i 0
+        while i < ncols
+        {
+            let col TeXFOTBuilder.cols_at(part, i)
+            if i = 0
+            {
+                if col.default_left_border <> 0
+                    s.put(0x7C as u8)
+            }
+            if col.computed_width > 0
+            {
+                var al 0x54 as u8
+                if (col.display_alignment = 46) or (col.display_alignment = 26)
+                    set al: 0x55 as u8
+                else if col.display_alignment = 27
+                    set al: 0x59 as u8
+                s.put(al)
+                s.put(0x7B as u8)
+                TeXFOTBuilder.b_pts(s, col.default_before_margin)
+                TeXFOTBuilder.b_raw(s, "}{")
+                TeXFOTBuilder.b_pts(s, col.display_size)
+                TeXFOTBuilder.b_raw(s, "}{")
+                TeXFOTBuilder.b_pts(s, col.default_after_margin)
+                s.put(0x7D as u8)
+            }
+            else
+            {
+                TeXFOTBuilder.b_raw(s, "@{\\hspace{")
+                TeXFOTBuilder.b_pts(s, col.default_before_margin)
+                TeXFOTBuilder.b_raw(s, "}}")
+                if (col.display_alignment = 46) or (col.display_alignment = 26)
+                    s.put(0x72 as u8)
+                else if col.display_alignment = 27
+                    s.put(0x63 as u8)
+                else
+                    s.put(0x6C as u8)
+                TeXFOTBuilder.b_raw(s, "@{\\hspace{")
+                TeXFOTBuilder.b_pts(s, col.default_after_margin)
+                TeXFOTBuilder.b_raw(s, "}}")
+            }
+            if col.default_right_border <> 0
+                s.put(0x7C as u8)
+            set i: i + 1
+        }
+        TeXFOTBuilder.b_raw(s, "}%\n")
+        TeXFOTBuilder.b_buf(s, part.header_prolog)
+        var recent: pointer[TexFotEl] null
+        let nh part.header_rows.get_length() as int
+        var r 0
+        while r < nh
+        {
+            let row TeXFOTBuilder.rows_at(part.header_rows, r)
+            TeXFOTBuilder.row_vertical_borders(recent, row, s)
+            TeXFOTBuilder.row_out(row, s)
+            set recent: row
+            set r: r + 1
+        }
+        TeXFOTBuilder.b_buf(s, part.header_epilog)
+        let nb part.body_rows.get_length() as int
+        set r: 0
+        while r < nb
+        {
+            let row TeXFOTBuilder.rows_at(part.body_rows, r)
+            TeXFOTBuilder.row_vertical_borders(recent, row, s)
+            TeXFOTBuilder.row_out(row, s)
+            set recent: row
+            set r: r + 1
+        }
+        TeXFOTBuilder.b_buf(s, part.footer_prolog)
+        let nf part.footer_rows.get_length() as int
+        set r: 0
+        while r < nf
+        {
+            let row TeXFOTBuilder.rows_at(part.footer_rows, r)
+            TeXFOTBuilder.row_vertical_borders(recent, row, s)
+            TeXFOTBuilder.row_out(row, s)
+            set recent: row
+            set r: r + 1
+        }
+        TeXFOTBuilder.b_buf(s, part.footer_epilog)
+        if recent <> null
+            TeXFOTBuilder.row_vertical_borders(recent, null, s)
+        TeXFOTBuilder.b_raw(s, "\\endTeXTable{}%\n")
+        if part.is_explicit
+            TeXFOTBuilder.el_out_epilog(part, s)
+    }
+
+    procedure table_out(t: pointer[TexFotEl], s: pointer[TexBuf])
+    {
+        TeXFOTBuilder.el_out_prolog(t, s)
+        let n t.parts.get_length() as int
+        var i 0
+        while i < n
+        {
+            TeXFOTBuilder.part_out(*(t.parts.get_buffer() + i), s)
+            set i: i + 1
+        }
+        TeXFOTBuilder.el_out_epilog(t, s)
+    }
+
+    ; --- table flow objects -------------------------------------------------------------
+    procedure part_begin(part: pointer[TexFotEl], t: pointer[TexFotEl])
+    {
+        set part.columns_processed: false
+        set part.needs_col_reproc: false
+        set t.cur_rows_sel: 1
+        set t.cur_part: part
+    }
+
+    function start_table(this: pointer[TeXFOTBuilder], tnic: pointer[TableNICRec], dnic: pointer[DisplayNIC])
+    {
+        let t this.table_push()
+        this.fo_start()
+        ; setTableNIC
+        this.set_display_nic(dnic)
+        if tnic <> null
+        {
+            if tnic.width_type = 0
+                this.set_stringc("TableWidth", StringC("full"))
+            else if tnic.width_type = 1
+                this.set_stringc("TableWidth", StringC("minimum"))
+            else
+                this.set_lenspec("TableWidth", tnic.width)
+        }
+        let f this.cur_format()
+        let cur_start_indent this.compute_length_spec(f.start_indent_spec)
+        set t.start_indent: cur_start_indent
+        this.capture_into(t)
+        this.el_open(t)
+        ; Table::begin
+        let host this.host
+        let part TexFotEl.make_part(host)
+        set part.sibling_idx: 0
+        set part.parent: t
+        set t.cur_cell: null
+        set t.no_parts_seen: true
+        t.parts.add(part)
+        TeXFOTBuilder.part_begin(part, t)
+        let f2 this.cur_format()
+        if f2.display_alignment <> 2
+            set t.t_display_alignment: f2.display_alignment
+        if tnic <> null
+        {
+            if tnic.width_type = 2
+                set t.table_width: this.compute_length_spec(tnic.width)
+            else
+                set t.table_width: f2.cur_display_size - cur_start_indent - this.compute_length_spec(f2.end_indent_spec)
+        }
+        else
+            set t.table_width: f2.cur_display_size - cur_start_indent - this.compute_length_spec(f2.end_indent_spec)
+        this.el_open(t.cur_part)
+    }
+
+    function end_table(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        if t.no_parts_seen
+        {
+            this.el_close(t.cur_part)
+            set t.cur_part.is_explicit: false
+        }
+        this.table_end_compute(t)
+        this.el_close(t)
+        let s this.cur_os()
+        TeXFOTBuilder.table_out(t, s)
+        this.fo_end()
+        set this.table_depth: this.table_depth - 1
+    }
+
+    function table_before_row_border(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        this.fo_start()
+        this.border_from_fot(t.t_br_border)
+        this.capture_into(t.t_br_border)
+        this.fo_end()
+    }
+
+    function table_after_row_border(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        this.fo_start()
+        this.border_from_fot(t.t_ar_border)
+        this.capture_into(t.t_ar_border)
+        this.fo_end()
+    }
+
+    function table_before_column_border(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        this.fo_start()
+        this.border_from_fot(t.t_bc_border)
+        this.capture_into(t.t_bc_border)
+        this.fo_end()
+    }
+
+    function table_after_column_border(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        this.fo_start()
+        this.border_from_fot(t.t_ac_border)
+        this.capture_into(t.t_ac_border)
+        this.fo_end()
+    }
+
+    function table_cell_before_row_border(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        let c t.cur_cell
+        if c = null
+            TeXFOTBuilder.trap("tableCellBeforeRowBorder without a current cell")
+        this.fo_start()
+        this.border_from_fot(c.br_border)
+        this.capture_into(c.br_border)
+        this.fo_end()
+    }
+
+    function table_cell_after_row_border(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        let c t.cur_cell
+        if c = null
+            TeXFOTBuilder.trap("tableCellAfterRowBorder without a current cell")
+        this.fo_start()
+        this.border_from_fot(c.ar_border)
+        this.capture_into(c.ar_border)
+        this.fo_end()
+    }
+
+    function table_cell_before_column_border(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        let c t.cur_cell
+        if c = null
+            TeXFOTBuilder.trap("tableCellBeforeColumnBorder without a current cell")
+        this.fo_start()
+        this.border_from_fot(c.bc_border)
+        this.capture_into(c.bc_border)
+        this.fo_end()
+    }
+
+    function table_cell_after_column_border(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        let c t.cur_cell
+        if c = null
+            TeXFOTBuilder.trap("tableCellAfterColumnBorder without a current cell")
+        this.fo_start()
+        this.border_from_fot(c.ac_border)
+        this.capture_into(c.ac_border)
+        this.fo_end()
+    }
+
+    function start_table_part_serial(this: pointer[TeXFOTBuilder], dnic: pointer[DisplayNIC])
+    {
+        let t this.cur_table()
+        this.fo_start()
+        this.set_display_nic(dnic)
+        if t.no_parts_seen
+            set t.no_parts_seen: false
+        else
+        {
+            let host this.host
+            let part TexFotEl.make_part(host)
+            set part.sibling_idx: t.parts.get_length() as int
+            set part.parent: t
+            t.parts.add(part)
+            TeXFOTBuilder.part_begin(part, t)
+            this.el_open(part)
+        }
+        this.capture_into(t.cur_part)
+    }
+
+    function end_table_part_serial(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        this.el_close(t.cur_part)
+        set t.cur_part: null
+        this.fo_end()
+    }
+
+    function start_table_part_header(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        set t.cur_rows_sel: 0
+        this.group_start_out("TablePartHeader", t.cur_part.header_prolog)
+    }
+
+    function end_table_part_header(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        set t.cur_rows_sel: 1
+        this.group_end_out("TablePartHeader", t.cur_part.header_epilog)
+    }
+
+    function start_table_part_footer(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        set t.cur_rows_sel: 2
+        this.group_start_out("TablePartFooter", t.cur_part.footer_prolog)
+    }
+
+    function end_table_part_footer(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        set t.cur_rows_sel: 1
+        this.group_end_out("TablePartFooter", t.cur_part.footer_epilog)
+    }
+
+    function start_table_row(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        let host this.host
+        let rows t.cur_rows()
+        let row TexFotEl.make_row(host)
+        set row.sibling_idx: rows.get_length() as int
+        set row.parent: t.cur_part
+        rows.add(row)
+        this.capture_into(row)
+        this.el_open(row)
+    }
+
+    function end_table_row(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        let rows t.cur_rows()
+        let n rows.get_length() as int
+        let row TeXFOTBuilder.rows_at(rows, n - 1)
+        this.el_close(row)
+    }
+
+    function table_column(this: pointer[TeXFOTBuilder], nic: pointer[TableColumnNICRec])
+    {
+        if nic = null
+            return
+        ; setTableColumnNIC
+        if nic.column_index <> 0
+            this.set_long("ColumnIndex", nic.column_index)
+        if nic.n_columns_spanned <> 1
+            this.set_long("NColumnsSpanned", nic.n_columns_spanned)
+        if nic.has_width
+            this.set_lenspec("Width", nic.width)
+        let t this.cur_table()
+        let part t.cur_part
+        if part = null
+            TeXFOTBuilder.trap("tableColumn outside a table part")
+        if nic.column_index >= (part.columns.get_length() as int)
+            this.cols_resize(part, nic.column_index + 1)
+        let col TeXFOTBuilder.cols_at(part, nic.column_index)
+        set col.is_explicit: true
+        set col.has_width: nic.has_width
+        if nic.has_width
+        {
+            set col.width: nic.width
+            set col.width_tuf: nic.width_tfactor
+        }
+        let f this.cur_format()
+        if f.display_alignment <> 2
+            set col.display_alignment: f.display_alignment
+        if f.cell_before_col_margin <> TEX_LEN_UNSPEC
+            set col.default_before_margin: f.cell_before_col_margin
+        if f.cell_after_col_margin <> TEX_LEN_UNSPEC
+            set col.default_after_margin: f.cell_after_col_margin
+        this.insert_atomic("TableColumn")
+    }
+
+    function start_table_cell(this: pointer[TeXFOTBuilder], nic: pointer[TableCellNICRec])
+    {
+        let t this.cur_table()
+        var col_index 0
+        var n_cols 1
+        var n_rows 1
+        var missing false
+        if nic <> null
+        {
+            set col_index: nic.column_index
+            set n_cols: nic.n_columns_spanned
+            set n_rows: nic.n_rows_spanned
+            set missing: nic.missing
+            ; setTableCellNIC
+            if nic.column_index <> 0
+                this.set_long("ColumnIndex", nic.column_index)
+            if nic.n_columns_spanned <> 1
+                this.set_long("NColumnsSpanned", nic.n_columns_spanned)
+            if nic.n_rows_spanned <> 1
+                this.set_long("NRowsSpanned", nic.n_rows_spanned)
+        }
+        let part t.cur_part
+        if part = null
+            TeXFOTBuilder.trap("tableCell outside a table part")
+        if part.columns_processed = false
+            this.part_process_columns(part)
+        let rows t.cur_rows()
+        let nr rows.get_length() as int
+        if nr <= 0
+            TeXFOTBuilder.trap("tableCell outside a table row")
+        let row TeXFOTBuilder.rows_at(rows, nr - 1)
+        if col_index >= (row.cells.get_length() as int)
+            this.cells_resize(row, col_index + 1)
+        let cell TeXFOTBuilder.cells_at(row, col_index)
+        set t.cur_cell: cell
+        set cell.missing: missing
+        set cell.parent: row
+        if n_cols <> 1
+            set cell.n_cols_spanned: n_cols
+        if n_rows <> 1
+            set cell.n_rows_spanned: n_rows
+        var i col_index
+        while i < (col_index + n_cols)
+        {
+            if i >= (part.columns.get_length() as int)
+            {
+                if missing = false
+                {
+                    this.cols_resize(part, (part.columns.get_length() as int) + 1)
+                    set part.columns_processed: false
+                }
+            }
+            set i: i + 1
+        }
+        if part.columns_processed = false
+            this.part_process_columns(part)
+        if missing = false
+        {
+            if this.next_format.cell_row_alignment <> 2
+                set cell.row_alignment: this.next_format.cell_row_alignment
+            if this.next_format.cell_before_col_margin <> TEX_LEN_UNSPEC
+                set cell.before_col_margin: this.next_format.cell_before_col_margin
+            if this.next_format.cell_after_col_margin <> TEX_LEN_UNSPEC
+                set cell.after_col_margin: this.next_format.cell_after_col_margin
+            if this.next_format.cell_background
+            {
+                set cell.cell_background: true
+                set cell.bg_r: this.next_format.bg_r
+                set cell.bg_g: this.next_format.bg_g
+                set cell.bg_b: this.next_format.bg_b
+            }
+            set cell.tex_col_idx: col_index
+            let col TeXFOTBuilder.cols_at(part, col_index)
+            set cell.eff_alignment: col.display_alignment
+            TeXFOTBuilder.cell_effective_margins(cell, part)
+            TeXFOTBuilder.cell_effective_width(cell, part)
+            set this.next_format.cur_display_size: cell.display_size
+        }
+        this.element_start(TEX_OC_CELL)
+        this.capture_into(cell)
+        this.el_open(cell)
+    }
+
+    function end_table_cell(this: pointer[TeXFOTBuilder])
+    {
+        let t this.cur_table()
+        let c t.cur_cell
+        if c = null
+            TeXFOTBuilder.trap("endTableCell without a current cell")
+        this.el_close(c)
+        set t.cur_cell: null
+        this.fo_end()
+    }
+}
