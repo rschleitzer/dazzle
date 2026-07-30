@@ -38,6 +38,29 @@ define GN_DOCUMENT: int 0
 define GN_ELEMENT: int 1
 define GN_DATA: int 2
 define GN_PI: int 3
+; The ATTRIBUTE axis (AttributeAsgnNode / AttributeValueTokenNode). Like data
+; nodes these are VIEWS, not built tree nodes: an assignment is
+; (origin element, attribute index) and a value token adds the token index —
+; exactly the reference's same2 identity — so `chunk` holds the origin, and
+; `char_index` / `element_index` the two indices (see GroveNode.attr_view).
+define GN_ATTR_ASSIGN: int 4
+define GN_ATTR_TOKEN: int 5
+; EntityNode / NotationNode — reached so far only as a value token's `entity` /
+; `notation` (the reference looks the name up in the governing DTD every time,
+; so the node carries just the NAME, in `gi`, and every property answer is
+; another DTD lookup — EntityNode::same2 compares the Entity pointer, which
+; within one DTD is the same statement as comparing names). Their remaining
+; properties and the named-node-lists that hand them out are the next slice;
+; see tests/dazzle/COMPLETENESS.md.
+define GN_ENTITY: int 6
+define GN_NOTATION: int 7
+
+; GroveImpl::generalSubstTable — the instance syntax's 256-entry name-fold table
+; that the NAMED node lists normalize a query name through (the grove owns it in
+; the reference; here the driver installs it once after the parse, like the
+; engine's other `shared` driver cells msg_prog / tex_prog / html_prog).
+; Null = no folding.
+shared GROVE_SUBST: pointer[u32] null
 
 ; GroveNode.flags — the element chunk's two decided-at-build-time booleans.
 define GN_FLAG_INCLUDED: int 1
@@ -443,6 +466,14 @@ define GroveClassDef
             return CN_DATA_CHAR
         if node_class = GN_PI
             return CN_PI
+        if node_class = GN_ATTR_ASSIGN
+            return CN_ATTRIBUTE_ASSIGNMENT
+        if node_class = GN_ATTR_TOKEN
+            return CN_ATTRIBUTE_VALUE_TOKEN
+        if node_class = GN_ENTITY
+            return CN_ENTITY
+        if node_class = GN_NOTATION
+            return CN_NOTATION
         CN_SGML_DOCUMENT
     }
 
@@ -453,6 +484,8 @@ define GroveClassDef
     {
         if node_class = GN_ELEMENT
             return CN_CONTENT
+        if node_class = GN_ATTR_ASSIGN
+            return CN_VALUE
         CN_NO_ID
     }
 
@@ -461,12 +494,19 @@ define GroveClassDef
     {
         if node_class = GN_DATA
             return CN_CHAR
+        if node_class = GN_ATTR_TOKEN
+            return CN_TOKEN
         CN_NO_ID
     }
 
-    ; ClassDef::dataSepPropertyName — none of our four classes declares one.
+    ; ClassDef::dataSepPropertyName — only attribute-assignment declares one
+    ; (its tokens are separated by the token-sep character).
     function data_sep_property_name(node_class: int) returns int
+    {
+        if node_class = GN_ATTR_ASSIGN
+            return CN_TOKEN_SEP
         CN_NO_ID
+    }
 
     ; ClassDef::subnodePropertyNames
     procedure subnode_property_names(node_class: int, out: pointer[Array[int]])
@@ -475,6 +515,23 @@ define GroveClassDef
         {
             out.add(CN_ATTRIBUTES)
             out.add(CN_CONTENT)
+            return
+        }
+        if node_class = GN_ATTR_ASSIGN
+        {
+            out.add(CN_VALUE)
+            return
+        }
+        if node_class = GN_ENTITY
+        {
+            out.add(CN_EXTERNAL_ID)
+            out.add(CN_ATTRIBUTES)
+            return
+        }
+        if node_class = GN_NOTATION
+        {
+            out.add(CN_EXTERNAL_ID)
+            out.add(CN_ATTRIBUTE_DEFS)
             return
         }
         if node_class = GN_DOCUMENT
@@ -529,6 +586,42 @@ define GroveClassDef
             out.add(CN_SYSTEM_DATA)
             out.add(CN_ENTITY_NAME)
             out.add(CN_ENTITY)
+            return
+        }
+        if node_class = GN_ATTR_ASSIGN
+        {
+            out.add(CN_ATTRIBUTE_DEF)
+            out.add(CN_VALUE)
+            out.add(CN_NAME)
+            out.add(CN_IMPLIED)
+            out.add(CN_TOKEN_SEP)
+            return
+        }
+        if node_class = GN_ATTR_TOKEN
+        {
+            out.add(CN_TOKEN)
+            out.add(CN_ENTITY)
+            out.add(CN_NOTATION)
+            out.add(CN_REFERENT)
+            return
+        }
+        if node_class = GN_ENTITY
+        {
+            out.add(CN_NAME)
+            out.add(CN_ENTITY_TYPE)
+            out.add(CN_TEXT)
+            out.add(CN_EXTERNAL_ID)
+            out.add(CN_ATTRIBUTES)
+            out.add(CN_NOTATION_NAME)
+            out.add(CN_NOTATION)
+            out.add(CN_DEFAULTED)
+            return
+        }
+        if node_class = GN_NOTATION
+        {
+            out.add(CN_NAME)
+            out.add(CN_EXTERNAL_ID)
+            out.add(CN_ATTRIBUTE_DEFS)
             return
         }
         out.add(CN_SGML_CONSTANTS)
@@ -662,6 +755,268 @@ define GroveNode (node_class: int, gi: StringC, chars: StringC, attributes: poin
         *(arr.get_buffer() + index)
     }
 
+    ; --- the ATTRIBUTE axis --------------------------------------------------
+    ;
+    ; ElementNode::getAttributes hands out ONE attribute-assignment per DECLARED
+    ; attribute of the element — specified, defaulted or implied alike — in
+    ; declaration order, and AttributeAsgnNode's identity is (origin, attIndex)
+    ; (same2, GroveBuilder.cxx:3785). So these are VIEWS exactly like the data
+    ; nodes: `chunk` is the origin element, `char_index` the attribute index,
+    ; `attributes` the origin's AttributeList (so every property answer is a
+    ; local lookup), and `parent` the element — the assignment's ORIGIN — while
+    ; the parent AXIS stays null (see get_axis_parent).
+    ;
+    ; Memoized on the ELEMENT's `views` slot, on the element's OWN grove page
+    ; (data chunks use theirs for character views; the two never collide because
+    ; a node is either an element or a data chunk). The reason is the same as
+    ; there: the callers are axis primitives whose per-node eval bracket releases
+    ; its scratch region, which would dangle every view built on it.
+    function attr_views(elem: pointer[GroveNode]) returns pointer[Array[pointer[GroveNode]]]
+    {
+        let have elem.views
+        if have <> null
+            return have
+        let gpage Page.get(elem as pointer[void])
+        let arr Array[pointer[GroveNode]]^gpage()
+        let atts elem.get_attributes()
+        var n: size_t 0
+        if atts <> null
+            set n: atts.size()
+        var i: size_t 0
+        while i < n
+        {
+            let p gpage.allocate(sizeof GroveNode, alignof GroveNode) as pointer[GroveNode]
+            set p.node_class: GN_ATTR_ASSIGN
+            set p.gi: StringC()
+            set p.chars: StringC()
+            set p.attributes: atts
+            set p.parent: elem
+            set p.children: null
+            set p.element_index: 0 - 1
+            set p.char_index: i as int
+            set p.chunk: elem
+            set p.views: null
+            set p.flags: 0
+            arr.add(p)
+            set i: i + (1 as size_t)
+        }
+        set elem.views: arr
+        arr
+    }
+
+    procedure set_grove_subst(tab: pointer[u32])
+        set GROVE_SUBST: tab
+
+    function get_grove_subst() returns pointer[u32]
+        GROVE_SUBST
+
+    ; an entity / notation node: the NAME is all it carries (see GN_ENTITY).
+    function make_named(host: pointer[Page], node_class: int, nm: StringC) returns pointer[GroveNode]
+    {
+        let p GroveNode.make(host, node_class)
+        set p.gi: nm
+        p
+    }
+
+    ; TokenizedAttributeValue::token, but copied onto an EXPLICIT page:
+    ; AttributeValue.token's own `substr` allocates through Page.get(<the return
+    ; slot>), which for a field store is a stack temporary — the bogus-page trap.
+    function value_token(host: pointer[Page], av: pointer[AttributeValue], k: size_t) returns pointer[StringC]
+    {
+        let s av.get_string()
+        let si av.get_space_index()
+        var start: size_t 0
+        var stop s.get_size()
+        if si <> null
+        {
+            let buf si.get_buffer()
+            let ns si.get_length()
+            if k <> (0 as size_t)
+                set start: *(buf + (k - (1 as size_t))) + (1 as size_t)
+            if k < ns
+                set stop: *(buf + k)
+        }
+        if stop < start
+            set stop: start
+        if start >= s.get_size()
+            return StringC^host()
+        StringC^host(s.data_ptr() + start, stop - start)
+    }
+
+    ; --- the attribute classes' own properties -------------------------------
+
+    ; AttributeAsgnNode::getName — the DEFINITION's name, i.e. already
+    ; normalized by the parse (upper-cased under NAMECASE GENERAL YES).
+    function assign_name(this: GroveNode) returns StringC
+    {
+        let atts attributes
+        if atts = null
+            return StringC()
+        atts.name(char_index as size_t)
+    }
+
+    ; the assignment's AttributeValue, null when the element has none
+    function assign_value(this: GroveNode) returns pointer[AttributeValue]
+    {
+        let atts attributes
+        if atts = null
+            return null
+        atts.value(char_index as size_t)
+    }
+
+    ; AttributeAsgnNode::getImplied — `value != 0 && value->text() == 0`: the
+    ; #IMPLIED-with-no-value test, so a DEFAULTED attribute is #f. accessNull
+    ; (out_ok false) when there is no value object at all.
+    function assign_implied(this: GroveNode, out_ok: pointer[bool]) returns bool
+    {
+        set *out_ok: true
+        let av this.assign_value()
+        if av = null
+            return false
+        av.get_text() = null
+    }
+
+    ; AttributeAsgnNode::getTokenSep — accessNull unless the VALUE is tokenized
+    ; with MORE THAN ONE token; then the character after token 0, which the
+    ; parse normalized to a space.
+    function assign_token_sep(this: GroveNode, out_ok: pointer[bool]) returns u32
+    {
+        set *out_ok: false
+        let av this.assign_value()
+        if av = null
+            return 0 as u32
+        if av.is_tokenized() = false
+            return 0 as u32
+        if av.n_tokens() <= (1 as size_t)
+            return 0 as u32
+        let si av.get_space_index()
+        if si = null
+            return 0 as u32
+        if si.get_length() = (0 as size_t)
+            return 0 as u32
+        let s av.get_string()
+        let at *(si.get_buffer())
+        if at >= s.get_size()
+            return 0 as u32
+        set *out_ok: true
+        s.get(at)
+    }
+
+    ; AttributeAsgnNode::tokens — the WHOLE tokenized value string, separators
+    ; included (accessNull for a CDATA or implied value). This is `nodeData`'s
+    ; second step and the reason `(data <assignment>)` reads "ONE TWO".
+    function assign_tokens(this: GroveNode, out_ok: pointer[bool]) returns StringC
+    {
+        set *out_ok: false
+        let av this.assign_value()
+        if av = null
+            return StringC()
+        if av.is_tokenized() = false
+            return StringC()
+        set *out_ok: true
+        av.get_string()
+    }
+
+    ; the attribute-assignment view for (element, attIndex), null out of range
+    function attr_view(elem: pointer[GroveNode], index: int) returns pointer[GroveNode]
+    {
+        let arr GroveNode.attr_views(elem)
+        if index < 0
+            return null
+        if index >= (arr.get_length() as int)
+            return null
+        *(arr.get_buffer() + index)
+    }
+
+    ; The VALUE of an assignment — `children` of the assignment node
+    ; (AttributeAsgnNode::getValue is getChildren). Two shapes, decided by the
+    ; attribute value's own kind (makeAttributeValueNodeList): a TOKENIZED value
+    ; becomes one attribute-value-token per token, and everything else (CDATA)
+    ; becomes a DATA CHUNK whose per-character views are the members — the
+    ; reference's CdataAttributeValueNode is of class data-char, so `(node-list-ref
+    ; (node-property 'value a) 0)` reports data-char and `data` gives one
+    ; character. An IMPLIED value has no node at all (accessNull).
+    ; Memoized on the assignment's own `views` slot, same page discipline.
+    function attr_value_views(asgn: pointer[GroveNode]) returns pointer[Array[pointer[GroveNode]]]
+    {
+        let have asgn.views
+        if have <> null
+            return have
+        let gpage Page.get(asgn as pointer[void])
+        let arr Array[pointer[GroveNode]]^gpage()
+        let atts asgn.get_attributes()
+        let ai asgn.char_index as size_t
+        if atts = null
+        {
+            set asgn.views: arr
+            return arr
+        }
+        let av atts.value(ai)
+        if av = null
+        {
+            set asgn.views: arr
+            return arr
+        }
+        ; an IMPLIED value has no node at all — the reference's own test is
+        ; `value->text() == 0` (getImplied), not the declared value's type.
+        if av.get_text() = null
+        {
+            set asgn.views: arr
+            return arr
+        }
+        ; ★the VALUE's own kind decides the shape, not the declared value — the
+        ; reference tests `value->info(text, str) != tokenized` (getTokenSep,
+        ; children) and never the attribute definition.
+        if av.is_tokenized()
+        {
+            let nt av.n_tokens()
+            var k: size_t 0
+            while k < nt
+            {
+                let p gpage.allocate(sizeof GroveNode, alignof GroveNode) as pointer[GroveNode]
+                set p.node_class: GN_ATTR_TOKEN
+                set p.gi: StringC()
+                set p.chars: *(GroveNode.value_token(gpage, av, k))
+                set p.attributes: atts
+                set p.parent: asgn
+                set p.children: null
+                set p.element_index: k as int
+                set p.char_index: asgn.char_index
+                set p.chunk: asgn.chunk
+                set p.views: null
+                set p.flags: 0
+                arr.add(p)
+                set k: k + (1 as size_t)
+            }
+            set asgn.views: arr
+            return arr
+        }
+        ; CDATA: one data chunk over the whole value; its character views are
+        ; the node-list members (the same chunk/view split as document data).
+        let t av.get_text()
+        var s StringC()
+        if t <> null
+            set s: t.string()
+        if s.get_size() > (0 as size_t)
+        {
+            let p gpage.allocate(sizeof GroveNode, alignof GroveNode) as pointer[GroveNode]
+            set p.node_class: GN_DATA
+            set p.gi: StringC()
+            set p.chars: s
+            set p.attributes: null
+            set p.parent: asgn
+            set p.children: null
+            set p.element_index: 0 - 1
+            set p.char_index: 0
+            set p.chunk: null
+            set p.views: null
+            set p.flags: 0
+            arr.add(p)
+        }
+        set asgn.views: arr
+        arr
+    }
+
     ; How many per-character nodes this member of an EXPANDED node-list stands
     ; for — the weight the node-list's prefix index sums (ELObj.NodeListObj).
     ; A data CHUNK covers its whole run; everything else (elements, pis, and
@@ -698,6 +1053,28 @@ define GroveNode (node_class: int, gi: StringC, chars: StringC, attributes: poin
             return false
         if b = null
             return false
+        ; AttributeAsgnNode::same2 — (origin, attIndex); the views are memoized
+        ; per element so this is pointer equality in practice, but a second
+        ; producer must still compare equal.
+        if a.get_class() = GN_ATTR_ASSIGN
+        {
+            if b.get_class() <> GN_ATTR_ASSIGN
+                return false
+            if a.char_index <> b.char_index
+                return false
+            return a.chunk = b.chunk
+        }
+        ; AttributeValueTokenNode::same2 — (origin, attIndex, tokenIndex)
+        if a.get_class() = GN_ATTR_TOKEN
+        {
+            if b.get_class() <> GN_ATTR_TOKEN
+                return false
+            if a.char_index <> b.char_index
+                return false
+            if a.element_index <> b.element_index
+                return false
+            return a.chunk = b.chunk
+        }
         if a.get_class() <> GN_DATA
             return false
         if b.get_class() <> GN_DATA
@@ -773,8 +1150,16 @@ define GroveNode (node_class: int, gi: StringC, chars: StringC, attributes: poin
     ; element. Consumers are classified one by one in COMPLETENESS.md work
     ; package 1 — ancestor/numbering/pattern walks take the axis, siblings and
     ; grove-root walks keep get_parent.
+    ; ★An ATTRIBUTE ASSIGNMENT answers the parent axis from `Node::getParent`,
+    ; whose DEFAULT is accessNull (grove/Node.cxx:39) — it does not override it,
+    ; so its parent is null even though its ORIGIN is the element. A VALUE TOKEN
+    ; does override it (AttributeValueTokenNode::getParent,
+    ; GroveBuilder.cxx:4096) and answers with its ASSIGNMENT, which is also its
+    ; origin — measured, so the ordinary structural path below is right for it.
     function get_axis_parent(this: GroveNode) returns pointer[GroveNode]
     {
+        if node_class = GN_ATTR_ASSIGN
+            return null
         let p parent
         if p = null
             return null
@@ -851,8 +1236,15 @@ define GroveNode (node_class: int, gi: StringC, chars: StringC, attributes: poin
     }
 
     ; firstSibling succeeds? (false = accessNotInClass: no sibling axis)
+    ; The attribute classes implement firstSibling themselves
+    ; (AttributeAsgnNode / AttributeValueTokenNode: index 0 of their own group),
+    ; so they always have one.
     function has_siblings(this: GroveNode) returns bool
     {
+        if node_class = GN_ATTR_ASSIGN
+            return true
+        if node_class = GN_ATTR_TOKEN
+            return true
         let p parent
         if p = null
             return false
@@ -863,12 +1255,49 @@ define GroveNode (node_class: int, gi: StringC, chars: StringC, attributes: poin
         true
     }
 
+    ; --- the sibling GROUP ---------------------------------------------------
+    ;
+    ; For a tree node the group is its structural parent's child list, addressed
+    ; by the [begin, end) range below. The attribute classes have their OWN
+    ; groups — an assignment's siblings are the origin's other ASSIGNMENTS
+    ; (followSiblingRef walks attIndex, GroveBuilder.cxx:3694) and a value
+    ; token's are the other TOKENS of the same value (it walks tokenIndex) — so
+    ; every sibling walk asks the NODE for its group member rather than reaching
+    ; through the parent's children.
+    function sibling_group_at(this: pointer[GroveNode], i: int) returns pointer[GroveNode]
+    {
+        if this.node_class = GN_ATTR_ASSIGN
+            return GroveNode.attr_view(this.chunk, i)
+        if this.node_class = GN_ATTR_TOKEN
+        {
+            let asgn this.parent
+            if asgn = null
+                return null
+            let arr GroveNode.attr_value_views(asgn)
+            if i >= (arr.get_length() as int)
+                return null
+            return *(arr.get_buffer() + i)
+        }
+        let p this.parent
+        if p = null
+            return null
+        ; a CDATA attribute value's data chunk hangs off the ASSIGNMENT, whose
+        ; children are its value nodes (the axis), not a structural child list.
+        if p.get_class() = GN_ATTR_ASSIGN
+            return p.axis_child_at(i)
+        p.child_at(i)
+    }
+
     ; the half-open [begin, end) index range of this node's sibling group inside
     ; its structural parent's child list. For the document element the range is
     ; EMPTY and does not contain the node — which makes both the preced and the
     ; follow scans yield nothing, exactly as the reference does.
     function sibling_range_begin(this: pointer[GroveNode]) returns int
     {
+        if this.node_class = GN_ATTR_ASSIGN
+            return 0
+        if this.node_class = GN_ATTR_TOKEN
+            return 0
         let p this.parent
         if p = null
             return 0
@@ -887,9 +1316,24 @@ define GroveNode (node_class: int, gi: StringC, chars: StringC, attributes: poin
 
     function sibling_range_end(this: pointer[GroveNode]) returns int
     {
+        if this.node_class = GN_ATTR_ASSIGN
+        {
+            let arr GroveNode.attr_views(this.chunk)
+            return arr.get_length() as int
+        }
+        if this.node_class = GN_ATTR_TOKEN
+        {
+            let asgn this.parent
+            if asgn = null
+                return 0
+            let arr GroveNode.attr_value_views(asgn)
+            return arr.get_length() as int
+        }
         let p this.parent
         if p = null
             return 0
+        if p.get_class() = GN_ATTR_ASSIGN
+            return p.axis_child_count()
         let n p.child_count()
         if p.get_class() <> GN_DOCUMENT
             return n
@@ -936,18 +1380,36 @@ define GroveNode (node_class: int, gi: StringC, chars: StringC, attributes: poin
     ; element and epilog PIs — that is what the builder, the sibling ranges,
     ; the prolog/epilog properties and the element-number walk read.
     function has_child_axis(this: GroveNode) returns bool
-        node_class = GN_ELEMENT
-
-    function axis_child_count(this: GroveNode) returns int
     {
-        if node_class <> GN_ELEMENT
+        if node_class = GN_ATTR_ASSIGN
+            return true
+        node_class = GN_ELEMENT
+    }
+
+    function axis_child_count(this: pointer[GroveNode]) returns int
+    {
+        if this.node_class = GN_ATTR_ASSIGN
+        {
+            let arr GroveNode.attr_value_views(this)
+            return arr.get_length() as int
+        }
+        if this.node_class <> GN_ELEMENT
             return 0
         this.child_count()
     }
 
-    function axis_child_at(this: GroveNode, i: int) returns pointer[GroveNode]
+    function axis_child_at(this: pointer[GroveNode], i: int) returns pointer[GroveNode]
     {
-        if node_class <> GN_ELEMENT
+        if this.node_class = GN_ATTR_ASSIGN
+        {
+            let arr GroveNode.attr_value_views(this)
+            if i < 0
+                return null
+            if i >= (arr.get_length() as int)
+                return null
+            return *(arr.get_buffer() + i)
+        }
+        if this.node_class <> GN_ELEMENT
             return null
         this.child_at(i)
     }

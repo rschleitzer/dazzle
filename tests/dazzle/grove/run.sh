@@ -91,9 +91,24 @@ run_case() { # name expected [expected_err] [document]
 # accessOK-even-when-empty, gi/id/included?/must-omit-end-tag?, prolog/epilog,
 # the EMPTY children axis of the grove root (kids/desc/data) — and
 # select-by-class over both spellings of a class name.
+# props2 (attrs.sgml): the ATTRIBUTE axis — the `attributes` named-node-list
+# and the attribute-assignment / attribute-value-token node classes, over an
+# ATTLIST that covers every declared-value and default-value type: CDATA
+# specified / defaulted / #FIXED, an enumeration default, ID, IDREFS, NMTOKENS,
+# NUMBER, #CURRENT, ENTITY, ENTITIES and NOTATION, each on a specified AND an
+# unspecified element. It pins that the list holds every DECLARED attribute in
+# declaration order under its normalized (upper-cased) name; that `implied?` is
+# the #IMPLIED-with-no-value test (a DEFAULTED attribute is #f); that
+# `token-sep` is a space only for the MULTI-token declared values and accessNull
+# everywhere else; that `value` is a data-char run for CDATA but one
+# attribute-value-token per token otherwise, accessNull when implied; that the
+# reference answers `attribute-def` with accessNotInClass although it LISTS it;
+# that a token's `entity` / `notation` / `referent` resolve to nodes (referent
+# only for an IDREF that hits); and the data/children shape of both classes.
 run_case axis1 "$HERE/axis1.expected"
 run_case chars1 "$HERE/chars1.expected"
 run_case chars2 "$HERE/chars2.expected"
 run_case props1 "$HERE/props1.expected" "" props.sgml
+run_case props2 "$HERE/props2.expected" "" attrs.sgml
 
 echo "dazzle-grove: PASS"
