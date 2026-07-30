@@ -60,6 +60,14 @@ run_case() { # name expected [expected_err] [document]
   fi
 }
 
+# chars1 (doc.sgml): per-character grove nodes. The reference's DataNode is a
+# (chunk, index) view, so `First <em>inner</em> text.` has 13 children and 18
+# descendants; the golden pins the class name (data-char), the leaf shape, the
+# `char` property, the one-character `data` of a member against the chunk-wise
+# `data` of the whole list, the character-counting follow/preced, (chunk, index)
+# identity across two children calls, and that processing such a node-list stays
+# CHUNK-WISE (each run emitted once, not once per character).
 run_case axis1 "$HERE/axis1.expected"
+run_case chars1 "$HERE/chars1.expected"
 
 echo "dazzle-grove: PASS"

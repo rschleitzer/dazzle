@@ -34,7 +34,21 @@ define GN_PI: int 3
 
 ; A grove node. `children` is null for leaf (data/pi) nodes; element/document
 ; nodes carry the ordered child list. `chars` holds a data node's text.
-define GroveNode (node_class: int, gi: StringC, chars: StringC, attributes: pointer[AttributeList], parent: pointer[GroveNode], children: pointer[Array[pointer[GroveNode]]], element_index: int)
+;
+; DATA NODES — the chunk/view split (spgrove/GroveBuilder.cxx:586-635). The
+; reference stores character data as a `DataChunk` (a run of Chars) and hands
+; out `DataNode`s, which are (chunk, index) VIEWS — one grove node PER
+; CHARACTER, of class `data-char`, without allocating any of them. A GN_DATA
+; node here is that chunk (`flush_pending` = the DataChunk boundary); a VIEW is
+; a GN_DATA node with `chunk` pointing at the chunk and `char_index` its offset.
+; The chunk node itself IS the view at index 0.
+;
+; The TREE stays chunk-level: the builder, ProcessContext's content walk and
+; every FOT backend iterate whole runs (the reference does the same through
+; nextChunkSibling/charChunk). Views are materialized only where the reference's
+; per-character node identity is OBSERVABLE — children/descendants/preced/follow
+; and the node properties — see Grove.expand_into and DataNode::same2.
+define GroveNode (node_class: int, gi: StringC, chars: StringC, attributes: pointer[AttributeList], parent: pointer[GroveNode], children: pointer[Array[pointer[GroveNode]]], element_index: int, char_index: int, chunk: pointer[GroveNode], views: pointer[Array[pointer[GroveNode]]])
 {
     function make(host: pointer[Page], node_class: int) returns pointer[GroveNode]
     {
@@ -46,7 +60,150 @@ define GroveNode (node_class: int, gi: StringC, chars: StringC, attributes: poin
         set p.parent: null
         set p.children: Array[pointer[GroveNode]]^host()
         set p.element_index: 0 - 1
+        set p.char_index: 0
+        set p.chunk: null
+        set p.views: null
         p
+    }
+
+    ; --- data chunks and their per-character views ---------------------------
+
+    ; the DataChunk this node belongs to (itself for a chunk node)
+    function data_chunk(this: pointer[GroveNode]) returns pointer[GroveNode]
+    {
+        if this.chunk = null
+            return this
+        this.chunk
+    }
+
+    ; this view's character offset inside its chunk (0 for a chunk node)
+    function get_char_index(this: GroveNode) returns int
+        char_index
+
+    ; the number of characters in this data node's chunk
+    function chunk_char_count(this: pointer[GroveNode]) returns int
+    {
+        let c this.data_chunk()
+        let s c.get_chars()
+        s.get_size() as int
+    }
+
+    ; DataNode(chunk, index) — a per-character view. The index-0 view IS the
+    ; chunk node, so identity stays pointer-comparable for the common case.
+    ;
+    ; MEMOIZED ON THE CHUNK, and deliberately on the chunk's OWN page (the grove
+    ; region, reached with Page.get — grove nodes are page-hosted), never on the
+    ; caller's page: the callers are the axis primitives, whose per-node eval
+    ; brackets release their scratch region, which would dangle every view.
+    ; Building them once per chunk is also what keeps the cost sane — the
+    ; reference pays nothing at all because its DataNodes are transient views,
+    ; and re-materializing per `children` call cost 1.7x wall / 2.6x memory on
+    ; the dsssl.xml fot run before this cache. Sharing the objects is sound
+    ; because identity is (chunk, index) either way (DataNode::same2).
+    function chunk_views(chunk: pointer[GroveNode]) returns pointer[Array[pointer[GroveNode]]]
+    {
+        let have chunk.views
+        if have <> null
+            return have
+        let gpage Page.get(chunk as pointer[void])
+        let arr Array[pointer[GroveNode]]^gpage()
+        let s chunk.get_chars()
+        let n s.get_size() as int
+        var i 0
+        while i < n
+        {
+            if i = 0
+                arr.add(chunk)
+            else
+            {
+                let p gpage.allocate(sizeof GroveNode, alignof GroveNode) as pointer[GroveNode]
+                set p.node_class: GN_DATA
+                set p.gi: StringC()
+                set p.chars: s
+                set p.attributes: null
+                set p.parent: chunk.get_parent()
+                set p.children: null
+                set p.element_index: 0 - 1
+                set p.char_index: i
+                set p.chunk: chunk
+                set p.views: null
+                arr.add(p)
+            }
+            set i: i + 1
+        }
+        set chunk.views: arr
+        arr
+    }
+
+    function make_char_view(host: pointer[Page], chunk: pointer[GroveNode], index: int) returns pointer[GroveNode]
+    {
+        if index = 0
+            return chunk
+        let arr GroveNode.chunk_views(chunk)
+        if index >= (arr.get_length() as int)
+            return chunk
+        *(arr.get_buffer() + index)
+    }
+
+    ; the single character this view stands for (0 when out of range) — the
+    ; reference's `char` property / the one-character `data` of a DataNode.
+    function view_char(this: pointer[GroveNode]) returns u32
+    {
+        let s this.get_chars()
+        let n s.get_size()
+        let i this.char_index as size_t
+        if i >= n
+            return 0 as u32
+        s.get(i)
+    }
+
+    ; DataNode::same2 — a data node is identified by (chunk, index), never by
+    ; object identity (the reference reuses its DataNode objects); every other
+    ; node class is identified by its single allocation.
+    function node_same(a: pointer[GroveNode], b: pointer[GroveNode]) returns bool
+    {
+        if a = b
+            return true
+        if a = null
+            return false
+        if b = null
+            return false
+        if a.get_class() <> GN_DATA
+            return false
+        if b.get_class() <> GN_DATA
+            return false
+        if a.char_index <> b.char_index
+            return false
+        let ca a.data_chunk()
+        let cb b.data_chunk()
+        ca = cb
+    }
+
+    ; append `node`'s children to `out`, expanding every data chunk into its
+    ; per-character views (the reference's children node-list over a mixed
+    ; content model: `(children p)` of `First <em>inner</em> text.` is 13 nodes).
+    procedure expand_into(host: pointer[Page], out: pointer[Array[pointer[GroveNode]]], node: pointer[GroveNode])
+    {
+        let m node.child_count()
+        var j 0
+        while j < m
+        {
+            let c node.child_at(j)
+            if c.get_class() = GN_DATA
+            {
+                let n c.chunk_char_count()
+                var k 0
+                while k < n
+                {
+                    let v GroveNode.make_char_view(host, c, k)
+                    out.add(v)
+                    set k: k + 1
+                }
+            }
+            else
+                out.add(c)
+            set j: j + 1
+        }
     }
 
     ; Node::elementIndex — the element's document-order ordinal (0-based,
