@@ -729,12 +729,25 @@ define CallCCFnObj ()
 ; A DSSSL node-list (Grove Inc 4): an ordered view over a node buffer from
 ; `start`. A single node is a length-1 node-list; the empty node-list has
 ; start == the buffer length. node-list-rest bumps `start` (cheap views).
-define NodeListObj (nodes: pointer[Array[pointer[GroveNode]]], start: int)
+;
+; LAZY CHARACTER EXPANSION. The child/descendant/sibling axes hand out one node
+; PER CHARACTER of a data run (Grove's chunk/view split), which as a flat array
+; costs a pointer per character — the reference pays nothing because
+; NodeListObj::nodeListChunkRest iterates LAZILY and skips a whole chunk in one
+; step. `prefix` is that protocol in random-access form: when it is non-null the
+; buffer holds CHUNK-LEVEL members and prefix[k] is the flat position of member
+; k's first character (prefix has one extra sentinel entry, the total). Then
+; `start` and the index of node_list_node are flat CHARACTER positions, resolved
+; by binary search, and a char view is materialized only when a caller actually
+; asks for that position. prefix == null keeps the plain one-node-per-slot
+; representation every other producer builds.
+define NodeListObj (nodes: pointer[Array[pointer[GroveNode]]], start: int, prefix: pointer[Array[int]])
 {
-    init(nodes: pointer[Array[pointer[GroveNode]]], start: int)
+    init(nodes: pointer[Array[pointer[GroveNode]]], start: int, prefix: pointer[Array[int]])
     {
         set this.nodes: nodes
         set this.start: start
+        set this.prefix: prefix
     }
 }
 
@@ -1589,8 +1602,38 @@ define ELObj union
     function make_node_list(host: pointer[Page], nodes: pointer[Array[pointer[GroveNode]]], start: int) returns pointer[ELObj]
     {
         let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
-        set *p: ELObj.NodeList(NodeListObj(nodes, start))
+        set *p: ELObj.NodeList(NodeListObj(nodes, start, null))
         p
+    }
+
+    ; a node-list over an existing (members, prefix) pair — node-list-rest and
+    ; friends carry the prefix along when they bump `start`.
+    function make_node_list_prefix(host: pointer[Page], nodes: pointer[Array[pointer[GroveNode]]], start: int, prefix: pointer[Array[int]]) returns pointer[ELObj]
+    {
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.NodeList(NodeListObj(nodes, start, prefix))
+        p
+    }
+
+    ; a CHARACTER-EXPANDED node-list over chunk-level members: builds the prefix
+    ; index (one int per member plus the total sentinel) instead of one pointer
+    ; per character. Members whose span is 1 make this identical in meaning to
+    ; the plain form, so producers may pass any mix.
+    function make_node_list_expanded(host: pointer[Page], members: pointer[Array[pointer[GroveNode]]], start: int) returns pointer[ELObj]
+    {
+        let m members.get_length() as int
+        let prefix Array[int]^host()
+        var total 0
+        var k 0
+        while k < m
+        {
+            prefix.add(total)
+            let node *(members.get_buffer() + k)
+            set total: total + GroveNode.member_span(node)
+            set k: k + 1
+        }
+        prefix.add(total)
+        ELObj.make_node_list_prefix(host, members, start, prefix)
     }
 
     ; a singleton node-list over one node
@@ -1611,7 +1654,8 @@ define ELObj union
         false
     }
 
-    ; count of nodes from `start` to the end of the buffer.
+    ; count of nodes from `start` to the end of the buffer — for an expanded
+    ; list, of CHARACTER positions (the prefix sentinel holds the total).
     function node_list_count(this: pointer[ELObj]) returns int
     {
         choose *this
@@ -1619,7 +1663,10 @@ define ELObj union
             {
                 if nl.nodes = null
                     return 0
-                return (nl.nodes.get_length() as int) - nl.start
+                let m nl.nodes.get_length() as int
+                if nl.prefix = null
+                    return m - nl.start
+                return *(nl.prefix.get_buffer() + m) - nl.start
             }
             else
                 return 0
@@ -1636,7 +1683,10 @@ define ELObj union
         0
     }
 
-    ; the i-th node from `start` (null if out of range).
+    ; the i-th node from `start` (null if out of range). On an expanded list the
+    ; position is resolved through the prefix index and the char view is
+    ; materialized only here — a caller that merely counts, or that walks
+    ; members (node_list_member*), never touches a per-character node.
     function node_list_node(this: pointer[ELObj], i: int) returns pointer[GroveNode]
     {
         choose *this
@@ -1644,14 +1694,46 @@ define ELObj union
             {
                 if nl.nodes = null
                     return null
+                let m nl.nodes.get_length() as int
                 let idx nl.start + i
-                if (idx < 0) or (idx >= (nl.nodes.get_length() as int))
+                if idx < 0
                     return null
-                return *(nl.nodes.get_buffer() + idx)
+                if nl.prefix = null
+                {
+                    if idx >= m
+                        return null
+                    return *(nl.nodes.get_buffer() + idx)
+                }
+                let pb nl.prefix.get_buffer()
+                if idx >= *(pb + m)
+                    return null
+                let k ELObj.locate_member(pb, m, idx)
+                let node *(nl.nodes.get_buffer() + k)
+                if GroveNode.member_span(node) = 1
+                    return node
+                return GroveNode.char_view(node, idx - *(pb + k))
             }
             else
                 return null
         null
+    }
+
+    ; the member of an expanded buffer covering flat position `p`: the largest k
+    ; in [0, m) with prefix[k] <= p. Zero-span members (empty data chunks) are
+    ; skipped by taking the LARGEST such k. Caller guarantees 0 <= p < total.
+    function locate_member(pb: pointer[int], m: int, p: int) returns int
+    {
+        var lo 0
+        var hi m - 1
+        while lo < hi
+        {
+            let mid (lo + hi + 1) / 2
+            if *(pb + mid) <= p
+                set lo: mid
+            else
+                set hi: mid - 1
+        }
+        lo
     }
 
     function node_list_buffer(this: pointer[ELObj]) returns pointer[Array[pointer[GroveNode]]]
@@ -1662,6 +1744,97 @@ define ELObj union
             else
                 return null
         null
+    }
+
+    function node_list_prefix(this: pointer[ELObj]) returns pointer[Array[int]]
+    {
+        choose *this
+            when nl: NodeList
+                return nl.prefix
+            else
+                return null
+        null
+    }
+
+    ; --- member-level walk (the reference's nodeListChunkRest) --------------
+    ; A consumer that does not care about per-character identity iterates
+    ; MEMBERS: whole data runs in one step, no view materialized. Positions are
+    ; still flat, so `start` may sit INSIDE the first member — node_list_member_
+    ; skip reports how many of its characters are already consumed.
+
+    ; number of members from the one holding `start` to the end of the buffer.
+    function node_list_member_count(this: pointer[ELObj]) returns int
+    {
+        choose *this
+            when nl: NodeList
+            {
+                if nl.nodes = null
+                    return 0
+                let m nl.nodes.get_length() as int
+                if nl.prefix = null
+                {
+                    if nl.start >= m
+                        return 0
+                    return m - nl.start
+                }
+                let pb nl.prefix.get_buffer()
+                if nl.start >= *(pb + m)
+                    return 0
+                return m - ELObj.locate_member(pb, m, nl.start)
+            }
+            else
+                return 0
+        0
+    }
+
+    ; the k-th member from the one holding `start` (null out of range).
+    function node_list_member(this: pointer[ELObj], k: int) returns pointer[GroveNode]
+    {
+        choose *this
+            when nl: NodeList
+            {
+                if nl.nodes = null
+                    return null
+                let m nl.nodes.get_length() as int
+                var base nl.start
+                if nl.prefix <> null
+                {
+                    let pb nl.prefix.get_buffer()
+                    if nl.start >= *(pb + m)
+                        return null
+                    set base: ELObj.locate_member(pb, m, nl.start)
+                }
+                let idx base + k
+                if (idx < 0) or (idx >= m)
+                    return null
+                return *(nl.nodes.get_buffer() + idx)
+            }
+            else
+                return null
+        null
+    }
+
+    ; characters of member 0 already consumed by `start` (always 0 for a plain
+    ; list, where a member IS one node).
+    function node_list_member_skip(this: pointer[ELObj]) returns int
+    {
+        choose *this
+            when nl: NodeList
+            {
+                if nl.nodes = null
+                    return 0
+                if nl.prefix = null
+                    return 0
+                let m nl.nodes.get_length() as int
+                let pb nl.prefix.get_buffer()
+                if nl.start >= *(pb + m)
+                    return 0
+                let k ELObj.locate_member(pb, m, nl.start)
+                return nl.start - *(pb + k)
+            }
+            else
+                return 0
+        0
     }
 
     ; --- sosofos (Inc 4 value model + Inc 5 process kinds) ------------------

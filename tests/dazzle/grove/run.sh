@@ -67,7 +67,17 @@ run_case() { # name expected [expected_err] [document]
 # `data` of the whole list, the character-counting follow/preced, (chunk, index)
 # identity across two children calls, and that processing such a node-list stays
 # CHUNK-WISE (each run emitted once, not once per character).
+# chars2 (doc.sgml): node-list navigation ACROSS data-chunk boundaries — the
+# contract the LAZY node-list representation has to keep. Where chars1 pins the
+# per-character node itself, chars2 pins what happens once a walk lands INSIDE
+# a run: node-list-rest stepping character by character through a chunk,
+# node-list-ref addressing a position that has no member of its own, `data`
+# over a partially consumed first member, select-elements skipping a chunk it
+# starts in the middle of, follow from a mid-chunk position, and descendants
+# order across the boundaries (including the reference's double `inner` — the
+# em element contributes its content AND its own character nodes follow).
 run_case axis1 "$HERE/axis1.expected"
 run_case chars1 "$HERE/chars1.expected"
+run_case chars2 "$HERE/chars2.expected"
 
 echo "dazzle-grove: PASS"
