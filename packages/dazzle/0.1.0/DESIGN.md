@@ -348,3 +348,84 @@ Decisions:
   cheap at need; until a corpus doc contains CJK it is a LOUD stub
   (charTable rows only affect CJK codepoints).
 - RBMM: all builder state on the sink's own page, per the S67 rule.
+
+## MifFOTBuilder (`-t mif`) — design note (2026-07-30)
+
+Reference: `~/repos/dazzle/jade/MifFOTBuilder.cxx` (6007 LOC, Kathleen
+Marszalek + Paul Prescod, JADE_MIF; NO C# mirror — the C++ is the only
+source). Gate: `tests/dazzle/mif` — 25 differential cases over the fot
+suite's fixtures plus the multi-book-component split, goldens minted from
+the reference binary. **There is no large-document gate**: the reference
+ASSERTS on dazzledoc (`Assertion failed: (CurPara != NULL), function
+curPara, MifFOTBuilder.cxx:1105`, rc 134), where our port finishes and
+writes a four-component MIF book.
+
+Unlike every other backend MIF is **not a stream**: it is a document object
+model committed at the end of the run.
+
+Decisions:
+- **One record, no CurInstance globals.** The reference splits `MifDoc`
+  (the document model + tag-stream stack) from `MifFOTBuilder` (the FOT
+  side) and wires them together through two `CurInstance` statics plus a
+  `MifDoc mifDoc` member. There is exactly one of each per run, so the
+  port merges them into a single `MifFOTBuilder` record; the statics
+  (`Para::currentlyOpened`, `ParaLine::setProperties/TextRectID/ATbl`,
+  `Object::IDCnt`, `NodeInfo::curNodeLevel`, `LinkInfo::pendingMifClosings`)
+  become plain fields. The class hierarchies collapse the way the TeX port's
+  FotElement did: `MifTagStream` is one tagged record covering
+  TagStream/TextFlow/Cell/Para, `MifObject` one covering
+  PolyLine/ImportObject/Frame/TextRect, and `MifFormat` one covering
+  FontFormat + ParagraphFormat + `MifFOTBuilder::Format`.
+- **Streams:** `MifOS` = the reference `MifOutputByteStream` — a byte sink
+  (`Array[u8]`) plus the `CurTagIndent` cursor; several MifOS views can share
+  one sink, which is what lets `commit` open a fresh indent-0 view over a
+  target the way the reference does. `MifTmp` = `MifTmpOutputByteStream`.
+- **Delta formats:** every `Pgf`/`Font` statement prints only the properties
+  that differ from the enclosing state, so `compare`/`setFrom`/`updateFrom`
+  and the per-property set-bit masks (`ff_set`, `pf_set`) are ported
+  literally. `Vector<TabStop>` is a VALUE member of the format in the
+  reference, so `copy_pf` allocates a fresh tab-stop list per copy.
+- **Cross-references are a second pass.** `<Marker>`/`<XRef>` cannot be
+  written until it is known whether anything referenced the element, so the
+  content stream carries a NUL escape + a 4-byte index into
+  `cross_ref_infos` and the commit-time splice expands it. The queued
+  CrossRefInfo is a COPY (`cri.copy`): a re-opened link rewrites its own
+  `tagIndent`, and sharing the record would retroactively change an
+  already-queued entry's indent.
+- **Hash tables in slot order.** The Ruling and Color catalogs and the
+  ElementSet's SgmlId table are OpenSP `PointerTable`s whose ITERATION order
+  (= slot order) is output-visible; the RTF fonttbl machine is reused
+  verbatim (Torek `h*33+c`, 8 slots, doubling at used>=size/2, DECREMENTING
+  probe).
+- **`CurRows` is a direct pointer**, not derived from `curTablePart()`: a
+  stray `table-row` after a table has ended must append to the stale (but
+  live) row list instead of asserting — that is how the reference survives
+  the bad4/bad7 fixtures.
+- Reference quirks reproduced deliberately (each verified against the
+  reference binary): the `case SP_LETTER2('D','E')` arm of
+  `computePgfLanguage` has NO `break`, so language "DE" yields `French`;
+  the T_dimension format loses the sign of values in (-1000, 0);
+  `fXRefSrcText` has no enumerator initialiser and is therefore 5;
+  `startLineField`'s `PgfNumTabs + leadingTab ? 2 : 1` parses as
+  `(PgfNumTabs + leadingTab) ? 2 : 1`; `setupHeaderFooterParagraphFormat`
+  assigns the FOOTER size to the header format and vice versa;
+  `TblColumn::out` prints `<TblFormat …>`; and `TablePart::begin` wipes the
+  column list a table declared before its first table-part, which is what
+  makes the `missing table column flow object` warning fire on ordinary
+  documents.
+- **index-entry:** the ISOGEN `index-entry` extension flow object needed
+  engine work — a new `FOC_INDEX_ENTRY` (30, `FOC_UNKNOWN` moved to 31),
+  `IndexEntryNICRec`, five syntactic keys, `Convert.convert_string_list`,
+  an `SV_INDEX_ENTRY` save-queue tag and the ProcessContext atomic
+  dispatch. Bound only under `-t mif` (jade.cxx passes it in the
+  makeMifFOTBuilder extension table), like the three MIF extension
+  characteristics.
+- **Documented deviation:** `systemIdFilename` does not round-trip the
+  system id through the ExtendEntityManager (the backend seam has no entity
+  manager); a leading `<OSFILE>` storage-spec prefix is stripped and the
+  remainder taken as the file name — the same simplification the RTF port's
+  `includePicture` makes. Output is byte-identical on the probes; only the
+  reference's `cannot open "…"` stderr for a missing figure is missing.
+- RBMM: everything on the builder's page, per the S67 rule — the whole
+  document model has to survive until commit anyway, so the reference's
+  `delete`s simply vanish.
