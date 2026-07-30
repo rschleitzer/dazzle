@@ -29,6 +29,10 @@ use opensp.Id.IdTable
 use opensp.EntityManager.EntityManager
 use opensp.EntityCatalog.EntityCatalog
 use opensp.EntityManager.EmConfig
+use opensp.CodingSystem.CodingSystem
+use opensp.CodingSystemKit.CodingSystemKit
+use opensp.CodingSystemKit.OutputEncoder
+use opensp.CodingSystem.IENC_UTF8
 use opensp.ParserOptions.ParserOptions
 use opensp.Message.MessageType
 use opensp.Message.MessageFragment
@@ -103,6 +107,18 @@ use opensp.Lpd.LinkSetTable
 ;  - Allocator — the arena makes it a no-op (allocate on the run page); dropped.
 
 ; Phase (ParserState.Phase enum) — modelled as int constants.
+; makeStdErr's coding system (CmdLineApp keeps it as an app member; here a
+; process-global cell the driver installs once at startup — null = the
+; historical identity/UTF-8 behaviour).
+; ★`shared`, not `mutable`, for the same reason as the engine's `msg_prog` /
+; `tex_prog` / `html_prog` cells: it is written ONCE while single-threaded (in
+; main, before the first parse) and read from everywhere, so a THREAD-LOCAL
+; would be both wrong and — the measured half — fatal, because a thread-local
+; in a JIT-LINKED DEPENDENCY object aborts ORC's TLV bootstrap
+; (`_tlv_bootstrap_error`, SIGABRT with no output; tests/dazzle/run.sh's --jit
+; leg found it).
+shared STDERR_ENC: pointer[OutputEncoder] null
+
 define PHASE_NONE: int 0
 define PHASE_INIT: int 1
 define PHASE_PROLOG: int 2
@@ -343,6 +359,8 @@ define ParserState
     entity_manager: pointer[EntityManager]
     entity_catalog: pointer[EntityCatalog]
     em_config: pointer[EmConfig]
+    ; the document declaration's SGML character set (CharsetDecl::usedSet)
+    declared_sgml_chars: pointer[ISet]
     ; --- SGML declaration + concrete syntaxes ---
     sd: pointer[Sd]
     syntax: pointer[Syntax]
@@ -595,6 +613,7 @@ define ParserState
         set ps.entity_manager: entity_manager
         set ps.entity_catalog: null
         set ps.em_config: null
+        set ps.declared_sgml_chars: null
         set ps.sd: null
         set ps.syntax: null
         set ps.prolog_syntax: null
@@ -1674,6 +1693,30 @@ define ParserState
 
     function get_em_config(this: ParserState) returns pointer[EmConfig]
         em_config
+
+    ; the SGML character set the DOCUMENT's declaration describes (null until a
+    ; declaration is parsed — then the built-in reference declaration's set
+    ; applies, see Parser.is_non_sgml_char).
+    procedure set_declared_sgml_chars(this: pointer[ParserState], s: pointer[ISet])
+        set this.declared_sgml_chars: s
+
+    function get_declared_sgml_chars(this: ParserState) returns pointer[ISet]
+        declared_sgml_chars
+
+    ; the app's input coding system. Without an EmConfig the default is the
+    ; same as EmConfig's own (UTF-8, see the note there), and the record is
+    ; built in ONE place — a by-value struct returned from two branches
+    ; region-allocates per site (CLAUDE.md's small-struct emitter rule).
+    function input_coding(this: ParserState) returns CodingSystem
+    {
+        var cs CodingSystem.simple(IENC_UTF8)
+        if em_config <> null
+        {
+            let c em_config.get_input_cs()
+            c.store(&cs)
+        }
+        cs
+    }
 
     ; PosixStorageManager::searchDirs_.size() > 0 — the switch that defers
     ; relative-system-id resolution to open time (the SOIBASE FSI form).
@@ -4498,8 +4541,36 @@ define ParserState
     ; (CmdLineApp::makeStdErr) uses the same coding system as stdout but has
     ; NO escaper, so under identity a Char > 0xFF in a diagnostic is silently
     ; dropped (handleUnencodable with a null escaper).
+    ; CmdLineApp::makeStdErr — the message stream is an EncodeOutputCharStream
+    ; over codingSystem(), i.e. the SAME coding system the app selected from the
+    ; environment, not merely identity-or-UTF-8. The app installs it here once
+    ; (the reference keeps it as a member of the app object); null keeps the
+    ; identity/UTF-8 behaviour, which is what every non-driver caller wants.
+    procedure set_stderr_encoder(e: pointer[OutputEncoder])
+        set STDERR_ENC: e
+
     function write_stderr(out: pointer[u32], n: size_t, utf8: bool, fd: int)
     {
+        let enc STDERR_ENC
+        if enc <> null
+        {
+            ; every char through the app's encoder — unencodable chars DROP
+            ; here: this stream has no escaper (SgmlsEventHandler installs one
+            ; only on the ESIS stream).
+            ; ★on the CALLER's page (`#`): a `let anchor String("e")` +
+            ; Page.get(anchor…) idiom would allocate the anchor's buffer through
+            ; Page.get(this) on a STACK local — a bogus page header, and the
+            ; allocator then runs away (the corpus died with SIGKILL).
+            let acc Array[u8]#()
+            var k: size_t 0
+            while k < n
+            {
+                CodingSystemKit.out_char(enc, *(out + k), acc, false)
+                set k: k + (1 as size_t)
+            }
+            write(fd, acc.get_buffer() as pointer[void], acc.get_length())
+            return
+        }
         var bytes u8[8192]
         let b bytes as pointer[u8]
         var w: size_t 0
