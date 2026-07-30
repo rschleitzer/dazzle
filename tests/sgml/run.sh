@@ -136,6 +136,23 @@ for entry in "$HERE"/corpus/*/ "$HERE"/corpus-private/*/; do
   fi
 done
 
+# --- stdin fidelity check (S85) ---------------------------------------------
+# A stdin document (`<OSFD>0`, no inheritable storage object) consults NO
+# implicit `catalog` — the port used to read the CWD's catalog, so a stray
+# cwd catalog's SGMLDECL (this repo's `catalog` -> scaly.dcl) silently
+# re-declared stdin parses (namecase off, reserved names rejected). Run from
+# the repo root, where exactly that catalog exists; expect the reference
+# concrete syntax (upcased GIs, `o o` minimization accepted). Golden verified
+# against real onsgmls 1.5.2.
+stdin_got="$(cd "$REPO_ROOT" && printf '<!DOCTYPE a [\n<!ELEMENT a o o (#pcdata)>\n]>\n<a>hi</a>\n' | "$BIN" 2>&1)"
+stdin_rc=$?
+stdin_want="$(printf '(A\n-hi\n)A\nC')"
+if [ "$stdin_rc" -ne 0 ] || [ "$stdin_got" != "$stdin_want" ]; then
+  echo "  MISMATCH stdin-no-doc-catalog (rc=$stdin_rc)"
+  printf '%s\n' "$stdin_got" | head -4
+  failed="$failed stdin-no-doc-catalog"
+fi
+
 echo
 if [ "$BLESS" -eq 1 ]; then
   echo "blessed $ok of $total models"
