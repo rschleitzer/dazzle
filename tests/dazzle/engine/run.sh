@@ -28,6 +28,21 @@
 # suppression: after the first unknown form the following ones report
 # nothing.
 
+# key3 (keydoc.sgml): the LAST FOUR keys[] names this port had never
+# installed — `data` (formatting-instruction's one characteristic and the
+# only hasNonInheritedC in the reference that tests a key for it), `open` and
+# `close` (multi-line-inline-note's two ports; that CLASS is commented out of
+# installFlowObjs and deliberately not ported, its keys are installed all the
+# same) and `null` (node-property's third keyword argument). ★None of them
+# belongs to the page/column model, where an earlier COMPLETENESS note had
+# grouped them. All four sit far above lastSyntacticKey and every consumer on
+# this side reaches them by NAME, so installing them was measured NOT
+# observable — this fixture is the guard that it stays that way: they remain
+# ordinary variable, procedure and let-binding names, `data:` still reaches
+# the formatting instruction, `null:` still reaches node-property, and all
+# four are still `not a valid keyword` on a class that does not name them
+# (a name with no key at all gives the identical message, measured).
+
 # pat1..pat4 (patdoc.sgml): the PATTERN QUALIFIERS — Style/Pattern.cxx plus
 # the keyword half of Interpreter::convertToPattern, which is dsssl2-ONLY.
 # pat2 (-2) is the positive matrix: the ancestor chain, the three repeat
@@ -185,6 +200,7 @@ compare() { # name expected_err rc
 
 run_case key1 keydoc.sgml key1.experr
 run_case key2 keydoc.sgml key2.experr -2
+run_case key3 keydoc.sgml key3.experr
 run_case prop1 propdoc.sgml prop1.experr
 run_case ccp1 propdoc.sgml ccp1.experr -2
 run_case ccp1b propdoc.sgml ccp1b.experr "" ccp1

@@ -163,6 +163,35 @@
 # our side until the transform path runs through the same FotSink as the five
 # print backends.
 #
+# --- the page/column model: page-sequence, column-set-sequence ---------
+#
+# pagecol1 (-t fot, -t tex, -t rtf, -t mif): the positive matrix of the last
+# two classes of the reference's registry. Both are plain compound brackets,
+# so the contract is which characteristics each one takes: ★`page-sequence`
+# has NO hasNonInheritedC at all — its six (page-category, force-last-page,
+# force-first-page, first-page-type, justify-spread?, binding-edge) are
+# INHERITED characteristics that reach the backend through the ics buffer —
+# while `column-set-sequence` carries a bare display NIC, exactly like
+# `aligned-column`. Only the fot backend overrides either; on tex/rtf/mif the
+# plain start()/end() brackets leave nothing but the content. ★It also pins
+# the reference's own typo: `justify-spread?` prints as `jystify-spread`.
+#
+# pagecol2 (-t fot): the diagnostic matrix — the unknown-keyword message for
+# a class with no keywords at all (a display key on `page-sequence` is
+# unknown, though its sibling accepts it) and a conversion failure per
+# characteristic. ★`first-page-type: #t` is NOT a failure: #t is a c-value
+# symbol, so it converts and prints `first-page-type="true"`. Like layout2 it
+# runs WITHOUT -2, because the reference's convertFromString coercion is
+# still an open item of the Convert layer.
+#
+# pagecol3 (-t sgml): the same stylesheet on the transform backend, where
+# both brackets are no-ops and only the document text survives.
+#
+# pagecol4 (-t fot, -t rtf): the CAPTURE path — both classes inside content
+# that is recorded and replayed (a simple-page-sequence header, a fraction
+# port, a table-part header), so `column-set-sequence`'s display NIC has to
+# survive the queue and `page-sequence` records a payload-less bracket.
+#
 # emph1 (-t fot): ★OUR behaviour. `emphasizing-mark` cannot run in the
 # reference binary at all — its copy constructor copies nic_ and forgets
 # emphmark_ (style/EmphasizingMark.h:28), so every make of the class
@@ -263,5 +292,16 @@ run_case online1m mif "" online1
 run_case online1b fot
 run_case online2 fot
 run_transform_case online3 "" online1
+
+# the page/column model: the positive matrix on the four -o backends, the
+# diagnostics, the transform run and the capture path.
+run_case pagecol1 fot
+run_case pagecol1t tex "" pagecol1
+run_case pagecol1r rtf "" pagecol1
+run_case pagecol1m mif "" pagecol1
+run_case pagecol2 fot
+run_transform_case pagecol3 "" pagecol1
+run_case pagecol4 fot
+run_case pagecol4r rtf "" pagecol4
 
 echo "dazzle-flowobj: PASS"
