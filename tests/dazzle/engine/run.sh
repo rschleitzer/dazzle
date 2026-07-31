@@ -147,6 +147,35 @@
 # form - collate/toupper/tolower/symbol/order/forward/backward are ordinary
 # variable and procedure names.
 
+# conv1 / conv1b / conv2 / conv2b (keydoc.sgml, -t fot): the `-2` STRING
+# LENIENCY of the characteristic converters (Interpreter::convertFromString,
+# Interpreter.cxx:1095) - COMPLETENESS.md gap (12). Under -2 every
+# characteristic value goes through it before its converter, so a STRING may
+# stand in for the number, symbol or boolean that converter wants; without
+# the flag the function is a no-op, which is why each stylesheet runs twice
+# and the b-goldens are almost entirely `invalid value`. The matrix runs over
+# the CONVERSION KINDS, not over the classes: the hints belong to the
+# converter (a union over all three would reinterpret a genuine string
+# characteristic, so `data: "5"` and `font-name: "12"` must stay strings).
+# conv1 covers the inherited side plus the shared display NIC - boolean,
+# integer with convertNumber's whole syntax (#x48, +9, -4), length,
+# length-spec, enum, real, and the two OPTIONAL forms whose leniency runs
+# BEFORE their #f test (expand-tabs?, min-leading, inline-space-space).
+# conv2 covers the per-class NIC records: the layout composite (the two
+# repros that measured the gap), the character NIC, rule, table-column,
+# table-cell, box/score/leader and the page/column model.
+# *Three measured details the goldens pin: case is NOT folded ("YES" is
+# invalid, the reference's own FIXME); the symbol half is a LOOKUP in the
+# symbol table and takes only a name that carries a c-value, so
+# `scale: "max-uniform"` stays a string while `quadding: "center"` converts;
+# and the number arm resolves quantities right there, so `space-before:
+# "3zz"` messages `quantity "zz" undefined` before the invalid value.
+# *conv1 also pins a quirk that is NOT about -2 at all and that this port
+# was missing: convertLengthSpec/convertLengthC hand the CALLER's field to
+# quantityValue, which stores the exact value before anyone checks the
+# DIMENSION - so a dimensionless `space-before: 12` messages `invalid value`
+# AND prints `.012pt,0pt,0pt`, the partial write left in the NIC.
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 BIN="${1:-$ROOT/scalyc/build/scalyc}"
@@ -173,10 +202,10 @@ run_case() { # name document expected_err [extra-flag] [stylesheet-base]
 # the same, on the `-t fot` backend: the flow object tree goes to the -o file
 # (macro4 is there because the sequence bracket and the style of a macro make
 # are invisible on the transform sink).
-run_fot_case() { # name document expected_err [extra-flag]
-  local name="$1" doc="$2" experr="$3" flag="${4:-}"
+run_fot_case() { # name document expected_err [extra-flag] [stylesheet-base]
+  local name="$1" doc="$2" experr="$3" flag="${4:-}" dsl="${5:-$1}"
   ( cd "$WORK" && SCALY_HOME="$ROOT" \
-      "$OUT" $flag -t fot -o "$name.out" -d "$name.dsl" "$doc" > "$name.stdout" 2> "$name.err" )
+      "$OUT" $flag -t fot -o "$name.out" -d "$dsl.dsl" "$doc" > "$name.stdout" 2> "$name.err" )
   compare "$name" "$experr" "$?"
 }
 
@@ -221,5 +250,9 @@ run_case macro3 patdoc.sgml macro3.experr -2
 run_fot_case macro4 patdoc.sgml macro4.experr -2
 run_case lang1 propdoc.sgml lang1.experr
 run_case lang2 propdoc.sgml lang2.experr
+run_fot_case conv1 keydoc.sgml conv1.experr -2
+run_fot_case conv1b keydoc.sgml conv1b.experr "" conv1
+run_fot_case conv2 keydoc.sgml conv2.experr -2
+run_fot_case conv2b keydoc.sgml conv2b.experr "" conv2
 
 echo "dazzle-engine: PASS"

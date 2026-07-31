@@ -118,8 +118,9 @@
 # because embedded-text's allowed set deliberately omits symbolFalse. It runs
 # WITHOUT -2 on purpose: under -2 the reference coerces a string value into a
 # number/symbol/boolean before every characteristic conversion
-# (Interpreter::convertFromString), which this port does not carry yet — a
-# measured gap of the Convert layer, not of this family (COMPLETENESS.md).
+# (Interpreter::convertFromString), so half these values would convert instead
+# of failing. That leniency is ported and has its own matrix in
+# tests/dazzle/engine (conv1/conv2); here it would only blunt the diagnostics.
 #
 # layout3 (-t sgml): the same stylesheet on the transform backend, where all
 # five brackets are no-ops and only the document text survives.
