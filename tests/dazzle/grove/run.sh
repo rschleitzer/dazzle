@@ -105,10 +105,42 @@ run_case() { # name expected [expected_err] [document]
 # reference answers `attribute-def` with accessNotInClass although it LISTS it;
 # that a token's `entity` / `notation` / `referent` resolve to nodes (referent
 # only for an IDREF that hits); and the data/children shape of both classes.
+# props3 (decls.sgml): the remaining NAMED NODE LISTS and every DECLARATION
+# node class they hand out. The document declares three notations (PUBLIC /
+# SYSTEM / both, one with a #NOTATION ATTLIST), an internal / external / NDATA /
+# PI / CDATA / SDATA general entity, a parameter entity, a #DEFAULT entity, and
+# element types over every declared content (model group with nested groups and
+# both connectors, ANY, CDATA, EMPTY), with inclusions, exclusions, both
+# omitted-tag flags, IDs and a #CURRENT attribute shared by two element types.
+# It pins: `elements` (keyed by ID VALUE, document order), `entities` /
+# `general-entities` / `parameter-entities` / `notations` / `element-types` /
+# `defaulted-entities` / `doctypes-and-linktypes` in the reference's HASH-BUCKET
+# order with the right substitution table per list (entity names unfolded,
+# everything else upper-cased); the document-type, entity, default-entity,
+# notation, external-id, element-type, attribute-def, model-group,
+# element-token, pcdata-token and sgml-constants classes with their ClassDef
+# tables and every property; that a declaration node has NO parent axis and no
+# siblings while its grove-root still reaches the sgml-document node; that an
+# attribute-def's `origin` is an attribute-def AGAIN (makeOriginNode); that a
+# defaulted entity's origin is the sgml-document node and a parameter entity's
+# is the doctype; the entity-origin attribute assignments of an NDATA entity;
+# and node identity (same2 over the underlying declaration object) across
+# separate accesses.
+# ★TWO DEVIATIONS are pinned with OUR value, both measured, both in
+# COMPLETENESS.md: `tokens` of a NOTATION / name-token-group attribute-def (the
+# reference builds its GroveStrings from a LOCAL AttributeDefinitionDesc and
+# prints freed memory), and `current-group`, which null-derefs in the reference
+# for any DTD with an element type that has no attribute definition list — the
+# fixture document gives every element type an ATTLIST so the property is
+# measurable at all.
+# props4 (appinfo.sgml): `application-info`, which needs an SGML DECLARATION
+# with APPINFO to be anything but accessNull.
 run_case axis1 "$HERE/axis1.expected"
 run_case chars1 "$HERE/chars1.expected"
 run_case chars2 "$HERE/chars2.expected"
 run_case props1 "$HERE/props1.expected" "" props.sgml
 run_case props2 "$HERE/props2.expected" "" attrs.sgml
+run_case props3 "$HERE/props3.expected" "" decls.sgml
+run_case props4 "$HERE/props4.expected" "" appinfo.sgml
 
 echo "dazzle-grove: PASS"
