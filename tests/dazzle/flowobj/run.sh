@@ -193,6 +193,50 @@
 # port, a table-part header), so `column-set-sequence`'s display NIC has to
 # survive the queue and `page-sequence` records a payload-less bracket.
 #
+# --- the address family (COMPLETENESS.md gap (3), the addresses cluster) ---
+#
+# addr1 (-t fot, addrdoc.sgml): the VALUE side — the seven producers, what
+# address? says about each, and how address-local? and address-visited?
+# classify all six reachable types. ★address-local? is #t for a resolved node
+# (sameGrove is groveIndex == groveIndex, and this engine has ONE grove) and
+# for ANY idref, even one no element carries — it never resolves; #f for an
+# entity reference and for everything the switch does not name. ★#f is not an
+# address: the link characteristic maps it to Address::none, the predicate
+# says no. ★`equal?` has no address arm, so two addresses of the same node
+# are not equal.
+#
+# addr2 (-t fot, addrdiag.sgml): the DIAGNOSTIC side — ONE probe per element,
+# because a primitive argError kills the whole construction rule and a second
+# probe in the same rule is never reached. Covers notAnAddress, notAString on
+# both arguments of sgml-document-address, notASingletonNode, and the two
+# producers whose only diagnostic is noCurrentNode (forced through a
+# top-level define, which is why their locations are the define's).
+# ★The reference prints an argument with no printed form of its own as
+# `#<unknown object <pointer>>`, so the harness normalizes that number.
+#
+# addr3 (-t fot / tex / rtf, addrdoc.sgml): the RENDERING side — one link per
+# Address type, plus the resolvedNode fork walked over three p's (two with an
+# ID, one without). ★The three backends disagree on purpose: fot writes the
+# WHOLE idref string as destination= (`alpha beta`), rtf and mif cut at the
+# first space, tex sets \Label to the whole string too. ★An idref is NEVER
+# namecase-folded on the way out — `destination="alpha"` for the idref of the
+# element whose resolved-node form prints `ALPHA`. ★tex is the only backend
+# that says anything about the types it cannot render: four warnings, one
+# each for a non-element node, an entity, an SGML document and a HyTime
+# linkend (the tei and html arms are unreachable — no primitive builds them).
+#
+# addr3m (-t mif) runs addr3m.dsl, which is addr3 MINUS the non-element
+# resolvedNode probe: MifFOTBuilder::startLink pushes no link-stack frame on
+# that path (its resize sits inside `if (elementIndex(n) == accessOK)`), so
+# endLink trips `assert(linkStack.size() > 0)` and the reference dies with
+# SIGABRT — measured rc 134. This port pushes unconditionally and survives;
+# a golden minted from a crash is worth nothing, so that probe is left to the
+# other backends and the divergence is recorded here.
+#
+# The html backend's idref arm — the only one that RESOLVES the name, through
+# getGroveRoot/getElements/namedNode — is pinned by ../html/hs3, which owns
+# that backend's file goldens.
+#
 # emph1 (-t fot): ★OUR behaviour. `emphasizing-mark` cannot run in the
 # reference binary at all — its copy constructor copies nic_ and forgets
 # emphmark_ (style/EmphasizingMark.h:28), so every make of the class
@@ -217,19 +261,19 @@ fi
 cp "$HERE"/*.sgml "$HERE"/*.dsl "$WORK/"
 
 # a backend whose tree goes to the -o file (fot/tex/rtf/mif/html)
-run_case() { # name backend [extra-flag] [stylesheet-base]
-  local name="$1" backend="$2" flag="${3:-}" dsl="${4:-$1}"
+run_case() { # name backend [extra-flag] [stylesheet-base] [document]
+  local name="$1" backend="$2" flag="${3:-}" dsl="${4:-$1}" doc="${5:-fodoc.sgml}"
   ( cd "$WORK" && SCALY_HOME="$ROOT" \
-      "$OUT" $flag -t "$backend" -o "$name.out" -d "$dsl.dsl" fodoc.sgml \
+      "$OUT" $flag -t "$backend" -o "$name.out" -d "$dsl.dsl" "$doc" \
       > "$name.stdout" 2> "$name.err" )
   compare "$name" "$name.out" "$?"
 }
 
 # the transform backend writes the instance to STDOUT
-run_transform_case() { # name [extra-flag] [stylesheet-base]
-  local name="$1" flag="${2:-}" dsl="${3:-$1}"
+run_transform_case() { # name [extra-flag] [stylesheet-base] [document]
+  local name="$1" flag="${2:-}" dsl="${3:-$1}" doc="${4:-fodoc.sgml}"
   ( cd "$WORK" && SCALY_HOME="$ROOT" \
-      "$OUT" $flag -t sgml -d "$dsl.dsl" fodoc.sgml \
+      "$OUT" $flag -t sgml -d "$dsl.dsl" "$doc" \
       > "$name.out" 2> "$name.err" )
   compare "$name" "$name.out" "$?"
 }
@@ -244,7 +288,12 @@ compare() { # name produced rc
     diff "$HERE/$name.expected" "$WORK/$produced" | head -14
     exit 1
   fi
-  sed 's/^[^:]*:/PROG:/' "$WORK/$name.err" > "$WORK/$name.err.norm"
+  # PROG: for the argv[0] prefix, and ADDR for the raw pointer the reference
+  # prints when an object has no printed representation of its own
+  # (`#<unknown object %lu>`, ELObj::print's default) — an allocation address,
+  # so it differs between binaries and between runs of the same binary.
+  sed -e 's/^[^:]*:/PROG:/' -e 's/unknown object [0-9][0-9]*/unknown object ADDR/g' \
+    "$WORK/$name.err" > "$WORK/$name.err.norm"
   if ! diff -q "$HERE/$name.experr" "$WORK/$name.err.norm" > /dev/null; then
     echo "dazzle-flowobj: FAIL $name (stderr differs)"
     diff "$HERE/$name.experr" "$WORK/$name.err.norm" | head -10
@@ -304,5 +353,31 @@ run_case pagecol2 fot
 run_transform_case pagecol3 "" pagecol1
 run_case pagecol4 fot
 run_case pagecol4r rtf "" pagecol4
+
+# the ADDRESS family: the value side, the diagnostics, and the link
+# rendering of every Address type on four of the five link-aware backends
+# (html is in ../html/hs3, which owns that backend's file goldens).
+run_case addr1 fot "" addr1 addrdoc.sgml
+run_case addr2 fot "" addr2 addrdiag.sgml
+run_case addr3 fot "" addr3 addrdoc.sgml
+run_case addr3t tex "" addr3 addrdoc.sgml
+run_case addr3r rtf "" addr3 addrdoc.sgml
+run_case addr3m mif "" addr3m addrdoc.sgml
+
+# the EXTENSION CHARACTERISTICS (COMPLETENESS.md gap (7)): all sixteen names
+# of the four backend tables, declared in one stylesheet and set on both a
+# page sequence and a paragraph, then rendered on three backends. The three
+# that appear in no other fixture are here: `preserve-sdata?` and the two
+# OpenJade-prefixed ones, `page-two-side?` / `two-side-start-on-right?` —
+# the only extension characteristics whose public id is not in the James
+# Clark namespace, and TeX-only (an earlier COMPLETENESS note filed them
+# under RTF). The sixteenth, `scroll-title`, is html-only and lives in
+# ../html/hs1. ★The rtf and mif runs are the contrast: resolution is by
+# PUBLIC ID against the ACTIVE backend's table, so the same declarations that
+# steer TeX are plain IgnoredCs there — accepted, rendering nothing — exactly
+# like the made-up public id this stylesheet also declares.
+run_case xchar1 tex
+run_case xchar1r rtf "" xchar1
+run_case xchar1m mif "" xchar1
 
 echo "dazzle-flowobj: PASS"

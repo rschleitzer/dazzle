@@ -97,5 +97,13 @@ for n in bad4 bad5 bad7; do run_case "$n" tdoc.sgml; done
 # the scroll fixtures: documents, titles, links, anchors, multi-file output
 run_case hs1
 run_case hs2
+# hs3: the IDREF link arm. This is the only backend that RESOLVES an idref
+# address itself (getGroveRoot -> getElements -> namedNode -> elementIndex);
+# every step must succeed or the anchor comes out with no HREF. ★namedNode
+# folds the query through the instance syntax's subst table, so the
+# lower-case `first` finds the element whose ID attribute is FIRST — while
+# the name is cut at the first space, an unknown ID and the empty string
+# both yield an HREF-less anchor.
+run_case hs3
 
 echo "dazzle-html: PASS"
