@@ -56,6 +56,47 @@
 # output encoder falls back to numeric character references (the still-open
 # OutputEncoder item of COMPLETENESS.md (5), unrelated to this family).
 #
+# --- the math bundle: math-sequence, fraction, unmath, superscript,
+#     subscript, script, mark, fence, radical, math-operator, grid, grid-cell
+#     ---------------------------------------------------------------------
+#
+# math1 (-t fot, -t tex, -t rtf, -t mif): the positive matrix — all twelve
+# classes, every port of the six that have them, both counts of grid and
+# grid-cell, a `radical:` character and its defaulted form, and the fraction
+# bar with and without a fraction-bar style. ★It pins the four things the
+# reference decides that no reading of the spec would: `fraction` alone has NO
+# principal port, so its unlabelled content lands directly after the bar and
+# BEFORE the numerator (pushPorts' hasPrincipalPort argument is a documented
+# FIXME the reference never reads); the other five open a `<x.principal>`
+# element inside their SERIAL open and close it in their first port bracket;
+# `radical.radical` and its defaulted twin BOTH open that principal port; and
+# a grid count of zero prints no attribute at all.
+#
+# math2 (-2, -t fot): the diagnostic matrix — a conversion failure per
+# characteristic, the `<= 0` gate of the four grid counts (same diagnostic as
+# a type failure), the isCharacter demand of `radical:`, and the
+# unknown-keyword message for a class with keywords, a class with different
+# ones, and a class with none.
+#
+# math3 (-t rtf): the RTF backend's own math machinery, which no other golden
+# reaches — the EQ field, the three grid positioning modes (including a cell
+# with no position, whose content the reference DISCARDS), the grid
+# separators and column alignment, `\i\in` for an inline math-operator, the
+# three operator glyphs that select `\su`/`\pr`/(nothing) and the `\vc\` any
+# other one gets, the EQ escaping of `,` `(` `)` `\` (and the fence
+# delimiters that are exempt from it), the sub/superscript and mark
+# distances, and the lazy (non-constant) characteristic chain.
+#
+# math4 (-t sgml): the same matrix on the TRANSFORM backend, where every math
+# bracket is a no-op and only the document text survives. ★Its STDOUT is
+# byte-identical to the reference; its STDERR is documented OUR behaviour —
+# this port does not push ports on the transform path (the measured legacy
+# item from the inline/mark bundle, COMPLETENESS.md gap (1)), so every
+# `label:` there draws a `no port for label` that the reference does not
+# raise. The text happens to come out in the same order because the ports
+# replay in declaration order; a stylesheet that put a labelled child before
+# an unlabelled one would diverge.
+#
 # emph1 (-t fot): ★OUR behaviour. `emphasizing-mark` cannot run in the
 # reference binary at all — its copy constructor copies nic_ and forgets
 # emphmark_ (style/EmphasizingMark.h:28), so every make of the class
@@ -126,5 +167,15 @@ run_case inline4 rtf
 run_case inline4m mif "" inline4
 run_transform_case inline5
 run_case emph1 fot
+
+# the math bundle: the positive matrix on each of the four backends that write
+# a tree to -o, then the diagnostics, the RTF machinery and the transform run.
+run_case math1 fot
+run_case math1t tex "" math1
+run_case math1r rtf "" math1
+run_case math1m mif "" math1
+run_case math2 fot -2
+run_case math3 rtf
+run_transform_case math4
 
 echo "dazzle-flowobj: PASS"
