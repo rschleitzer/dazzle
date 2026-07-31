@@ -92,6 +92,26 @@
 # the three the reference creates EMPTY (glyph-id, both drop-*-line-break?)
 # answer #f. The diagnostics point at the VALUE EXPRESSION, not the form.
 
+# ccp1 / ccp1b (propdoc.sgml): declare-char-characteristic+property — the one
+# declaration that installs BOTH a char NIC (a non-inherited characteristic of
+# the `character` flow object, a flag on the Identifier) and a char property
+# of that name. ★Its duplicate gate is the MIRROR IMAGE of
+# declare-characteristic's: a name carrying a characteristic is refused with
+# NO part comparison — a BUILT-IN one too, and that one prints no auxiliary
+# line because a built-in's location is empty — while a name already
+# registered as a char NIC is refused only within the same part. ★The reverse
+# gate is new here too: a char NIC makes a later declare-characteristic
+# `duplicate characteristic`. ★The refusal comes BEFORE the property half, so
+# the first default survives; a non-constant default is rejected exactly as in
+# declare-char-property and then the property is never created, so reading it
+# is `unknown character property`. ★These diagnostics point at the FORM, the
+# opposite of declare-char-property's. ccp1b is the SAME file without -2: the
+# form itself is a keys[] entry and needs no flag — only `#f` for the public
+# identifier is dsssl2-only, which is why that one declaration comes last.
+# ★The fixture also pins that the five built-in property names the reference
+# keys (space? punct? record-end? input-tab? input-whitespace?) are INERT
+# above lastSyntacticKey: `space?` is still an ordinary procedure name.
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 BIN="${1:-$ROOT/scalyc/build/scalyc}"
@@ -146,6 +166,8 @@ compare() { # name expected_err rc
 run_case key1 keydoc.sgml key1.experr
 run_case key2 keydoc.sgml key2.experr -2
 run_case prop1 propdoc.sgml prop1.experr
+run_case ccp1 propdoc.sgml ccp1.experr -2
+run_case ccp1b propdoc.sgml ccp1b.experr "" ccp1
 run_case pat1 patdoc.sgml pat1.experr
 run_case pat2 patdoc.sgml pat2.experr -2
 run_case pat3 patdoc.sgml pat3.experr -2
