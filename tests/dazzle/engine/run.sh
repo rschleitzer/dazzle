@@ -28,6 +28,22 @@
 # suppression: after the first unknown form the following ones report
 # nothing.
 
+# pat1..pat4 (patdoc.sgml): the PATTERN QUALIFIERS — Style/Pattern.cxx plus
+# the keyword half of Interpreter::convertToPattern, which is dsssl2-ONLY.
+# pat2 (-2) is the positive matrix: the ancestor chain, the three repeat
+# metacharacters, the #t wildcard element, the attribute qualifiers with
+# their -2-only #t/#f values, id:/class: against declare-id-attribute /
+# declare-class-attribute, the four position: and two only: qualifiers,
+# children:, and the vacuous priority:/importance:. pat1 is the same feature
+# WITHOUT -2, where every keyword qualifier is `cannot occur in a pattern`
+# and the two declarations are unknown top level forms. pat3 walks every
+# convertToPattern diagnostic, one malformed pattern per rule. pat4 is
+# SPECIFICITY: which of several matching rules wins, and the ambiguity
+# diagnostic — ★whose LOCATION is the element's start tag, the one grove
+# node location this port needs (the reference's LocNode). ★pat4's two tied
+# rules print the same text on purpose: the reference sorts with qsort,
+# so which member of an equal-specificity run fires is not a contract.
+
 # prop1 (propdoc.sgml): CHARACTER PROPERTIES — the thirteen built-in
 # properties of installCharProperties, the declare-char-property /
 # add-char-properties declarations and the char-property primitive. ★It pins
@@ -82,5 +98,9 @@ run_case() { # name document expected_err [extra-flag]
 run_case key1 keydoc.sgml key1.experr
 run_case key2 keydoc.sgml key2.experr -2
 run_case prop1 propdoc.sgml prop1.experr
+run_case pat1 patdoc.sgml pat1.experr
+run_case pat2 patdoc.sgml pat2.experr -2
+run_case pat3 patdoc.sgml pat3.experr -2
+run_case pat4 patdoc.sgml pat4.experr -2
 
 echo "dazzle-engine: PASS"

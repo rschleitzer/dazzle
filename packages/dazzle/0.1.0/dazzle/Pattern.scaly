@@ -4,15 +4,19 @@
 ; of Qualifiers. matches() walks the chain against a grove node. Rule ordering
 ; uses compareSpecificity over a fixed vector of specificity dimensions.
 ;
-; Inc 5a scope (Konstruktionsregeln-Kern): the GI + attribute-qualifier subset
-; that convertToPattern's string/symbol/#t/list forms and
-; patternAddAttributeQualifiers produce — the bulk of the codegen corpus.
-; Deferred (faithful classes exist upstream): id/class qualifiers keyed by
-; declare-*-attribute, position/only qualifiers (dsssl2), children qualifier,
-; repeat metacharacters, priority/importance. GI folding here is an ASCII
-; uppercase approximation of Interpreter::normalizeGeneralName (matches the
-; default reference SD's NAMECASE GENERAL YES grove); full per-grove namecase
-; normalization is deferred.
+; COMPLETENESS work package 10 completed the qualifier set: all ten
+; Pattern::Qualifier subclasses (attribute / attribute-has / attribute-missing,
+; id, class, the four position qualifiers, the two only qualifiers, children,
+; priority, importance), the repeat metacharacters, and the whole keyword half
+; of convertToPattern — which is dsssl2-ONLY, exactly like the `-2` gates found
+; in packages 7 and 8 (`KeywordObj *key = dsssl2() ? head->asKeyword() : 0;`,
+; Interpreter.cxx:1466). Its diagnostics are issued too; they used to be this
+; port's debt (a malformed pattern returned null in silence).
+;
+; The MatchContext of the reference is the Interpreter itself (it derives from
+; Pattern::MatchContext), which is why the class/id attribute NAME lists that
+; `declare-class-attribute` / `declare-id-attribute` fill live there and the
+; interpreter is threaded through every satisfies() here.
 
 use scaly.memory.Page
 use scaly.containers.Array
@@ -20,7 +24,10 @@ use opensp.StringC.StringC
 use opensp.Location.Location
 use dazzle.Grove.GroveNode
 use dazzle.ELObj.ELObj
+use dazzle.ELObj.OutputCharStream
+use dazzle.ELObj.Identifier
 use dazzle.Interpreter.Interpreter
+use dazzle.InterpreterMessages.InterpreterMessages
 use opensp.AttributeList.AttributeList
 use opensp.Attribute.AttributeValue
 use opensp.Attribute.Text
@@ -39,12 +46,32 @@ define N_SPECIFICITY: int 9
 
 define REPEAT_INF: int 0x7FFFFFFF
 
-; --- attribute helpers (shared with the qualifier satisfies) ---------------
-; the value string of a named attribute on `node`, or empty StringC if absent.
-; Name lookup is GiMatch-case-insensitive: the reference normalizes the query
-; via the grove's general subst table (upper-folding for a NAMECASE GENERAL
-; YES grove, identity for an XML one) — folding both sides matches either
-; regime without threading the parse's namecase here.
+; the ten Pattern::Qualifier subclasses as one tagged record — they differ only
+; in which of (name, value, number, child list) they carry, and a tag keeps
+; every satisfies/contributeSpecificity switch in one place next to the C++.
+define QK_ATTR: int 0            ; AttributeQualifier             name + value
+define QK_ATTR_HAS: int 1        ; AttributeHasValueQualifier     name
+define QK_ATTR_MISSING: int 2    ; AttributeMissingValueQualifier name
+define QK_ID: int 3              ; IdQualifier                    value
+define QK_CLASS: int 4           ; ClassQualifier                 value
+define QK_POSITION: int 5        ; {First,Last}Of{Type,Any}       n
+define QK_ONLY: int 6            ; OnlyOf{Type,Any}               n
+define QK_CHILDREN: int 7        ; ChildrenQualifier              children
+define QK_PRIORITY: int 8        ; PriorityQualifier              n
+define QK_IMPORTANCE: int 9      ; ImportanceQualifier            n
+
+define POS_FIRST_OF_TYPE: int 0
+define POS_LAST_OF_TYPE: int 1
+define POS_FIRST_OF_ANY: int 2
+define POS_LAST_OF_ANY: int 3
+
+define ONLY_OF_TYPE: int 0
+define ONLY_OF_ANY: int 1
+
+; --- attribute helpers (the loose, case-insensitive lookup) ----------------
+; Kept for the primitives that still use it (attribute-string and friends);
+; the PATTERN side now goes through Pattern.match_attribute, which is
+; Qualifier::matchAttribute proper.
 define AttrLookup
 {
     ; the index of the case-insensitively named attribute, or -1.
@@ -100,9 +127,7 @@ define AttrLookup
         result
     }
 
-    ; whether the attribute's value is TOKENIZED (the reference then
-    ; normalizes the pattern value through the grove's general-name
-    ; substitution before comparing — Pattern::Qualifier::matchAttribute).
+    ; whether the attribute's value is TOKENIZED
     function tokenized(node: pointer[GroveNode], name: StringC) returns bool
     {
         if node = null
@@ -120,93 +145,9 @@ define AttrLookup
     }
 }
 
-; --- Qualifier -------------------------------------------------------------
-define AttrQualifier (name: StringC, value: StringC)
-{
-    init(name: StringC, value: StringC)
-    {
-        set this.name: name
-        set this.value: value
-    }
-}
-define AttrHasQualifier (name: StringC)
-{
-    init(name: StringC)
-        set this.name: name
-}
-define AttrMissingQualifier (name: StringC)
-{
-    init(name: StringC)
-        set this.name: name
-}
-
-define Qualifier union
-(
-    Attr: AttrQualifier
-    AttrHas: AttrHasQualifier
-    AttrMissing: AttrMissingQualifier
-)
-{
-    function make_attr(host: pointer[Page], name: StringC, value: StringC) returns pointer[Qualifier]
-    {
-        let p host.allocate(sizeof Qualifier, alignof Qualifier) as pointer[Qualifier]
-        set *p: Qualifier.Attr(AttrQualifier(name, value))
-        p
-    }
-    function make_attr_has(host: pointer[Page], name: StringC) returns pointer[Qualifier]
-    {
-        let p host.allocate(sizeof Qualifier, alignof Qualifier) as pointer[Qualifier]
-        set *p: Qualifier.AttrHas(AttrHasQualifier(name))
-        p
-    }
-    function make_attr_missing(host: pointer[Page], name: StringC) returns pointer[Qualifier]
-    {
-        let p host.allocate(sizeof Qualifier, alignof Qualifier) as pointer[Qualifier]
-        set *p: Qualifier.AttrMissing(AttrMissingQualifier(name))
-        p
-    }
-
-    function satisfies(this: pointer[Qualifier], node: pointer[GroveNode]) returns bool
-    {
-        choose *this
-            when q: Attr
-            {
-                if AttrLookup.present(node, q.name) = false
-                    return false
-                let v AttrLookup.value(node, q.name)
-                ; tokenized values compare after general-name normalization
-                ; (matchAttribute normalizes the pattern value; the GiMatch
-                ; upper-fold approximates both namecase regimes — see the
-                ; GiMatch note); CDATA compares exactly.
-                if AttrLookup.tokenized(node, q.name)
-                    return GiMatch.equal(v, q.value)
-                return v.equals(q.value)
-            }
-            when q: AttrHas
-                return AttrLookup.present(node, q.name)
-            when q: AttrMissing
-                return AttrLookup.present(node, q.name) = false
-        false
-    }
-
-    ; NB: distinct name from Element.contribute_specificity — a same-named
-    ; method on two concepts collides in call resolution (the get_insn/get_action
-    ; footgun), and `q.contribute_specificity(...)` silently mis-dispatched,
-    ; dropping all attribute specificity.
-    function qualifier_specificity(this: pointer[Qualifier], s: pointer[int])
-        set *(s + SPEC_ATTRIBUTE): *(s + SPEC_ATTRIBUTE) + 1
-
-    ; none of the Inc-5a qualifiers are vacuous (all constrain the match).
-    function vacuous(this: pointer[Qualifier]) returns bool
-        false
-}
-
-; --- Element ---------------------------------------------------------------
-; ASCII case-insensitive GI match: approximates normalizeGeneralName for both
-; namecase regimes — a NAMECASE GENERAL YES grove stores upper-folded names,
-; an XML (NAMECASE NO) grove stores them as-is; folding both sides matches
-; either. (Known divergence: two names differing only in case in one XML
-; document collide here where the reference keeps them distinct.)
+; --- GI matching -----------------------------------------------------------
+; GiMatch is the loose ASCII fold the PRIMITIVES still compare with; the
+; pattern matcher uses Pattern.gi_matches, which is ElementNode::hasGi.
 define GiMatch
 {
     function fold(c: u32) returns u32
@@ -232,6 +173,235 @@ define GiMatch
     }
 }
 
+; --- Qualifier -------------------------------------------------------------
+define Qualifier (kind: int, name: StringC, value: StringC, n: int, children: pointer[Array[pointer[Element]]])
+{
+    function alloc(host: pointer[Page], kind: int) returns pointer[Qualifier]
+    {
+        let p host.allocate(sizeof Qualifier, alignof Qualifier) as pointer[Qualifier]
+        set p.kind: kind
+        set p.name: StringC()
+        set p.value: StringC()
+        set p.n: 0
+        set p.children: null
+        p
+    }
+
+    function make_attr(host: pointer[Page], name: StringC, value: StringC) returns pointer[Qualifier]
+    {
+        let p Qualifier.alloc(host, QK_ATTR)
+        set p.name: name
+        set p.value: value
+        p
+    }
+    function make_attr_has(host: pointer[Page], name: StringC) returns pointer[Qualifier]
+    {
+        let p Qualifier.alloc(host, QK_ATTR_HAS)
+        set p.name: name
+        p
+    }
+    function make_attr_missing(host: pointer[Page], name: StringC) returns pointer[Qualifier]
+    {
+        let p Qualifier.alloc(host, QK_ATTR_MISSING)
+        set p.name: name
+        p
+    }
+    function make_id(host: pointer[Page], id: StringC) returns pointer[Qualifier]
+    {
+        let p Qualifier.alloc(host, QK_ID)
+        set p.value: id
+        p
+    }
+    function make_class(host: pointer[Page], cls: StringC) returns pointer[Qualifier]
+    {
+        let p Qualifier.alloc(host, QK_CLASS)
+        set p.value: cls
+        p
+    }
+    function make_position(host: pointer[Page], which: int) returns pointer[Qualifier]
+    {
+        let p Qualifier.alloc(host, QK_POSITION)
+        set p.n: which
+        p
+    }
+    function make_only(host: pointer[Page], which: int) returns pointer[Qualifier]
+    {
+        let p Qualifier.alloc(host, QK_ONLY)
+        set p.n: which
+        p
+    }
+    function make_children(host: pointer[Page], kids: pointer[Array[pointer[Element]]]) returns pointer[Qualifier]
+    {
+        let p Qualifier.alloc(host, QK_CHILDREN)
+        set p.children: kids
+        p
+    }
+    function make_priority(host: pointer[Page], n: int) returns pointer[Qualifier]
+    {
+        let p Qualifier.alloc(host, QK_PRIORITY)
+        set p.n: n
+        p
+    }
+    function make_importance(host: pointer[Page], n: int) returns pointer[Qualifier]
+    {
+        let p Qualifier.alloc(host, QK_IMPORTANCE)
+        set p.n: n
+        p
+    }
+
+    function satisfies(this: pointer[Qualifier], host: pointer[Page], interp: pointer[Interpreter], node: pointer[GroveNode]) returns bool
+    {
+        let k this.kind
+        if k = QK_ATTR
+            return Pattern.match_attribute(host, this.name, this.value, node)
+        if k = QK_ATTR_HAS
+        {
+            ; AttributeHasValueQualifier::satisfies — the attribute must be
+            ; present AND not #IMPLIED-without-value.
+            let idx Pattern.named_attr_index(host, node, this.name)
+            if idx < 0
+                return false
+            return Pattern.attr_implied(node, idx) = false
+        }
+        if k = QK_ATTR_MISSING
+        {
+            ; AttributeMissingValueQualifier::satisfies — the exact negation,
+            ; including "the node has no attributes at all".
+            let idx Pattern.named_attr_index(host, node, this.name)
+            if idx < 0
+                return true
+            return Pattern.attr_implied(node, idx)
+        }
+        if k = QK_ID
+        {
+            ; IdQualifier::satisfies — the node's ID-typed attribute value
+            ; first (compared after normalizing the PATTERN's id through the
+            ; grove's general subst table, Interpreter::normalizeGeneralName),
+            ; then every name declared with `declare-id-attribute`.
+            let node_id node.get_id()
+            if node_id.get_size() > (0 as size_t)
+            {
+                if node_id.get_size() = this.value.get_size()
+                {
+                    let q Pattern.normalize_general(host, this.value)
+                    if node_id.equals(*q)
+                        return true
+                }
+            }
+            let names interp.get_id_attribute_names()
+            if names = null
+                return false
+            let nn names.get_length()
+            let nb names.get_buffer()
+            var i: size_t 0
+            while i < nn
+            {
+                let nm *(nb + i)
+                if Pattern.match_attribute(host, *nm, this.value, node)
+                    return true
+                set i: i + (1 as size_t)
+            }
+            return false
+        }
+        if k = QK_CLASS
+        {
+            ; ClassQualifier::satisfies — ONLY the declared class attribute
+            ; names; with none declared the qualifier can never be satisfied.
+            let names interp.get_class_attribute_names()
+            if names = null
+                return false
+            let nn names.get_length()
+            let nb names.get_buffer()
+            var i: size_t 0
+            while i < nn
+            {
+                let nm *(nb + i)
+                if Pattern.match_attribute(host, *nm, this.value, node)
+                    return true
+                set i: i + (1 as size_t)
+            }
+            return false
+        }
+        if k = QK_POSITION
+            return Pattern.position_satisfies(node, this.n)
+        if k = QK_ONLY
+            return Pattern.only_satisfies(node, this.n)
+        if k = QK_CHILDREN
+            return Pattern.children_satisfies(host, interp, this.children, node)
+        ; PriorityQualifier / ImportanceQualifier are pure specificity.
+        true
+    }
+
+    ; NB: distinct name from Element.contribute_specificity — a same-named
+    ; method on two concepts collides in call resolution (the get_insn/get_action
+    ; footgun), and `q.contribute_specificity(...)` silently mis-dispatched,
+    ; dropping all attribute specificity.
+    function qualifier_specificity(this: pointer[Qualifier], s: pointer[int])
+    {
+        let k this.kind
+        if k = QK_ID
+        {
+            set *(s + SPEC_ID): *(s + SPEC_ID) + 1
+            return
+        }
+        if k = QK_CLASS
+        {
+            set *(s + SPEC_CLASS): *(s + SPEC_CLASS) + 1
+            return
+        }
+        if k = QK_POSITION
+        {
+            set *(s + SPEC_POSITION): *(s + SPEC_POSITION) + 1
+            return
+        }
+        if k = QK_ONLY
+        {
+            set *(s + SPEC_ONLY): *(s + SPEC_ONLY) + 1
+            return
+        }
+        if k = QK_PRIORITY
+        {
+            set *(s + SPEC_PRIORITY): *(s + SPEC_PRIORITY) + this.n
+            return
+        }
+        if k = QK_IMPORTANCE
+        {
+            set *(s + SPEC_IMPORTANCE): *(s + SPEC_IMPORTANCE) + this.n
+            return
+        }
+        if k = QK_CHILDREN
+        {
+            ; ChildrenQualifier::contributeSpecificity — every child element
+            ; contributes as if it stood in the ancestor chain.
+            let kids this.children
+            if kids = null
+                return
+            let n kids.get_length()
+            let b kids.get_buffer()
+            var i: size_t 0
+            while i < n
+            {
+                let e *(b + i)
+                e.contribute_specificity(s)
+                set i: i + (1 as size_t)
+            }
+            return
+        }
+        ; the three attribute qualifiers
+        set *(s + SPEC_ATTRIBUTE): *(s + SPEC_ATTRIBUTE) + 1
+    }
+
+    ; VacuousQualifier — priority and importance constrain nothing, so an
+    ; element carrying only those is still trivial.
+    function vacuous(this: pointer[Qualifier]) returns bool
+    {
+        if this.kind = QK_PRIORITY
+            return true
+        this.kind = QK_IMPORTANCE
+    }
+}
+
+; --- Element ---------------------------------------------------------------
 define Element (gi: StringC, min_repeat: int, max_repeat: int, qualifiers: pointer[Array[pointer[Qualifier]]])
 {
     function make(host: pointer[Page], gi: StringC) returns pointer[Element]
@@ -253,15 +423,18 @@ define Element (gi: StringC, min_repeat: int, max_repeat: int, qualifiers: point
         set this.max_repeat: mx
     }
 
-    function matches(this: pointer[Element], node: pointer[GroveNode]) returns bool
+    function matches(this: pointer[Element], host: pointer[Page], interp: pointer[Interpreter], node: pointer[GroveNode]) returns bool
     {
         if node = null
             return false
+        ; both branches of Element::matches need a GI: the empty-GI element
+        ; tests `getGi(tem) == accessOK`, and Node::hasGi is false for every
+        ; class that has none.
         if node.get_class() <> GN_ELEMENT
             return false
         if this.gi.get_size() > (0 as size_t)
         {
-            if GiMatch.equal(node.get_gi(), this.gi) = false
+            if Pattern.gi_matches(node, this.gi) = false
                 return false
         }
         let qs this.qualifiers
@@ -271,7 +444,7 @@ define Element (gi: StringC, min_repeat: int, max_repeat: int, qualifiers: point
         while i < n
         {
             let q *(b + i)
-            if q.satisfies(node) = false
+            if q.satisfies(host, interp, node) = false
                 return false
             set i: i + 1
         }
@@ -371,15 +544,275 @@ define Pattern (ancestors: pointer[Array[pointer[Element]]], is_trivial: bool)
         head.must_have_gi(out)
     }
 
+    ; --- the grove-side tests the qualifiers run on ------------------------
+
+    ; BaseNamedNodeList::normalize (GroveBuilder.cxx:1565) — fold every
+    ; character through the list's substitution table. Both lists a pattern
+    ; ever normalizes against (attributes, elements) carry the parse's GENERAL
+    ; table, so one helper serves matchAttribute and normalizeGeneralName
+    ; alike. Answers on `host` through an explicit construction (a StringC
+    ; RETURNED by value allocates its buffer through Page.get(<return slot>)).
+    function normalize_general(host: pointer[Page], s: StringC) returns pointer[StringC]
+    {
+        let n s.get_size()
+        let tab GroveNode.get_grove_subst()
+        if tab = null
+            return StringC^host(s.data_ptr(), n)
+        if n = (0 as size_t)
+            return StringC^host()
+        let buf host.allocate(n * (sizeof u32), alignof u32) as pointer[u32]
+        var i: size_t 0
+        while i < n
+        {
+            let c s.get(i)
+            var f c
+            if c < (256 as u32)
+                set f: *(tab + (c as size_t))
+            set *(buf + i): f
+            set i: i + (1 as size_t)
+        }
+        StringC^host(buf, n)
+    }
+
+    ; ElementNode::hasGi (spgrove/GroveBuilder.cxx:2998) — the PATTERN's GI is
+    ; folded through the grove's general subst table and compared against the
+    ; stored name, which the parse already normalized. ★A ONE-SIDED fold, not
+    ; the two-sided ASCII approximation GiMatch does: in an XML (NAMECASE NO)
+    ; grove the table is the identity and the comparison is therefore CASE
+    ; SENSITIVE, exactly as the reference. ★With no table at all the reference
+    ; matches NOTHING (`if (!subst) return 0`) — the driver installs it right
+    ; after the parse.
+    function gi_matches(node: pointer[GroveNode], gi: StringC) returns bool
+    {
+        let ng node.get_gi()
+        let n gi.get_size()
+        if ng.get_size() <> n
+            return false
+        let tab GroveNode.get_grove_subst()
+        if tab = null
+            return false
+        var i: size_t 0
+        while i < n
+        {
+            let c gi.get(i)
+            var f c
+            if c < (256 as u32)
+                set f: *(tab + (c as size_t))
+            if f <> ng.get(i)
+                return false
+            set i: i + (1 as size_t)
+        }
+        true
+    }
+
+    ; NamedNodeList::namedNode over an element's attributes: normalize the
+    ; query name, then find the DEFINITION whose (already normalized) name
+    ; equals it. -1 = accessNull/no such attribute.
+    function named_attr_index(host: pointer[Page], node: pointer[GroveNode], name: StringC) returns int
+    {
+        if node = null
+            return -1
+        let atts: pointer[AttributeList] node.get_attributes()
+        if atts = null
+            return -1
+        let q Pattern.normalize_general(host, name)
+        let n atts.size()
+        var i: size_t 0
+        while i < n
+        {
+            let an atts.name(i)
+            if an.equals(*q)
+                return i as int
+            set i: i + (1 as size_t)
+        }
+        -1
+    }
+
+    ; AttributeAsgnNode::getImplied — `value->text() == 0`, the
+    ; #IMPLIED-without-a-value test (a DEFAULTED attribute is NOT implied).
+    ; No value object at all is accessNull, which every caller reads as "not
+    ; implied".
+    function attr_implied(node: pointer[GroveNode], idx: int) returns bool
+    {
+        let atts: pointer[AttributeList] node.get_attributes()
+        if atts = null
+            return false
+        let v: pointer[AttributeValue] atts.value(idx as size_t)
+        if v = null
+            return false
+        v.get_text() = null
+    }
+
+    ; Pattern::Qualifier::matchAttribute (Pattern.cxx:88) — the shared engine
+    ; of the attribute, id and class qualifiers.
+    ; ★A TOKENIZED value compares against the WHOLE token string (separators
+    ; included) after normalizing the pattern value; a CDATA value compares
+    ; against its character data EXACTLY. ★An implied attribute never matches,
+    ; not even against the empty string.
+    function match_attribute(host: pointer[Page], name: StringC, value: StringC, node: pointer[GroveNode]) returns bool
+    {
+        let idx Pattern.named_attr_index(host, node, name)
+        if idx < 0
+            return false
+        if Pattern.attr_implied(node, idx)
+            return false
+        let atts: pointer[AttributeList] node.get_attributes()
+        let av: pointer[AttributeValue] atts.value(idx as size_t)
+        if av = null
+            return value.get_size() = (0 as size_t)
+        if av.is_tokenized()
+        {
+            let tokens av.get_string()
+            if tokens.get_size() <> value.get_size()
+                return false
+            ; the reference picks the normalizer from the value's ENTITY grove
+            ; when it has one and falls back to the attribute list; both carry
+            ; the general subst table, so one fold covers either path.
+            let q Pattern.normalize_general(host, value)
+            return tokens.equals(*q)
+        }
+        let t: pointer[Text] av.get_text()
+        if t = null
+            return value.get_size() = (0 as size_t)
+        let s t.string()
+        s.equals(value)
+    }
+
+    ; The four position qualifiers (Pattern.cxx:270-330). The reference walks
+    ; the CHUNK sibling axis — firstSibling, then assignNextChunkSibling — and
+    ; reads a FAILING firstSibling as "must be document element", i.e. the
+    ; qualifier is satisfied. In this port that root rule is
+    ; GroveNode.has_siblings, and the axis is the node's sibling GROUP.
+    ; ★"of type" compares the stored GIs directly (both already normalized);
+    ; "of any" counts every node that HAS a GI, i.e. every element.
+    function position_satisfies(node: pointer[GroveNode], which: int) returns bool
+    {
+        if node.has_siblings() = false
+            return true
+        let me node.index_in_parent()
+        if me < 0
+            return true
+        let gi node.get_gi()
+        var i node.sibling_range_begin()
+        var stop me
+        if (which = POS_LAST_OF_TYPE) or (which = POS_LAST_OF_ANY)
+        {
+            set i: me + 1
+            set stop: node.sibling_range_end()
+        }
+        while i < stop
+        {
+            let s node.sibling_group_at(i)
+            if s <> null
+            {
+                if s.get_class() = GN_ELEMENT
+                {
+                    if (which = POS_FIRST_OF_ANY) or (which = POS_LAST_OF_ANY)
+                        return false
+                    let sg s.get_gi()
+                    if sg.equals(gi)
+                        return false
+                }
+            }
+            set i: i + 1
+        }
+        true
+    }
+
+    ; OnlyOfTypeQualifier / OnlyOfAnyQualifier — count over the WHOLE sibling
+    ; group (the node itself included); a second hit fails.
+    function only_satisfies(node: pointer[GroveNode], which: int) returns bool
+    {
+        if node.has_siblings() = false
+            return true
+        let gi node.get_gi()
+        let stop node.sibling_range_end()
+        var count 0
+        var i node.sibling_range_begin()
+        while i < stop
+        {
+            let s node.sibling_group_at(i)
+            if s <> null
+            {
+                if s.get_class() = GN_ELEMENT
+                {
+                    var hit false
+                    if which = ONLY_OF_ANY
+                        set hit: true
+                    else
+                    {
+                        let sg s.get_gi()
+                        if sg.equals(gi)
+                            set hit: true
+                    }
+                    if hit
+                    {
+                        set count: count + 1
+                        if count > 1
+                            return false
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        true
+    }
+
+    ; ChildrenQualifier::satisfies (Pattern.cxx:138) — EVERY element of the
+    ; children list must match SOME child; the reference keeps the unmatched
+    ; ones in a shrinking vector and succeeds as soon as it is empty. A node
+    ; with no children can never satisfy it.
+    function children_satisfies(host: pointer[Page], interp: pointer[Interpreter], kids: pointer[Array[pointer[Element]]], node: pointer[GroveNode]) returns bool
+    {
+        if kids = null
+            return false
+        var live kids.get_length() as int
+        if live = 0
+            return false
+        let to_match Array[pointer[Element]]^host()
+        let kb kids.get_buffer()
+        var k: size_t 0
+        while k < kids.get_length()
+        {
+            to_match.add(*(kb + k))
+            set k: k + (1 as size_t)
+        }
+        let tb to_match.get_buffer()
+        let nc node.axis_child_count()
+        var ci 0
+        while ci < nc
+        {
+            let child node.axis_child_at(ci)
+            var j 0
+            var i 0
+            while i < live
+            {
+                let e *(tb + i)
+                if e.matches(host, interp, child) = false
+                {
+                    if j <> i
+                        to_match.put(j as size_t, e)
+                    set j: j + 1
+                }
+                set i: i + 1
+            }
+            if j = 0
+                return true
+            set live: j
+            set ci: ci + 1
+        }
+        false
+    }
+
     ; --- matching (matchAncestors / matchAncestors1) -----------------------
-    function match_ancestors(a: pointer[Array[pointer[Element]]], idx: size_t, node: pointer[GroveNode]) returns bool
+    function match_ancestors(a: pointer[Array[pointer[Element]]], idx: size_t, host: pointer[Page], interp: pointer[Interpreter], node: pointer[GroveNode]) returns bool
     {
         if idx >= a.get_length()
             return true
-        Pattern.match_ancestors1(a, idx, node)
+        Pattern.match_ancestors1(a, idx, host, interp, node)
     }
 
-    function match_ancestors1(a: pointer[Array[pointer[Element]]], idx: size_t, node: pointer[GroveNode]) returns bool
+    function match_ancestors1(a: pointer[Array[pointer[Element]]], idx: size_t, host: pointer[Page], interp: pointer[Interpreter], node: pointer[GroveNode]) returns bool
     {
         let r *(a.get_buffer() + idx)
         var tem node
@@ -388,7 +821,7 @@ define Pattern (ancestors: pointer[Array[pointer[Element]]], is_trivial: bool)
         {
             if tem = null
                 return false
-            if r.matches(tem) = false
+            if r.matches(host, interp, tem) = false
                 return false
             ; Pattern::matchAncestors1 climbs with getParent -> the parent AXIS
             ; (`if (tem->getParent(tem) != accessOK) tem.clear();`).
@@ -398,13 +831,13 @@ define Pattern (ancestors: pointer[Array[pointer[Element]]], is_trivial: bool)
         set i: r.min_repeat
         repeat
         {
-            if Pattern.match_ancestors(a, idx + (1 as size_t), tem)
+            if Pattern.match_ancestors(a, idx + (1 as size_t), host, interp, tem)
                 break
             if i = r.max_repeat
                 return false
             if tem = null
                 return false
-            if r.matches(tem) = false
+            if r.matches(host, interp, tem) = false
                 return false
             set i: i + 1
             set tem: tem.get_axis_parent()
@@ -412,8 +845,8 @@ define Pattern (ancestors: pointer[Array[pointer[Element]]], is_trivial: bool)
         true
     }
 
-    function matches(this: pointer[Pattern], node: pointer[GroveNode]) returns bool
-        Pattern.match_ancestors(this.ancestors, 0 as size_t, node)
+    function matches(this: pointer[Pattern], host: pointer[Page], interp: pointer[Interpreter], node: pointer[GroveNode]) returns bool
+        Pattern.match_ancestors(this.ancestors, 0 as size_t, host, interp, node)
 
     ; --- specificity -------------------------------------------------------
     function compute_specificity(this: pointer[Pattern], s: pointer[int])
@@ -459,8 +892,8 @@ define Pattern (ancestors: pointer[Array[pointer[Element]]], is_trivial: bool)
         0
     }
 
-    ; a GI / attribute name may be a string OR a symbol (identifier). Both carry
-    ; a name; anything else has none. (string_data alone misses symbols.)
+    ; a GI / attribute name may be a string OR a symbol (identifier) — that IS
+    ; ELObj::convertToString ("either symbol or string", ELObj.h:78).
     function has_name(obj: pointer[ELObj]) returns bool
     {
         if obj.has_string_data()
@@ -478,66 +911,28 @@ define Pattern (ancestors: pointer[Array[pointer[Element]]], is_trivial: bool)
         result
     }
 
+    ; ELObjMessageArg — the object as the reference prints it into a message.
+    function obj_arg(host: pointer[Page], interp: pointer[Interpreter], obj: pointer[ELObj]) returns StringC
+    {
+        let os OutputCharStream.make(host)
+        obj.print(os, interp.get_units_per_inch())
+        os.to_string_c(host)
+    }
+
     ; --- convertToPattern (Interpreter::convertToPattern) ------------------
     ; string/symbol -> single GI element; #t -> empty-GI (any element);
-    ; list -> ancestor chain with optional attribute-qualifier sublists.
-    ; Returns null on a malformed pattern (a diagnostic is recorded).
+    ; list -> ancestor chain with attribute-qualifier sublists and (under -2)
+    ; keyword qualifiers. Returns null on a malformed pattern, after reporting
+    ; the reference's diagnostic.
     function convert(host: pointer[Page], interp: pointer[Interpreter], obj: pointer[ELObj], loc: Location) returns pointer[Pattern]
     {
-        let pat Pattern.make(host)
-        ; a bare string/symbol GI
-        if Pattern.has_name(obj)
-        {
-            let gi Pattern.name_of(host, obj)
-            if gi.get_size() = (0 as size_t)
-                return null
-            let e Element.make(host, gi)
-            pat.add_element(e)
-            pat.finish()
-            return pat
-        }
-        ; #t -> the empty-GI (any-element) pattern. NB: identity vs the #t
-        ; singleton — is_true() is "not #f", true for pairs/symbols too, which
-        ; would send every list pattern down this branch.
-        if obj = interp.make_true()
-        {
-            let e Element.make(host, StringC())
-            pat.add_element(e)
-            pat.finish()
-            return pat
-        }
-        ; a list: ancestor GIs OUTERMOST-FIRST in source order, attribute-
-        ; qualifier sublists attaching to the preceding GI. The reference's
-        ; IList::insert PREPENDS, so the SOURCE-LAST name is the match TARGET
-        ; (`(chapter title)` = a title inside a chapter) — collect in source
-        ; order, then add reversed (ancestors[0] must be the target).
-        var cur obj
-        var cur_elem: pointer[Element] null
         let elems Array[pointer[Element]]^host()
-        while cur.is_nil() = false
-        {
-            if cur.is_pair() = false
-                return null
-            let head cur.get_car()
-            set cur: cur.get_cdr()
-            ; a nested list on the head is an attribute-qualifier group
-            if head.is_pair()
-            {
-                if cur_elem = null
-                    return null
-                if Pattern.add_attribute_qualifiers(host, interp, head, cur_elem) = false
-                    return null
-                continue
-            }
-            if Pattern.has_name(head) = false
-                return null
-            let gi Pattern.name_of(host, head)
-            if gi.get_size() = (0 as size_t)
-                return null
-            let e Element.make(host, gi)
-            elems.add(e)
-            set cur_elem: e
-        }
+        if Pattern.convert_list(host, interp, obj, loc, false, elems) = false
+            return null
+        ; the reference's IList::insert PREPENDS, so the SOURCE-LAST name is the
+        ; match TARGET (`(chapter title)` = a title inside a chapter) — collect
+        ; in source order, then add reversed (ancestors[0] must be the target).
+        let pat Pattern.make(host)
         var k elems.get_length()
         while k > (0 as size_t)
         {
@@ -548,9 +943,284 @@ define Pattern (ancestors: pointer[Array[pointer[Element]]], is_trivial: bool)
         pat
     }
 
+    ; Interpreter::convertToPattern's list half (Interpreter.cxx:1402).
+    ; `is_child` is set inside a `children:` qualifier, where `repeat:` is an
+    ; error.
+    function convert_list(host: pointer[Page], interp: pointer[Interpreter], obj_in: pointer[ELObj], loc: Location, is_child: bool, list: pointer[Array[pointer[Element]]]) returns bool
+    {
+        ; a bare string/symbol GI
+        if Pattern.has_name(obj_in)
+        {
+            let gi Pattern.name_of(host, obj_in)
+            if gi.get_size() = (0 as size_t)
+            {
+                interp.set_next_location(loc)
+                interp.message0(InterpreterMessages.patternEmptyGi())
+                return false
+            }
+            let e Element.make(host, gi)
+            list.add(e)
+            return true
+        }
+        ; #t -> the empty-GI (any-element) pattern. NB: identity vs the #t
+        ; singleton — is_true() is "not #f", true for pairs/symbols too, which
+        ; would send every list pattern down this branch.
+        if obj_in = interp.make_true()
+        {
+            let e Element.make(host, StringC())
+            list.add(e)
+            return true
+        }
+        var obj obj_in
+        var cur_elem: pointer[Element] null
+        while obj.is_nil() = false
+        {
+            if obj.is_pair() = false
+            {
+                interp.set_next_location(loc)
+                interp.message0(InterpreterMessages.patternNotList())
+                return false
+            }
+            let head obj.get_car()
+            set obj: obj.get_cdr()
+            ; ★#t as a LIST MEMBER is a -2-only wildcard element.
+            if head = interp.make_true()
+            {
+                if interp.is_dsssl2()
+                {
+                    let e Element.make(host, StringC())
+                    list.add(e)
+                    set cur_elem: e
+                    continue
+                }
+            }
+            if Pattern.has_name(head)
+            {
+                let gi Pattern.name_of(host, head)
+                if gi.get_size() = (0 as size_t)
+                {
+                    interp.set_next_location(loc)
+                    interp.message0(InterpreterMessages.patternEmptyGi())
+                    return false
+                }
+                let e Element.make(host, gi)
+                list.add(e)
+                set cur_elem: e
+                continue
+            }
+            if cur_elem = null
+            {
+                interp.set_next_location(loc)
+                let a Pattern.obj_arg(host, interp, head)
+                interp.message1(InterpreterMessages.patternBadGi(), a)
+                return false
+            }
+            ; ★an EMPTY attribute list is simply skipped
+            if head.is_nil()
+                continue
+            if head.is_pair()
+            {
+                if Pattern.add_attribute_qualifiers(host, interp, head, cur_elem) = false
+                {
+                    interp.set_next_location(loc)
+                    interp.message0(InterpreterMessages.patternBadAttributeQualifier())
+                    return false
+                }
+                continue
+            }
+            ; ★the whole keyword-qualifier half is dsssl2-ONLY: without `-2`
+            ; a keyword in a pattern is `%1 cannot occur in a pattern`.
+            var key: pointer[Identifier] null
+            if interp.is_dsssl2()
+                set key: head.keyword_ident()
+            if key = null
+            {
+                interp.set_next_location(loc)
+                let a Pattern.obj_arg(host, interp, head)
+                interp.message1(InterpreterMessages.patternBadMember(), a)
+                return false
+            }
+            if obj.is_pair() = false
+            {
+                interp.set_next_location(loc)
+                if obj.is_nil()
+                    interp.message0(InterpreterMessages.patternMissingQualifierValue())
+                else
+                    interp.message0(InterpreterMessages.patternNotList())
+                return false
+            }
+            let value obj.get_car()
+            set obj: obj.get_cdr()
+            let sk key.syntactic_key()
+            if sk = SK_NOTKEY
+            {
+                interp.set_next_location(loc)
+                let kn key.get_name()
+                interp.message1(InterpreterMessages.patternUnknownQualifier(), kn)
+                return false
+            }
+            if Pattern.add_key_qualifier(host, interp, sk, key, value, loc, is_child, cur_elem) = false
+                return false
+        }
+        true
+    }
+
+    ; the `switch (k)` of convertToPattern — one keyword qualifier.
+    function add_key_qualifier(host: pointer[Page], interp: pointer[Interpreter], sk: int, key: pointer[Identifier], value: pointer[ELObj], loc: Location, is_child: bool, elem: pointer[Element]) returns bool
+    {
+        if sk = SK_ATTRIBUTES
+        {
+            if Pattern.add_attribute_qualifiers(host, interp, value, elem) = false
+            {
+                interp.set_next_location(loc)
+                interp.message0(InterpreterMessages.patternBadAttributeQualifier())
+                return false
+            }
+            return true
+        }
+        if sk = SK_CHILDREN
+        {
+            let kids Array[pointer[Element]]^host()
+            if Pattern.convert_list(host, interp, value, loc, true, kids) = false
+                return false
+            ; an empty children list adds no qualifier at all
+            if kids.get_length() > (0 as size_t)
+            {
+                let q Qualifier.make_children(host, kids)
+                elem.add_qualifier(q)
+            }
+            return true
+        }
+        if sk = SK_REPEAT
+        {
+            if is_child
+            {
+                interp.set_next_location(loc)
+                interp.message0(InterpreterMessages.patternChildRepeat())
+                return false
+            }
+            ; the three metacharacters, as ONE-character symbols
+            var ok false
+            if value.is_symbol_p()
+            {
+                let nm value.symbol_name()
+                if nm.get_size() = (1 as size_t)
+                {
+                    let c nm.get(0 as size_t)
+                    if c = (0x2A as u32)
+                    {
+                        elem.set_repeat(0, REPEAT_INF)
+                        set ok: true
+                    }
+                    else if c = (0x3F as u32)
+                    {
+                        elem.set_repeat(0, 1)
+                        set ok: true
+                    }
+                    else if c = (0x2B as u32)
+                    {
+                        elem.set_repeat(1, REPEAT_INF)
+                        set ok: true
+                    }
+                }
+            }
+            if ok = false
+                return Pattern.bad_qualifier_value(host, interp, key, value, loc)
+            return true
+        }
+        if sk = SK_POSITION
+        {
+            var which -1
+            if value.is_symbol_p()
+            {
+                let nm value.symbol_name()
+                if nm.equals(StringC("first-of-type"))
+                    set which: POS_FIRST_OF_TYPE
+                else if nm.equals(StringC("last-of-type"))
+                    set which: POS_LAST_OF_TYPE
+                else if nm.equals(StringC("first-of-any"))
+                    set which: POS_FIRST_OF_ANY
+                else if nm.equals(StringC("last-of-any"))
+                    set which: POS_LAST_OF_ANY
+            }
+            if which < 0
+                return Pattern.bad_qualifier_value(host, interp, key, value, loc)
+            let q Qualifier.make_position(host, which)
+            elem.add_qualifier(q)
+            return true
+        }
+        if sk = SK_ONLY
+        {
+            var which -1
+            if value.is_symbol_p()
+            {
+                let nm value.symbol_name()
+                if nm.equals(StringC("of-type"))
+                    set which: ONLY_OF_TYPE
+                else if nm.equals(StringC("of-any"))
+                    set which: ONLY_OF_ANY
+            }
+            if which < 0
+                return Pattern.bad_qualifier_value(host, interp, key, value, loc)
+            let q Qualifier.make_only(host, which)
+            elem.add_qualifier(q)
+            return true
+        }
+        if sk = SK_ID
+        {
+            if Pattern.has_name(value) = false
+                return Pattern.bad_qualifier_value(host, interp, key, value, loc)
+            let s Pattern.name_of(host, value)
+            let q Qualifier.make_id(host, s)
+            elem.add_qualifier(q)
+            return true
+        }
+        if sk = SK_CLASS
+        {
+            if Pattern.has_name(value) = false
+                return Pattern.bad_qualifier_value(host, interp, key, value, loc)
+            let s Pattern.name_of(host, value)
+            let q Qualifier.make_class(host, s)
+            elem.add_qualifier(q)
+            return true
+        }
+        if sk = SK_IMPORTANCE
+        {
+            if value.is_exact_integer() = false
+                return Pattern.bad_qualifier_value(host, interp, key, value, loc)
+            let q Qualifier.make_importance(host, value.exact_integer_value())
+            elem.add_qualifier(q)
+            return true
+        }
+        if sk = SK_PRIORITY
+        {
+            if value.is_exact_integer() = false
+                return Pattern.bad_qualifier_value(host, interp, key, value, loc)
+            let q Qualifier.make_priority(host, value.exact_integer_value())
+            elem.add_qualifier(q)
+            return true
+        }
+        ; a key with no pattern meaning (`font-size:`, `use:` …)
+        interp.set_next_location(loc)
+        let kn key.get_name()
+        interp.message1(InterpreterMessages.patternUnknownQualifier(), kn)
+        false
+    }
+
+    function bad_qualifier_value(host: pointer[Page], interp: pointer[Interpreter], key: pointer[Identifier], value: pointer[ELObj], loc: Location) returns bool
+    {
+        interp.set_next_location(loc)
+        let a Pattern.obj_arg(host, interp, value)
+        let kn key.get_name()
+        interp.message2(InterpreterMessages.patternBadQualifierValue(), a, kn)
+        false
+    }
+
     ; patternAddAttributeQualifiers: a FLAT (name value name2 value2 …) list —
-    ; e.g. (ALIGN "center") is one qualifier, (A "x" B #t) is two. value #f =>
-    ; attribute-missing, #t => attribute-has-value, else string equality.
+    ; e.g. (ALIGN "center") is one qualifier, (A "x" B #t) is two.
+    ; ★#f (attribute-missing) and #t (attribute-has-value) are dsssl2-ONLY;
+    ; without `-2` neither converts to a string and the whole qualifier list is
+    ; malformed.
     function add_attribute_qualifiers(host: pointer[Page], interp: pointer[Interpreter], obj_in: pointer[ELObj], elem: pointer[Element]) returns bool
     {
         var obj obj_in
@@ -573,21 +1243,27 @@ define Pattern (ancestors: pointer[Array[pointer[Element]]], is_trivial: bool)
             ; are "is/isn't #f" — is_true("center") is true, which would make it an
             ; attribute-has qualifier). Bind the make_* result to a local — a
             ; chained call passed directly as an argument mis-emits.
-            if val = interp.make_false()
+            var handled false
+            if interp.is_dsssl2()
             {
-                let q Qualifier.make_attr_missing(host, name)
-                elem.add_qualifier(q)
+                if val = interp.make_false()
+                {
+                    let q Qualifier.make_attr_missing(host, name)
+                    elem.add_qualifier(q)
+                    set handled: true
+                }
+                else if val = interp.make_true()
+                {
+                    let q Qualifier.make_attr_has(host, name)
+                    elem.add_qualifier(q)
+                    set handled: true
+                }
             }
-            else if val = interp.make_true()
+            if handled = false
             {
-                let q Qualifier.make_attr_has(host, name)
-                elem.add_qualifier(q)
-            }
-            else
-            {
-                if val.has_string_data() = false
+                if Pattern.has_name(val) = false
                     return false
-                let vs val.string_data(host)
+                let vs Pattern.name_of(host, val)
                 let q Qualifier.make_attr(host, name, vs)
                 elem.add_qualifier(q)
             }
