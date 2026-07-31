@@ -125,6 +125,60 @@ define CharPart (name: StringC, c: u32, def_part: u32)
     }
 }
 
+; CharProp (Interpreter.h) — one character property: a DEFAULT value plus a
+; per-character map. The reference's map is a full CharMap<ELObjPart> whose
+; unset slot is a null object; here it is an ordered list of
+; [first, last] -> value entries searched BACKWARD, so a later
+; add-char-properties overrides an earlier install exactly as setChar over
+; setRange does. `def_part` carries the spec part that supplied the default,
+; which is what the duplicate-declaration rule compares.
+define CharPropRange (first: u32, last: u32, obj: pointer[ELObj])
+{
+    init(first: u32, last: u32, obj: pointer[ELObj])
+    {
+        set this.first: first
+        set this.last: last
+        set this.obj: obj
+    }
+}
+
+define CharProp (name: StringC, def: pointer[ELObj], def_part: u32, loc: Location, ranges: pointer[Array[CharPropRange]])
+{
+    function make(host: pointer[Page], name: StringC, def: pointer[ELObj], def_part: u32) returns pointer[CharProp]
+    {
+        let p host.allocate(sizeof CharProp, alignof CharProp) as pointer[CharProp]
+        set p.name: name
+        set p.def: def
+        set p.def_part: def_part
+        set p.loc: Location()
+        set p.ranges: Array[CharPropRange]^host()
+        p
+    }
+
+    ; CharMap::setRange — a later entry wins, so the lookup walks BACKWARD.
+    procedure set_range(this: pointer[CharProp], first: u32, last: u32, obj: pointer[ELObj])
+        this.ranges.add(CharPropRange(first, last, obj))
+
+    ; (*cp->map)[c].obj — null when the character has no value of its own.
+    function lookup(this: CharProp, c: u32) returns pointer[ELObj]
+    {
+        let n ranges.get_length()
+        var i n
+        while i > (0 as size_t)
+        {
+            set i: i - (1 as size_t)
+            let rp ranges.get(i)
+            if rp <> null
+            {
+                let r *rp
+                if (c >= r.first) and (c <= r.last)
+                    return r.obj
+            }
+        }
+        null
+    }
+}
+
 ; Unit — a named measurement unit (Interpreter.h class Unit : Named).
 ; Builtin units get their value from unitsPerInch in installUnits (setValue
 ; marks them computedExact/Inexact); define-unit bodies arrive via
@@ -414,6 +468,9 @@ define Interpreter
     default_language_def: pointer[Expression]
     default_language_loc: Location
     default_language: pointer[ELObj]
+    ; charProperties_ — the character-property table (installCharProperties +
+    ; declare-char-property + add-char-properties).
+    char_property_table: pointer[Array[pointer[CharProp]]]
     ; externalProcTable_ — public id -> FunctionObj (external-procedure).
     external_proc_table: pointer[Array[pointer[ExternalProc]]]
     ; the canned border styles (a single border-present? spec; table borders
@@ -472,6 +529,7 @@ define Interpreter
         set interp.default_language_def: null
         set interp.default_language_loc: Location()
         set interp.default_language: null
+        set interp.char_property_table: Array[pointer[CharProp]]^host()
         set interp.external_proc_table: Array[pointer[ExternalProc]]^host()
         set interp.border_true_style_obj: null
         set interp.border_false_style_obj: null
@@ -505,6 +563,9 @@ define Interpreter
             CharNames.install(interp)
             Sdata.install(interp)
         }
+        ; installCharProperties runs unconditionally — every built-in
+        ; property EXISTS under -s, only its table stays empty.
+        CharProps.install(interp, strict_mode)
 
         ; the lexical-category table (constructor tail, Interpreter.cxx:107)
         let lex XcharMap.make(host, LEX_OTHER as u8)
@@ -718,6 +779,145 @@ define Interpreter
     }
 
     ; --- declare-default-language (Interpreter::compileDefaultLanguage) -----
+    ; --- character properties (Interpreter.cxx:2064-2380) -------------------
+
+    function lookup_char_property(this: pointer[Interpreter], nm: StringC) returns pointer[CharProp]
+    {
+        let t this.char_property_table
+        let n t.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let pp t.get(i)
+            if pp <> null
+            {
+                let p *pp
+                if p.name.equals(nm)
+                    return p
+            }
+            set i: i + (1 as size_t)
+        }
+        null
+    }
+
+    ; the installCharProperties helper: a fresh property with `def` as its
+    ; default and defPart -1 (predefined).
+    ;
+    ; ★The name is widened onto the HOST page, not built with `StringC(nm)`:
+    ; that init allocates its buffer through `Page.get(this)`, and for a
+    ; temporary the compiler may place on the stack the resulting `data`
+    ; pointer is garbage. The name then compares unequal to everything and
+    ; every property reads back as unknown — measured, and invisible until
+    ; the first lookup.
+    function new_char_property(this: pointer[Interpreter], nm: pointer[const_char], def: pointer[ELObj]) returns pointer[CharProp]
+    {
+        let host this.host
+        let p CharProp.make(host, Interpreter.ascii_string_c(host, nm), def, 0xFFFFFFFF as u32)
+        this.char_property_table.add(p)
+        p
+    }
+
+    ; widen an ASCII literal onto `host` — the safe replacement for a bound
+    ; or passed `StringC(<cstring>)` (see new_char_property).
+    function ascii_string_c(host: pointer[Page], s: pointer[const_char]) returns StringC
+    {
+        let b s as pointer[u8]
+        let buf Array[u32]^host()
+        var i: size_t 0
+        while (*(b + i)) <> (0 as u8)
+        {
+            buf.add((*(b + i)) as u32)
+            set i: i + (1 as size_t)
+        }
+        StringC^host(buf.get_buffer(), buf.get_length())
+    }
+
+    ; Interpreter::charProperty — the `char-property` primitive's engine.
+    ; An unknown NAME is a hard diagnostic; a character with no value of its
+    ; own falls back to the caller's default argument if there is one, else
+    ; to the property's own default.
+    function char_property(this: pointer[Interpreter], prop: StringC, c: u32, loc: Location, def: pointer[ELObj]) returns pointer[ELObj]
+    {
+        let cp this.lookup_char_property(prop)
+        if cp = null
+        {
+            this.set_next_location(loc)
+            this.message1(InterpreterMessages.unknownCharProperty(), prop)
+            return this.make_error()
+        }
+        let p *cp
+        let v p.lookup(c)
+        if v <> null
+            return v
+        if def <> null
+            return def
+        p.def
+    }
+
+    ; Interpreter::addCharProperty — declare-char-property. The default must
+    ; be a CONSTANT (a variable expression is varCharPropertyExprUnsupported);
+    ; re-declaring in the SAME spec part with a different value is
+    ; duplicateCharPropertyDecl, while an EARLIER part simply wins.
+    procedure add_char_property(this: pointer[Interpreter], ident: pointer[Identifier], val: pointer[ELObj], loc: Location)
+    {
+        if val = null
+        {
+            this.set_next_location(loc)
+            this.message0(InterpreterMessages.varCharPropertyExprUnsupported())
+            return
+        }
+        let nm ident.get_name()
+        let cp this.lookup_char_property(nm)
+        if cp = null
+        {
+            let host this.host
+            let p CharProp.make(host, nm, val, this.part_index)
+            set p.loc: loc
+            this.char_property_table.add(p)
+            return
+        }
+        let p *cp
+        if this.part_index < p.def_part
+        {
+            set p.def: val
+            set p.def_part: this.part_index
+            set p.loc: loc
+            return
+        }
+        if this.part_index = p.def_part
+        {
+            if ELObj.eqv(val, p.def) = false
+            {
+                this.set_next_location(loc)
+                this.message1(InterpreterMessages.duplicateCharPropertyDecl(), nm)
+                this.emit_aux(InterpreterMessages.duplicateCharPropertyDecl_aux(), p.loc)
+            }
+        }
+    }
+
+    ; Interpreter::setCharProperty — one (property, character) cell from
+    ; add-char-properties. An unknown property name is the same diagnostic
+    ; the primitive gives.
+    procedure set_char_property(this: pointer[Interpreter], ident: pointer[Identifier], c: u32, val: pointer[ELObj], loc: Location)
+    {
+        let nm ident.get_name()
+        let cp this.lookup_char_property(nm)
+        if cp = null
+        {
+            this.set_next_location(loc)
+            this.message1(InterpreterMessages.unknownCharProperty(), nm)
+            return
+        }
+        if val = null
+        {
+            this.set_next_location(loc)
+            this.message0(InterpreterMessages.varCharPropertyExprUnsupported())
+            return
+        }
+        let p *cp
+        p.set_range(c, c, val)
+    }
+
     function set_default_language_def(this: pointer[Interpreter], expr: pointer[Expression], loc: Location)
     {
         set this.default_language_def: expr
@@ -858,23 +1058,34 @@ define Interpreter
     ; --- syntactic keys ----------------------------------------------------
     function install_syntactic_key(this: pointer[Interpreter], name: pointer[const_char], key: int)
     {
-        let nm StringC(name)
-        let ident this.lookup(nm)
+        let ident this.lookup(StringC(name))
         ident.set_syntactic_key(key)
         ; ★installSyntacticKeys' dsssl2 alias (Interpreter.cxx:388): a key
         ; whose name ends in `?` is ALSO bound without the `?` under -2, so
         ; `keep-with-previous:` is a valid make keyword there and an error
         ; without the flag. Measured against the reference binary.
+        ; ★the name is scanned as RAW BYTES, not bound as a StringC: that
+        ; init allocates through `Page.get(this)`, which is a bogus page for
+        ; a stack-bound value (see CharProps.script_value).
         if this.dsssl2
         {
-            let n nm.get_size()
+            let b name as pointer[u8]
+            var n: size_t 0
+            while (*(b + n)) <> (0 as u8)
+                set n: n + (1 as size_t)
             if n > (0 as size_t)
             {
-                if nm.get(n - (1 as size_t)) = (0x3F as u32)
+                if (*(b + (n - (1 as size_t)))) = (0x3F as u8)
                 {
                     let host this.host
-                    let short StringC^host(nm.data_ptr(), n - (1 as size_t))
-                    let id2 this.lookup(short)
+                    let sbuf Array[u32]^host()
+                    var i: size_t 0
+                    while i < (n - (1 as size_t))
+                    {
+                        sbuf.add((*(b + i)) as u32)
+                        set i: i + (1 as size_t)
+                    }
+                    let id2 this.lookup(StringC^host(sbuf.get_buffer(), sbuf.get_length()))
                     id2.set_syntactic_key(key)
                 }
             }
@@ -921,6 +1132,8 @@ define Interpreter
         this.install_syntactic_key("declare-reference-value-type", SK_DECLARE_REFERENCE_VALUE_TYPE)
         this.install_syntactic_key("define-page-model", SK_DEFINE_PAGE_MODEL)
         this.install_syntactic_key("define-column-set-model", SK_DEFINE_COLUMN_SET_MODEL)
+        this.install_syntactic_key("declare-char-property", SK_DECLARE_CHAR_PROPERTY)
+        this.install_syntactic_key("add-char-properties", SK_ADD_CHAR_PROPERTIES)
         this.install_syntactic_key("default", SK_DEFAULT)
         this.install_syntactic_key("root", SK_ROOT)
         this.install_syntactic_key("id", SK_ID)
@@ -2182,6 +2395,9 @@ define Interpreter
         this.install_primitive("with-language", PRIM_WITH_LANGUAGE, Signature(2, 0, false))
         this.install_primitive("string-equiv?", PRIM_STRING_EQUIV, Signature(3, 0, false))
         this.install_x_primitive("UNREGISTERED::OpenJade//Procedure::", "language", PRIM_LANGUAGE, Signature(2, 0, false))
+        ; character properties
+        this.install_primitive("char-property", PRIM_CHAR_PROPERTY, Signature(2, 1, false))
+        this.install_primitive("char-script-case", PRIM_CHAR_SCRIPT_CASE, Signature(1, 0, true))
         ; apply and call/cc are FunctionObj subclasses (custom call/tailCall),
         ; not PrimitiveObj — install the dedicated arms. `apply` is
         ; unconditional; call/cc and the string->quantity alias are the tail

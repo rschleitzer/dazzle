@@ -28,6 +28,20 @@
 # suppression: after the first unknown form the following ones report
 # nothing.
 
+# prop1 (propdoc.sgml): CHARACTER PROPERTIES — the thirteen built-in
+# properties of installCharProperties, the declare-char-property /
+# add-char-properties declarations and the char-property primitive. ★It pins
+# the three-step fallback (the character's own value, then the CALLER's
+# optional default, then the declared one), that a declared default must be a
+# CONSTANT (even `(+ 1 2)` is rejected — the reference asks for
+# constantValue() after optimizing, and a call never folds), the duplicate
+# declaration with its AUXILIARY "first definition was here" line, and the
+# built-in tables themselves including `script`, whose value is the ISO
+# public identifier plus the script name. ★math-class is the one built-in
+# whose default is neither a boolean nor a number but the SYMBOL `ordinary`;
+# the three the reference creates EMPTY (glyph-id, both drop-*-line-break?)
+# answer #f. The diagnostics point at the VALUE EXPRESSION, not the form.
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 BIN="${1:-$ROOT/scalyc/build/scalyc}"
@@ -67,5 +81,6 @@ run_case() { # name document expected_err [extra-flag]
 
 run_case key1 keydoc.sgml key1.experr
 run_case key2 keydoc.sgml key2.experr -2
+run_case prop1 propdoc.sgml prop1.experr
 
 echo "dazzle-engine: PASS"
