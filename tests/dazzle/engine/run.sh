@@ -112,6 +112,26 @@
 # keys (space? punct? record-end? input-tab? input-whitespace?) are INERT
 # above lastSyntacticKey: `space?` is still an ordinary procedure name.
 
+# lang1 / lang2 (propdoc.sgml): define-language and its COLLATION half
+# (style/LangObj.cxx). lang1 is the positive matrix - the collating order,
+# multi-collating elements, collating symbols, per-level weights (including a
+# string weight, which contributes one weight per CHARACTER), the #t default
+# position, backward and position levels, the case tables and with-language /
+# current-language / declare-default-language. ★A language with no `collate`
+# clause has ZERO levels, so compare() answers 0 for every pair: string<? is
+# #f and string<=? #t whatever the code points say. ★An unknown character has
+# no weights, atLevel stops at the first miss, and the SHORTER level string
+# sorts FIRST - `(string<? "z" "a")` is #t in a language that orders only
+# a b c. lang2 is the failure side: the only two diagnostics the form can
+# produce (syntacticKeywordAsVariable, duplicateDefinition with its auxiliary
+# line - and the duplicate FAILS the form, so the first language survives),
+# the silent failures (unknown clause key, unknown collate sub-key, an
+# undeclared multi-character position, and ★a (forward) level followed by a
+# (backward) one, because the reference's LevelSort accumulator is never
+# reset between levels), and that the seven new keys are inert outside the
+# form - collate/toupper/tolower/symbol/order/forward/backward are ordinary
+# variable and procedure names.
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 BIN="${1:-$ROOT/scalyc/build/scalyc}"
@@ -183,5 +203,7 @@ run_case macro1b patdoc.sgml macro1b.experr "" macro1
 run_case macro2 patdoc.sgml macro2.experr -2
 run_case macro3 patdoc.sgml macro3.experr -2
 run_fot_case macro4 patdoc.sgml macro4.experr -2
+run_case lang1 propdoc.sgml lang1.experr
+run_case lang2 propdoc.sgml lang2.experr
 
 echo "dazzle-engine: PASS"

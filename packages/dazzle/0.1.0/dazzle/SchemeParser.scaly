@@ -4,6 +4,7 @@ use opensp.StringC.StringC
 use opensp.Location.Location
 use opensp.Location.InputSource
 use opensp.Message.MessageType
+use dazzle.LangObj.LangObj
 use dazzle.ELObj.ELObj
 use dazzle.ELObj.Identifier
 use dazzle.ELObj.FlowObj
@@ -2841,22 +2842,44 @@ define SchemeParser
         true
     }
 
-    ; doDefineLanguage — `(define-language NAME (toupper (lc UC)…)
-    ; (tolower (UC lc)…) …)`: build a LanguageObj from the case-pair tables
-    ; and bind it as the identifier's definition (a constant, like the
-    ; reference's ConstantExpression(LangObj)). The collation sub-forms are
-    ; consumed without effect (LangObj collation is not modeled).
+    ; doDefineLanguage — `(define-language NAME (collate …) (toupper (lc UC)…)
+    ; (tolower (UC lc)…))`: build a LangObj, compile it and bind it as the
+    ; identifier's definition (a constant, the reference's
+    ; ConstantExpression(LangObj)).
+    ;
+    ; ★Its duplicate gate is NOT doDefine's: a same-part redefinition reports
+    ; and FAILS the form (so the first language survives), while an
+    ; earlier-part definition falls through and is OVERWRITTEN — doDefine
+    ; skips that case instead.
+    ; ★Every clause dispatches on the KEY, and a head that is no key at all,
+    ; or a key with no meaning here, fails the form SILENTLY: no diagnostic
+    ; is reported anywhere in define-language's sub-parsers, only the
+    ; top-level recovery is entered.
     function do_define_language(this: pointer[SchemeParser]) returns bool
     {
-        let hp this.host
         let interp this.interp
+        ; the language and its tables outlive the parse and every eval
+        ; bracket — the run arena, never a scratch region.
+        let hp interp.get_perm_host()
         let loc this.cur_loc()
         var tok TOKEN_END_OF_ENTITY
         if this.get_token(ALLOW_IDENTIFIER, &tok) = false
             return false
         let ident interp.lookup(this.current_token)
-        let upmap Array[u32]^hp()
-        let downmap Array[u32]^hp()
+        let sk ident.syntactic_key()
+        if (sk <> SK_NOTKEY) and (sk <= SK_WITH_MODE)
+            this.message1(InterpreterMessages.syntacticKeywordAsVariable(), this.current_token)
+        let dp ident.get_def_part()
+        if (ident.is_def() and (dp <> (0xFFFFFFFF as u32))) and (dp <= interp.current_part_index())
+        {
+            if dp = interp.current_part_index()
+            {
+                this.message1(InterpreterMessages.duplicateDefinition(), ident.get_name())
+                interp.emit_aux(InterpreterMessages.duplicateDefinition_aux(), ident.get_def_loc())
+                return false
+            }
+        }
+        let lang LangObj.make(hp)
         repeat
         {
             if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
@@ -2865,48 +2888,309 @@ define SchemeParser
                 break
             if this.get_token(ALLOW_IDENTIFIER, &tok) = false
                 return false
-            var m: pointer[Array[u32]] null
-            if this.current_token.equals(StringC("toupper"))
-                set m: upmap
-            else if this.current_token.equals(StringC("tolower"))
-                set m: downmap
-            if m = null
+            let clause interp.lookup(this.current_token)
+            let ck clause.syntactic_key()
+            if ck = SK_COLLATE
             {
-                ; collate etc.: consume to the sub-form's close paren.
-                if this.skip_form() = false
+                if this.do_collate(lang) = false
                     return false
-                continue
             }
-            ; pairs: ((#\a #\A) …)
-            repeat
+            else if ck = SK_TOUPPER
             {
-                if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                if this.do_case_pairs(lang, true) = false
                     return false
-                if tok = TOKEN_CLOSE_PAREN
-                    break
-                if this.get_token(ALLOW_OTHER_EXPR, &tok) = false
+            }
+            else if ck = SK_TOLOWER
+            {
+                if this.do_case_pairs(lang, false) = false
                     return false
-                if tok <> TOKEN_CHAR
+            }
+            else
+                return false
+        }
+        if lang.compile() = false
+            return false
+        let value ELObj.make_language(hp, lang)
+        ; ★the constant carries the location AFTER the form; the definition
+        ; the one from before it (the reference passes both separately).
+        let expr Expression.make_constant(hp, value, this.cur_loc())
+        ident.set_expression(expr, interp.current_part_index(), loc)
+        true
+    }
+
+    ; doCollate — the `(collate …)` clause: multi-collating elements,
+    ; collating symbols and the order. ★`element` and `position` are the same
+    ; keys the construction rules and the NIC tables use.
+    function do_collate(this: pointer[SchemeParser], lang: pointer[LangObj]) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+                return false
+            let ident this.interp.lookup(this.current_token)
+            let k ident.syntactic_key()
+            if k = SK_ELEMENT
+            {
+                if this.do_multi_collating_element(lang) = false
                     return false
-                var from: u32 0
-                if this.current_token.get_size() > (0 as size_t)
-                    set from: this.current_token.get(0 as size_t)
-                if this.get_token(ALLOW_OTHER_EXPR, &tok) = false
+            }
+            else if k = SK_SYMBOL
+            {
+                if this.do_collating_symbol(lang) = false
                     return false
-                if tok <> TOKEN_CHAR
+            }
+            else if k = SK_ORDER
+            {
+                if this.do_collating_order(lang) = false
                     return false
-                var to: u32 0
-                if this.current_token.get_size() > (0 as size_t)
-                    set to: this.current_token.get(0 as size_t)
-                if this.expect_close_paren() = false
+            }
+            else
+                return false
+        }
+        true
+    }
+
+    ; doMultiCollatingElement — `(element SYM "string")`: SYM collates as one
+    ; unit standing for that character sequence.
+    function do_multi_collating_element(this: pointer[SchemeParser], lang: pointer[LangObj]) returns bool
+    {
+        let hp lang.get_host()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        ; currentToken_ is overwritten by the next token — copy onto the
+        ; language's own page.
+        let ct this.current_token
+        let sym StringC^hp(ct.data_ptr(), ct.get_size())
+        if this.get_token(ALLOW_STRING, &tok) = false
+            return false
+        let ct2 this.current_token
+        let str StringC^hp(ct2.data_ptr(), ct2.get_size())
+        if this.expect_close_paren() = false
+            return false
+        lang.add_multi_collating_element(sym, str)
+        true
+    }
+
+    ; doCollatingSymbol — `(symbol SYM)`: a name that takes a collating
+    ; position of its own without standing for any characters.
+    function do_collating_symbol(this: pointer[SchemeParser], lang: pointer[LangObj]) returns bool
+    {
+        let hp lang.get_host()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let ct this.current_token
+        let sym StringC^hp(ct.data_ptr(), ct.get_size())
+        if this.expect_close_paren() = false
+            return false
+        lang.add_collating_symbol(sym)
+        true
+    }
+
+    ; doCollatingOrder — `(order (LEVELS…) POSITIONS…)`. The first list gives
+    ; one sort level per parenthesized group; then the collating positions in
+    ; ascending order, each of them an identifier, a character, `#t` (the
+    ; position unknown characters take) or a `(SYM WEIGHTS…)` group.
+    ;
+    ; ★The LevelSort accumulator is NEVER reset between levels — that is the
+    ; reference's own structure, and it is observable: a `(forward)` level
+    ; followed by a `(backward)` one fails the whole define-language form
+    ; (silently), and a `position` flag, once set, holds for every level
+    ; after it.
+    function do_collating_order(this: pointer[SchemeParser], lang: pointer[LangObj]) returns bool
+    {
+        let hp lang.get_host()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_OPEN_PAREN, &tok) = false
+            return false
+        var nested 0
+        var s_forward false
+        var s_backward false
+        var s_position false
+        repeat
+        {
+            var allowed ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER
+            if nested = 0
+                set allowed: allowed | ALLOW_OPEN_PAREN
+            if this.get_token(allowed, &tok) = false
+                return false
+            if tok = TOKEN_OPEN_PAREN
+                set nested: nested + 1
+            else if tok = TOKEN_CLOSE_PAREN
+                set nested: nested - 1
+            else
+            {
+                let ident this.interp.lookup(this.current_token)
+                let k ident.syntactic_key()
+                if k = SK_FORWARD
+                {
+                    if s_backward
+                        return false
+                    set s_forward: true
+                }
+                else if k = SK_BACKWARD
+                {
+                    if s_forward
+                        return false
+                    set s_backward: true
+                }
+                else if k = SK_POSITION
+                    set s_position: true
+                else
                     return false
-                m.add(from)
-                m.add(to)
+            }
+            if nested < 0
+                break
+            if nested = 0
+            {
+                if s_backward = false
+                    set s_forward: true
+                lang.add_level(s_forward, s_backward, s_position)
             }
         }
-        let lang ELObj.make_language(hp, upmap, downmap)
-        let expr Expression.make_constant(hp, lang, loc)
-        ident.set_expression(expr, 0 as u32, loc)
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER | ALLOW_OTHER_EXPR, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if tok = TOKEN_TRUE
+            {
+                ; #t — the DEFAULT position: unknown characters collate here
+                ; (and, unlike the implicit default, they then have weights).
+                lang.add_default_pos()
+                let empty StringC()
+                let n lang.levels()
+                var i 0 as u32
+                while i < n
+                {
+                    let ok lang.add_level_weight(i, empty)
+                    set i: i + (1 as u32)
+                }
+            }
+            else if (tok = TOKEN_IDENTIFIER) or (tok = TOKEN_CHAR)
+            {
+                let ct this.current_token
+                let sym StringC^hp(ct.data_ptr(), ct.get_size())
+                if lang.add_collating_pos(sym) = false
+                    return false
+                let n lang.levels()
+                var i 0 as u32
+                while i < n
+                {
+                    let ok lang.add_level_weight(i, sym)
+                    set i: i + (1 as u32)
+                }
+            }
+            else if tok = TOKEN_OPEN_PAREN
+            {
+                if this.do_weights(lang) = false
+                    return false
+            }
+            else
+                return false
+        }
+        true
+    }
+
+    ; doWeights — `(SYM (level-0 weights…) (level-1 weights…) …)`: a
+    ; collating position with explicit weights per level. ★A STRING weight
+    ; contributes one weight PER CHARACTER, and an unparenthesized weight
+    ; advances the level just like a group does (the level counter is bumped
+    ; whenever the nesting is back at zero).
+    function do_weights(this: pointer[SchemeParser], lang: pointer[LangObj]) returns bool
+    {
+        let hp lang.get_host()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER | ALLOW_OTHER_EXPR, &tok) = false
+            return false
+        let ct this.current_token
+        let sym StringC^hp(ct.data_ptr(), ct.get_size())
+        if lang.add_collating_pos(sym) = false
+            return false
+        var nested 0
+        var l 0 as u32
+        repeat
+        {
+            var allowed ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER | ALLOW_OTHER_EXPR | ALLOW_STRING
+            if nested = 0
+                set allowed: allowed | ALLOW_OPEN_PAREN
+            if this.get_token(allowed, &tok) = false
+                return false
+            if tok = TOKEN_OPEN_PAREN
+                set nested: nested + 1
+            else if tok = TOKEN_CLOSE_PAREN
+                set nested: nested - 1
+            else if tok = TOKEN_STRING
+            {
+                let s this.current_token
+                let sp s.data_ptr()
+                let sn s.get_size()
+                var i: size_t 0
+                while i < sn
+                {
+                    let one StringC^hp(sp + i, 1 as size_t)
+                    if lang.add_level_weight(l, one) = false
+                        return false
+                    set i: i + (1 as size_t)
+                }
+            }
+            else if (tok = TOKEN_IDENTIFIER) or (tok = TOKEN_CHAR)
+            {
+                let ct2 this.current_token
+                let w StringC^hp(ct2.data_ptr(), ct2.get_size())
+                if lang.add_level_weight(l, w) = false
+                    return false
+            }
+            else
+                return false
+            if nested < 0
+                break
+            if nested = 0
+                set l: l + (1 as u32)
+        }
+        true
+    }
+
+    ; doToupper / doTolower — `(toupper (lc UC) …)` / `(tolower (UC lc) …)`.
+    ; The pairs go into a CharMap in the reference, so a repeated left-hand
+    ; character is REPLACED: the last pair wins.
+    function do_case_pairs(this: pointer[SchemeParser], lang: pointer[LangObj], up: bool) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if this.get_token(ALLOW_OTHER_EXPR, &tok) = false
+                return false
+            if tok <> TOKEN_CHAR
+                return false
+            var from: u32 0
+            if this.current_token.get_size() > (0 as size_t)
+                set from: this.current_token.get(0 as size_t)
+            if this.get_token(ALLOW_OTHER_EXPR, &tok) = false
+                return false
+            if tok <> TOKEN_CHAR
+                return false
+            var to: u32 0
+            if this.current_token.get_size() > (0 as size_t)
+                set to: this.current_token.get(0 as size_t)
+            if this.expect_close_paren() = false
+                return false
+            if up
+                lang.add_toupper(from, to)
+            else
+                lang.add_tolower(from, to)
+        }
         true
     }
 
@@ -3279,13 +3563,11 @@ define SchemeParser
         ; one the reference reports `no current language` and yields the
         ; error object (lang2 in tests/dazzle/prims pins it). Declare one, as
         ; a real stylesheet must.
-        let upmap Array[u32]^host()
-        upmap.add(0x61 as u32)
-        upmap.add(0x41 as u32)
-        let downmap Array[u32]^host()
-        downmap.add(0x5A as u32)
-        downmap.add(0x7A as u32)
-        set ei.default_language: ELObj.make_language(host, upmap, downmap)
+        let tl LangObj.make(host)
+        tl.add_toupper(0x61 as u32, 0x41 as u32)
+        tl.add_tolower(0x5A as u32, 0x7A as u32)
+        let tlok tl.compile()
+        set ei.default_language: ELObj.make_language(host, tl)
 
         ; --- string primitives --------------------------------------------
         if SchemeParser.eval_int(host, ei, "(string-length \"hello\")") <> 5
