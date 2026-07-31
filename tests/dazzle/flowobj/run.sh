@@ -130,6 +130,39 @@
 # that included-container-area's two halves — its own record and the shared
 # display NIC — survive the queue together.
 #
+# --- the online bundle: marginalia, multi-mode -------------------------
+#
+# online1 (-t fot, -t tex, -t rtf, -t mif): the positive matrix. marginalia is
+# a bare bracket whose four characteristics are all INHERITED ones; multi-mode
+# is the only class in the port whose PORTS are decided at run time — its
+# `multi-modes:` list names them, in all four member shapes (`#f`, a symbol,
+# `(#f "desc")`, `(sym "desc")`). ★It pins that the modes replay in the order
+# the LIST gives, not the order the content gives; that a mode with no content
+# still gets its element; that an empty list is a valid value; and that
+# unlabelled content still lands in the enclosing stream when no principal
+# mode was asked for (pushPorts' hasPrincipalMode is the same never-read
+# argument `fraction` exposes).
+#
+# online1b (-t fot): ★OUR behaviour. A multi-mode inside another multi-mode's
+# NAMED MODE crashes the reference binary — SerialFOTBuilder keeps ONE save_
+# list for every open multi-mode (FOTBuilder.cxx:3335), so the outer's replay
+# reads a dangling head (measured rc 139, EXC_BAD_ACCESS in
+# SerialFOTBuilder::endMultiMode). Nesting inside the PRINCIPAL stream works
+# and is in online1.
+#
+# online2 (-t fot): the diagnostic matrix — every malformed shape of a
+# `multi-modes:` member. ★The first bad member messages and STOPS, so the
+# modes collected before it survive into the dump.
+#
+# online3 (-t sgml): ★OUR behaviour, and the sharpest measurement so far of
+# the open TRANSFORM-PATH gap (COMPLETENESS.md gap (1)): this port pushes no
+# ports on the transform path, so every `label:` draws a `no port for label`
+# the reference does not raise — and here the divergence reaches STDOUT, not
+# just stderr, because the reference replays the modes in list order while we
+# leave the content where it stands. The fixture is the regression guard for
+# our side until the transform path runs through the same FotSink as the five
+# print backends.
+#
 # emph1 (-t fot): ★OUR behaviour. `emphasizing-mark` cannot run in the
 # reference binary at all — its copy constructor copies nic_ and forgets
 # emphmark_ (style/EmphasizingMark.h:28), so every make of the class
@@ -221,5 +254,14 @@ run_case layout2 fot
 run_transform_case layout3 "" layout1
 run_case layout4 fot
 run_case layout4r rtf "" layout4
+
+# the online bundle
+run_case online1 fot
+run_case online1t tex "" online1
+run_case online1r rtf "" online1
+run_case online1m mif "" online1
+run_case online1b fot
+run_case online2 fot
+run_transform_case online3 "" online1
 
 echo "dazzle-flowobj: PASS"
