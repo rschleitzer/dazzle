@@ -5,6 +5,7 @@ use opensp.StringC.StringC
 use dazzle.ELObj.ELObj
 use dazzle.ELObj.Identifier
 use dazzle.ELObj.FlowObj
+use dazzle.ELObj.MacroDef
 use dazzle.ELObj.OutputCharStream
 use dazzle.VM.VM
 use dazzle.Interpreter.Interpreter
@@ -119,6 +120,19 @@ define MakeStyleInsn (keys: pointer[Array[pointer[Identifier]]], key_class: poin
 ; pointer[void] — the VM keeps no ProcessingMode import), restore on pop.
 define PushModeInsn (mode: pointer[void], next: pointer[Insn])
 define PopModeInsn (next: pointer[Insn])
+; CheckSosofoInsn (Insn.cxx:1132): the value on top of the stack must be a
+; sosofo — otherwise `this context requires a sosofo` at `loc` and the whole
+; eval unwinds (sp = 0, no successor), which makes the enclosing construction
+; rule an error and hands the node to process-children. The reference wraps
+; EVERY content expression of a make in one, and the body of a flow-object
+; macro.
+define CheckSosofoInsn (loc: Location, next: pointer[Insn])
+; UnpackMacroFlowObjInsn (MacroFlowObj.cxx:146) — the entry point of a
+; macro's compiled body: pop the macro flow object and push its characteristic
+; values as frame slots, then (for a compound macro) its content sosofo. A
+; characteristic never set stays NULL, which is what the TestNullInsn chain
+; behind this insn reads to substitute the declared default.
+define UnpackMacroFlowObjInsn (next: pointer[Insn])
 
 define Insn union
 (
@@ -167,6 +181,8 @@ define Insn union
     MakeStyle: MakeStyleInsn
     PushMode: PushModeInsn
     PopMode: PopModeInsn
+    CheckSosofo: CheckSosofoInsn
+    UnpackMacroFlowObj: UnpackMacroFlowObjInsn
 )
 {
     ; --- isReturn / isPopBindings peephole predicates ----------------------
@@ -515,6 +531,20 @@ define Insn union
     {
         let p Insn.alloc(host)
         set *p: Insn.MakeFlowObj(MakeFlowObjInsn(foc, keys, key_class, nic_code, tnic, dnic, hf_proto, force_specs, specs, n_bound, n_content, has_cm, cm_loc, loc, next))
+        p
+    }
+
+    function make_check_sosofo(host: pointer[Page], loc: Location, next: pointer[Insn]) returns pointer[Insn]
+    {
+        let p Insn.alloc(host)
+        set *p: Insn.CheckSosofo(CheckSosofoInsn(loc, next))
+        p
+    }
+
+    function make_unpack_macro(host: pointer[Page], next: pointer[Insn]) returns pointer[Insn]
+    {
+        let p Insn.alloc(host)
+        set *p: Insn.UnpackMacroFlowObj(UnpackMacroFlowObjInsn(next))
         p
     }
 
@@ -915,6 +945,11 @@ define Insn union
                     return this.exec_make_styled_flow_obj(vm, mf.foc, mf.keys, mf.key_class, mf.nic_code, mf.tnic, mf.dnic, mf.hf_proto, mf.force_specs, mf.specs, mf.n_bound, mf.n_content, mf.has_cm, mf.cm_loc, mf.loc, mf.next)
                 if (mf.foc >= FOC_PARAGRAPH) and (mf.foc <= FOC_INDEX_ENTRY)
                     return this.exec_make_styled_flow_obj(vm, mf.foc, mf.keys, mf.key_class, mf.nic_code, mf.tnic, mf.dnic, mf.hf_proto, mf.force_specs, mf.specs, mf.n_bound, mf.n_content, mf.has_cm, mf.cm_loc, mf.loc, mf.next)
+                ; a keyless macro make still needs the styled path — that is
+                ; where the definition and the characteristic slots are copied
+                ; off the compile-time prototype.
+                if mf.foc = FOC_MACRO
+                    return this.exec_make_styled_flow_obj(vm, mf.foc, mf.keys, mf.key_class, mf.nic_code, mf.tnic, mf.dnic, mf.hf_proto, mf.force_specs, mf.specs, mf.n_bound, mf.n_content, mf.has_cm, mf.cm_loc, mf.loc, mf.next)
                 return this.exec_make_flow_obj(vm, mf.foc, mf.keys, mf.n_content, mf.loc, mf.next)
             }
             when lsi: LabelSosofo
@@ -933,6 +968,27 @@ define Insn union
                 vm.pop_mode()
                 return qm.next
             }
+            when cs2: CheckSosofo
+            {
+                let top vm.stack_ref(vm.get_sp() - 1)
+                var ok false
+                if top <> null
+                {
+                    if top.is_sosofo_p()
+                        set ok: true
+                }
+                if ok = false
+                {
+                    vm.set_sp(0 - 1)
+                    let interp vm.get_interp()
+                    interp.set_next_location(cs2.loc)
+                    interp.message0(InterpreterMessages.sosofoContext())
+                    return null
+                }
+                return cs2.next
+            }
+            when um: UnpackMacroFlowObj
+                return this.exec_unpack_macro(vm, um.next)
             else
                 return null
         null
@@ -1061,7 +1117,22 @@ define Insn union
         let base vm.get_sp() - total
         let display Insn.capture_display(vm, host, base + n_slots + n_content + n_cm, n_bound)
 
-        let fo: pointer[FlowObj] FlowObj.make(host, foc)
+        ; a macro make COPIES the compile-time prototype (MacroFlowObj's copy
+        ; constructor: shared definition, copied characteristic slots — the
+        ; constant values were baked into the prototype by
+        ; applyConstNonInheritedCs). For FOC_MACRO the tnic slot of the insn
+        ; carries that prototype.
+        var fo: pointer[FlowObj] null
+        if foc = FOC_MACRO
+        {
+            let proto tnic_proto as pointer[FlowObj]
+            if proto <> null
+                set fo: proto.macro_copy(host)
+            else
+                set fo: FlowObj.make(host, foc)
+        }
+        else
+            set fo: FlowObj.make(host, foc)
         ; the table-family NIC record: a fresh per-exec copy of the compile
         ; prototype (constant keys baked in), or defaults — exec/resolve-time
         ; sets must never mutate the shared insn state.
@@ -1182,7 +1253,17 @@ define Insn union
             ; SetDefaultContentInsn / MakeDefaultContentInsn — a compound flow
             ; object with no content defaults to (process-children) in the
             ; current processing mode; outside processing that is a hard error.
-            if FlowObj.is_atomic_class(foc) = false
+            ; A macro is compound exactly when it declared `#!contents`
+            ; (MacroFlowObj::asCompoundFlowObj).
+            var compound FlowObj.is_atomic_class(foc) = false
+            if foc = FOC_MACRO
+            {
+                set compound: false
+                let mdef fo.get_macro_def()
+                if mdef <> null
+                    set compound: mdef.is_compound()
+            }
+            if compound
             {
                 let pmode vm.get_processing_mode()
                 if pmode = null
@@ -1267,6 +1348,12 @@ define Insn union
                     fo.set_hf(host, part, val)
                 else
                     Convert.invalid_value(interp, ident, loc)
+            }
+            else if fo.get_foc() = FOC_MACRO
+            {
+                ; MacroFlowObj::setNonInheritedC — straight into the named
+                ; characteristic's slot, no conversion and no diagnostic.
+                fo.set_charic(ident, val)
             }
             else
             {
@@ -1535,6 +1622,75 @@ define Insn union
         }
         vm.stack_set(tem, ELObj.make_closure(host, sig, code, disp))
         vm.set_sp(tem + 1)
+        next
+    }
+
+    ; UnpackMacroFlowObjInsn::execute + MacroFlowObj::unpack. The seed on the
+    ; stack is the macro's SOSO_FLOWOBJ sosofo (this port keeps a flow
+    ; object's content in the sosofo, not on the FlowObj, so the seed carries
+    ; both halves); it is POPPED and replaced by one frame slot per declared
+    ; characteristic plus, for a compound macro, the content sosofo. Several
+    ; content sosofos fold into one SOSO_APPEND (the reference's SetContentInsn
+    ; already appended them into a single SosofoObj).
+    function exec_unpack_macro(this: pointer[Insn], vm: pointer[VM], next: pointer[Insn]) returns pointer[Insn]
+    {
+        let host vm.get_host()
+        let base vm.get_sp() - 1
+        let seed vm.stack_ref(base)
+        vm.set_sp(base)
+        if seed = null
+            return next
+        let fo seed.sosofo_flowobj()
+        if fo = null
+            return next
+        let def fo.get_macro_def()
+        if def = null
+            return next
+        let n def.n_nics()
+        var extra 0
+        if def.is_compound()
+            set extra: 1
+        vm.need_stack(n + extra)
+        let vals fo.get_charic_vals()
+        var i 0
+        while i < n
+        {
+            var v: pointer[ELObj] null
+            if vals <> null
+            {
+                let vp vals.get(i as size_t)
+                if vp <> null
+                    set v: *vp
+            }
+            vm.stack_set(vm.get_sp(), v)
+            vm.set_sp(vm.get_sp() + 1)
+            set i: i + 1
+        }
+        if def.is_compound()
+        {
+            var content: pointer[ELObj] null
+            let parts seed.sosofo_parts()
+            if parts <> null
+            {
+                let np parts.get_length()
+                if np = (1 as size_t)
+                {
+                    let p0 parts.get(0 as size_t)
+                    if p0 <> null
+                        set content: *p0
+                }
+                else if np > (1 as size_t)
+                    set content: ELObj.make_sosofo(host, parts)
+            }
+            ; MacroFlowObj::unpack's own fallback — unreachable through a
+            ; make (SetDefaultContentInsn already substituted process-children
+            ; in the CURRENT mode), kept because the reference has it: the
+            ; INITIAL mode, not the current one.
+            if content = null
+                set content: ELObj.make_process_children_sosofo(host, false, vm.get_interp().initial_processing_mode_ptr())
+            vm.stack_set(vm.get_sp(), content)
+            vm.set_sp(vm.get_sp() + 1)
+        }
         next
     }
 

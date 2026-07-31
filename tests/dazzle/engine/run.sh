@@ -59,6 +59,25 @@
 # top-level loop NEVER skips a failed form - it reads on token by token, so
 # a construction rule buried inside `(bogus ...)` is really installed.
 
+# macro1..macro4 (patdoc.sgml): declare-flow-object-macro and the
+# MacroFlowObj it binds. macro1 (-2) is the positive matrix: characteristics
+# given / defaulted / #f, a default reading the characteristic declared before
+# it, #!contents used twice and not at all, the process-children default
+# content, a non-constant characteristic through the lazy chain, nesting, a
+# characteristic shadowing `font-size` and `label`, and the fact that a second
+# declaration of the same macro name simply wins. macro1b is the SAME file
+# without -2, where the form is `unknown top level form` (it is a keys2[]
+# entry) and every make an unknown class - which reports NO invalid keyword,
+# because unknownStyleKeyword bails out on a null flowObj. macro2 walks the
+# declaration and make diagnostics, including the body/content
+# CheckSosofoInsn. macro3 has the duplicate gate - which reads the
+# CHARACTERISTIC definition record, so declare-characteristic refuses a later
+# macro AND a later flow object class of that name while a built-in
+# characteristic name (part -1) does not - plus, LAST, the one malformed form
+# whose recovery swallows the rest of the entity. macro4 is `-t fot`, the only
+# place where the startSequence/endSequence bracket and the style of a macro
+# make are visible.
+
 # prop1 (propdoc.sgml): CHARACTER PROPERTIES — the thirteen built-in
 # properties of installCharProperties, the declare-char-property /
 # add-char-properties declarations and the char-property primitive. ★It pins
@@ -93,7 +112,21 @@ run_case() { # name document expected_err [extra-flag] [stylesheet-base]
   local name="$1" doc="$2" experr="$3" flag="${4:-}" dsl="${5:-$1}"
   ( cd "$WORK" && SCALY_HOME="$ROOT" \
       "$OUT" $flag -t sgml -d "$dsl.dsl" "$doc" > "$name.out" 2> "$name.err" )
-  local rc=$?
+  compare "$name" "$experr" "$?"
+}
+
+# the same, on the `-t fot` backend: the flow object tree goes to the -o file
+# (macro4 is there because the sequence bracket and the style of a macro make
+# are invisible on the transform sink).
+run_fot_case() { # name document expected_err [extra-flag]
+  local name="$1" doc="$2" experr="$3" flag="${4:-}"
+  ( cd "$WORK" && SCALY_HOME="$ROOT" \
+      "$OUT" $flag -t fot -o "$name.out" -d "$name.dsl" "$doc" > "$name.stdout" 2> "$name.err" )
+  compare "$name" "$experr" "$?"
+}
+
+compare() { # name expected_err rc
+  local name="$1" experr="$2" rc="$3"
   if [ "$rc" -ne 0 ]; then
     echo "dazzle-engine: FAIL $name (rc=$rc)"; cat "$WORK/$name.err"; exit 1
   fi
@@ -123,5 +156,10 @@ run_case query3 patdoc.sgml query3.experr
 run_case query4 patdoc.sgml query4.experr
 run_case query4b patdoc.sgml query4b.experr -2 query4
 run_case query5 patdoc.sgml query5.experr
+run_case macro1 patdoc.sgml macro1.experr -2
+run_case macro1b patdoc.sgml macro1b.experr "" macro1
+run_case macro2 patdoc.sgml macro2.experr -2
+run_case macro3 patdoc.sgml macro3.experr -2
+run_fot_case macro4 patdoc.sgml macro4.experr -2
 
 echo "dazzle-engine: PASS"
