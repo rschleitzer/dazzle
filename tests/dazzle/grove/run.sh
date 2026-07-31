@@ -135,6 +135,24 @@ run_case() { # name expected [expected_err] [document]
 # measurable at all.
 # props4 (appinfo.sgml): `application-info`, which needs an SGML DECLARATION
 # with APPINFO to be anything but accessNull.
+# props5 (entrefs.sgml): the ENTITY-REFERENCE branch of the grove — the sdata,
+# external-data, subdocument and non-sgml node classes, plus the pi class's
+# entity origin (PiEntityNode). One paragraph per class, the probe node always
+# the paragraph's second child. It pins their ClassDef tables (note the
+# reference's FIXME classes: non-sgml has NO class name and an EMPTY
+# all-property-names), the four shared properties (system-data / char /
+# entity-name / entity, each measured accessOK vs accessNull vs
+# accessNotInClass), the entity DECLARATION node each one points at, that all
+# of them are ordinary content siblings with the element as parent and origin,
+# both spellings in select-by-class, the RCS class names and node identity
+# across two accesses. ★`char` on a non-sgml node is accessNULL, not
+# not-in-class: Node::property answers idChar through getChar/charChunk, which
+# every class has.
+# chars3 (entrefs.sgml): the CHARACTER STREAM the same nodes hand a backend —
+# an sdata node contributes the ONE character Interpreter::sdataMap resolves
+# (built-in name table, text table, convertUnicodeCharName, then defaultChar),
+# never its replacement text; external-data, subdocument and non-sgml
+# contribute nothing at all.
 run_case axis1 "$HERE/axis1.expected"
 run_case chars1 "$HERE/chars1.expected"
 run_case chars2 "$HERE/chars2.expected"
@@ -142,5 +160,7 @@ run_case props1 "$HERE/props1.expected" "" props.sgml
 run_case props2 "$HERE/props2.expected" "" attrs.sgml
 run_case props3 "$HERE/props3.expected" "" decls.sgml
 run_case props4 "$HERE/props4.expected" "" appinfo.sgml
+run_case props5 "$HERE/props5.expected" "" entrefs.sgml
+run_case chars3 "$HERE/chars3.expected" "" entrefs.sgml
 
 echo "dazzle-grove: PASS"
