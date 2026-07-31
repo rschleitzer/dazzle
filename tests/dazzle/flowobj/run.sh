@@ -97,6 +97,39 @@
 # replay in declaration order; a stylesheet that put a labelled child before
 # an unlabelled one would diverge.
 #
+# --- the layout-composite bundle: embedded-text, included-container-area,
+#     side-by-side, side-by-side-item, aligned-column --------------------
+#
+# layout1 (-t fot, -t tex, -t rtf, -t mif): the positive matrix — all five
+# classes, every characteristic each one takes, the lazy (non-constant) chain,
+# an inherited characteristic per class (including the family's own three
+# side-by-side-* ICs) and the family nested inside itself. ★It pins the one
+# initial value in the family that is not "unset": included-container-area's
+# scale defaults to max-uniform, so even an untouched one carries a scale
+# attribute — and a numeric or paired scale switches it to scale-x/scale-y.
+# Only the fot backend overrides any of the five; on tex/rtf/mif the plain
+# start()/end() brackets leave nothing but the content.
+#
+# layout2 (-t fot): the diagnostic matrix — a conversion failure per
+# characteristic and the unknown-keyword message per class, including the two
+# classes that take a display NIC (where a non-display key is unknown) and
+# side-by-side-item, which takes nothing at all. ★Two asymmetries: `#f` is a
+# VALID width:/height: (it selects the minimum form) but an INVALID direction:,
+# because embedded-text's allowed set deliberately omits symbolFalse. It runs
+# WITHOUT -2 on purpose: under -2 the reference coerces a string value into a
+# number/symbol/boolean before every characteristic conversion
+# (Interpreter::convertFromString), which this port does not carry yet — a
+# measured gap of the Convert layer, not of this family (COMPLETENESS.md).
+#
+# layout3 (-t sgml): the same stylesheet on the transform backend, where all
+# five brackets are no-ops and only the document text survives.
+#
+# layout4 (-t fot, -t rtf): the CAPTURE path — each class inside content that
+# is recorded and replayed instead of emitted straight through (a
+# simple-page-sequence header, a fraction port, a table-part header). It pins
+# that included-container-area's two halves — its own record and the shared
+# display NIC — survive the queue together.
+#
 # emph1 (-t fot): ★OUR behaviour. `emphasizing-mark` cannot run in the
 # reference binary at all — its copy constructor copies nic_ and forgets
 # emphmark_ (style/EmphasizingMark.h:28), so every make of the class
@@ -130,10 +163,10 @@ run_case() { # name backend [extra-flag] [stylesheet-base]
 }
 
 # the transform backend writes the instance to STDOUT
-run_transform_case() { # name [extra-flag]
-  local name="$1" flag="${2:-}"
+run_transform_case() { # name [extra-flag] [stylesheet-base]
+  local name="$1" flag="${2:-}" dsl="${3:-$1}"
   ( cd "$WORK" && SCALY_HOME="$ROOT" \
-      "$OUT" $flag -t sgml -d "$name.dsl" fodoc.sgml \
+      "$OUT" $flag -t sgml -d "$dsl.dsl" fodoc.sgml \
       > "$name.out" 2> "$name.err" )
   compare "$name" "$name.out" "$?"
 }
@@ -177,5 +210,16 @@ run_case math1m mif "" math1
 run_case math2 fot -2
 run_case math3 rtf
 run_transform_case math4
+
+# the layout-composite bundle: the positive matrix on the four -o backends,
+# the diagnostics, the transform run and the capture path.
+run_case layout1 fot
+run_case layout1t tex "" layout1
+run_case layout1r rtf "" layout1
+run_case layout1m mif "" layout1
+run_case layout2 fot
+run_transform_case layout3 "" layout1
+run_case layout4 fot
+run_case layout4r rtf "" layout4
 
 echo "dazzle-flowobj: PASS"
