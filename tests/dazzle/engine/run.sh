@@ -44,6 +44,21 @@
 # rules print the same text on purpose: the reference sorts with qsort,
 # so which member of an equal-specificity run fires is not a contract.
 
+# query1..query5 (patdoc.sgml): the DSSSL QUERY LANGUAGE and, next door, the
+# two parse shapes it leans on. query1 (no -2) is the semantic matrix of the
+# four forms - they are keys[] entries, so they need no flag; query2 (-2)
+# adds only the `?`-less ALIAS, which makes `there-exists` and `for-all` the
+# same keys. ★The operator of a query form is resolved at PARSE time through
+# Identifier::computeBuiltinValue, so a stylesheet that redefines
+# node-list-filter changes its own calls and never `select-each` - the only
+# reason Identifier carries a builtin shadow. query3 walks every malformed
+# query form. ★query4/query4b pin parseBegin: an EMPTY body is `unexpected
+# token ")"` in both modes, but the SEQUENCE body is -2-only and a second
+# expression without the flag is `missing closing parenthesis` reported
+# TWICE (tokenRecover ungets and answers SUCCESS). ★query5 pins that the
+# top-level loop NEVER skips a failed form - it reads on token by token, so
+# a construction rule buried inside `(bogus ...)` is really installed.
+
 # prop1 (propdoc.sgml): CHARACTER PROPERTIES — the thirteen built-in
 # properties of installCharProperties, the declare-char-property /
 # add-char-properties declarations and the char-property primitive. ★It pins
@@ -74,10 +89,10 @@ fi
 
 cp "$HERE"/*.sgml "$HERE"/*.dsl "$WORK/"
 
-run_case() { # name document expected_err [extra-flag]
-  local name="$1" doc="$2" experr="$3" flag="${4:-}"
+run_case() { # name document expected_err [extra-flag] [stylesheet-base]
+  local name="$1" doc="$2" experr="$3" flag="${4:-}" dsl="${5:-$1}"
   ( cd "$WORK" && SCALY_HOME="$ROOT" \
-      "$OUT" $flag -t sgml -d "$name.dsl" "$doc" > "$name.out" 2> "$name.err" )
+      "$OUT" $flag -t sgml -d "$dsl.dsl" "$doc" > "$name.out" 2> "$name.err" )
   local rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "dazzle-engine: FAIL $name (rc=$rc)"; cat "$WORK/$name.err"; exit 1
@@ -102,5 +117,11 @@ run_case pat1 patdoc.sgml pat1.experr
 run_case pat2 patdoc.sgml pat2.experr -2
 run_case pat3 patdoc.sgml pat3.experr -2
 run_case pat4 patdoc.sgml pat4.experr -2
+run_case query1 patdoc.sgml query1.experr
+run_case query2 patdoc.sgml query2.experr -2
+run_case query3 patdoc.sgml query3.experr
+run_case query4 patdoc.sgml query4.experr
+run_case query4b patdoc.sgml query4b.experr -2 query4
+run_case query5 patdoc.sgml query5.experr
 
 echo "dazzle-engine: PASS"

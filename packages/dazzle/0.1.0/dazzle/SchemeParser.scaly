@@ -946,6 +946,42 @@ define SchemeParser
         this.parse_expr_full(ALLOW_EXPR, result, &key, &tok)
     }
 
+    ; `key <= Identifier::lastSyntacticKey` (= keyWithMode). The EXPRESSION
+    ; keys are the eval-core forms plus the four query forms, make, style,
+    ; with-mode, and — ordered inside that run by the reference — define,
+    ; else and =>. Everything ABOVE lastSyntacticKey (element, mode, label,
+    ; define-unit, query, every NIC keyword) is an ordinary name in
+    ; expression position and must NOT be reported. In this port's numbering
+    ; that set is SK_DEFINE plus the contiguous SK_QUOTE..SK_ARROW run.
+    function is_expression_key(sk: int) returns bool
+    {
+        if sk = SK_DEFINE
+            return true
+        (sk >= SK_QUOTE) and (sk <= SK_ARROW)
+    }
+
+    ; the allow-bit half of that arm: define/else/=> each carry their own bit
+    ; (a cond clause may open with `else`, a body with `define`); unquote and
+    ; unquote-splicing have none in identifier position, so they always
+    ; report; every other expression key needs ALLOW_EXPRESSION_KEY, which
+    ; only the OPERATOR position of a form ever sets.
+    function expression_key_allowed(this: SchemeParser, sk: int, allowed: int) returns bool
+    {
+        if SchemeParser.is_expression_key(sk) = false
+            return true
+        if sk = SK_DEFINE
+            return (allowed & ALLOW_KEY_DEFINE) <> 0
+        if sk = SK_ARROW
+            return (allowed & ALLOW_KEY_ARROW) <> 0
+        if sk = SK_ELSE
+            return (allowed & ALLOW_KEY_ELSE) <> 0
+        if sk = SK_UNQUOTE
+            return false
+        if sk = SK_UNQUOTE_SPLICING
+            return false
+        (allowed & ALLOW_EXPRESSION_KEY) <> 0
+    }
+
     ; bool parseExpression(allowed, out expr, out key, out tok).
     function parse_expr_full(this: pointer[SchemeParser], allowed: int, result: pointer[pointer[Expression]], key: pointer[int], tok: pointer[int]) returns bool
     {
@@ -960,7 +996,15 @@ define SchemeParser
         if t = TOKEN_IDENTIFIER
         {
             let ident interp.lookup(this.current_token)
-            set *key: ident.syntactic_key()
+            let sk ident.syntactic_key()
+            set *key: sk
+            ; parseExpression's tokenIdentifier arm (SchemeParser.cxx:873): an
+            ; EXPRESSION key in VARIABLE position is a diagnostic unless this
+            ; context allows it. The reference then builds the
+            ; VariableExpression anyway, so the message is the whole
+            ; observable difference.
+            if this.expression_key_allowed(sk, allowed) = false
+                this.message1(InterpreterMessages.syntacticKeywordAsVariable(), this.current_token)
             set *result: Expression.make_variable(hp, ident, this.cur_loc())
             return true
         }
@@ -1082,8 +1126,16 @@ define SchemeParser
                 return this.parse_style(result)
             if sk = SK_WITH_MODE
                 return this.parse_with_mode(result)
-            ; query forms are later increments; for now they resolve as an
-            ; ordinary call on the identifier.
+            ; the four query-language forms (SchemeParser.cxx:847) — each one
+            ; is nothing but a spelling of one builtins.dsl procedure.
+            if sk = SK_THERE_EXISTS
+                return this.parse_special_query(result, "node-list-some?")
+            if sk = SK_FOR_ALL
+                return this.parse_special_query(result, "node-list-every?")
+            if sk = SK_SELECT_EACH
+                return this.parse_special_query(result, "node-list-filter")
+            if sk = SK_UNION_FOR_EACH
+                return this.parse_special_query(result, "node-list-union-map")
             ; The op VariableExpression anchors at the IDENTIFIER's own token
             ; start (parseExpression's tokenIdentifier arm: in_->currentLocation()
             ; after getToken) — only the CallExpression carries the paren loc.
@@ -1312,11 +1364,30 @@ define SchemeParser
         set *result: null
         let hp this.host
         let loc this.cur_loc()
+        var key SK_NOTKEY
+        var tok TOKEN_END_OF_ENTITY
+        ; ★the FIRST expression is parsed WITHOUT ALLOW_CLOSE_PAREN in both
+        ; modes (SchemeParser.cxx:1252), so an EMPTY body — `(define (f x))`,
+        ; `(lambda (z))` — is `unexpected token ")"` and the form is skipped.
+        ; This port used to accept it and hand back an unspecified body.
+        var first: pointer[Expression] null
+        if this.parse_expr_full(ALLOW_EXPR, &first, &key, &tok) = false
+            return false
+        ; ★and the SEQUENCE half is -2-gated (SchemeParser.cxx:1254): without
+        ; the flag a body is exactly ONE expression, and a second one is
+        ; `missing closing parenthesis` — reported TWICE, because tokenRecover
+        ; ungets the offending token and answers SUCCESS, so the enclosing
+        ; body-close sees it again. Measured; this port used to take the -2
+        ; shape unconditionally.
+        if this.dsssl2 = false
+        {
+            set *result: first
+            return this.expect_close_paren()
+        }
         let exprs Array[pointer[Expression]]^hp()
+        exprs.add(first)
         repeat
         {
-            var key SK_NOTKEY
-            var tok TOKEN_END_OF_ENTITY
             var e: pointer[Expression] null
             if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &e, &key, &tok) = false
                 return false
@@ -1982,6 +2053,56 @@ define SchemeParser
         Signature(n_required, n_optional, has_rest, n_key, keys)
     }
 
+    ; bool parseSpecialQuery(out expr, const char *query) — SchemeParser.cxx:2401.
+    ; The whole DSSSL query language is this one desugaring: `(FORM v nl e)`
+    ; becomes `(PRIM (lambda (v) e) nl)`, PRIM being one of four builtins.dsl
+    ; procedures. Two things follow from the shape and are pinned in
+    ; tests/dazzle/engine/query1:
+    ;  - the bound variable is a LAMBDA variable, so it is in scope in the
+    ;    EXPRESSION only — the node-list argument still sees the outer binding;
+    ;  - the operator is a CONSTANT holding the primitive's BUILTIN value,
+    ;    read here at parse time, so a stylesheet that redefines
+    ;    node-list-filter changes its own calls and never `select-each`.
+    ; The order matters: the reference resolves the operator BEFORE parsing
+    ; the two argument expressions, and compute_builtin_value can run the VM.
+    function parse_special_query(this: pointer[SchemeParser], result: pointer[pointer[Expression]], prim: pointer[const_char]) returns bool
+    {
+        set *result: null
+        let hp this.host
+        let interp this.interp
+        ; currentLocation at entry: the START of the form keyword.
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let var_ident interp.lookup(this.current_token)
+        if SchemeParser.is_expression_key(var_ident.syntactic_key())
+            this.message1(InterpreterMessages.syntacticKeywordAsVariable(), this.current_token)
+        let prim_name Interpreter.ascii_string_c(hp, prim)
+        let prim_ident interp.lookup(prim_name)
+        let prim_value prim_ident.compute_builtin_value(true, interp)
+        let op Expression.make_constant(hp, prim_value, loc)
+        var key SK_NOTKEY
+        var nl_expr: pointer[Expression] null
+        if this.parse_expr_full(ALLOW_EXPR, &nl_expr, &key, &tok) = false
+            return false
+        var body: pointer[Expression] null
+        if this.parse_expr_full(ALLOW_EXPR, &body, &key, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        let formals Array[pointer[Identifier]]^hp()
+        formals.add(var_ident)
+        let defaults Array[pointer[Expression]]^hp()
+        let sig Signature(1, 0, false)
+        let lam Expression.make_lambda(hp, formals, defaults, sig, body, loc)
+        let args Array[pointer[Expression]]^hp()
+        args.add(lam)
+        args.add(nl_expr)
+        set *result: Expression.make_call(hp, op, args, loc)
+        true
+    }
+
     ; bool parseFormals(formals, inits, out nRequired, out hasRest, out nKey).
     function parse_formals(this: pointer[SchemeParser], formals: pointer[Array[pointer[Identifier]]], inits: pointer[Array[pointer[Expression]]], n_required: pointer[int], has_rest: pointer[bool], n_key: pointer[int]) returns bool
     {
@@ -2096,19 +2217,27 @@ define SchemeParser
                 set recovering: true
                 continue
             }
+            ; ★the top-level loop does NOT skip a failed form
+            ; (SchemeParser.cxx:114): it only raises `recovering` and reads on
+            ; TOKEN BY TOKEN, so a `(` + keyed identifier INSIDE the wreckage
+            ; is parsed as a top-level form of its own —
+            ; `(bogus (define x 1))` really does define x, and the leftover
+            ; `)` is then an `unexpected token`. Only the three deliberately
+            ; ignored declarations skipForm, and they do it in parse_top_level.
             let success this.parse_top_level(recovering)
-            if success = false
-                this.skip_form()
             set recovering: success = false
         }
     }
 
-    ; `recovering` only gates the DIAGNOSTIC (SchemeParser.cxx:133) — the
-    ; form is skipped either way.
+    ; `recovering` gates the DIAGNOSTIC and, like the reference, widens the
+    ; head token's allow set to everything (SchemeParser.cxx:126).
     function parse_top_level(this: pointer[SchemeParser], recovering: bool) returns bool
     {
         var tok TOKEN_END_OF_ENTITY
-        if this.get_token(ALLOW_IDENTIFIER | ALLOW_KEY_DEFINE, &tok) = false
+        var head_allowed ALLOW_IDENTIFIER
+        if recovering
+            set head_allowed: ALLOW_ALL
+        if this.get_token(head_allowed, &tok) = false
             return false
         if tok = TOKEN_IDENTIFIER
         {
@@ -2164,7 +2293,9 @@ define SchemeParser
                 this.message1(InterpreterMessages.unknownTopLevelForm(), this.current_token)
             return false
         }
-        this.skip_form()
+        ; head is not an identifier: the reference falls straight through to
+        ; `recovering = 1` with no message and no skip.
+        false
     }
 
     ; --- construction-rule top-level forms (SchemeParser.cxx do*) -----------
