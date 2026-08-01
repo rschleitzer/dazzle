@@ -2,7 +2,7 @@
 <STYLE-SHEET>
 <STYLE-SPECIFICATION ID=main>
 <![CDATA[
-; online1b - ★OUR behaviour. A multi-mode inside another multi-mode's NAMED
+; online1b - *OUR behaviour. A multi-mode inside another multi-mode's NAMED
 ; MODE crashes the reference binary: SerialFOTBuilder keeps ONE save_ list
 ; for every open multi-mode (FOTBuilder.cxx:3335), so the inner class inserts
 ; its port queues into the same list and consumes them again during the

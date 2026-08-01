@@ -88,14 +88,11 @@
 # distances, and the lazy (non-constant) characteristic chain.
 #
 # math4 (-t sgml): the same matrix on the TRANSFORM backend, where every math
-# bracket is a no-op and only the document text survives. ★Its STDOUT is
-# byte-identical to the reference; its STDERR is documented OUR behaviour —
-# this port does not push ports on the transform path (the measured legacy
-# item from the inline/mark bundle, COMPLETENESS.md gap (1)), so every
-# `label:` there draws a `no port for label` that the reference does not
-# raise. The text happens to come out in the same order because the ports
-# replay in declaration order; a stylesheet that put a labelled child before
-# an unlabelled one would diverge.
+# bracket is a no-op and only the document text survives. Byte-identical to
+# the reference on BOTH streams since work package 23 — the transform path
+# runs through the same FotSink as the five print backends, so its ports are
+# real ports and the `no port for label` flood this golden used to document is
+# gone.
 #
 # --- the layout-composite bundle: embedded-text, included-container-area,
 #     side-by-side, side-by-side-item, aligned-column --------------------
@@ -155,14 +152,14 @@
 # `multi-modes:` member. ★The first bad member messages and STOPS, so the
 # modes collected before it survive into the dump.
 #
-# online3 (-t sgml): ★OUR behaviour, and the sharpest measurement so far of
-# the open TRANSFORM-PATH gap (COMPLETENESS.md gap (1)): this port pushes no
-# ports on the transform path, so every `label:` draws a `no port for label`
-# the reference does not raise — and here the divergence reaches STDOUT, not
-# just stderr, because the reference replays the modes in list order while we
-# leave the content where it stands. The fixture is the regression guard for
-# our side until the transform path runs through the same FotSink as the five
-# print backends.
+# online3 (-t sgml): the multi-mode matrix on the TRANSFORM backend, and the
+# fixture that USED to document the transform-path gap — its stdout diverged
+# (the reference replays the modes in list order, this port left the content
+# where it stood) and its stderr carried nine `no port for label` lines the
+# reference never raised. Work package 23 closed both: the golden is now
+# minted from the reference, on both streams. ★It is therefore a real
+# DISCRIMINATOR, not just a guard — reverting the FotSink seam brings the nine
+# lines and the swapped mode order straight back.
 #
 # --- the page/column model: page-sequence, column-set-sequence ---------
 #
@@ -379,5 +376,40 @@ run_case addr3m mif "" addr3m addrdoc.sgml
 run_case xchar1 tex
 run_case xchar1r rtf "" xchar1
 run_case xchar1m mif "" xchar1
+
+# --- the TRANSFORM PATH itself (work package 23) --------------------------
+#
+# trans1 (-t sgml): the PORT ORDER matrix. Every multi-port class is written
+# with its labelled children BEFORE the unlabelled content, so the principal
+# content has to come out first and the ports in PORT-DECLARATION order, not
+# in source order. ★This is the DISCRIMINATOR for the whole package: before
+# the transform path ran through the FotSink, this port replayed the children
+# where they stood and drew a `no port for label` per label. It also pins that
+# a label with NO port still messages here, and that the table decomposition
+# reaches the transform sink.
+#
+# trans1b (-t sgml): ★OUR behaviour. `emphasizing-mark` is the one port class
+# the reference binary cannot survive on this backend (see the stylesheet's
+# own header for the reference line) — alone it silently loses the flow
+# object, with a sibling after it it SEGFAULTS (rc 139).
+#
+# trans2 (-t sgml): the STYLE SEAM. FlowObj::process pushes the attached style
+# on every backend, so a LAZY characteristic evaluates and its failure is
+# reported even though no setter renders anything. ★Four `car` failures, one
+# per lazy site — including one on the transform backend's OWN `element`
+# class, which is what forced that class onto the styled make path (its
+# hasNIC claims only `gi`/`attributes`, everything else is an inherited
+# characteristic). `use:`, the actual-* circularity and the eager conversion
+# diagnostics ride along in reference order.
+#
+# trans3 (-t sgml): the transform classes THROUGH A CAPTURED PORT. A `label:`ed
+# child is recorded onto a save queue and replayed when its owner flushes, so
+# element brackets, attribute lists, entity refs, PIs and the formatting
+# instruction all have to survive the round trip — and come back in port
+# order, before the principal stream's own copies.
+run_transform_case trans1
+run_transform_case trans1b
+run_transform_case trans2
+run_transform_case trans3
 
 echo "dazzle-flowobj: PASS"

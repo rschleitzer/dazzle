@@ -4,7 +4,7 @@
 <![CDATA[
 ; online2 - the DIAGNOSTIC matrix of the ONLINE family. `multi-modes:` is the
 ; one characteristic, and every member of its list has to be one of four
-; shapes: #f, a symbol, (#f "desc") or (sym "desc"). ★The FIRST member that
+; shapes: #f, a symbol, (#f "desc") or (sym "desc"). *The FIRST member that
 ; is none of them messages and STOPS - the prefix already collected stays,
 ; which is why the dump still shows the modes that came before it.
 

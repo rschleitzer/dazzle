@@ -34,7 +34,7 @@
     ; the principal mode alone (#f in the list)
     (make multi-mode multi-modes: '(#f) (literal "mm-principal"))
 
-    ; named modes only. ★The unlabelled content still lands in the enclosing
+    ; named modes only. *The unlabelled content still lands in the enclosing
     ; stream: the reference passes hasPrincipalMode to pushPorts and never
     ; reads it.
     (make multi-mode multi-modes: '(a b)

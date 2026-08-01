@@ -19,7 +19,7 @@
     (make embedded-text direction: 'inside)
     (make embedded-text direction: "left-to-right")
 
-    ; included-container-area: one failure per key. ★width:/height: #f is
+    ; included-container-area: one failure per key. *width:/height: #f is
     ; NOT a failure - it selects the minimum form (see layout1).
     (make included-container-area display?: 'yes)
     (make included-container-area scale: "big")
