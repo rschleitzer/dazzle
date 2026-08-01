@@ -67,7 +67,38 @@ if [ ! -f /tmp/libscaly.a ]; then
 fi
 
 # --- 3. link the program --------------------------------------------------
-if ! "$BIN" -o "$OUT" packages/opensp/0.1.0/onsgmls.scaly "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
-  echo "onsgmls: FAIL (link)"; tail -8 "$TMP/link.log"; exit 1
+# Preferred path: whole-program LTO (tools/link-lto.sh) — one module out of the
+# program, the opensp package and the runtime, `opt -O2` across all of it. Worth
+# 13 % CPU on a 13.7 MB parse at byte-identical output (tests/dazzle/PERFORMANCE.md),
+# because the hot RBMM prologue/epilogue calls stop going through the stub table
+# and become inlinable. SCALYC_NO_LTO=1, or a checkout without llvm-link/opt,
+# falls back to the archive link below.
+LTO_OK=0
+RT_LL=""
+if [ "${SCALYC_NO_LTO:-0}" != "1" ]; then
+  # Emit the runtime IR fresh rather than trusting whatever /tmp/libscaly.ll a
+  # previous build left behind — the archive can be current while the IR next
+  # to it is stale, and a stale runtime would be linked in silently.
+  if "$BIN" -S --no-prelude --no-tests -o "$TMP/scaly_rt.ll" packages/scaly/0.1.0/scaly.scaly > "$TMP/rtll.log" 2>&1; then
+    RT_LL="$TMP/scaly_rt.ll"
+  fi
 fi
-echo "onsgmls: built $OUT"
+if [ -n "$RT_LL" ]; then
+  if "$BIN" -S -o "$TMP/onsgmls.ll" packages/opensp/0.1.0/onsgmls.scaly > "$TMP/prog.log" 2>&1; then
+    tools/link-lto.sh "$OUT" "$TMP/onsgmls.ll" "$TMP/opensp.ll" "$RT_LL" > "$TMP/lto.log" 2>&1
+    rc=$?
+    if [ "$rc" = 0 ]; then
+      LTO_OK=1
+      echo "onsgmls: built $OUT (whole-program LTO)"
+    elif [ "$rc" != 3 ]; then
+      echo "onsgmls: FAIL (lto)"; tail -8 "$TMP/lto.log"; exit 1
+    fi
+  fi
+fi
+
+if [ "$LTO_OK" = 0 ]; then
+  if ! "$BIN" -o "$OUT" packages/opensp/0.1.0/onsgmls.scaly "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
+    echo "onsgmls: FAIL (link)"; tail -8 "$TMP/link.log"; exit 1
+  fi
+  echo "onsgmls: built $OUT"
+fi
