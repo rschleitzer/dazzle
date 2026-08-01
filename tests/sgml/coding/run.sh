@@ -27,11 +27,16 @@
 #   u16be/u16le  a byte-order mark and UTF-16 content
 #   pi16be  an XML declaration in UTF-16BE (the 0x003C003F autodetect pattern)
 #
-# KNOWN RESIDUAL, deliberately not in the matrix: SP_ENCODING=UNICODE / UTF-16
-# make the SYSTEM coding system multi-byte, and the reference then also decodes
-# ARGV through it (CmdLineApp::convertInput — the filename becomes mojibake and
-# the open fails) and encodes STDERR through it (makeStdErr). Those two are
-# CmdLineApp stream plumbing, not coding systems; see COMPLETENESS.md gap (6).
+# DELIBERATE DEVIATION, out of this matrix on purpose: with SP_CHARSET_FIXED=YES
+# (★without it SP_BCTF is read and the names below do nothing) SP_ENCODING=UNICODE
+# / UTF-16 make the SYSTEM coding system multi-byte, and the reference then also
+# decodes ARGV through it (CmdLineApp::convertInput — the filename becomes
+# mojibake and, at odd byte length, cannot be opened at all), pushes its own
+# MESSAGE TABLE through it (the getMessageText override — `%1` is never
+# substituted) and encodes STDERR through it (makeStdErr). We do NOT reproduce
+# that (Ralf, 2026-08-01: no dependency on a bug). Pinned separately in
+# ./deviation.sh, whose golden is OUR behaviour; rationale + measurements in
+# COMPLETENESS.md, coding-system dimension.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"

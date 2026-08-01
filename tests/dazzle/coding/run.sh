@@ -32,16 +32,18 @@
 #     FILE: the `ent` rows write a second file through an entity flow object
 #     and pin that it gets its own FF FE.
 #
-# KNOWN RESIDUAL, deliberately out of the matrix: SP_ENCODING=UNICODE /
-# UTF-16. Those systems are NOT rejected as the app coding system
-# (UnicodeCodingSystem does not override fixedBytesPerChar, so it answers the
-# base 0), and the reference then also runs its MESSAGE TABLE and its ARGV
-# through them — measured: argv0 comes out truncated, `%1` is never
-# substituted, and `-d enc.dsl` becomes a filename that cannot be opened, so
-# the run ends with an empty flow-object tree. Our input decoder and output
-# encoder agree with the reference cell for cell there; only that CmdLineApp
-# string plumbing does not. Same exclusion as tests/sgml/coding/run.sh; see
-# COMPLETENESS.md gap (6).
+# DELIBERATE DEVIATION, out of this matrix on purpose: SP_CHARSET_FIXED=YES
+# plus SP_ENCODING=UNICODE / UTF-16 (★SP_ENCODING alone does nothing — without
+# SP_CHARSET_FIXED the app reads SP_BCTF). Those systems are NOT rejected as the
+# app coding system (UnicodeCodingSystem does not override fixedBytesPerChar, so
+# it answers the base 0), and the reference then also runs its MESSAGE TABLE and
+# its ARGV through them — measured: argv0 comes out truncated, the severity
+# letter is gone, `%1` is never substituted, and an odd-byte-length filename
+# cannot be opened at all, so the run ends with an empty flow-object tree. Our
+# input decoder and output encoder agree with the reference cell for cell there;
+# that CmdLineApp string plumbing we deliberately do NOT reproduce (Ralf,
+# 2026-08-01: no dependency on a bug). Pinned in tests/sgml/coding/deviation.sh
+# with OUR behaviour as the golden; rationale in COMPLETENESS.md.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
