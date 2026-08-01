@@ -49,7 +49,11 @@ run_case() { # name expected [expected_err] [document]
     exit 1
   fi
   if [ -n "$experr" ]; then
-    sed 's/^[^:]*:/PROG:/' "$WORK/$name.err" > "$WORK/$name.err.norm"
+    # the argv0 prefix, plus the HEAP ADDRESS an un-printable ELObj renders as
+    # ("#<unknown object 46116584256>") — the same object, a different address
+    # in every binary.
+    sed -E 's/^[^:]*:/PROG:/; s/#<unknown object [0-9]+>/#<unknown object ADDR>/' \
+      "$WORK/$name.err" > "$WORK/$name.err.norm"
     if ! diff -q "$experr" "$WORK/$name.err.norm" > /dev/null; then
       echo "dazzle-grove: FAIL $name (stderr differs)"
       diff "$experr" "$WORK/$name.err.norm" | head -10
@@ -148,6 +152,20 @@ run_case() { # name expected [expected_err] [document]
 # across two accesses. ★`char` on a non-sgml node is accessNULL, not
 # not-in-class: Node::property answers idChar through getChar/charChunk, which
 # every class has.
+# parse1 (doc.sgml, loading mg1.sgml + mg2.sgml): `sgml-parse` — the
+# GroveManager seam. A second document becomes a second GROVE, and every table
+# a property reads is that grove's: element-with-id, the entity and notation
+# lookups, `elements`, the governing doctype. It pins that `groveTable_` keys on
+# the sysid (two loads of one name are the SAME grove, node-list=?-equal; two
+# names are not), that a loaded grove's axes are self-contained (grove-root /
+# tree-root of a loaded node stay inside it), and that `address-local?` is a
+# REAL sameGrove comparison now — an address into a loaded grove is not local
+# to a current node in the document grove, but is to one inside it.
+# parse2 (mgdoc.sgml): the ARGUMENT decode of both variants, one probe per
+# element (a failing decode aborts the whole rule, so each needs its own).
+# It pins the ISO diagnostics, the single "cannot open" for two loads of one
+# unreadable sysid, and the reachable halves of the OpenJade-prefixed variant's
+# BROKEN decode loop — see the note at the head of parse2.scm.
 # chars3 (entrefs.sgml): the CHARACTER STREAM the same nodes hand a backend —
 # an sdata node contributes the ONE character Interpreter::sdataMap resolves
 # (built-in name table, text table, convertUnicodeCharName, then defaultChar),
@@ -162,5 +180,7 @@ run_case props3 "$HERE/props3.expected" "" decls.sgml
 run_case props4 "$HERE/props4.expected" "" appinfo.sgml
 run_case props5 "$HERE/props5.expected" "" entrefs.sgml
 run_case chars3 "$HERE/chars3.expected" "" entrefs.sgml
+run_case parse1 "$HERE/parse1.expected"
+run_case parse2 "$HERE/parse2.expected" "$HERE/parse2.expected.err" mgdoc.sgml
 
 echo "dazzle-grove: PASS"

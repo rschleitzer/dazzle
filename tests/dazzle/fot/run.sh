@@ -94,6 +94,15 @@
 # "first definition was here" auxiliary location line) + a user define
 # displacing a builtin (part -1) so the later call reports
 # callNonFunction at compile.
+# mg1 (doc.sgml, loading mgsub.sgml + mgsub2.sgml): the GROVE INDEX in an
+# element name. Every backend prefixes a NON-document grove's index and a dot
+# to the anchor / destination it writes (SgmlFOTBuilder::outputElementName;
+# grove 0 writes the bare name) — live only since sgml-parse can put a second
+# grove in reach. The golden pins a resolved-node link into each of two loaded
+# groves and into the document's own, the idref address (whose grove is the
+# CURRENT node's, not the target's), and the pending anchors a processed node
+# of a loaded grove leaves, by ID and by element index. ★The first LOADED grove
+# is index 2: the document grove's own groveTable_ entry is counted first.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -164,6 +173,7 @@ run_case bad9 "$HERE/bad9.expected" "$HERE/bad9.expected.err"
 run_case bad10 "$HERE/bad10.expected" "$HERE/bad10.expected.err"
 run_case bad11 "$HERE/bad11.expected" "$HERE/bad11.expected.err"
 run_case bad12 "$HERE/bad12.expected" "$HERE/bad12.expected.err"
+run_case mg1 "$HERE/mg1.expected"
 
 # default output name: <docbase>.fot in the current directory (JadeApp).
 ( cd "$WORK" && rm -f doc.fot && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \

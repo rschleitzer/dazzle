@@ -1,0 +1,254 @@
+; GroveManager — the seam through which the style engine loads a SECOND
+; document (style/GroveManager.h; DssslApp implements it, style/DssslApp.cxx:356).
+; `sgml-parse` is its only caller: given a system identifier it hands back the
+; sgml-document node of that document's grove, parsing it on first use and
+; answering from a table on every later use — the reference's `groveTable_`,
+; keyed by sysid, which is what makes two `(sgml-parse "x.sgml")` calls yield
+; the SAME grove (and hence `node-list=?`-equal nodes).
+;
+; The reference makes this a virtual on the app object because the app owns the
+; entity manager, the parser options and the messenger. This port keeps the same
+; shape without the virtual: the CLI installs a record holding exactly those
+; parse parameters, and `load` runs a full document parse with them.
+;
+; What the reference's load does and this one mirrors, in order: table lookup;
+; a fresh GroveBuilder carrying `groveTable_.count() + 1` as the grove index
+; (the document grove is 0); the subdoc inheritance when a `parent:` node was
+; given; the table insert BEFORE the parse; link-type activation from `active:`;
+; and the architecture engine when `architecture:` names one.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.io.Console
+use opensp.StringC.StringC
+use opensp.Parser.Parser
+use opensp.ParserState.ParserState
+use opensp.ParserOptions.ParserOptions
+use opensp.EntityManager.EmConfig
+use opensp.Syntax.Syntax
+use opensp.Dtd.Dtd
+use opensp.Entity.Entity
+use opensp.CodingSystem.CodingSystem
+use dazzle.Grove.GroveNode
+use dazzle.Grove.GroveInfo
+use dazzle.Grove.GroveBuilder
+use dazzle.Grove.GroveBuildState
+use dazzle.Grove.IdEntry
+
+; The one manager of a run (DssslApp IS the GroveManager, and there is one app).
+; A `shared` module cell by the S62 rule that governs every other driver cell in
+; this engine (msg_prog / tex_prog / html_prog): no Interpreter field growth, and
+; `mutable` — thread-local — aborts under --jit in a dependency package. Null
+; wherever no driver installed one (the unit tests, the JIT suite): `sgml-parse`
+; then behaves as the reference does with a load that fails, i.e. it answers the
+; empty node-list.
+shared GROVE_MGR: pointer[GroveManager] null
+
+; one entry of `groveTable_`: the system identifier it was loaded under and the
+; grove's sgml-document node.
+define GroveEntry (sysid: StringC, root: pointer[GroveNode])
+{
+    function make(host: pointer[Page], sysid: StringC, root: pointer[GroveNode]) returns pointer[GroveEntry]
+    {
+        let p host.allocate(sizeof GroveEntry, alignof GroveEntry) as pointer[GroveEntry]
+        set p.sysid: sysid
+        set p.root: root
+        p
+    }
+}
+
+; the streaming-drain sink of a manager-run parse — the same shape as the
+; driver's own (opensp's do_content pump calls it through scaly_call_ptr with
+; the ParserState as its single argument, and resets the event scratch region
+; afterwards). A module-level procedure because only a bare name can be taken
+; as a function pointer.
+procedure grove_load_drain(arg: pointer[void]) returns pointer[void]
+{
+    let ps arg as pointer[ParserState]
+    let st ps.get_stream_w() as pointer[GroveBuildState]
+    GroveBuilder.feed(st, ps)
+    null
+}
+
+define GroveManager (host: pointer[Page], prog_name: String, error_limit: u32, reporter_options: u32, popts: pointer[ParserOptions], em_cfg: pointer[EmConfig], msg_fd: int, table: pointer[Array[pointer[GroveEntry]]], next_index: int, document_root: pointer[GroveNode])
+{
+    ; the driver installs this once, before style processing, with the same
+    ; parse parameters the document parse ran under (SgmlParser::Params carries
+    ; the app's entity manager and options; the reference reuses the app's).
+    ; `host` is the RUN arena — a loaded grove outlives every eval scratch
+    ; region, exactly like the document grove.
+    procedure install(host: pointer[Page], prog_name: String, error_limit: u32, reporter_options: u32, popts: pointer[ParserOptions], em_cfg: pointer[EmConfig], msg_fd: int)
+    {
+        let gm host.allocate(sizeof GroveManager, alignof GroveManager) as pointer[GroveManager]
+        set gm.host: host
+        set gm.prog_name: prog_name
+        set gm.error_limit: error_limit
+        set gm.reporter_options: reporter_options
+        set gm.popts: popts
+        set gm.em_cfg: em_cfg
+        set gm.msg_fd: msg_fd
+        set gm.table: Array[pointer[GroveEntry]]^host()
+        ; ★The first LOADED grove is index 2, not 1. The reference computes
+        ; `groveTable_.count() + 1` — and the table is NOT empty at that point:
+        ; `DssslApp::generateEvents` (DssslApp.cxx:140) has already inserted the
+        ; DOCUMENT grove under `rootSystemId_`, so the count is 1 before any
+        ; load. Measured: two loaded groves come out as 2 and 3, while the
+        ; document grove stays 0 (GroveApp.cxx:44). This port keeps that entry
+        ; out of the lookup table and starts the counter at 2 instead: its KEY
+        ; is the CANONICALIZED command-line system id (`<OSFILE>doc.sgml`), and
+        ; a stylesheet cannot spell that — `<` opens markup in a .dsl, so the
+        ; literal is a hard `element "OSFILE" undefined` before the primitive
+        ; ever runs (measured). The entry is therefore observable only through
+        ; the count.
+        set gm.next_index: 2
+        set gm.document_root: null
+        set GROVE_MGR: gm
+    }
+
+    function get() returns pointer[GroveManager]
+        GROVE_MGR
+
+    ; the DOCUMENT grove's sgml-document node (grove 0), installed by the driver
+    ; right after the document parse. It is the fallback for the handful of
+    ; places where the reference reads a table off a grove this port cannot name
+    ; from the arguments alone — see Primitive.nnl_normalize's note. Null under
+    ; the unit/JIT paths, where nothing folds anyway.
+    procedure set_document_root(root: pointer[GroveNode])
+    {
+        let gm GROVE_MGR
+        if gm = null
+            return
+        set gm.document_root: root
+    }
+
+    function principal() returns pointer[GroveNode]
+    {
+        let gm GROVE_MGR
+        if gm = null
+            return null
+        gm.document_root
+    }
+
+    ; the parser-side half of GroveImpl, read off a finished ParserState: setDtd
+    ; (the governing DTD), the instance syntax's general fold table, the
+    ; defaulted-entity side table and the ID index. The reference fills these
+    ; from the event stream as it builds; this port reads the same data off the
+    ; state the parse leaves behind. The driver's document parse runs through
+    ; here too, so both groves are filled the same way.
+    procedure fill_from_parse(host: pointer[Page], root: pointer[GroveNode], ps: pointer[ParserState])
+    {
+        let info GroveInfo.of(root)
+        if info = null
+            return
+        if ps = null
+            return
+        let ididx GroveBuilder.build_id_index(host, root)
+        set info.id_index: ididx
+        let dtd ps.get_current_dtd()
+        set info.dtd: dtd as pointer[void]
+        let dflt ps.get_defaulted_entities()
+        set info.entity_defaulted: dflt
+        let inst ps.get_instance_syntax()
+        ; GroveImpl::generalSubstTable is the INSTANCE syntax's; before the
+        ; instance syntax exists (a document with no DOCTYPE) the base syntax's
+        ; table is the same object the parser folded names with.
+        if inst <> null
+        {
+            let tab inst.general_subst()
+            set info.subst: tab
+        }
+        else
+        {
+            let base ps.get_syntax()
+            if base <> null
+            {
+                let tab2 base.general_subst()
+                set info.subst: tab2
+            }
+        }
+    }
+
+    ; groveTable_ lookup — the sysid AS GIVEN (the reference keys on
+    ; params.sysid, i.e. the unresolved string).
+    function lookup(gm: pointer[GroveManager], sysid: StringC) returns pointer[GroveNode]
+    {
+        let tab gm.table
+        let n tab.get_length()
+        let buf tab.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let e *(buf + i)
+            if e.sysid.equals(sysid)
+                return e.root
+            set i: i + (1 as size_t)
+        }
+        null
+    }
+
+    ; DssslApp::load. Returns the grove's sgml-document node, or null when no
+    ; manager is installed (`load` returning 0 — the empty node-list case).
+    ; `active` and `architecture` are the two string lists sgml-parse decoded;
+    ; `parent` selects subdoc mode.
+    function load(sysid: StringC, active: pointer[Array[String]], parent: pointer[GroveNode], architecture: pointer[Array[String]]) returns pointer[GroveNode]
+    {
+        let gm GROVE_MGR
+        if gm = null
+            return null
+        let cached GroveManager.lookup(gm, sysid)
+        if cached <> null
+            return cached
+        let host gm.host
+
+        ; the sysid as a byte string for the entity manager (the CLI's own
+        ; document specs arrive that way from argv).
+        let n sysid.get_size()
+        let cap n * (4 as size_t) + (1 as size_t)
+        let pbytes host.allocate(cap, 1) as pointer[u8]
+        let blen CodingSystem.encode_utf8_bytes(sysid.data_ptr(), n, pbytes, cap)
+        let spec String^host(pbytes as pointer[const_char], blen)
+        let specs Array[String]^host()
+        specs.add(spec)
+
+        ; a fresh grove, index groveTable_.count() + 1.
+        let idx gm.next_index
+        set gm.next_index: idx + 1
+        let st GroveBuilder.begin(host, idx)
+        let root st.root
+        let info GroveInfo.of(root)
+        if info <> null
+            set info.sysid: sysid
+
+        ; the table insert happens BEFORE the parse in the reference, so a
+        ; document that reaches its own sysid again mid-parse sees the (still
+        ; growing) grove rather than starting a second one.
+        let entry GroveEntry.make(host, sysid, root)
+        gm.table.add(entry)
+
+        ; ★The `parent:` node reaches NOTHING beyond its own type check. The
+        ; reference's load takes a SUBDOC branch for it —
+        ;
+        ;   sdNode = SdNode::convert(parentRoot)   // DssslApp.cxx:369
+        ;
+        ; which would make the loaded document inherit the parent grove's SGML
+        ; declaration and both syntaxes instead of reading its own. That branch
+        ; is DEAD in the reference: `SdNode::convert` goes through
+        ; `Node::queryInterface`, and the only implementation
+        ; (`BaseNode::queryInterface`, spgrove/GroveBuilder.cxx:5228) answers
+        ; `LocNode::iid` and nothing else — `SgmlDocumentNode` never overrides
+        ; it, although it derives from SdNode. So convert always returns 0 and
+        ; every load runs in document mode. Measured against the reference
+        ; binary: a document with its own `<!SGML …>` declaring NAMECASE GENERAL
+        ; NO keeps its lowercase GIs whether or not `parent:` is passed, and its
+        ; declaration's diagnostics fire either way. Same non-ability here.
+        let ps Parser.parse_simple_stream(host, String(), &specs, StringC(), gm.prog_name, &grove_load_drain, st as pointer[void], gm.error_limit, gm.popts, gm.reporter_options, active, architecture, gm.em_cfg, gm.msg_fd)
+        if ps <> null
+        {
+            GroveBuilder.feed(st, ps)
+            GroveBuilder.finish(st)
+            GroveManager.fill_from_parse(host, root, ps)
+        }
+        root
+    }
+}
