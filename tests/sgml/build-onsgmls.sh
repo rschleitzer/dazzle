@@ -28,8 +28,28 @@ trap 'rm -rf "$TMP"' EXIT
 if ! "$BIN" -S --no-prelude -o "$TMP/opensp.ll" packages/opensp/0.1.0/opensp.scaly > "$TMP/emit.log" 2>&1; then
   echo "onsgmls: FAIL (opensp emit)"; tail -8 "$TMP/emit.log"; exit 1
 fi
+# Arity gate — see tools/arity-audit.py. A call site that passes fewer
+# arguments than its callee reads is a silent miscompile waiting for the
+# optimizer to reallocate the register; scalyc does not diagnose it yet, so the
+# IR is checked here, before opt can turn it into wrong output.
+if command -v python3 >/dev/null 2>&1; then
+  if ! python3 "$ROOT/tools/arity-audit.py" "$TMP/opensp.ll" > "$TMP/arity.log" 2>&1; then
+    echo "onsgmls: FAIL (opensp arity)"; cat "$TMP/arity.log"; exit 1
+  fi
+fi
 sed 's/^define linkonce_odr /define weak_odr /' "$TMP/opensp.ll" > "$TMP/opensp_weak.ll"
-if ! "$LLC" -relocation-model=pic -O2 -filetype=obj "$TMP/opensp_weak.ll" -o "$TMP/opensp.o" > "$TMP/llc.log" 2>&1; then
+# The IR pipeline (`opt -O2`) before llc — same recipe as the runtime archive
+# below. Measured 2026-08-01: llc -O2 alone leaves 1.6-2.0x on the table (the
+# ClaML 13.7 MB parse goes 1.25 s -> 0.63 s) at byte-identical output. `opt` is
+# optional in tools/llvm-env.sh, so fall back to the bare weak IR without it.
+OPTIN="$TMP/opensp_weak.ll"
+if [ -n "${OPT:-}" ]; then
+  if ! "$OPT" -O2 "$TMP/opensp_weak.ll" -o "$TMP/opensp.bc" > "$TMP/opt.log" 2>&1; then
+    echo "onsgmls: FAIL (opensp opt)"; tail -8 "$TMP/opt.log"; exit 1
+  fi
+  OPTIN="$TMP/opensp.bc"
+fi
+if ! "$LLC" -relocation-model=pic -O2 -filetype=obj "$OPTIN" -o "$TMP/opensp.o" > "$TMP/llc.log" 2>&1; then
   echo "onsgmls: FAIL (opensp llc)"; tail -8 "$TMP/llc.log"; exit 1
 fi
 ar rcs "$TMP/libopensp.a" "$TMP/opensp.o"
