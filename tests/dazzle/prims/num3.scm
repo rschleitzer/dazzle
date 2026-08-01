@@ -2,7 +2,7 @@
 ; "UNREGISTERED::OpenJade//Procedure::expt" through external-procedure: the
 ; identifier `expt` stays bound to the ISO primitive, which num1/num2 pin.
 ;
-; ★This fixture exists because the OpenJade variant carries a defect that is
+; *This fixture exists because the OpenJade variant carries a defect that is
 ; DETERMINISTIC and therefore part of the contract: primitive.cxx:5042 reads
 ; its second quantity from argv[0], so in the dimensionless branch the
 ; exponent IS the base and argv[1] is never even type-checked. The golden is

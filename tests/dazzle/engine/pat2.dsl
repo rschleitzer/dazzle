@@ -6,7 +6,7 @@
 ; Interpreter::convertToPattern), run WITH -2. pat1.dsl is the same feature
 ; seen from the other side: without -2 the whole keyword half is rejected.
 ;
-; ★What this pins:
+; *What this pins:
 ;  - the ancestor chain, the three repeat metacharacters (* ? +) and the
 ;    -2-only #t wildcard element;
 ;  - attributes:/(NAME VALUE) qualifiers, including the -2-only #t

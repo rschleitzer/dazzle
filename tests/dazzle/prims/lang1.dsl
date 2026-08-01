@@ -7,11 +7,11 @@
 ; XXPRIMITIVE `language`, together with the six collating primitives that
 ; depend on one (char<? char<=? char-upcase char-downcase string<? string<=?).
 ;
-; ★A MARKED SECTION is used instead of a SYSTEM entity because a `.scm`
-; included as an SGML entity cannot contain `<?` — that opens a processing
+; *A MARKED SECTION is used instead of a SYSTEM entity because a `.scm`
+; included as an SGML entity cannot contain `<?` - that opens a processing
 ; instruction, and `char<?` is a perfectly ordinary DSSSL name.
 ;
-; ★The measured heart of this fixture: a define-language with no `collate`
+; *The measured heart of this fixture: a define-language with no `collate`
 ; clause has ZERO collating levels, so LangObj::compare returns 0 for EVERY
 ; pair. `char<?` is therefore always #f, `char<=?` always #t and
 ; string-equiv? always #t, no matter what the code points are. This port used
@@ -44,15 +44,15 @@
   (p "langp-lat"   (language? lat))
   (p "langp-str"   (language? "en"))
   (p "langp-false" (language? #f))
-  ; ★DOCUMENTED DIVERGENCE, pinned with OUR value: the XXPRIMITIVE is
+  ; *DOCUMENTED DIVERGENCE, pinned with OUR value: the XXPRIMITIVE is
   ; reachable in both, but the reference binary is built WITH
-  ; SP_HAVE_LOCALE + SP_HAVE_WCHAR and hands back a RefLangObj — a live C
+  ; SP_HAVE_LOCALE + SP_HAVE_WCHAR and hands back a RefLangObj - a live C
   ; locale that calls setlocale + wcscoll + towupper around every single
   ; comparison. This port answers #f, which is what the reference itself
   ; answers on a build without those two macros. Porting it would put
   ; process-global setlocale state under every collation; it is named in
   ; COMPLETENESS.md as an open remainder, not silently skipped. Nothing
-  ; else in the language cluster depends on it — define-language is the
+  ; else in the language cluster depends on it - define-language is the
   ; LangObj branch, and that IS ported (everything below).
   (p "have-xlang"  (procedure? xlang))
   (p "xlang-lang?" (language? (xlang "en" "US")))

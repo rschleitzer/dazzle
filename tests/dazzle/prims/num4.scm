@@ -9,8 +9,8 @@
 ; RESET semantics of element-number-list are visible: the paragraph numbers
 ; restart per section, the section numbers per chapter.
 ;
-; ★It also pins general-name-normalize, which folds a GI with the parse's
-; general substitution table — the lowercase names written here reach
+; *It also pins general-name-normalize, which folds a GI with the parse's
+; general substitution table - the lowercase names written here reach
 ; elements stored upper-cased, and every GI-matching primitive below depends
 ; on that same fold.
 ;

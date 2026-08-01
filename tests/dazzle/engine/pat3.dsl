@@ -7,11 +7,11 @@
 ; the rule stands and the rule is dropped; the body is consumed either way,
 ; so every later rule still parses and the surviving ones still fire.
 ;
-; ★What this pins: which shape produces which of the eight messages —
+; *What this pins: which shape produces which of the eight messages -
 ; patternEmptyGi, patternNotList, patternBadGi, patternBadMember,
 ; patternMissingQualifierValue, patternUnknownQualifier,
 ; patternBadQualifierValue, patternBadAttributeQualifier and
-; patternChildRepeat — and that `repeat:` is an error only INSIDE a
+; patternChildRepeat - and that `repeat:` is an error only INSIDE a
 ; children: list.
 ;
 ; A MARKED SECTION, not a SYSTEM .scm entity (see key1.dsl).

@@ -106,8 +106,8 @@ use opensp.CmdLineAppMessages.CmdLineAppMessages
 use opensp.EntityAppMessages.EntityAppMessages
 use opensp.ParserAppMessages.ParserAppMessages
 use opensp.CodingSystemKit.CodingSystemKit
+use opensp.CodingSystemKit.OutputEncoder
 use opensp.CodingSystem.CodingSystem
-use opensp.CodingSystem.IENC_UTF8
 use dazzle.Grove.GroveNode
 use dazzle.Grove.GroveBuilder
 use dazzle.Grove.GroveBuildState
@@ -200,38 +200,52 @@ function env_matches(v: pointer[const_char], key: String) returns bool
     ((*(v + n)) as u32) = (0 as u32)
 }
 
-; SP_CHARSET_FIXED=YES/1 — CmdLineApp::initCodingSystem (see onsgmls.scaly).
-function charset_fixed() returns bool
+; whether app-level stderr messages encode as UTF-8 — the fallback path of
+; write_stderr, used only until the driver installs the real stderr encoder
+; below. ★A DssslApp is a GroveApp("unicode"), i.e. it passes a
+; requiredInternalCode, so `internalCharsetIsDocCharset_` is 0 whatever
+; SP_CHARSET_FIXED says: the name consulted is ALWAYS SP_ENCODING, never
+; SP_BCTF (CmdLineApp::initCodingSystem).
+function output_is_utf8() returns bool
 {
-    let fixed getenv("SP_CHARSET_FIXED")
-    if fixed <> null
+    let enc getenv("SP_ENCODING")
+    if enc <> null
     {
-        if env_matches(fixed, String("YES")) or env_matches(fixed, String("1"))
+        if env_matches(enc, String("XML")) or env_matches(enc, String("UTF-8"))
             return true
     }
     false
 }
 
-; whether app-level stderr messages encode as UTF-8 (see onsgmls.scaly).
-function output_is_utf8(is_fixed: bool) returns bool
+; codingSystem() as an OUTPUT encoder — the app's coding system, which is both
+; the default for `outputCodingSystem_` (processOptions' epilogue) and the
+; message stream's encoder (makeStdErr). SP_ENCODING names it; anything else
+; (unknown name, or a system wider than one byte per char, which the reference
+; rejects for the APP coding system) falls back to SP_DEFAULT_ENCODING =
+; IS8859-1 = the identity system.
+procedure dz_coding_system(host: pointer[Page], e: pointer[OutputEncoder])
 {
-    if is_fixed
+    let name getenv("SP_ENCODING")
+    if name <> null
     {
-        let enc getenv("SP_ENCODING")
-        if enc <> null
+        var kind 0
+        var which 0
+        if CodingSystemKit.lookup(String(name), false, &kind, &which)
         {
-            if env_matches(enc, String("XML")) or env_matches(enc, String("UTF-8"))
-                return true
+            var probe CodingSystem.identity()
+            if CodingSystemKit.lookup_input_name(host, String(name), false, &probe)
+            {
+                if probe.fixed_bytes_per_char() > 1
+                {
+                    CodingSystemKit.make_default(host, false, e)
+                    return
+                }
+            }
+            CodingSystemKit.make_encoder(host, kind, which, e)
+            return
         }
-        return false
     }
-    let bctf getenv("SP_BCTF")
-    if bctf <> null
-    {
-        if env_matches(bctf, String("UTF-8"))
-            return true
-    }
-    false
+    CodingSystemKit.make_default(host, false, e)
 }
 
 ; split a colon-separated env value into path segments (EntityApp).
@@ -886,8 +900,20 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
     let anchor0 String("x")
     let host Page.get(anchor0.get_buffer() as pointer[void])
 
-    let is_fixed charset_fixed()
-    let out_utf8 output_is_utf8(is_fixed)
+    let out_utf8 output_is_utf8()
+
+    ; ---- initCodingSystem, which the reference runs BEFORE processOptions:
+    ;      the message stream (makeStdErr) encodes through codingSystem(), so
+    ;      even an option-time diagnostic is already encoded. `-b` never
+    ;      touches this half — it selects outputCodingSystem_ only. ----
+    let err_enc CodingSystemKit.new_encoder(host)
+    dz_coding_system(host, err_enc)
+    ParserState.set_stderr_encoder(err_enc)
+    ; outputCodingSystem_: `-b` overrides it, otherwise it IS codingSystem()
+    ; (the processOptions epilogue). Every char-stream backend of this run
+    ; shares it: the fot sink, the transform sink and the HTML files.
+    let out_enc CodingSystemKit.new_encoder(host)
+    var have_b false
 
     ; ---- the option registry, in reference registration order (CmdLineApp,
     ;      EntityApp, ParserApp, DssslApp, JadeApp). ----
@@ -991,14 +1017,24 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
         }
         else if c = (0x62 as u32)
         {
-            ; processOption 'b': validate the encoding name (GroveApp's fixed
-            ; unicode internal charset -> always the encoding table). A VALID
-            ; non-default encoding does not switch the output encoder (port
-            ; emits UTF-8); an unknown one reports unknownEncoding.
+            ; processOption 'b' (CmdLineApp.cxx:432): the name selects
+            ; outputCodingSystem_ — the ENCODING table, because a GroveApp has
+            ; the fixed unicode internal charset (`internalCharsetIsDocCharset_`
+            ; is 0, which also picks the unknownEncoding wording over
+            ; unknownBctf). An unknown name leaves outputCodingSystem_ null, so
+            ; the epilogue below still falls back to codingSystem().
+            ; ★NOT rejected here for being wider than one byte per char: that
+            ; test guards the APP coding system only, so `-b UNICODE` really
+            ; does write UTF-16 (measured).
             var bkind 0
             var bwhich 0
             let barg String(os.get_arg() as pointer[const_char])
-            if CodingSystemKit.lookup(barg, false, &bkind, &bwhich) = false
+            if CodingSystemKit.lookup(barg, false, &bkind, &bwhich)
+            {
+                CodingSystemKit.make_encoder(host, bkind, bwhich, out_enc)
+                set have_b: true
+            }
+            else
             {
                 let repn (reporter_options & DZ_REP_MESSAGE_NUMBERS) <> (0 as u32)
                 app_msg1(prog_name, out_utf8, repn, 2, CmdLineAppMessages.unknownEncoding(), StringC(os.get_arg() as pointer[const_char]))
@@ -1170,6 +1206,12 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
         set scanning: os.get(&c)
     }
 
+    ; processOptions epilogue: `if (!outputCodingSystem_) outputCodingSystem_
+    ; = codingSystem()`, then every char-stream backend of this run reads it.
+    if have_b = false
+        dz_coding_system(host, out_enc)
+    CodingSystemKit.install_output_encoder(out_enc)
+
     ; -f: opened AFTER the option loop (processOptions does), so option-time
     ; messages always reach the real stderr; open failure aborts.
     var msg_fd: int 2
@@ -1240,28 +1282,20 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
     ; otherwise falls back to SP_DEFAULT_ENCODING = IS8859-1, which on the
     ; ISO 10646 system charset IS the identity system.
     ;
-    ; ★DELIBERATE DEVIATION, and the one place this port is not the reference:
-    ; the default here stays UTF-8, not identity. This engine's SIX backends
-    ; write their bytes as UTF-8 unconditionally (SgmlFOTBuilder.to_utf8,
-    ; TransformFOTBuilder, the HTML chunk files, MIF, TeX, RTF), so an identity
-    ; DECODER would pair 8-bit chars with a UTF-8 ENCODER and turn every
-    ; non-ASCII byte into mojibake — where the reference is byte-transparent
-    ; because BOTH its halves are identity. Making this faithful means threading
-    ; an OutputEncoder through those six backends first (the S48 wishlist item);
-    ; until then UTF-8-in/UTF-8-out keeps the reference output byte-identical.
-    ; See tests/dazzle/COMPLETENESS.md, gap (6).
-    var dz_cs CodingSystem.simple(IENC_UTF8)
+    ; ★This default was UTF-8 until the OUTPUT half was ported: an identity
+    ; DECODER under a hardwired UTF-8 ENCODER would have turned every non-ASCII
+    ; byte into mojibake, where the reference is byte-transparent because BOTH
+    ; its halves are identity. Now the encoder follows the same environment
+    ; name, so the pair is the reference's pair again.
+    var dz_cs CodingSystem.identity()
     let enc_name getenv("SP_ENCODING")
     if enc_name <> null
-    {
-        var sel CodingSystem.identity()
-        if CodingSystemKit.lookup_input_name(arg_host, String(enc_name), false, &sel)
-        {
-            if sel.fixed_bytes_per_char() <= 1
-                sel.store(&dz_cs)
-        }
-    }
+        CodingSystemKit.select_app_input(host, String(enc_name), &dz_cs)
     em_cfg.set_input_cs(dz_cs)
+    ; and everything else the run decodes with the same system: the DSSSL
+    ; spec (its own EmConfig in load_stylesheet) and every grove sgml-parse
+    ; loads. The reference has one app coding system, not one per parse.
+    EmConfig.install_app_input_cs(host, dz_cs)
 
     ; ---- the document args: every remaining argument merges into ONE
     ; document entity; "-" (or none) is stdin `<OSFD>0` ----------------------

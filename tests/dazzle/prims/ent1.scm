@@ -9,7 +9,7 @@
 ; parameter entity and a #DEFAULT entity - and three notations covering PUBLIC
 ; only, SYSTEM only and both, one of them with a #NOTATION attribute list.
 ;
-; ★What the golden pins beyond the values: these primitives do not
+; *What the golden pins beyond the values: these primitives do not
 ; distinguish "no such entity" from "that entity has no such property". Every
 ; link of the reference's chained accessOK test collapses to the SAME #f, so
 ; an unknown name and an external entity asked for its text are

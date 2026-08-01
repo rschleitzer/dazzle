@@ -3,17 +3,17 @@
 <![CDATA[
 ; lang2 - the same cluster with NO declared language.
 ;
-; ★This is the deviation this package closes. GETCURLANG (primitive.cxx:4639)
-; takes the context language, else the DECLARED DEFAULT — and that default is
+; *This is the deviation this package closes. GETCURLANG (primitive.cxx:4639)
+; takes the context language, else the DECLARED DEFAULT - and that default is
 ; #f until declare-default-language sets one. So without a language every
 ; COLLATING primitive reports `no current language` and yields the error
 ; object: char<? char<=? char-upcase char-downcase string<? string<=? and
 ; string-equiv?. This port used to answer them anyway, comparing code points
 ; and folding ASCII; that fallback is gone.
 ;
-; ★The two primitives that are NOT collating still work: char=? and string=?
+; *The two primitives that are NOT collating still work: char=? and string=?
 ; are plain code-point tests in the reference too. And current-language
-; answers #f rather than erroring — it is the one language primitive with no
+; answers #f rather than erroring - it is the one language primitive with no
 ; gate.
 ;
 ; The diagnostic carries NO file/line: the reference's GETCURLANG macro calls

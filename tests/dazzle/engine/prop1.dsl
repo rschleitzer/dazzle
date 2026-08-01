@@ -6,10 +6,10 @@
 ; (installCharProperties), the declare-char-property / add-char-properties
 ; declarations, and the char-property primitive that reads them.
 ;
-; ★What the golden pins:
+; *What the golden pins:
 ;  - the three-step fallback of char-property: the character's OWN value, then
 ;    the CALLER's optional default, then the property's declared default;
-;  - that a declared default must be a CONSTANT — even `(+ 1 2)` is
+;  - that a declared default must be a CONSTANT - even `(+ 1 2)` is
 ;    varCharPropertyExprUnsupported, measured, because the reference asks for
 ;    `constantValue()` after optimizing and a call never folds;
 ;  - re-declaring in the SAME spec part is `duplicate definition` plus an
@@ -24,7 +24,7 @@
 ;  - and that the three properties the reference creates EMPTY (glyph-id and
 ;    the two drop-*-line-break? flags) answer with their #f default.
 ;
-; ★The diagnostics point at the VALUE EXPRESSION, not at the form.
+; *The diagnostics point at the VALUE EXPRESSION, not at the form.
 
 (declare-flow-object-class fi
   "UNREGISTERED::James Clark//Flow Object Class::formatting-instruction")

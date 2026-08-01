@@ -41,6 +41,18 @@ use opensp.CodingSystem.OSP_REPLACEMENT_CHAR
 ; A TranslateEncoder's SUB-encoder never has a handler (the reference's
 ; `FIXME set unencodeable handler for underlying encoder`) — a char the map
 ; resolves but the sub bctf cannot express drops silently, bug-for-bug.
+;
+; There are exactly TWO escapers in the reference tree, and which one a stream
+; carries is a property of the WRITER, not of the coding system:
+;   `\#<decimal>;`  SgmlsEventHandler::escaper — the ESIS stream (onsgmls)
+;   `&#<decimal>;`  outputNumericCharRef — the jade backends that write a char
+;                   stream (SgmlFOTBuilder.cxx:615, TransformFOTBuilder.cxx:368
+;                   and :553). The HTML backend deliberately sets NONE
+;                   (`// FIXME setEscaper`, HtmlFOTBuilder.cxx:997), so an
+;                   unencodable char DROPS there.
+define OESC_NONE: int 0
+define OESC_BACKSLASH: int 1
+define OESC_CHARREF: int 2
 
 ; encoder kinds (CodingSystemId, restricted to what an OUTPUT system needs;
 ; XML's makeEncoder returns the UTF-8 encoder, so XML lookups yield OENC_UTF8)
@@ -100,6 +112,16 @@ define OutputEncoder
         set illegal: 0 as u32
     }
 }
+
+; CmdLineApp::outputCodingSystem() — the app's OUTPUT coding system, the one
+; every char-stream writer of a run shares (`-b` if given, else the
+; environment's codingSystem()). onsgmls threads its encoder through the call
+; chain; the jade backends cannot (the reference reaches it through the app
+; pointer they were handed at construction), so the driver installs it here
+; once, exactly like ParserState's STDERR_ENC cell.
+; ★`shared`, not `mutable`: written ONCE while single-threaded in main, and a
+; THREAD-LOCAL in a JIT-linked dependency object aborts ORC's TLV bootstrap.
+shared OUTPUT_ENC: pointer[OutputEncoder] null
 
 ; translate-system selectors for make_encoder (`which`; 0 = a simple kind)
 define OENC_T_ISO8859_1: int 1
@@ -172,6 +194,59 @@ define CodingSystemKit
         let e host.allocate(sizeof OutputEncoder, alignof OutputEncoder) as pointer[OutputEncoder]
         set *e: OutputEncoder()
         e
+    }
+
+    ; the driver installs the run's output coding system here (see OUTPUT_ENC).
+    ; ★named `install_output_encoder`, not `set_output_encoder`: ParserState
+    ; already has a METHOD of that name, and a same-named static here made the
+    ; planner mangle the method calls onto this one (an undefined symbol at
+    ; link time, `set_output_encoder(OutputEncoder*)`).
+    procedure install_output_encoder(e: pointer[OutputEncoder])
+        set OUTPUT_ENC: e
+
+    ; A writer's internal UTF-8 char stream through the app's OUTPUT coding
+    ; system — one call per FILE, because `bom` is Encoder::startFile, which
+    ; the reference runs when it builds the EncodeOutputCharStream for that
+    ; file. A null cell (unit tests, the in-process JIT paths that never went
+    ; through a driver) means UTF-8, i.e. the internal bytes unchanged.
+    ;
+    ; ★Answers a RAW BUFFER plus its length, not a String and not the
+    ; accumulator. Two measured constraints shape that signature:
+    ;   - a String built two frames down lands through `Page.get(this)` on the
+    ;     outermost caller's return slot (a stack local) and comes back as
+    ;     garbage — this package's first cut segfaulted the fot backend;
+    ;   - a `pointer[Array[u8]]` handed ACROSS THE PACKAGE BOUNDARY reads back
+    ;     as garbage in the caller (get_buffer/get_length answer nonsense),
+    ;     so the generic instance never leaves opensp.
+    ; The backend then does `String(p as pointer[const_char], n)` as its own
+    ; return expression, which is the shape it always had.
+    ; ★TWO entry points instead of an `esc` argument: a module-level constant
+    ; of THIS package is not visible inside a MODULE of another one (only in a
+    ; program ROOT), and — the expensive half — passing it anyway does not
+    ; diagnose: the whole CALL is silently dropped and its result is garbage.
+    ; The escaper is a property of the writer, so a wrapper per writer kind
+    ; carries it without a constant ever crossing the boundary.
+    function encode_output_charref(host: pointer[Page], data: pointer[u8], len: size_t, bom: bool, out_len: pointer[size_t]) returns pointer[u8]
+        CodingSystemKit.encode_output(host, data, len, OESC_CHARREF, bom, out_len)
+
+    function encode_output_plain(host: pointer[Page], data: pointer[u8], len: size_t, bom: bool, out_len: pointer[size_t]) returns pointer[u8]
+        CodingSystemKit.encode_output(host, data, len, OESC_NONE, bom, out_len)
+
+    function encode_output(host: pointer[Page], data: pointer[u8], len: size_t, esc: int, bom: bool, out_len: pointer[size_t]) returns pointer[u8]
+    {
+        var fb OutputEncoder()
+        CodingSystemKit.make_default(host, true, &fb)
+        var enc &fb
+        if OUTPUT_ENC <> null
+            set enc: OUTPUT_ENC
+        if enc.kind = OENC_UTF8
+        {
+            set *out_len: len
+            return data
+        }
+        let acc CodingSystemKit.encode_bytes(host, enc, data, len, esc, bom)
+        set *out_len: acc.get_length()
+        acc.get_buffer()
     }
 
     ; the environment default (initCodingSystem's fallback): the identity
@@ -593,6 +668,27 @@ define CodingSystemKit
             }
         }
         CodingSystemKit.lookup_input(host, name, is_bctf, out)
+    }
+
+    ; CmdLineApp::initCodingSystem's INPUT half for an app whose internal
+    ; charset is fixed (a GroveApp, i.e. dazzle): the SP_ENCODING name, unless
+    ; it names no system or one wider than a byte per char — then
+    ; SP_DEFAULT_ENCODING = IS8859-1 = the identity system.
+    ; ★The whole decision lives HERE and not in the driver: the driver's own
+    ; version of it (lookup_input_name, then `sel.fixed_bytes_per_char()`, then
+    ; `sel.store(&dz_cs)`) silently answered the untouched default for EVERY
+    ; name — a cross-package METHOD CALL on a record VALUE is the same trap the
+    ; IdTable port hit, and it is silent.
+    function select_app_input(host: pointer[Page], name: String, out: pointer[CodingSystem])
+    {
+        let id CodingSystem.identity()
+        id.store(out)
+        var sel CodingSystem.identity()
+        if CodingSystemKit.lookup_input_name(host, name, false, &sel) = false
+            return
+        if sel.fixed_bytes_per_char() > 1
+            return
+        sel.store(out)
     }
 
     ; ---- resolve_input: the two STATEFUL systems -----------------------------
@@ -1182,10 +1278,18 @@ define CodingSystemKit
     ; the escaper (SgmlsEventHandler::escaper): `\#<decimal>;` written back
     ; through the same encoder — each escape char is re-encoded (and could in
     ; principle recurse; every table maps the ASCII escape chars).
-    function put_escape(enc: pointer[OutputEncoder], acc: pointer[Array[u8]], c: u32, escaper: bool)
+    ; the escape sequence itself goes back through the SAME encoder (the
+    ; reference builds a temporary EncodeOutputCharStream over the same
+    ; Encoder), so its own chars are translated too. The lead-in is the only
+    ; difference between the two escapers: `\#` for the ESIS stream,
+    ; `&#` for outputNumericCharRef in the jade backends.
+    function put_escape(enc: pointer[OutputEncoder], acc: pointer[Array[u8]], c: u32, esc: int)
     {
-        CodingSystemKit.out_char(enc, 0x5C as u32, acc, escaper)
-        CodingSystemKit.out_char(enc, 0x23 as u32, acc, escaper)
+        var lead 0x5C as u32
+        if esc = OESC_CHARREF
+            set lead: 0x26 as u32
+        CodingSystemKit.out_char(enc, lead, acc, esc)
+        CodingSystemKit.out_char(enc, 0x23 as u32, acc, esc)
         var digits u8[16]
         let dp digits as pointer[u8]
         var v c
@@ -1203,16 +1307,17 @@ define CodingSystemKit
         while i > (0 as size_t)
         {
             set i: i - (1 as size_t)
-            CodingSystemKit.out_char(enc, (*(dp + i)) as u32, acc, escaper)
+            CodingSystemKit.out_char(enc, (*(dp + i)) as u32, acc, esc)
         }
-        CodingSystemKit.out_char(enc, 0x3B as u32, acc, escaper)
+        CodingSystemKit.out_char(enc, 0x3B as u32, acc, esc)
     }
 
-    ; one Char through the output coding system. `escaper` is the stream's
-    ; SgmlsEventHandler::escaper (set for ESIS stdout, unset for RAST) — it
-    ; only ever fires for the RecoveringEncoder-derived systems (Identity,
-    ; Fixed2, SJIS, Translate); the plain-Encoder systems drop.
-    function out_char(enc: pointer[OutputEncoder], c: u32, acc: pointer[Array[u8]], escaper: bool)
+    ; one Char through the output coding system. `esc` is the stream's escaper
+    ; (OESC_BACKSLASH for ESIS stdout, OESC_CHARREF for the jade char-stream
+    ; backends, OESC_NONE for RAST / the HTML backend / stderr) — it only ever
+    ; fires for the RecoveringEncoder-derived systems (Identity, Fixed2, SJIS,
+    ; Translate); the plain-Encoder systems drop.
+    function out_char(enc: pointer[OutputEncoder], c: u32, acc: pointer[Array[u8]], esc: int)
     {
         let kind enc.kind
         if kind = OENC_UTF8
@@ -1227,16 +1332,16 @@ define CodingSystemKit
                 acc.add(c as u8)
                 return
             }
-            if escaper
-                CodingSystemKit.put_escape(enc, acc, c, escaper)
+            if esc <> OESC_NONE
+                CodingSystemKit.put_escape(enc, acc, c, esc)
             return
         }
         if kind = OENC_FIXED2
         {
             if c > (0xFFFF as u32)
             {
-                if escaper
-                    CodingSystemKit.put_escape(enc, acc, c, escaper)
+                if esc <> OESC_NONE
+                    CodingSystemKit.put_escape(enc, acc, c, esc)
                 return
             }
             acc.add(((c >> (8 as u32)) & (0xFF as u32)) as u8)
@@ -1266,8 +1371,8 @@ define CodingSystemKit
             ; direct SJIS is a RecoveringEncoder — unencodable escapes.
             if CodingSystemKit.put_sjis(acc, c) = false
             {
-                if escaper
-                    CodingSystemKit.put_escape(enc, acc, c, escaper)
+                if esc <> OESC_NONE
+                    CodingSystemKit.put_escape(enc, acc, c, esc)
             }
             return
         }
@@ -1284,8 +1389,8 @@ define CodingSystemKit
             set mapped: *(enc.map + (c as size_t))
         if mapped = enc.illegal
         {
-            if escaper
-                CodingSystemKit.put_escape(enc, acc, c, escaper)
+            if esc <> OESC_NONE
+                CodingSystemKit.put_escape(enc, acc, c, esc)
             return
         }
         if enc.sub = OENC_EUC
@@ -1313,18 +1418,29 @@ define CodingSystemKit
     ; only UnicodeEncoder writes one: the byteOrderMark in HOST byte order
     ; (all four LP64 targets are little-endian, so FF FE) followed by
     ; big-endian UTF-16 content, bug-for-bug with the reference.
-    function transcode(host: pointer[Page], enc: pointer[OutputEncoder], internal: String, escaper: bool, bom: bool) returns String
+    function transcode(host: pointer[Page], enc: pointer[OutputEncoder], internal: String, esc: int, bom: bool) returns String
     {
         if enc.kind = OENC_UTF8
             return internal
+        let acc CodingSystemKit.encode_bytes(host, enc, internal.get_buffer(), internal.get_length(), esc, bom)
+        String(acc.get_buffer() as pointer[const_char], acc.get_length())
+    }
+
+    ; the byte-level core of transcode: an internal UTF-8 buffer decoded char
+    ; by char and written through `enc` into a fresh page-hosted accumulator.
+    ; ★Returns the ACCUMULATOR, not a String: every caller builds the String
+    ; itself, as its own return expression. A String constructed two frames
+    ; down lands through `Page.get(this)` on the outermost caller's return
+    ; slot — a stack local — and comes back as garbage (the SIGSEGV this
+    ; package's first cut produced in the fot backend).
+    function encode_bytes(host: pointer[Page], enc: pointer[OutputEncoder], buf: pointer[u8], n: size_t, esc: int, bom: bool) returns pointer[Array[u8]]
+    {
         let acc Array[u8]^host()
         if bom and (enc.kind = OENC_UNICODE)
         {
             acc.add(0xFF as u8)
             acc.add(0xFE as u8)
         }
-        let buf internal.get_buffer()
-        let n internal.get_length()
         var i: size_t 0
         while i < n
         {
@@ -1357,10 +1473,10 @@ define CodingSystemKit
                 set c: (c << (6 as u32)) | (((*(buf + i)) as u32) & (0x3F as u32))
                 set k: k + (1 as size_t)
             }
-            CodingSystemKit.out_char(enc, c, acc, escaper)
+            CodingSystemKit.out_char(enc, c, acc, esc)
             set i: i + (1 as size_t)
         }
-        String(acc.get_buffer() as pointer[const_char], acc.get_length())
+        acc
     }
 
     function test() returns int
@@ -1372,8 +1488,8 @@ define CodingSystemKit
         var e0 OutputEncoder()
         CodingSystemKit.make_encoder(host, OENC_IDENTITY, 0, &e0)
         var acc0 Array[u8]()
-        CodingSystemKit.out_char(&e0, 0xE9 as u32, &acc0, true)
-        CodingSystemKit.out_char(&e0, 0x20AC as u32, &acc0, true)
+        CodingSystemKit.out_char(&e0, 0xE9 as u32, &acc0, OESC_BACKSLASH)
+        CodingSystemKit.out_char(&e0, 0x20AC as u32, &acc0, OESC_BACKSLASH)
         if acc0.get_length() <> (8 as size_t)
             return -1
         if *(acc0.get_buffer()) <> (0xE9 as u8)
@@ -1385,7 +1501,7 @@ define CodingSystemKit
         var e1 OutputEncoder()
         CodingSystemKit.make_encoder(host, OENC_EUC, 0, &e1)
         var acc1 Array[u8]()
-        CodingSystemKit.out_char(&e1, 0xE9 as u32, &acc1, true)
+        CodingSystemKit.out_char(&e1, 0xE9 as u32, &acc1, OESC_BACKSLASH)
         if acc1.get_length() <> (2 as size_t)
             return -4
         if *(acc1.get_buffer()) <> (0x8E as u8)
@@ -1395,8 +1511,8 @@ define CodingSystemKit
         var e2 OutputEncoder()
         CodingSystemKit.make_encoder(host, OENC_TRANSLATE, OENC_T_ISO8859_1, &e2)
         var acc2 Array[u8]()
-        CodingSystemKit.out_char(&e2, 0xE9 as u32, &acc2, true)
-        CodingSystemKit.out_char(&e2, 0x20AC as u32, &acc2, true)
+        CodingSystemKit.out_char(&e2, 0xE9 as u32, &acc2, OESC_BACKSLASH)
+        CodingSystemKit.out_char(&e2, 0x20AC as u32, &acc2, OESC_BACKSLASH)
         if acc2.get_length() <> (8 as size_t)
             return -6
         if *(acc2.get_buffer()) <> (0xE9 as u8)
@@ -1463,7 +1579,7 @@ define CodingSystemKit
         let s4 String(acc4.get_buffer() as pointer[const_char], acc4.get_length())
         var e4 OutputEncoder()
         CodingSystemKit.make_encoder(host, OENC_UNICODE, 0, &e4)
-        let t4 CodingSystemKit.transcode(host, &e4, s4, false, true)
+        let t4 CodingSystemKit.transcode(host, &e4, s4, OESC_NONE, true)
         if t4.get_length() <> (6 as size_t)
             return -12
         if *(t4.get_buffer()) <> (0xFF as u8)

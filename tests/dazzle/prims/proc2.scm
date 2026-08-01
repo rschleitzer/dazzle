@@ -1,13 +1,13 @@
 ; proc2.scm - sosofo-discard-labeled where it actually discards, on the
 ; `-t fot` backend.
 ;
-; ★It needs a backend with a CAPTURE SEAM. The reference buffers a connected
+; *It needs a backend with a CAPTURE SEAM. The reference buffers a connected
 ; port's content into a SaveFOTBuilder on every backend; this port has that
 ; seam on the five styled backends (fot / rtf / tex / html / mif) but NOT on
 ; the `-t sgml` transform builder, where connected content still leaks into
 ; the output stream. proc1.scm carries the note; COMPLETENESS.md names the
-; gap. Everything else about these two primitives — the argument gates, the
-; badConnection diagnostic, an unmatched discard label — is
+; gap. Everything else about these two primitives - the argument gates, the
+; badConnection diagnostic, an unmatched discard label - is
 ; backend-independent and pinned in proc1.
 ;
 ; ASCII ONLY, and MARKUP-FREE (see num1.scm).

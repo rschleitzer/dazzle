@@ -4,10 +4,10 @@
 <![CDATA[
 ; pat4 - SPECIFICITY, the second half of what a qualifier is for: which of
 ; several matching construction rules wins. Pattern::compareSpecificity walks
-; nine dimensions IN ORDER — importance, id, class, gi, repeat, priority,
-; only, position, attribute — and the first difference decides.
+; nine dimensions IN ORDER - importance, id, class, gi, repeat, priority,
+; only, position, attribute - and the first difference decides.
 ;
-; ★What this pins:
+; *What this pins:
 ;  - id: outranks an attribute qualifier, class: outranks a plain GI, and
 ;    priority: (dimension 5) outranks BOTH only: and position: (6 and 7),
 ;    which in turn outrank the attribute dimension (8);
@@ -54,8 +54,8 @@
 (element em (out "em-plain"))
 
 ; --- sec: a deliberate TIE between two attribute qualifiers --------------
-; ★both rules print the SAME text on purpose: which one of an equal-
-; specificity run fires is not a contract — the reference sorts its rules
+; *both rules print the SAME text on purpose: which one of an equal-
+; specificity run fires is not a contract - the reference sorts its rules
 ; with qsort, which is not stable. The DIAGNOSTIC is the contract.
 (element ("sec" ("cls" "big")) (make sequence (out "sec-tie") (process-children)))
 (element ("sec" ("xid" "s1")) (make sequence (out "sec-tie") (process-children)))

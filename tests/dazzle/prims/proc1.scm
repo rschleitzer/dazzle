@@ -86,7 +86,7 @@
 ; --- sosofo-label / sosofo-discard-labeled -------------------------------
 ; an unmatched label is a badConnection diagnostic and the content follows on
 (element n (sosofo-label (literal "LABELED ") 'lab))
-; ★The case where discard-labeled actually SWALLOWS its label lives in
+; *The case where discard-labeled actually SWALLOWS its label lives in
 ; proc2.scm, on the `-t fot` backend: the `-t sgml` TRANSFORM builder has no
 ; capture seam in this port, so a connected port's content leaks into the
 ; output stream instead of being buffered. That is a pre-existing gap in the

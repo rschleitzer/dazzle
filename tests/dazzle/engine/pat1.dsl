@@ -4,7 +4,7 @@
 <![CDATA[
 ; pat1 - the PATTERN language WITHOUT -2, the other side of pat2.dsl.
 ;
-; ★What this pins:
+; *What this pins:
 ;  - the whole KEYWORD half of convertToPattern is dsssl2-ONLY
 ;    (`KeywordObj *key = dsssl2() ? head->asKeyword() : 0`,
 ;    Interpreter.cxx:1466): without the flag a qualifier keyword is
