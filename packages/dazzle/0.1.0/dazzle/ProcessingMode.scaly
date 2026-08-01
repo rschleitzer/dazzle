@@ -5,16 +5,32 @@
 ;
 ; Inc 5a scope: construction rules only (styleRule needs InheritedC/StyleStack
 ; = the print path, deferred). Faithful simplification of the two-ruletype /
-; initial-mode-chaining machinery: a single initial mode, one grove. The
-; reference's per-GI GroveRules table is a lookup optimization; here element
-; rules are kept in one list sorted by specificity and scanned with a GI/
-; qualifier match filter — semantically the same first-(most-specific-)match.
+; initial-mode-chaining machinery: a single initial mode.
+;
+; Element rules are kept in ONE list sorted by specificity (build_sorted) and,
+; on top of it, in the reference's per-grove / per-GI index (GroveRules +
+; ElementRules, ProcessingMode.cxx:36): a node is matched only against the
+; rules that can possibly match it — those whose pattern pins its GI plus the
+; ones that pin no GI at all. Without the index every node was tried against
+; EVERY rule, which measured 14.17 million pattern attempts for 12 929 element
+; nodes on the DocBook print stylesheets (~1 096 per node; see
+; tests/dazzle/PERFORMANCE.md, "Zwei algorithmische Abweichungen von der
+; Referenz").
+;
+; ★The buckets are FILTERED OUT OF the flat sorted list, not sorted per bucket
+; the way the reference builds them (bucket rules first, then all GI-less ones
+; appended, then qsort). Same set, same specificity order — but ties keep the
+; order the flat scan gave them, so which rule of an equal-specificity run
+; fires does not change with this index. (The reference's own tie order is
+; qsort's, i.e. undefined; only the ambiguity diagnostic is a contract.)
 
 use scaly.memory.Page
 use scaly.containers.Array
 use opensp.StringC.StringC
 use opensp.Location.Location
+use dazzle.NameTable.NameTable
 use dazzle.Grove.GroveNode
+use dazzle.Grove.GroveInfo
 use dazzle.ELObj.ELObj
 use dazzle.Expression.Expression
 use dazzle.Expression.Environment
@@ -105,7 +121,101 @@ define Rule (action: pointer[Action], pattern: pointer[Pattern])
     }
 }
 
-define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_flag: bool, root_rules: pointer[Array[pointer[Rule]]], element_rules: pointer[Array[pointer[Rule]]], sorted_elements: pointer[Array[pointer[Rule]]], sorted_built: bool)
+; ProcessingMode::ElementRules — one GI's scan vector: the rules whose pattern
+; must have that GI, merged with the GI-less ones, in flat sorted order.
+define ElementRules (gi: pointer[StringC], rules: pointer[Array[pointer[Rule]]])
+{
+    function make(host: pointer[Page], gi: pointer[StringC]) returns pointer[ElementRules]
+    {
+        let e host.allocate(sizeof ElementRules, alignof ElementRules) as pointer[ElementRules]
+        set e.gi: gi
+        set e.rules: Array[pointer[Rule]]^host()
+        e
+    }
+}
+
+; ProcessingMode::GroveRules — the GI index of ONE grove. Per grove because
+; the key is the pattern's GI folded through THAT grove's general substitution
+; table (the reference normalizes with Interpreter::normalizeGeneralName(node)
+; while building, and looks up with the node's stored GI, which the parse
+; already normalized).
+define GroveRules (element_table: pointer[NameTable], buckets: pointer[Array[pointer[ElementRules]]], other_rules: pointer[Array[pointer[Rule]]])
+{
+    ; One pass over the sorted rules. A GI-less rule joins other_rules AND
+    ; every bucket opened so far; a new bucket starts as a copy of the GI-less
+    ; rules seen up to that point. That is what keeps each bucket a
+    ; SUBSEQUENCE of the flat scan order (see the module header).
+    function build(host: pointer[Page], node: pointer[GroveNode], sorted: pointer[Array[pointer[Rule]]]) returns pointer[GroveRules]
+    {
+        let g host.allocate(sizeof GroveRules, alignof GroveRules) as pointer[GroveRules]
+        set g.element_table: NameTable.make(host, 256 as size_t)
+        set g.buckets: Array[pointer[ElementRules]]^host()
+        set g.other_rules: Array[pointer[Rule]]^host()
+        let n sorted.get_length()
+        let b sorted.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let r *(b + i)
+            var raw StringC()
+            var has_gi false
+            if r.pattern <> null
+                set has_gi: r.pattern.must_have_gi(&raw)
+            if has_gi
+            {
+                let key Pattern.normalize_general(host, node, raw)
+                var er g.element_table.lookup(*key) as pointer[ElementRules]
+                if er = null
+                {
+                    set er: ElementRules.make(host, key)
+                    g.element_table.insert(host, *key, er as pointer[void])
+                    g.buckets.add(er)
+                    ; seed the fresh bucket with the GI-less rules that sort
+                    ; ahead of this one
+                    let o g.other_rules
+                    let on o.get_length()
+                    let ob o.get_buffer()
+                    var k: size_t 0
+                    while k < on
+                    {
+                        er.rules.add(*(ob + k))
+                        set k: k + (1 as size_t)
+                    }
+                }
+                er.rules.add(r)
+            }
+            else
+            {
+                g.other_rules.add(r)
+                let bl g.buckets
+                let bn bl.get_length()
+                let bb bl.get_buffer()
+                var k: size_t 0
+                while k < bn
+                {
+                    let er *(bb + k)
+                    er.rules.add(r)
+                    set k: k + (1 as size_t)
+                }
+            }
+            set i: i + (1 as size_t)
+        }
+        g
+    }
+
+    ; the scan vector for a node: its GI's bucket, or the GI-less rules when no
+    ; rule in this mode pins that GI.
+    function rules_for(this: pointer[GroveRules], node: pointer[GroveNode]) returns pointer[Array[pointer[Rule]]]
+    {
+        let gi node.get_gi()
+        let er this.element_table.lookup(gi) as pointer[ElementRules]
+        if er = null
+            return this.other_rules
+        er.rules
+    }
+}
+
+define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_flag: bool, root_rules: pointer[Array[pointer[Rule]]], element_rules: pointer[Array[pointer[Rule]]], sorted_elements: pointer[Array[pointer[Rule]]], sorted_built: bool, grove_rules: pointer[Array[pointer[GroveRules]]])
 {
     function make(host: pointer[Page], name: StringC, initial: pointer[ProcessingMode]) returns pointer[ProcessingMode]
     {
@@ -119,6 +229,7 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
         set m.element_rules: null
         set m.sorted_elements: null
         set m.sorted_built: false
+        set m.grove_rules: null
         m
     }
 
@@ -154,6 +265,10 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
             }
         }
         set this.sorted_built: false
+        ; a rule added after a grove was indexed invalidates the index too
+        ; (rules only ever arrive at stylesheet-read time, before the first
+        ; match — this is belt and braces).
+        set this.grove_rules: null
         if root = false
             return
         let r Rule.make(host, action, null)
@@ -237,11 +352,33 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
         null
     }
 
-    ; one scan pass over THIS mode's sorted element rules from the spec cursor.
+    ; ProcessingMode::groveRules — the node's grove index into the per-grove
+    ; index, built on first use. ★On the PERMANENT arena, never on
+    ; interp.get_host(): during processing that is the per-node eval scratch
+    ; region, and an index built there would dangle after the bracket (the
+    ; same reason build_sorted runs from Interpreter.compile).
+    function grove_rules_for(this: pointer[ProcessingMode], node: pointer[GroveNode], interp: pointer[Interpreter]) returns pointer[GroveRules]
+    {
+        let host interp.get_perm_host()
+        this.build_sorted(host)
+        if this.grove_rules = null
+            set this.grove_rules: Array[pointer[GroveRules]]^host()
+        let table this.grove_rules
+        let idx GroveInfo.index_of(node) as size_t
+        while table.get_length() <= idx
+            table.add(null)
+        let slot table.get_buffer() + idx
+        if *slot = null
+            set *slot: GroveRules.build(host, node, this.sorted_elements)
+        *slot
+    }
+
+    ; one scan pass over THIS mode's element rules for the node's GI, from the
+    ; spec cursor.
     function scan_element_rules(this: pointer[ProcessingMode], node: pointer[GroveNode], host: pointer[Page], interp: pointer[Interpreter], spec: pointer[Specificity]) returns pointer[Rule]
     {
-        this.build_sorted(host)
-        let sorted this.sorted_elements
+        let gr this.grove_rules_for(node, interp)
+        let sorted gr.rules_for(node)
         let n sorted.get_length() as int
         let b sorted.get_buffer()
         var i spec.next_rule_index

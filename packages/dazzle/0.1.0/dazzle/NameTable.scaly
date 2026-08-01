@@ -1,0 +1,207 @@
+; NameTable — the hash-probed name index the reference reaches for wherever a
+; name maps to ONE object: `NamedTable<T>` (generic/NamedTable.h, an open
+; hash table over `Named` objects) behind `Interpreter::identTable_`,
+; `symbolTable_`, `unitTable_` and `ProcessingMode::GroveRules::elementTable`.
+;
+; The port grew up without it — every one of those tables was a linear Array
+; scan, which is a CONSTANT-factor loss on the small tables but an asymptotic
+; one on the interning path: measured on the DocBook print stylesheets,
+; `Interpreter.lookup` ran 81 804 times for 83.5 million StringC comparisons
+; (~1 020 per lookup). See tests/dazzle/PERFORMANCE.md, "Zwei algorithmische
+; Abweichungen von der Referenz".
+;
+; Shape: open addressing with linear probing, capacity a power of two, load
+; factor 3/4, entries allocated on the caller's arena page and never removed
+; (no table in this engine ever deletes a name). The value is a
+; `pointer[void]` the caller casts back — the port's stand-in for the
+; reference's template parameter; every table here maps a name to a
+; page-hosted object.
+;
+; ★The KEY is stored as a StringC VALUE, i.e. a (data, size) pair sharing the
+; buffer of the object it names. Callers must therefore hand in a key that
+; lives on the arena — `ident.get_name()`, not a `StringC(lit)` temporary
+; (CLAUDE.md, "Strings": a stack-built StringC's buffer is garbage by the time
+; anyone compares against it).
+
+use scaly.memory.Page
+use opensp.StringC.StringC
+
+; One occupied slot. `hash_code` is kept so a probe can reject a collision
+; without touching the key's characters.
+define NameEntry (key: StringC, hash_code: size_t, value: pointer[void])
+{
+    function make(host: pointer[Page], key: StringC, hash_code: size_t, value: pointer[void]) returns pointer[NameEntry]
+    {
+        let e host.allocate(sizeof NameEntry, alignof NameEntry) as pointer[NameEntry]
+        set e.key: key
+        set e.hash_code: hash_code
+        set e.value: value
+        e
+    }
+
+    function get_key(this: NameEntry) returns StringC
+        key
+
+    function get_value(this: NameEntry) returns pointer[void]
+        value
+}
+
+define NameTable (slots: pointer[pointer[NameEntry]], capacity: size_t, count: size_t)
+{
+    ; `initial` is a hint; the capacity is rounded up to a power of two and
+    ; never drops below 8.
+    function make(host: pointer[Page], initial: size_t) returns pointer[NameTable]
+    {
+        let t host.allocate(sizeof NameTable, alignof NameTable) as pointer[NameTable]
+        var cap: size_t 8
+        while cap < initial
+            set cap: cap * (2 as size_t)
+        set t.slots: NameTable.alloc_slots(host, cap)
+        set t.capacity: cap
+        set t.count: 0 as size_t
+        t
+    }
+
+    function alloc_slots(host: pointer[Page], cap: size_t) returns pointer[pointer[NameEntry]]
+    {
+        let s host.allocate(cap * sizeof pointer[NameEntry], alignof pointer[NameEntry]) as pointer[pointer[NameEntry]]
+        var i: size_t 0
+        while i < cap
+        {
+            set *(s + i): null
+            set i: i + (1 as size_t)
+        }
+        s
+    }
+
+    ; djb2 over the characters. The reference hashes bytes; a DSSSL name is a
+    ; sequence of Chars here, so the loop runs over `get`.
+    function hash_of(key: StringC) returns size_t
+    {
+        let n key.get_size()
+        var h: size_t 5381
+        var i: size_t 0
+        while i < n
+        {
+            set h: (h * (33 as size_t)) + (key.get(i) as size_t)
+            set i: i + (1 as size_t)
+        }
+        h
+    }
+
+    function get_count(this: NameTable) returns size_t
+        count
+
+    ; the value under `key`, null when the name is not in the table.
+    function lookup(this: pointer[NameTable], key: StringC) returns pointer[void]
+    {
+        let cap this.capacity
+        let mask cap - (1 as size_t)
+        let h NameTable.hash_of(key)
+        let slots this.slots
+        var i h & mask
+        var probes: size_t 0
+        ; the load factor keeps at least one slot empty, so the walk always
+        ; terminates on a null; the counter is the belt-and-braces bound.
+        while probes < cap
+        {
+            let e *(slots + i)
+            if e = null
+                return null
+            if e.hash_code = h
+            {
+                let k e.key
+                if k.equals(key)
+                    return e.value
+            }
+            set i: (i + (1 as size_t)) & mask
+            set probes: probes + (1 as size_t)
+        }
+        null
+    }
+
+    ; Insert a name the caller has already established is absent (every table
+    ; here does lookup-then-insert, exactly as the reference's `insert`).
+    function insert(this: pointer[NameTable], host: pointer[Page], key: StringC, value: pointer[void])
+    {
+        if ((this.count + (1 as size_t)) * (4 as size_t)) > (this.capacity * (3 as size_t))
+            this.grow(host)
+        let h NameTable.hash_of(key)
+        let e NameEntry.make(host, key, h, value)
+        NameTable.place(this.slots, this.capacity, e)
+        set this.count: this.count + (1 as size_t)
+    }
+
+    function place(slots: pointer[pointer[NameEntry]], cap: size_t, e: pointer[NameEntry])
+    {
+        let mask cap - (1 as size_t)
+        var i e.hash_code & mask
+        var probes: size_t 0
+        while probes < cap
+        {
+            if *(slots + i) = null
+            {
+                set *(slots + i): e
+                return
+            }
+            set i: (i + (1 as size_t)) & mask
+            set probes: probes + (1 as size_t)
+        }
+    }
+
+    function grow(this: pointer[NameTable], host: pointer[Page])
+    {
+        let old this.slots
+        let old_cap this.capacity
+        let cap old_cap * (2 as size_t)
+        let slots NameTable.alloc_slots(host, cap)
+        var i: size_t 0
+        while i < old_cap
+        {
+            let e *(old + i)
+            if e <> null
+                NameTable.place(slots, cap, e)
+            set i: i + (1 as size_t)
+        }
+        set this.slots: slots
+        set this.capacity: cap
+    }
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr() as pointer[void])
+        let t NameTable.make(host, 4)
+        ; 26 distinct names (the prefixes of the alphabet) — three growths of
+        ; the initial table, so the rehash path is exercised too.
+        let alphabet StringC^host("abcdefghijklmnopqrstuvwxyz")
+        let chars alphabet.data_ptr()
+        var i: size_t 0
+        while i < (26 as size_t)
+        {
+            let key StringC^host(chars, i + (1 as size_t))
+            if t.lookup(*key) <> null
+                return 1
+            t.insert(host, *key, key as pointer[void])
+            set i: i + (1 as size_t)
+        }
+        if t.get_count() <> (26 as size_t)
+            return 2
+        set i: 0 as size_t
+        while i < (26 as size_t)
+        {
+            let key StringC^host(chars, i + (1 as size_t))
+            let hit t.lookup(*key)
+            if hit = null
+                return 3
+            let back hit as pointer[StringC]
+            if back.equals(*key) = false
+                return 4
+            set i: i + (1 as size_t)
+        }
+        let miss StringC^host("no-such-name")
+        if t.lookup(*miss) <> null
+            return 5
+        0
+    }
+}
