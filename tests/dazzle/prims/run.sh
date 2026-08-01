@@ -109,6 +109,23 @@
 # live C locale calling setlocale + wcscoll + towupper around every
 # comparison; we return #f, which is what the reference returns without those
 # macros. See COMPLETENESS.md.
+# time1 + time2 (langdoc.sgml): the TIME family — time, time->string and the
+# four comparisons over timeConv, the last primitives of primitive.h that
+# needed a C shim (packages/scaly/0.1.0/scaly/time/ctime.c: struct tm plus
+# variadic sscanf/sprintf, containment rule (a)+(b)). Both run under a FIXED
+# TZ so localtime is deterministic without tzdata, and both are MARKED
+# SECTIONS rather than SYSTEM .scm entities for lang1's reason — `time<?`
+# cannot survive SGML parsing, `<?` opens a processing instruction.
+# ★time1 pins timeConv's four measured quirks as contract: a bare year is
+# December FIRST OF THE YEAR BEFORE (the switch falls through case 1 and case
+# 2 into the month decrement, so the "January First" comment above it is
+# wrong); an unparsable string errors but an EMPTY one does NOT (sscanf
+# answers 0 for the first and EOF for the second, and EOF lands in the
+# `default` arm); a 4-digit year below 1900 is left alone, so "1000-01-01" is
+# the year 2900; and the Y2K window turns "37" into 2037 but leaves "38" at
+# 1938. ★time2 pins the two argument gates and, with them, the installed
+# signatures: an over-long call reports `too many arguments for function` and
+# the primitive still runs and yields its value.
 # num3 (doc3.sgml): the XXPRIMITIVE `expt` under the OpenJade public id, which
 # external-procedure reaches and the identifier does not. ★Its golden records
 # a MEASURED reference defect as contract: primitive.cxx:5042 reads the second
@@ -196,5 +213,16 @@ run_fot_case() { # name document expected_err
 run_fot_case proc2 procdoc.sgml proc2.experr
 run_case lang1 langdoc.sgml lang1.experr
 run_case lang2 langdoc.sgml lang2.experr
+
+# time1/time2 need a FIXED local zone: `time->string` without a gmt argument
+# and timeConv's mktime both read it. EST5 is a POSIX TZ string — a plain
+# offset with no DST rule — so it resolves without a tzdata database (a bare
+# CI container has none) and still differs from UTC, which is what makes the
+# local/gmt split observable.
+run_tz_case() { # name document [expected_err]
+  ( export TZ=EST5; run_case "$@" ) || exit 1
+}
+run_tz_case time1 langdoc.sgml
+run_tz_case time2 langdoc.sgml time2.experr
 
 echo "dazzle-prims: PASS"

@@ -42,7 +42,8 @@ if [ ! -f /tmp/libscaly.a ]; then
   "$LLC" -relocation-model=pic -O2 -filetype=obj /tmp/libscaly_opt.bc -o /tmp/libscaly.o >> "$TMP/rt.log" 2>&1 || { echo "onsgmls: FAIL (runtime llc)"; tail -8 "$TMP/rt.log"; exit 1; }
   tools/fcontext.sh /tmp/fcontext.o >> "$TMP/rt.log" 2>&1
   tools/eio.sh /tmp/eio.o >> "$TMP/rt.log" 2>&1
-  ar rcs /tmp/libscaly.a /tmp/libscaly.o /tmp/fcontext.o /tmp/eio.o
+  tools/ctime.sh /tmp/ctime.o >> "$TMP/rt.log" 2>&1
+  ar rcs /tmp/libscaly.a /tmp/libscaly.o /tmp/fcontext.o /tmp/eio.o /tmp/ctime.o
 fi
 
 # --- 3. link the program --------------------------------------------------
