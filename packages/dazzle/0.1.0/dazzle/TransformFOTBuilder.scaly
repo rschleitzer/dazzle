@@ -44,6 +44,63 @@ function scaly_eio_errno() returns i32 extern
 procedure scaly_eputs(s: pointer[const_char]) extern
 procedure scaly_eputnl() extern
 
+; ---- measurement hook: DZ_REGION_BYTES=1 ---------------------------------
+; Not a feature — the codegen counterpart of onsgmls' SP_REGION_BYTES (see
+; tests/dazzle/PERFORMANCE.md, "Wo der Speicher liegt"). Peak RSS alone cannot
+; say how much of it is ONE region that dies only at run end, nor how much of
+; that region is built INSIDE an entity-file bracket, which is exactly the
+; question lever 2 asks. This walks the run region the way
+; deallocate_extensions does (next_page chain + exclusive pages, oversized ones
+; by their recorded block length) and sums the bytes; the entity hooks sample
+; it at the outermost start/end-entity pair and accumulate the difference.
+; PAGE_SIZE is spelled 4096 on purpose: a module-level `define` of another
+; package is invisible from inside a module (CLAUDE.md).
+function getenv(name: pointer[const_char]) returns pointer[const_char] extern
+procedure scaly_eputi(value: i64) extern
+
+function tfb_region_bytes(p: pointer[Page]) returns size_t
+{
+    var total 0 as size_t
+    var q p
+    while q <> null
+    {
+        set total: total + (4096 as size_t)
+        var nd q.exclusive_pages.head
+        while nd <> null
+        {
+            let excl nd.page
+            if excl.next_object = null
+                set total: total + Page.oversized_size(excl)
+            else
+                set total: total + tfb_region_bytes(excl)
+            set nd: nd.next
+        }
+        set q: q.next_page
+    }
+    total
+}
+
+; 0 = not yet asked, 1 = on, 2 = off
+shared tfb_probe: int 0
+; DZ_REGION_ENTITY=1 additionally samples the region at every outermost entity
+; bracket. That walk is O(region) per file, so it is its own switch: on a
+; multi-GB region it turns a 30 s run into an hour.
+shared tfb_probe_ent: int 0
+; run-region bytes at the outermost start_entity
+shared tfb_probe_mark: size_t 0
+; summed growth across all outermost entity brackets, and their count
+shared tfb_probe_bytes: size_t 0
+shared tfb_probe_files: size_t 0
+; summed capacity (in u32 slots) of the entity output buffers
+shared tfb_probe_bufcap: size_t 0
+; region bytes before processing starts, and at the first / last outermost
+; end_entity. Those two are sampled at the SAME nesting depth, so their
+; difference is the PERSISTENT per-file residue; a start/end delta also counts
+; the eval scratch that is live at that moment and dies later.
+shared tfb_probe_base: size_t 0
+shared tfb_probe_first: size_t 0
+shared tfb_probe_last: size_t 0
+
 ; argv0 for the app-message prefix: the reference reports entity-file
 ; failures through CmdLineApp::message, which renders `<argv0>:E: <text>`.
 ; The CLI driver sets this once (set_prog_name). A `shared` module global,
@@ -56,7 +113,12 @@ shared tfb_prog: pointer[const_char] null
 ; no name — content flows to the parent stream, like the reference leaving
 ; os_ untouched), and the raw system id (the close-error message argument —
 ; endEntity reports of.systemId, not the directory-joined path).
-define TfbOpenFile (buf: pointer[Array[u32]], save: pointer[Array[u32]], filename: String, sysid: String)
+; ... and the file's own REGION (null when the entity was not redirected): an
+; exclusive page of the run region that hosts this file's u32 buffer and the
+; encode scratch, released when the file is written. This is where a codegen
+; run's memory goes — 84 % of the peak is per-file work, and the entity flow
+; object is its seam (tests/dazzle/PERFORMANCE.md, lever 2).
+define TfbOpenFile (buf: pointer[Array[u32]], save: pointer[Array[u32]], filename: String, sysid: String, region: pointer[Page])
 
 define TransformFOTBuilder
 (
@@ -451,6 +513,60 @@ define TransformFOTBuilder
         scaly_eputnl()
     }
 
+    ; DZ_REGION_BYTES probe — see the hook comment at the top of the file.
+    function probe_on() returns bool
+    {
+        if tfb_probe = 0
+        {
+            set tfb_probe: 2
+            if getenv("DZ_REGION_BYTES") <> null
+                set tfb_probe: 1
+        }
+        tfb_probe = 1
+    }
+
+    function probe_entity_on() returns bool
+    {
+        if tfb_probe_ent = 0
+        {
+            set tfb_probe_ent: 2
+            if getenv("DZ_REGION_ENTITY") <> null
+                set tfb_probe_ent: 1
+        }
+        tfb_probe_ent = 1
+    }
+
+    procedure mark_base(host: pointer[Page])
+    {
+        if TransformFOTBuilder.probe_on()
+            set tfb_probe_base: tfb_region_bytes(host)
+    }
+
+    procedure report_region(host: pointer[Page])
+    {
+        if TransformFOTBuilder.probe_on() = false
+            return
+        scaly_eputs "dazzle: run region bytes: "
+        scaly_eputi(tfb_region_bytes(host) as i64)
+        scaly_eputs "  base before processing: "
+        scaly_eputi(tfb_probe_base as i64)
+        scaly_eputnl()
+        scaly_eputs "dazzle: entity-bracket bytes: "
+        scaly_eputi(tfb_probe_bytes as i64)
+        scaly_eputs " over "
+        scaly_eputi(tfb_probe_files as i64)
+        scaly_eputs " files"
+        scaly_eputnl()
+        scaly_eputs "dazzle: entity buffer capacity (u32 slots): "
+        scaly_eputi(tfb_probe_bufcap as i64)
+        scaly_eputnl()
+        scaly_eputs "dazzle: region at first/last outermost end_entity: "
+        scaly_eputi(tfb_probe_first as i64)
+        scaly_eputs " / "
+        scaly_eputi(tfb_probe_last as i64)
+        scaly_eputnl()
+    }
+
     ; --- entity flow object: redirect output to a file ----------------------
     ; startEntity (TransformFOTBuilder.cxx): the output file is opened HERE.
     ; A failed open reports cannotOpenOutputError and leaves os_ on the
@@ -460,6 +576,9 @@ define TransformFOTBuilder
     ; eager FileOutputByteStream::open) whose failure routes the content.
     function start_entity(this: pointer[TransformFOTBuilder], system_id: StringC)
     {
+        if TransformFOTBuilder.probe_entity_on()
+            if this.file_count = (0 as size_t)
+                set tfb_probe_mark: tfb_region_bytes(this.host)
         this.flush_pending_re()
         let name_str this.stringc_to_string(system_id)
         var filename name_str
@@ -485,11 +604,16 @@ define TransformFOTBuilder
                 set redirected: true
             }
         }
-        var of TfbOpenFile(this.out, this.out, String(), String())
+        var of TfbOpenFile(this.out, this.out, String(), String(), null)
         if redirected
         {
-            let newbuf Array[u32]^this.host()
-            set of: TfbOpenFile(newbuf, this.out, filename, name_str)
+            ; the file's own region — see the TfbOpenFile comment. The buffer
+            ; is built ON it (`^fr`, a LET-bound page name: a `var` one places
+            ; the construction at the page BASE), so its growth chains there
+            ; too and the whole file's output cost dies at end_entity.
+            let fr this.host.allocate_exclusive_page()
+            let newbuf Array[u32]^fr()
+            set of: TfbOpenFile(newbuf, this.out, filename, name_str, fr)
             set this.out: newbuf
         }
         if this.file_count < this.file_stack.get_length()
@@ -514,12 +638,32 @@ define TransformFOTBuilder
                     ; a failed write is the reference's fb.close() failure:
                     ; closeFileError, %1 = the RAW system id (endEntity
                     ; reports of.systemId, not the joined path).
-                    if this.flush_buffer_to_file(of.buf, of.filename) = false
+                    var scratch this.host
+                    if of.region <> null
+                        set scratch: of.region
+                    if this.flush_buffer_to_file(scratch, of.buf, of.filename) = false
                         this.file_error("cannot close output file ", of.sysid, scaly_eio_errno())
+                    if TransformFOTBuilder.probe_on()
+                        set tfb_probe_bufcap: tfb_probe_bufcap + of.buf.get_capacity()
                 }
                 set this.out: of.save
+                ; the file is written and `out` is back on the parent stream:
+                ; nothing points into this file's region any more.
+                if of.region <> null
+                    this.host.deallocate_exclusive_page(of.region)
             }
         }
+        if TransformFOTBuilder.probe_entity_on()
+            if this.file_count = (0 as size_t)
+            {
+                let now tfb_region_bytes(this.host)
+                if now > tfb_probe_mark
+                    set tfb_probe_bytes: tfb_probe_bytes + (now - tfb_probe_mark)
+                if tfb_probe_files = (0 as size_t)
+                    set tfb_probe_first: now
+                set tfb_probe_last: now
+                set tfb_probe_files: tfb_probe_files + (1 as size_t)
+            }
     }
 
     ; --- directory flow object: mkdir + prefix entity filenames -------------
@@ -593,9 +737,14 @@ define TransformFOTBuilder
     ; outputNumericCharRef as their escaper (:368 / :553), so an unencodable
     ; char leaves as `&#<decimal>;`. One call per FILE, because the BOM is
     ; Encoder::startFile.
-    function encode_records(this: pointer[TransformFOTBuilder], buf: pointer[u32], n: size_t) returns String
+    ; `scratch` is where the three conversion buffers go: the file's own region
+    ; while an entity file is being written (they are the same order of
+    ; magnitude as the file and die with it), the run region for the top-level
+    ; stream. NOT named `page`/`rp` — a first parameter of that name is peeled
+    ; into the implicit caller-page slot.
+    function encode_records(this: pointer[TransformFOTBuilder], scratch: pointer[Page], buf: pointer[u32], n: size_t) returns String
     {
-        let host this.host
+        let host scratch
         let cap n * (4 as size_t) + (1 as size_t)
         let src host.allocate(n * (4 as size_t) + (4 as size_t), 4) as pointer[u32]
         var m: size_t 0
@@ -624,9 +773,9 @@ define TransformFOTBuilder
         String(obytes as pointer[const_char], olen)
     }
 
-    function flush_buffer_to_file(this: pointer[TransformFOTBuilder], buf: pointer[Array[u32]], filename: String) returns bool
+    function flush_buffer_to_file(this: pointer[TransformFOTBuilder], scratch: pointer[Page], buf: pointer[Array[u32]], filename: String) returns bool
     {
-        let content this.encode_records(buf.get_buffer(), buf.get_length())
+        let content this.encode_records(scratch, buf.get_buffer(), buf.get_length())
         File.write_from_string(filename, content)
     }
 
@@ -641,7 +790,7 @@ define TransformFOTBuilder
     ; (entity/directory flow objects write their own files; this is the main
     ; stream, exactly what `jade -t sgml`/`xml` sends to its output byte stream.)
     function root_to_utf8(this: pointer[TransformFOTBuilder]) returns String
-        this.encode_records(this.root.get_buffer(), this.root.get_length())
+        this.encode_records(this.host, this.root.get_buffer(), this.root.get_length())
 
     function test() returns int
     {
