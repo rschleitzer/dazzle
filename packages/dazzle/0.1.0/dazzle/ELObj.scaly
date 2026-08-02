@@ -12,6 +12,8 @@ use dazzle.Insn.Insn
 use dazzle.Insn.Signature
 use dazzle.VM.VM
 use dazzle.Grove.GroveNode
+use dazzle.Grove.GN_ELEMENT
+use dazzle.Pattern.Pattern
 use dazzle.Primitive.Primitive
 
 ; ELObj — the expression-language value model (Style/ELObj.cs, upstream
@@ -1079,14 +1081,62 @@ define NNL_ATTRIBUTE_DEFS: int 7
 ; value carries it (it behaves as NNL_ENTITIES everywhere else).
 define NNL_DOC_ENTITIES: int 8
 
-define NodeListObj (nodes: pointer[Array[pointer[GroveNode]]], start: int, prefix: pointer[Array[int]], named: int)
+; LAZY FILTERING (SelectElementsNodeListObj, style/primitive.cxx:5602). The
+; reference does not materialize a filtered node-list at all: select-elements
+; returns a view that runs the pattern in nodeListFirst / nodeListRest, so a
+; caller asking only whether anything matches walks to the FIRST match and
+; stops. Ported here as an incremental generator behind the same buffer: `out`
+; IS the node-list's `nodes` array, `cursor` the next member of `src` still to
+; test, and every accessor extends the buffer just far enough for what it was
+; asked (ELObj.force_select). Measured on the DocBook print stylesheets: the
+; same 3732 calls step over 0.56 M source members instead of 1.70 M and run
+; 1952 pattern matches instead of 3037 — 2.0 % of the styling run's
+; instructions, and O(first match) instead of O(n) for the callers that only
+; ask whether anything matched.
+; `host` is the page the node-list itself lives on, so the deferred matches
+; land in exactly the region the eager version used; `src` is a value the
+; primitive received, hence never in a region younger than that page.
+define SelectGen
+(
+    src: pointer[ELObj]
+    pat: pointer[Pattern]
+    interp: pointer[Interpreter]
+    host: pointer[Page]
+    out: pointer[Array[pointer[GroveNode]]]
+    cursor: int
+)
 {
-    init(nodes: pointer[Array[pointer[GroveNode]]], start: int, prefix: pointer[Array[int]], named: int)
+    ; ★Every field gets a PARAMETER, `cursor` included. With a 5-argument init
+    ; that assigned `set this.cursor: 0` itself, three of four construction
+    ; sites came back with a RANDOM cursor (5120, 18, a pointer value) and the
+    ; view then silently answered "no matches" — reproduced and re-reproduced
+    ; here 2026-08-02 (tests/dazzle/grove axis1). A minimal 6-field/5-argument
+    ; program does NOT reproduce it, so the trigger is not arity alone; until
+    ; it is diagnosed, no init in this file leaves a field to a constant.
+    init(src: pointer[ELObj], pat: pointer[Pattern], interp: pointer[Interpreter], host: pointer[Page], out: pointer[Array[pointer[GroveNode]]], cursor: int)
+    {
+        set this.src: src
+        set this.pat: pat
+        set this.interp: interp
+        set this.host: host
+        set this.out: out
+        set this.cursor: cursor
+    }
+}
+
+define NodeListObj (nodes: pointer[Array[pointer[GroveNode]]], start: int, prefix: pointer[Array[int]], named: int, gen: pointer[SelectGen])
+{
+    ; ONE init, `gen` always explicit: a second, shorter overload would be
+    ; picked apart by argument COUNT, and a construction that misses the last
+    ; argument compiles silently with garbage in the field (CLAUDE.md, "a call
+    ; with too many/too few arguments compiles silently").
+    init(nodes: pointer[Array[pointer[GroveNode]]], start: int, prefix: pointer[Array[int]], named: int, gen: pointer[SelectGen])
     {
         set this.nodes: nodes
         set this.start: start
         set this.prefix: prefix
         set this.named: named
+        set this.gen: gen
     }
 }
 
@@ -2142,7 +2192,7 @@ define ELObj union
     function make_node_list(host: pointer[Page], nodes: pointer[Array[pointer[GroveNode]]], start: int) returns pointer[ELObj]
     {
         let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
-        set *p: ELObj.NodeList(NodeListObj(nodes, start, null, NNL_NONE))
+        set *p: ELObj.NodeList(NodeListObj(nodes, start, null, NNL_NONE, null))
         p
     }
 
@@ -2151,7 +2201,7 @@ define ELObj union
     function make_node_list_prefix(host: pointer[Page], nodes: pointer[Array[pointer[GroveNode]]], start: int, prefix: pointer[Array[int]]) returns pointer[ELObj]
     {
         let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
-        set *p: ELObj.NodeList(NodeListObj(nodes, start, prefix, NNL_NONE))
+        set *p: ELObj.NodeList(NodeListObj(nodes, start, prefix, NNL_NONE, null))
         p
     }
 
@@ -2160,7 +2210,7 @@ define ELObj union
     function make_named_node_list(host: pointer[Page], nodes: pointer[Array[pointer[GroveNode]]], named: int) returns pointer[ELObj]
     {
         let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
-        set *p: ELObj.NodeList(NodeListObj(nodes, 0, null, named))
+        set *p: ELObj.NodeList(NodeListObj(nodes, 0, null, named, null))
         p
     }
 
@@ -2196,6 +2246,65 @@ define ELObj union
         ELObj.make_node_list_prefix(host, members, start, prefix)
     }
 
+    ; --- the lazy select-elements view (SelectElementsNodeListObj) ----------
+    ; select-elements' result: an empty buffer plus the generator that fills it
+    ; on demand. Nothing is matched here — DEFPRIMITIVE(SelectElements) only
+    ; converts the pattern and wraps the source list.
+    function make_select_node_list(host: pointer[Page], interp: pointer[Interpreter], src: pointer[ELObj], pat: pointer[Pattern]) returns pointer[ELObj]
+    {
+        let out Array[pointer[GroveNode]]^host()
+        let g host.allocate(sizeof SelectGen, alignof SelectGen) as pointer[SelectGen]
+        set *g: SelectGen(src, pat, interp, host, out, 0)
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.NodeList(NodeListObj(out, 0, null, NNL_NONE, g))
+        p
+    }
+
+    ; Extend a select view's buffer until it holds `need` matches, or until the
+    ; source is exhausted (need < 0 forces to the end). `cursor` < 0 marks an
+    ; exhausted source, so a repeated full force costs one compare.
+    ;
+    ; The walk steps over MEMBERS, not character positions: an element pattern
+    ; can never match a data-char or PI node (Element::matches bails on the
+    ; class), and a node-list over mixed content is mostly characters. That is
+    ; the reference's chunk skip (nodeListChunkRest steps over a whole data
+    ; chunk at once) — a data run costs one step here instead of one
+    ; Pattern.matches call, hence one region, per character. Elements always
+    ; span one position, so the member walk and the flat walk agree on
+    ; everything this primitive can select.
+    function force_select(g: pointer[SelectGen], need: int)
+    {
+        if g.cursor < 0
+            return
+        let src g.src
+        let pat g.pat
+        let interp g.interp
+        let host g.host
+        let out g.out
+        var i g.cursor
+        repeat
+        {
+            if need >= 0
+            {
+                if (out.get_length() as int) >= need
+                    break
+            }
+            let node src.node_list_member(i)
+            if node = null
+            {
+                set g.cursor: 0 - 1
+                return
+            }
+            set i: i + 1
+            if node.get_class() = GN_ELEMENT
+            {
+                if pat.matches(host, interp, node)
+                    out.add(node)
+            }
+        }
+        set g.cursor: i
+    }
+
     ; a singleton node-list over one node
     function make_node_singleton(host: pointer[Page], node: pointer[GroveNode]) returns pointer[ELObj]
     {
@@ -2221,6 +2330,8 @@ define ELObj union
         choose *this
             when nl: NodeList
             {
+                if nl.gen <> null
+                    ELObj.force_select(nl.gen, 0 - 1)
                 if nl.nodes = null
                     return 0
                 let m nl.nodes.get_length() as int
@@ -2252,12 +2363,14 @@ define ELObj union
         choose *this
             when nl: NodeList
             {
-                if nl.nodes = null
-                    return null
-                let m nl.nodes.get_length() as int
                 let idx nl.start + i
                 if idx < 0
                     return null
+                if nl.gen <> null
+                    ELObj.force_select(nl.gen, idx + 1)
+                if nl.nodes = null
+                    return null
+                let m nl.nodes.get_length() as int
                 if nl.prefix = null
                 {
                     if idx >= m
@@ -2296,14 +2409,68 @@ define ELObj union
         lo
     }
 
+    ; the raw buffer — a caller that reads it directly sees no generator, so a
+    ; select view is materialized in full first.
     function node_list_buffer(this: pointer[ELObj]) returns pointer[Array[pointer[GroveNode]]]
     {
         choose *this
             when nl: NodeList
+            {
+                if nl.gen <> null
+                    ELObj.force_select(nl.gen, 0 - 1)
                 return nl.nodes
+            }
             else
                 return null
         null
+    }
+
+    ; node-list-rest: the same view one node further in. A select view hands its
+    ; generator to the tail (SelectElementsNodeListObj::nodeListRest returns
+    ; another select list over the rest of the source), so walking a filtered
+    ; list one node at a time keeps matching on demand. A named list loses its
+    ; name protocol here, as in the reference — a derived list is a plain one.
+    function node_list_rest(host: pointer[Page], list: pointer[ELObj]) returns pointer[ELObj]
+    {
+        choose *list
+            when nl: NodeList
+            {
+                var st nl.start
+                if list.node_list_is_empty() = false
+                    set st: st + 1
+                let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+                set *p: ELObj.NodeList(NodeListObj(nl.nodes, st, nl.prefix, NNL_NONE, nl.gen))
+                return p
+            }
+            else
+                return ELObj.make_node_list(host, null, 0)
+        null
+    }
+
+    ; whether the list has no node at all (nodeListFirst == 0). Exactly
+    ; `node_list_count() = 0`, but a select view is only forced far enough to
+    ; answer it — that is the whole point of the lazy form: the caller asking
+    ; "does anything match?" stops at the first match instead of at the end.
+    function node_list_is_empty(this: pointer[ELObj]) returns bool
+    {
+        choose *this
+            when nl: NodeList
+            {
+                ; `start` nodes are already consumed, so the question is whether
+                ; match number start+1 exists — forcing just 1 would call a
+                ; half-walked list empty as soon as node-list-rest moved on.
+                if nl.gen <> null
+                    ELObj.force_select(nl.gen, nl.start + 1)
+                if nl.nodes = null
+                    return true
+                let m nl.nodes.get_length() as int
+                if nl.prefix = null
+                    return (m - nl.start) = 0
+                return (*(nl.prefix.get_buffer() + m) - nl.start) = 0
+            }
+            else
+                return true
+        true
     }
 
     function node_list_prefix(this: pointer[ELObj]) returns pointer[Array[int]]
@@ -2328,6 +2495,8 @@ define ELObj union
         choose *this
             when nl: NodeList
             {
+                if nl.gen <> null
+                    ELObj.force_select(nl.gen, 0 - 1)
                 if nl.nodes = null
                     return 0
                 let m nl.nodes.get_length() as int
@@ -2353,6 +2522,8 @@ define ELObj union
         choose *this
             when nl: NodeList
             {
+                if nl.gen <> null
+                    ELObj.force_select(nl.gen, nl.start + k + 1)
                 if nl.nodes = null
                     return null
                 let m nl.nodes.get_length() as int
