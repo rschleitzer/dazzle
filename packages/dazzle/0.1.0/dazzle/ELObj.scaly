@@ -1096,9 +1096,23 @@ define NNL_DOC_ENTITIES: int 8
 ; `host` is the page the node-list itself lives on, so the deferred matches
 ; land in exactly the region the eager version used; `src` is a value the
 ; primitive received, hence never in a region younger than that page.
+; The two lazy node-list views, both driven through ELObj.force_gen.
+; GEN_SELECT: `select-elements` — SelectElementsNodeListObj, `pat` filters `src`.
+; GEN_CONCAT: `(node-list a b …)` — the reference's PairNodeListObj (ELObj.cxx
+;   :1201), which is a two-pointer cell and copies NOTHING. `src`/`src2` are the
+;   two operands; `pat` is unused.
+define GEN_SELECT: int 0
+define GEN_CONCAT: int 1
+
+; A lazy node-list generator. Both kinds live in ONE record rather than in two
+; ELObj union arms on purpose: the union's arm size is paid by EVERY ELObj
+; allocation in the engine (see the note on SosofoObj), while this record is
+; only allocated for a list that actually is a view.
 define SelectGen
 (
+    kind: int
     src: pointer[ELObj]
+    src2: pointer[ELObj]
     pat: pointer[Pattern]
     interp: pointer[Interpreter]
     host: pointer[Page]
@@ -1116,9 +1130,11 @@ define SelectGen
     ; (tests/dazzle/grove axis1). Fixed 2026-08-02 in
     ; Planner.region_value_matches_pointer; the explicit form stays because it
     ; cannot go wrong either way.
-    init(src: pointer[ELObj], pat: pointer[Pattern], interp: pointer[Interpreter], host: pointer[Page], out: pointer[Array[pointer[GroveNode]]], cursor: int)
+    init(kind: int, src: pointer[ELObj], src2: pointer[ELObj], pat: pointer[Pattern], interp: pointer[Interpreter], host: pointer[Page], out: pointer[Array[pointer[GroveNode]]], cursor: int)
     {
+        set this.kind: kind
         set this.src: src
+        set this.src2: src2
         set this.pat: pat
         set this.interp: interp
         set this.host: host
@@ -2257,10 +2273,75 @@ define ELObj union
     {
         let out Array[pointer[GroveNode]]^host()
         let g host.allocate(sizeof SelectGen, alignof SelectGen) as pointer[SelectGen]
-        set *g: SelectGen(src, pat, interp, host, out, 0)
+        set *g: SelectGen(GEN_SELECT, src, null, pat, interp, host, out, 0)
         let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
         set *p: ELObj.NodeList(NodeListObj(out, 0, null, NNL_NONE, g))
         p
+    }
+
+    ; (node-list a b) — PairNodeListObj: a two-pointer cell, no copy. The
+    ; reference walks the pair tree through nodeListFirst/Rest and never
+    ; materializes an array; our node-list protocol is random-access
+    ; (node_list_node/count), so the pair materializes ONCE, on the first
+    ; access that needs members, and memoizes into `out` — the same
+    ; flatten-once-in-place shape StrCatObj uses for a string rope.
+    ;
+    ; ★What makes that O(n) instead of O(n²): concat_fill recurses into a
+    ; nested, still-unforced CONCAT view DIRECTLY instead of asking it for its
+    ; members, so the intermediate levels of a fold never build an array of
+    ; their own. That is what the eager version got wrong — `node-list-filter`
+    ; (dsssl/builtins.dsl) folds `(node-list result snl)` per member, which
+    ; copied result's whole prefix every step: n(n+1)/2 members for n matches,
+    ; measured 177.7 M copies / 4814 MB on the heaviest codegen.
+    function make_concat_node_list(host: pointer[Page], interp: pointer[Interpreter], a: pointer[ELObj], b: pointer[ELObj]) returns pointer[ELObj]
+    {
+        let out Array[pointer[GroveNode]]^host()
+        let g host.allocate(sizeof SelectGen, alignof SelectGen) as pointer[SelectGen]
+        set *g: SelectGen(GEN_CONCAT, a, b, null, interp, host, out, 0)
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.NodeList(NodeListObj(out, 0, null, NNL_NONE, g))
+        p
+    }
+
+    ; append every node of `list` (flat positions, from its own start) to `out`,
+    ; recursing straight through an unforced CONCAT view. The `start = 0` guard
+    ; is what keeps the shortcut sound: a view that node-list-rest has already
+    ; advanced must be read through the flat accessor, which honours `start`.
+    procedure concat_fill(list: pointer[ELObj], out: pointer[Array[pointer[GroveNode]]])
+    {
+        if list = null
+            return
+        choose *list
+            when nl: NodeList
+            {
+                let g nl.gen
+                if g <> null
+                {
+                    if g.kind = GEN_CONCAT
+                    {
+                        if nl.start = 0
+                        {
+                            if g.cursor = 0
+                            {
+                                ELObj.concat_fill(g.src, out)
+                                ELObj.concat_fill(g.src2, out)
+                                return
+                            }
+                        }
+                    }
+                }
+            }
+            else
+                return
+        let n list.node_list_count()
+        var j 0
+        while j < n
+        {
+            let node list.node_list_node(j)
+            if node <> null
+                out.add(node)
+            set j: j + 1
+        }
     }
 
     ; Extend a select view's buffer until it holds `need` matches, or until the
@@ -2279,6 +2360,17 @@ define ELObj union
     {
         if g.cursor < 0
             return
+        ; a CONCAT view materializes in one pass — its operands are fixed, so
+        ; there is nothing to gain from stopping early, and the eager version it
+        ; replaces built the whole thing at construction time anyway.
+        if g.kind = GEN_CONCAT
+        {
+            let out2 g.out
+            ELObj.concat_fill(g.src, out2)
+            ELObj.concat_fill(g.src2, out2)
+            set g.cursor: 0 - 1
+            return
+        }
         let src g.src
         let pat g.pat
         let interp g.interp
