@@ -1,0 +1,636 @@
+use scaly.memory.Page
+
+; ---- measurement hook: DZ_FRAME_PROBE ------------------------------------
+; Not a feature. It answers the one open question of the memory decomposition
+; (tests/dazzle/PERFORMANCE.md, "Woraus die Codegen-Spitze WIRKLICH besteht"):
+; of the posts that remain after the lazy node-list — attribute-string,
+; node-list-first, children, node-list-rest, select-elements — how much dies at
+; a VM FRAME boundary, which is exactly what stage 6b's per-frame regions would
+; reclaim, and how much survives it and would accumulate anyway?
+;
+; Byte accounting alone cannot answer that: it says WHERE bytes are born, not
+; WHEN they stop being used. So this probe measures the lifetime directly, and
+; in the unit the question is asked in — frame boundaries crossed:
+;
+;   * every Nth call of a probed primitive gets its result hosted on a PAGE OF
+;     ITS OWN (DZ_FRAME_PROBE_RATE, default 1000),
+;   * when the frame that created it returns, that page is ARMED (PROT_NONE),
+;   * any later read or write faults; the shim (dzprobe.c) records the frame-pop
+;     clock and the eval-bracket generation, un-protects the page and lets the
+;     access retry, so the run stays correct,
+;   * the next frame pop re-arms it, so one fault per boundary per object tells
+;     us at which boundaries the object was still in use.
+;
+; A sample with NO fault after arming died at its own frame boundary: a 6b
+; frame region would have reclaimed it. A sample still faulting in a LATER eval
+; generation outlived its construction rule and no frame granularity helps it.
+; Sample bytes scale by the sampling rate to the totals the byte attribution
+; measured, which is the cross-check that the two instruments agree.
+;
+; Costs a signal handler and one page per sample; measurement builds only
+; (DZ_FRAME_PROBE unset = every hook returns immediately — measured free:
+; cpu median 14.27 s against 14.51 s for the un-hooked engine on the heaviest
+; codegen). Built by tests/dazzle/frameprobe/run.sh, never by build-cli.sh.
+function getenv(name: pointer[const_char]) returns pointer[const_char] extern
+function atol(s: pointer[const_char]) returns i64 extern
+function calloc(count: size_t, size: size_t) returns pointer[void] extern
+procedure scaly_eputs(s: pointer[const_char]) extern
+procedure scaly_eputi(value: i64) extern
+procedure scaly_eputnl() extern
+
+; the shim (tests/dazzle/frameprobe/frameprobe.c)
+function dz_probe_install(report: pointer[void]) returns i64 extern
+function dz_probe_page() returns pointer[void] extern
+function dz_probe_selftest() returns i64 extern
+function dz_probe_arm(page: pointer[void]) returns i64 extern
+function dz_probe_rearm(page: pointer[void]) returns i64 extern
+function dz_probe_tick() returns i64 extern
+procedure dz_probe_set_gen(g: i64) extern
+function dz_probe_drain(pages: pointer[i64], seqs: pointer[i64], gens: pointer[i64], max: i64) returns i64 extern
+function dz_probe_pending() returns i64 extern
+function dz_probe_faults() returns i64 extern
+function dz_probe_dropped() returns i64 extern
+
+; 0 = not yet asked, 1 = on, 2 = off
+shared fp_state: int 0
+shared fp_rate: i64 1000
+shared fp_cap: i64 400000
+shared fp_n: i64 0
+shared fp_gen: i64 0
+shared fp_vm_ids: i64 0
+shared fp_overflow: i64 0
+shared fp_pops: i64 0
+shared fp_evals: i64 0
+shared fp_armcalls: i64 0
+shared fp_pend_cap: i64 4096
+; a long-lived sample would fault once per frame pop for millions of pops, so
+; stop watching it after this many observed boundaries and count it as capped.
+shared fp_fault_cap: i64 32
+shared fp_capped: i64 0
+; per-sample columns
+shared fp_page: pointer[i64] null
+shared fp_prim: pointer[i64] null
+shared fp_bytes: pointer[i64] null
+shared fp_arm_seq: pointer[i64] null
+shared fp_arm_gen: pointer[i64] null
+shared fp_last_seq: pointer[i64] null
+shared fp_last_gen: pointer[i64] null
+shared fp_nfault: pointer[i64] null
+; per-primitive call counts (index = primitive id)
+shared fp_calls: pointer[i64] null
+; which primitive ids are probed (index = primitive id, 1 = probed)
+shared fp_probed: pointer[i64] null
+; armed page -> sample index (open addressing, key 0 = empty)
+shared fp_key: pointer[i64] null
+shared fp_val: pointer[i64] null
+shared fp_mask: i64 0
+; fault drain buffers
+shared fp_dp: pointer[i64] null
+shared fp_ds: pointer[i64] null
+shared fp_dg: pointer[i64] null
+; created but not yet armed (their frame has not returned yet)
+shared fp_pend_page: pointer[i64] null
+shared fp_pend_prim: pointer[i64] null
+shared fp_pend_vm: pointer[i64] null
+shared fp_pend_csp: pointer[i64] null
+shared fp_pend_n: i64 0
+
+; the atexit entry point (see dz_probe_install): a bare module-level function
+; name is a function-pointer value, which a concept static is not.
+function fp_report_hook()
+    FrameProbe.report()
+
+define FrameProbe
+{
+    function setup()
+    {
+        set fp_state: 2
+        let e getenv("DZ_FRAME_PROBE")
+        if e = null
+            return
+        let r getenv("DZ_FRAME_PROBE_RATE")
+        if r <> null
+        {
+            let v atol(r)
+            if v > 0
+                set fp_rate: v
+        }
+        let cap fp_cap as size_t
+        let eight 8 as size_t
+        set fp_page: calloc(cap, eight) as pointer[i64]
+        set fp_prim: calloc(cap, eight) as pointer[i64]
+        set fp_bytes: calloc(cap, eight) as pointer[i64]
+        set fp_arm_seq: calloc(cap, eight) as pointer[i64]
+        set fp_arm_gen: calloc(cap, eight) as pointer[i64]
+        set fp_last_seq: calloc(cap, eight) as pointer[i64]
+        set fp_last_gen: calloc(cap, eight) as pointer[i64]
+        set fp_nfault: calloc(cap, eight) as pointer[i64]
+        set fp_calls: calloc(1024 as size_t, eight) as pointer[i64]
+        set fp_probed: calloc(1024 as size_t, eight) as pointer[i64]
+        if fp_probed = null
+            return
+        ; DZ_FRAME_PROBE_IDS=<comma-separated primitive ids>; unset = the
+        ; default set: the posts the byte attribution left
+        ; open — node-list-first 80, node-list-rest 81, children 85,
+        ; attribute-string 92, select-elements 102. Spelled as numerals because
+        ; Primitive's PRIM_* constants live in a module declared LATER, which
+        ; makes them invisible here (CLAUDE.md, module declaration order).
+        var digits false
+        var acc: i64 0
+        var nprobed: i64 0
+        var ids getenv("DZ_FRAME_PROBE_IDS")
+        if ids = null
+            set ids: "" as pointer[const_char]
+        var q ids as pointer[u8]
+        while true
+        {
+            let ch (*q) as i64
+            if (ch >= 48) and (ch <= 57)
+            {
+                set acc: (acc * 10) + (ch - 48)
+                set digits: true
+            }
+            else
+            {
+                if digits
+                {
+                    if acc < 1024
+                    {
+                        set *(fp_probed + acc): 1
+                        set nprobed: nprobed + 1
+                    }
+                    set acc: 0
+                }
+                set digits: false
+            }
+            if ch = 0
+                break
+            set q: q + (1 as size_t)
+        }
+        if nprobed = 0
+        {
+            set *(fp_probed + 80): 1
+            set *(fp_probed + 81): 1
+            set *(fp_probed + 85): 1
+            set *(fp_probed + 92): 1
+            set *(fp_probed + 102): 1
+        }
+        let slots 4194304 as size_t
+        set fp_key: calloc(slots, eight) as pointer[i64]
+        set fp_val: calloc(slots, eight) as pointer[i64]
+        set fp_mask: 4194303
+        set fp_dp: calloc(8192 as size_t, eight) as pointer[i64]
+        set fp_ds: calloc(8192 as size_t, eight) as pointer[i64]
+        set fp_dg: calloc(8192 as size_t, eight) as pointer[i64]
+        set fp_pend_page: calloc(4096 as size_t, eight) as pointer[i64]
+        set fp_pend_prim: calloc(4096 as size_t, eight) as pointer[i64]
+        set fp_pend_vm: calloc(4096 as size_t, eight) as pointer[i64]
+        set fp_pend_csp: calloc(4096 as size_t, eight) as pointer[i64]
+        if fp_page = null
+            return
+        if fp_key = null
+            return
+        let hook &fp_report_hook
+        let rc dz_probe_install(hook)
+        if rc <> 0
+        {
+            scaly_eputs "dazzle: frame probe: handler install failed, rc "
+            scaly_eputi rc
+            scaly_eputnl()
+            return
+        }
+        set fp_state: 1
+        let st dz_probe_selftest()
+        if st <> 1
+        {
+            scaly_eputs "dazzle: frame probe: selftest failed, "
+            scaly_eputi st
+            scaly_eputnl()
+            set fp_state: 2
+            return
+        }
+        scaly_eputs "dazzle: frame probe on, rate 1/"
+        scaly_eputi fp_rate
+        scaly_eputnl()
+    }
+
+    function on() returns bool
+    {
+        if fp_state = 0
+            FrameProbe.setup()
+        fp_state = 1
+    }
+
+    ; the dispatch gate: is this primitive one of the probed ones? Off (the
+    ; normal case) this is one comparison.
+    function probed(id: int) returns bool
+    {
+        if fp_state <> 1
+        {
+            if fp_state <> 0
+                return false
+            FrameProbe.setup()
+            if fp_state <> 1
+                return false
+        }
+        let iid id as i64
+        if iid >= 1024
+            return false
+        *(fp_probed + iid) = 1
+    }
+
+    ; a fresh identity per VM: the (vm, csp) pair is what identifies the frame
+    ; a sample was born in, and a nested VM starts counting csp at 0 again.
+    function next_vm_id() returns i64
+    {
+        set fp_vm_ids: fp_vm_ids + 1
+        fp_vm_ids
+    }
+
+    function map_put(key: i64, value: i64)
+    {
+        var i (key / 4096) & fp_mask
+        while true
+        {
+            let k *(fp_key + i)
+            if k = 0
+            {
+                set *(fp_key + i): key
+                set *(fp_val + i): value
+                return
+            }
+            if k = key
+            {
+                set *(fp_val + i): value
+                return
+            }
+            set i: (i + 1) & fp_mask
+        }
+    }
+
+    function map_get(key: i64) returns i64
+    {
+        var i (key / 4096) & fp_mask
+        while true
+        {
+            let k *(fp_key + i)
+            if k = 0
+                return 0 - 1
+            if k = key
+                return *(fp_val + i)
+            set i: (i + 1) & fp_mask
+        }
+        0 - 1
+    }
+
+    ; Primitive.dispatch calls this for the probed primitives: it counts the
+    ; call and, on a sampling hit, hands back a private page to host the
+    ; result on instead of the eval region.
+    function probe_host(id: int, vmid: i64, csp: int, host: pointer[Page]) returns pointer[Page]
+    {
+        if fp_state <> 1
+        {
+            if fp_state <> 0
+                return host
+            FrameProbe.setup()
+            if fp_state <> 1
+                return host
+        }
+        let iid id as i64
+        let c *(fp_calls + iid) + 1
+        set *(fp_calls + iid): c
+        if c % fp_rate <> 0
+            return host
+        if fp_n >= fp_cap
+            return host
+        if fp_pend_n >= fp_pend_cap
+        {
+            set fp_overflow: fp_overflow + 1
+            return host
+        }
+        ; a page of its own, straight from the allocator's pool so its header
+        ; is a real, reset Page header (hand-initializing one from here is a
+        ; trap: `set p.exclusive_pages.head: null` emits a store THROUGH the
+        ; uninitialized field, and `p + 1` steps 8 bytes, not sizeof Page).
+        ; The page is never released — the samples must stay watchable, and
+        ; nothing else in the bucket is touched by protecting this slot.
+        ; a page of its own (mmap'd by the shim: zeroed, and mprotect-able —
+        ; pool pages live inside a malloc'd bucket and mprotect refuses them).
+        ; Never released: the samples must stay watchable.
+        let raw dz_probe_page()
+        if raw = null
+            return host
+        let p raw as pointer[Page]
+        ; mmap gives a zeroed page, so only the two live header fields need
+        ; writing. NB `set p.exclusive_pages.head: null` would emit a store
+        ; THROUGH the uninitialized field (a wild store), and `p + 1` steps 8
+        ; bytes, not sizeof Page — both were measured the hard way.
+        ; 40 = sizeof Page ({ptr, ptr, ptr, {ptr}, ptr}), spelled as a literal:
+        ; `sizeof Page` across the package boundary answers 8 (the opaque-pointer
+        ; trap), and the first allocation then overwrites the page header.
+        set p.next_object: ((p as size_t) + (40 as size_t)) as pointer[void]
+        set p.region: p
+        set *(fp_pend_page + fp_pend_n): p as i64
+        set *(fp_pend_prim + fp_pend_n): iid
+        set *(fp_pend_vm + fp_pend_n): vmid
+        set *(fp_pend_csp + fp_pend_n): csp as i64
+        set fp_pend_n: fp_pend_n + 1
+        p
+    }
+
+    ; arm one pending entry: measure what the primitive put on the page, take
+    ; away access to every page of it, and start its lifetime clock.
+    function arm_pending(i: i64, seq: i64)
+    {
+        set fp_armcalls: fp_armcalls + 1
+        let pa *(fp_pend_page + i)
+        let pg pa as pointer[Page]
+        var bytes (pg.next_object as i64) - pa
+        let idx fp_n
+        set fp_n: fp_n + 1
+        var q pg.next_page
+        while q <> null
+        {
+            set bytes: bytes + 4096
+            let qa q as i64
+            FrameProbe.map_put(qa, idx)
+            let rc2 dz_probe_arm(q as pointer[void])
+            set q: q.next_page
+        }
+        set *(fp_page + idx): pa
+        set *(fp_prim + idx): *(fp_pend_prim + i)
+        set *(fp_bytes + idx): bytes
+        set *(fp_arm_seq + idx): seq
+        set *(fp_arm_gen + idx): fp_gen
+        set *(fp_last_seq + idx): 0 - 1
+        set *(fp_last_gen + idx): 0 - 1
+        set *(fp_nfault + idx): 0
+        FrameProbe.map_put(pa, idx)
+        let rc dz_probe_arm(pg as pointer[void])
+    }
+
+    ; record the faults the handler collected since the last drain and re-arm
+    ; those pages, so each object can report at most one use per boundary.
+    function drain()
+    {
+        let pend dz_probe_pending()
+        if pend = 0
+            return
+        let n dz_probe_drain(fp_dp, fp_ds, fp_dg, 8192)
+        var i: i64 0
+        while i < n
+        {
+            let pa *(fp_dp + i)
+            let idx FrameProbe.map_get(pa)
+            if idx >= 0
+            {
+                set *(fp_last_seq + idx): *(fp_ds + i)
+                set *(fp_last_gen + idx): *(fp_dg + i)
+                let nf *(fp_nfault + idx) + 1
+                set *(fp_nfault + idx): nf
+                if nf < fp_fault_cap
+                {
+                    let rc dz_probe_rearm(pa as pointer[void])
+                }
+                else if nf = fp_fault_cap
+                    set fp_capped: fp_capped + 1
+            }
+            set i: i + 1
+        }
+    }
+
+    ; VM.pop_frame: the frame clock ticks, and everything born in the frame
+    ; that just returned (same VM, deeper csp) is armed.
+    function pop(vmid: i64, new_csp: int)
+    {
+        if fp_state <> 1
+            return
+        set fp_pops: fp_pops + 1
+        let seq dz_probe_tick()
+        if fp_pend_n > 0
+        {
+            let lim new_csp as i64
+            var w: i64 0
+            var i: i64 0
+            while i < fp_pend_n
+            {
+                var keep true
+                if *(fp_pend_vm + i) = vmid
+                {
+                    if *(fp_pend_csp + i) > lim
+                    {
+                        FrameProbe.arm_pending(i, seq)
+                        set keep: false
+                    }
+                }
+                if keep
+                {
+                    set *(fp_pend_page + w): *(fp_pend_page + i)
+                    set *(fp_pend_prim + w): *(fp_pend_prim + i)
+                    set *(fp_pend_vm + w): *(fp_pend_vm + i)
+                    set *(fp_pend_csp + w): *(fp_pend_csp + i)
+                    set w: w + 1
+                }
+                set i: i + 1
+            }
+            set fp_pend_n: w
+        }
+        FrameProbe.drain()
+    }
+
+    ; VM.eval exit: an error unwind abandons frames without popping them, so
+    ; arm whatever this VM still has pending.
+    function eval_end(vmid: i64)
+    {
+        if fp_state <> 1
+            return
+        set fp_evals: fp_evals + 1
+        if fp_pend_n = 0
+            return
+        let seq dz_probe_tick()
+        var w: i64 0
+        var i: i64 0
+        while i < fp_pend_n
+        {
+            var keep true
+            if *(fp_pend_vm + i) = vmid
+            {
+                FrameProbe.arm_pending(i, seq)
+                set keep: false
+            }
+            if keep
+            {
+                set *(fp_pend_page + w): *(fp_pend_page + i)
+                set *(fp_pend_prim + w): *(fp_pend_prim + i)
+                set *(fp_pend_vm + w): *(fp_pend_vm + i)
+                set *(fp_pend_csp + w): *(fp_pend_csp + i)
+                set w: w + 1
+            }
+            set i: i + 1
+        }
+        set fp_pend_n: w
+    }
+
+    ; a new eval bracket (Interpreter.set_eval_region): the generation that
+    ; separates "still used inside its construction rule" from "outlived it".
+    function gen_bump()
+    {
+        if fp_state <> 1
+            return
+        set fp_gen: fp_gen + 1
+        dz_probe_set_gen fp_gen
+    }
+
+    procedure report_row(id: i64)
+    {
+        var samples: i64 0
+        var bytes: i64 0
+        var dead: i64 0
+        var dead_bytes: i64 0
+        var le1: i64 0
+        var le1_bytes: i64 0
+        var le10: i64 0
+        var le10_bytes: i64 0
+        var le100: i64 0
+        var le100_bytes: i64 0
+        var gt100: i64 0
+        var gt100_bytes: i64 0
+        var capped: i64 0
+        var capped_bytes: i64 0
+        var crossgen: i64 0
+        var crossgen_bytes: i64 0
+        let calls *(fp_calls + id)
+        var i: i64 0
+        while i < fp_n
+        {
+            if *(fp_prim + i) = id
+            {
+                set samples: samples + 1
+                let b *(fp_bytes + i)
+                set bytes: bytes + b
+                let nf *(fp_nfault + i)
+                if nf = 0
+                {
+                    set dead: dead + 1
+                    set dead_bytes: dead_bytes + b
+                }
+                if nf > 0
+                {
+                    let life *(fp_last_seq + i) - *(fp_arm_seq + i)
+                    if life <= 1
+                    {
+                        set le1: le1 + 1
+                        set le1_bytes: le1_bytes + b
+                    }
+                    else if life <= 10
+                    {
+                        set le10: le10 + 1
+                        set le10_bytes: le10_bytes + b
+                    }
+                    else if life <= 100
+                    {
+                        set le100: le100 + 1
+                        set le100_bytes: le100_bytes + b
+                    }
+                    else
+                    {
+                        set gt100: gt100 + 1
+                        set gt100_bytes: gt100_bytes + b
+                    }
+                    if nf >= fp_fault_cap
+                    {
+                        set capped: capped + 1
+                        set capped_bytes: capped_bytes + b
+                    }
+                    if *(fp_last_gen + i) > *(fp_arm_gen + i)
+                    {
+                        set crossgen: crossgen + 1
+                        set crossgen_bytes: crossgen_bytes + b
+                    }
+                }
+            }
+            set i: i + 1
+        }
+        if samples = 0
+        {
+            if calls = 0
+                return
+        }
+        scaly_eputs "  prim "
+        scaly_eputi id
+        scaly_eputs ": calls "
+        scaly_eputi calls
+        scaly_eputs " samples "
+        scaly_eputi samples
+        scaly_eputs " bytes "
+        scaly_eputi bytes
+        let est_mb (bytes * fp_rate) / 1048576
+        scaly_eputs " estMB "
+        scaly_eputi est_mb
+        scaly_eputnl()
+        scaly_eputs "    dead-at-own-frame "
+        scaly_eputi dead
+        scaly_eputs " (bytes "
+        scaly_eputi dead_bytes
+        scaly_eputs ") life<=1 "
+        scaly_eputi le1
+        scaly_eputs "/"
+        scaly_eputi le1_bytes
+        scaly_eputs " <=10 "
+        scaly_eputi le10
+        scaly_eputs "/"
+        scaly_eputi le10_bytes
+        scaly_eputs " <=100 "
+        scaly_eputi le100
+        scaly_eputs "/"
+        scaly_eputi le100_bytes
+        scaly_eputs " >100 "
+        scaly_eputi gt100
+        scaly_eputs "/"
+        scaly_eputi gt100_bytes
+        scaly_eputs " capped "
+        scaly_eputi capped
+        scaly_eputs "/"
+        scaly_eputi capped_bytes
+        scaly_eputs " cross-gen "
+        scaly_eputi crossgen
+        scaly_eputs "/"
+        scaly_eputi crossgen_bytes
+        scaly_eputnl()
+    }
+
+    procedure report()
+    {
+        if fp_state <> 1
+            return
+        let faults dz_probe_faults()
+        let dropped dz_probe_dropped()
+        scaly_eputs "dazzle: frame probe: samples "
+        scaly_eputi fp_n
+        scaly_eputs " faults "
+        scaly_eputi faults
+        scaly_eputs " dropped "
+        scaly_eputi dropped
+        scaly_eputs " generations "
+        scaly_eputi fp_gen
+        scaly_eputs " pending-overflow "
+        scaly_eputi fp_overflow
+        scaly_eputs " pending-now "
+        scaly_eputi fp_pend_n
+        scaly_eputs " pops "
+        scaly_eputi fp_pops
+        scaly_eputs " evalends "
+        scaly_eputi fp_evals
+        scaly_eputs " armcalls "
+        scaly_eputi fp_armcalls
+        scaly_eputs " capped "
+        scaly_eputi fp_capped
+        scaly_eputnl()
+        var id: i64 0
+        while id < 1024
+        {
+            FrameProbe.report_row(id)
+            set id: id + 1
+        }
+    }
+}
