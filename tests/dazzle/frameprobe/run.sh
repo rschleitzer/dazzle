@@ -86,9 +86,13 @@ patch('/packages/dazzle/0.1.0/dazzle/Primitive.scaly', [
      "        }\n"
      "        let a0 *args")])
 
+# The probe object goes BEFORE -lm: a left-to-right ELF linker only pulls a
+# library for symbols undefined so far, so -lm has to stay last on the line
+# (that is why f2c06204 put it there, and why re-aiming this anchor means
+# inserting ahead of it rather than appending).
 patch('/tools/link-lto.sh', [(
-    '"$WORK/whole.o" "$WORK/fcontext.o" "$WORK/eio.o" "$WORK/ctime.o" -o "$OUT"',
-    '"$WORK/whole.o" "$WORK/fcontext.o" "$WORK/eio.o" "$WORK/ctime.o" ${LTO_EXTRA_OBJS:-} -o "$OUT"')])
+    '"$WORK/whole.o" "$WORK/fcontext.o" "$WORK/eio.o" "$WORK/ctime.o" -lm -o "$OUT"',
+    '"$WORK/whole.o" "$WORK/fcontext.o" "$WORK/eio.o" "$WORK/ctime.o" ${LTO_EXTRA_OBJS:-} -lm -o "$OUT"')])
 
 patch('/packages/dazzle/0.1.0/dazzle/Interpreter.scaly', [
     ("use dazzle.NameTable.NameTable",
