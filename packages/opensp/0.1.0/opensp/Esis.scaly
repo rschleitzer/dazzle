@@ -2,6 +2,7 @@ use scaly.memory.Page
 use scaly.containers.Array
 use scaly.containers.String
 use scaly.io.Path
+use scaly.fiber.Io
 use opensp.StringC.StringC
 use opensp.ParserState.ParserState
 use opensp.Event.Event
@@ -107,6 +108,22 @@ define EsisW
     stack_e: pointer[Array[pointer[Array[StringC]]]]
     stack_n: pointer[Array[pointer[Array[StringC]]]]
     sub_depth: size_t
+    ; Streaming output: the fd the accumulated ESIS goes out on at every drain,
+    ; or -1 to DISCARD it there (-s: the caller writes nothing, so the bytes are
+    ; dead as soon as they are rendered). Not streaming at all (the RAST and
+    ; unit-test paths, which construct the writer inside Esis.write) leaves this
+    ; -1 and never drains, so the full text still comes back as the return value.
+    ;
+    ; Why: the writer used to accumulate the WHOLE ESIS text and Esis.write then
+    ; copied it into a String — measured on a 13.1 MiB parse whose output is
+    ; 22.5 MiB, that is 31.6 MiB of accumulator capacity plus a 22.5 MiB String
+    ; alive at the same moment, 29 % of the peak, for bytes that were already
+    ; final. The reference writes to its stdout as it goes (EncodeOutputCharStream
+    ; over a FileOutputByteStream); flushing per drain is that behaviour.
+    out_fd: int
+    ; the BOM (UNICODE output) belongs to the STREAM, so only the first flush
+    ; may emit it — see Esis.encode_out's `bom` argument.
+    bom_done: bool
 )
 
 define Esis
@@ -837,7 +854,7 @@ define Esis
     ; writer construction — everything write() did before the event loop.
     ; Streaming delivery calls this BEFORE the parse; the classic whole-queue
     ; path calls it from write().
-    function begin(host: pointer[Page], ps: pointer[ParserState]) returns pointer[EsisW]
+    function begin(host: pointer[Page], ps: pointer[ParserState], out_fd: int) returns pointer[EsisW]
     {
         let acc Array[u8]^host()
         let w host.allocate(sizeof EsisW, alignof EsisW) as pointer[EsisW]
@@ -859,9 +876,42 @@ define Esis
         set w.stack_e: ste0
         set w.stack_n: stn0
         set w.sub_depth: 0
+        set w.out_fd: out_fd
+        set w.bom_done: false
         if (w.flags & OF_PARSER_INFO) <> (0 as u32)
             Esis.features(w)
         w
+    }
+
+    ; Hand the rendered ESIS bytes to the output and empty the accumulator —
+    ; called at every streaming drain, where everything in `acc` is already
+    ; final. `acc.clear()` keeps the buffer, so it stays chunk-sized instead of
+    ; growing with the document.
+    ;
+    ; ★The transcode temporaries go on the EVENT SCRATCH (ps.event_host()),
+    ; which the drain resets immediately after this returns — otherwise the
+    ; per-chunk copies would accumulate on the run region and this would move
+    ; the cost rather than remove it.
+    ;
+    ; ★The encoder is the RUN's (ps.get_output_encoder(), reached through
+    ; encode_out), so whatever state it carries continues across chunks; only
+    ; the BOM is per-stream, hence bom_done.
+    function flush_out(w: pointer[EsisW], ps: pointer[ParserState])
+    {
+        let acc w.acc
+        let n acc.get_length()
+        if n = (0 as size_t)
+            return
+        if w.out_fd >= 0
+        {
+            let host ps.event_host()
+            let internal String(acc.get_buffer() as pointer[const_char], n)
+            let out Esis.encode_out(host, ps, internal, true, w.bom_done = false)
+            if out.get_length() > (0 as size_t)
+                Io.write_all(w.out_fd as i32, out.get_buffer() as pointer[void], out.get_length())
+        }
+        set w.bom_done: true
+        acc.clear()
     }
 
     ; render the queued events [from, n) — the writer state carries across
@@ -1143,7 +1193,7 @@ define Esis
             set from: ps.get_drained()
         }
         else
-            set w: Esis.begin(host, ps)
+            set w: Esis.begin(host, ps, -1)
         Esis.write_events(w, ps, from, ps.n_events())
         Esis.flush_data(w)
         ; The conformance marker `C` is written iff the document conformed
@@ -1160,7 +1210,7 @@ define Esis
         let internal String(acc.get_buffer() as pointer[const_char], acc.get_length())
         ; the ESIS stream has the escaper set; a BOM-writing system (UNICODE)
         ; stamps it at stream creation, i.e. per document.
-        Esis.encode_out(host, ps, internal, true, true)
+        Esis.encode_out(host, ps, internal, true, w.bom_done = false)
     }
 
     ; run a writer's internal UTF-8 stream through the run's output coding
