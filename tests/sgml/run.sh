@@ -26,9 +26,12 @@
 #   DOC=<file>            document passed to the binary (required)
 #   BASE=repo|entry       resolve DOC/cwd against repo root or the entry dir
 #                         (default: entry — self-contained fixture)
-#   WORKDIR=<abs path>    absolute cwd override (wins over BASE) — used by the
-#                         private tier to point at models in their home repos
-#                         WITHOUT copying local source into this tree
+#   WORKDIR=<path>        cwd override (wins over BASE). ABSOLUTE: the model
+#                         stays in its home repo and no local source is
+#                         copied into this tree. RELATIVE: resolved against the
+#                         entry — a FROZEN private entry (freeze-private.sh)
+#                         carrying its own copy, so the corpus stops drifting
+#                         when those repos move on
 #   SP_ENV="K=V K=V"      environment prefix (e.g. SP_CHARSET_FIXED=YES SP_ENCODING=XML)
 #   EXTRA_ARGS="..."      extra args before DOC (e.g. a leading xml.dcl, -c catalog)
 #   RAST=1                run with -t <tmpfile> and compare it against the
@@ -77,7 +80,16 @@ for entry in "$HERE"/corpus/*/ "$HERE"/corpus-private/*/; do
   [ -n "$DOC" ] || { echo "  $name: manifest missing DOC" >&2; continue; }
 
   if [ -n "$WORKDIR" ]; then
-    workdir="$WORKDIR"
+    # A RELATIVE WORKDIR resolves against the entry — that is how a frozen
+    # private entry names the subdirectory holding its own copy of the model
+    # (freeze-private.sh writes `WORKDIR=frozen`). The doc sits one level down
+    # so a system identifier reaching upwards (`../x/y.dtd`) still lands inside
+    # the entry. An ABSOLUTE WORKDIR keeps its old meaning: the model stays in
+    # its home repo and nothing local is copied here.
+    case "$WORKDIR" in
+      /*) workdir="$WORKDIR" ;;
+      *)  workdir="$entry/$WORKDIR" ;;
+    esac
   else
     case "$BASE" in
       repo)  workdir="$REPO_ROOT" ;;
