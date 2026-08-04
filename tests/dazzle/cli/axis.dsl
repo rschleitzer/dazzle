@@ -1,4 +1,4 @@
-; the sibling/axis primitives surfaced by the modules reproduction:
+; the sibling/axis primitives surfaced by the reproduction sweep:
 ; children over a MULTI-node list (reference Children self-maps), id,
 ; node-list-reverse, node-list=?, first-sibling?, last-sibling?,
 ; child-number, node-list-map.

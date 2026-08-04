@@ -99,7 +99,7 @@ if [ "$rc5" -ne 0 ] || [ "$got5" != "$want5" ]; then
   exit 1
 fi
 
-# sibling/axis primitives from the modules reproduction: children over a
+# sibling/axis primitives from the reproduction sweep: children over a
 # multi-node list, id, node-list-reverse, node-list=?, first-sibling?,
 # last-sibling?, child-number, node-list-map.
 got6="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/axis.dsl" "$HERE/axis.sgml")"
@@ -113,7 +113,7 @@ if [ "$rc6" -ne 0 ] || [ "$got6" != "$want6" ]; then
 fi
 
 # (data nl) over a MULTI-node list concatenates every member's data
-# (modules sweep: multi-<return> sprocs were truncated to the first).
+# (module sweep: multi-<return> sprocs were truncated to the first).
 got7="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/data.dsl" "$HERE/axis.sgml")"
 rc7=$?
 want7="$(cat "$HERE/data.expected")"
@@ -126,7 +126,7 @@ fi
 
 # entity FO whose output file cannot be created: reference reports
 # cannotOpenOutputError on stderr, the content falls through to stdout,
-# rc stays 0 (the modules sweep ran against un-created output dirs).
+# rc stays 0 (the module sweep ran against un-created output dirs).
 got8="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/entityfall.dsl" "$HERE/axis.sgml" 2>"$OUT.eferr")"
 rc8=$?
 if [ "$rc8" -ne 0 ] || [ "$got8" != "FALLBACK" ] \

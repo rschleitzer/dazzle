@@ -10,7 +10,14 @@
 #   REF_ONSGMLS  reference parser    (default: onsgmls)
 #   REF_JADE     reference engine    (default: dazzle, else openjade)
 #   DAZZLEDOC    DocBook workload    (default: $HOME/repos/dazzledoc)
-#   CLAML        ClaML workload      (default: $HOME/repos/fhir-repo/fhir/icd10-transform)
+#   CLAML        ClaML workload      (no default — the corpus lives in a
+#                                     local-only repo, see the note below)
+#
+# Paths that name other repos do not belong in this file. Put them in the
+# gitignored `tests/dazzle/perf-survey.local` instead, which is sourced when
+# CLAML is not already in the environment:
+#
+#   CLAML=$HOME/repos/<repo>/<path-to-claml-corpus>
 #
 # The two external corpora are optional; missing ones are skipped with a note.
 # Each row first runs both sides ONCE and diffs the output — a row whose output
@@ -34,7 +41,10 @@ if [ -z "$REF_JADE" ]; then
   if command -v dazzle >/dev/null 2>&1; then REF_JADE=dazzle; else REF_JADE=openjade; fi
 fi
 DAZZLEDOC="${DAZZLEDOC:-$HOME/repos/dazzledoc}"
-CLAML="${CLAML:-$HOME/repos/fhir-repo/fhir/icd10-transform}"
+if [ -z "${CLAML:-}" ] && [ -f "$HERE/perf-survey.local" ]; then
+  . "$HERE/perf-survey.local"
+fi
+CLAML="${CLAML:-}"
 cd "$ROOT"
 set -u
 
@@ -185,12 +195,15 @@ else
   echo "  (dazzledoc corpus missing at $DAZZLEDOC — parse/style rows skipped)"
 fi
 
-CLAMLDOC="$CLAML/icd10gm2022syst_claml_20210917.xml"
-if [ -f "$CLAMLDOC" ]; then
+CLAMLDOC=""
+[ -n "$CLAML" ] && CLAMLDOC="$CLAML/icd10gm2022syst_claml_20210917.xml"
+if [ -n "$CLAMLDOC" ] && [ -f "$CLAMLDOC" ]; then
   row "parse ClaML 13.7M" "$CLAML" "$XMLENV" \
     "$ONS $(basename "$CLAMLDOC")" "$REF_ONSGMLS $(basename "$CLAMLDOC")"
-else
+elif [ -n "$CLAML" ]; then
   echo "  (ClaML corpus missing at $CLAML — large rows skipped)"
+else
+  echo "  (CLAML unset — large rows skipped; see the header note)"
 fi
 
 # ---- 2. DSSSL codegen (the mkp corpus) -----------------------------------
