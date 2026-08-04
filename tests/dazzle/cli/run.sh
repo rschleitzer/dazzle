@@ -46,14 +46,32 @@ fi
 
 # full DSSSL style-sheet SGML wrapper (<!DOCTYPE STYLE-SHEET> + <STYLE-SPECIFICATION>
 # + CDATA body) routed through DssslSpecEventHandler (the -d spec reader). Same
-# stylesheet body as ids.dsl, so same golden.
-got3="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/wrapped.dsl" "$HERE/suite.sgml")"
+# stylesheet body as ids.dsl, so same golden. The inline subset declares the
+# DSSSL architecture the way dsssl/style-sheet.dtd does (ArcBase PI + notation +
+# ArcDTD support attributes) — that is what loadDoc's gotArc_ gate requires.
+got3="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/wrapped.dsl" "$HERE/suite.sgml" 2>"$OUT.arcerr")"
 rc3=$?
 want3="$(cat "$HERE/wrapped.expected")"
-if [ "$rc3" -ne 0 ] || [ "$got3" != "$want3" ]; then
-  echo "dazzle-cli: FAIL wrapped-spec (rc=$rc3)"
+err3="$(cat "$OUT.arcerr")"
+if [ "$rc3" -ne 0 ] || [ "$got3" != "$want3" ] || [ -n "$err3" ]; then
+  echo "dazzle-cli: FAIL wrapped-spec (rc=$rc3, err: $err3)"
   echo "  want: $(printf '%s' "$want3" | cat -v)"
   echo "  got:  $(printf '%s' "$got3" | cat -v)"
+  exit 1
+fi
+
+# ...the same stylesheet MINUS the ArcBase PI: declaring the DSSSL notation does
+# NOT declare the architecture as a base architecture, so the spec reader reports
+# specNotArc and processes the document with NO construction rules (default
+# processing -> the document's own character data). Both reference binaries agree,
+# and the too-lenient notation-only gate this pins used to load the rules.
+got3b="$(SCALY_HOME="$ROOT" "$OUT" -t sgml -d "$HERE/notarc.dsl" "$HERE/suite.sgml" 2>"$OUT.arcerr")"
+rc3b=$?
+err3b="$(sed "s|^$OUT|PROG|" "$OUT.arcerr")"
+if [ "$rc3b" -ne 0 ] || [ "$got3b" != "abc" ] \
+   || [ "$err3b" != 'PROG:E: specification document does not have the DSSSL architecture as a base architecture' ]; then
+  echo "dazzle-cli: FAIL notarc-spec (rc=$rc3b, err: $err3b)"
+  echo "  got:  $(printf '%s' "$got3b" | cat -v)"
   exit 1
 fi
 
