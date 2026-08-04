@@ -132,6 +132,10 @@ All four exit criteria green through the JIT (`tests/opensp/run.sh` → `PASS`;
   InputSourceOrigin, `parent()`→ref location), in-memory `InputSource`;
   **location tracking through nested pushed sources** via the parent chain.
   Streaming `fill()`/mutable cursor + the rest of the Origin hierarchy: Stage 2+.
+  (Both landed since: the Origin hierarchy is folded into the one record, and
+  `InputSource` grew the `ExternalInputSource` half — a decoding window plus
+  `SourceFill`, 2026-08-04. See `tests/dazzle/PERFORMANCE.md`, „Der
+  Eingabe-Layer streamt".)
 
 Deferred within Stage 1 by scope (not blockers): the full `Tokens` constant
 table (lands with the lexer, Stage 3), OutputByteStream/OutputCharStream sinks

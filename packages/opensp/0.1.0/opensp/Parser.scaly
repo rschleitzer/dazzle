@@ -542,14 +542,9 @@ define APT_NAMETOKEN: int 2
 define APT_VI: int 3
 define APT_RECOVER_UNQUOTED: int 4
 
-; ExternalInputSource::RecordType — how an entity's records are delimited. Detected
-; from its first CR/LF (make_char_source); see the record-normalization comment
-; there. `unknown`/`crUnknown` are the reference's streaming-only intermediates: a
-; whole-buffer source decides in one look.
-define RT_LF: int 0
-define RT_CRLF: int 1
-define RT_CR: int 2
-define RT_ASIS: int 3
+; (ExternalInputSource::RecordType — RT_LF/RT_CRLF/RT_CR/RT_ASIS moved to
+; Location.scaly with the streaming source that carries one; see the
+; record-normalization comment on make_char_source below.)
 
 ; Text-item tracking for AttributeValue::handleAsUnterminated (Attribute.cxx:
 ; 1377) inside parse_literal. The reference iterates the Text's ITEM list and
@@ -7601,16 +7596,21 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         if idx0 + (n as u32) <> str_loc.get_index()
             return false
         let vs (*t).string()
-        let contents org0.get_contents()
         var j: size_t 0
         while j < n
         {
             let lj *(locs + j)
             if (lj.get_origin() <> org0) or (lj.get_index() <> idx0 + (j as u32))
                 return false
-            if contents <> null
+            ; cross-check the value against the source chars while they are
+            ; still in the input window (the value sits immediately before the
+            ; junk token, so normally all of it is); once decoded over, the
+            ; location check above stands on its own — the reference holds no
+            ; more of the entity than we do.
+            var sch: u32 0
+            if ins.window_char((idx0 as size_t) + j, &sch)
             {
-                if *(contents + ((idx0 as size_t) + j)) <> vs.get(j)
+                if sch <> vs.get(j)
                     return false
             }
             set j: j + 1
@@ -11445,6 +11445,93 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     function make_char_source_block(host: pointer[Page], bytes: String, org: pointer[Origin], block: size_t) returns pointer[InputSource]
         Parser.make_char_source_block_cs(host, bytes, org, block, CodingSystem.simple(IENC_UTF8))
 
+    ; ---- the STREAMING form (ExternalInputSource) --------------------------
+    ; What every external source is built with. The source keeps a WINDOW of the
+    ; entity and decodes the next read block on demand (InputSource.fill), so the
+    ; document costs a window plus its RS-offset list instead of 4 bytes per char
+    ; — plus as much again in worst-case reserve — for the whole text.
+    ;
+    ; `raw`/`raw_len` MUST OUTLIVE the source: it decodes from them for the whole
+    ; parse. The eager form below could be handed a transient String; this one
+    ; cannot, so its callers pin the bytes on `host`.
+    ;
+    ; Everything that needs CodingSystemKit (declared after Location) or the
+    ; whole object at once happens HERE, once: the decoder split and the record
+    ; type. fill() then only calls CodingSystem.decode_one.
+    function make_char_source_stream_cs(host: pointer[Page], raw: pointer[u8], raw_len: size_t, org: pointer[Origin], block: size_t, cs: CodingSystem) returns pointer[InputSource]
+    {
+        var skip: size_t 0
+        var cs_first CodingSystem.identity()
+        var switch_at raw_len
+        var cs_rest CodingSystem.identity()
+        CodingSystemKit.resolve_input(host, cs, raw, raw_len, &skip, &cs_first, &switch_at, &cs_rest)
+        let start skip + cs_first.bom_skip(raw + skip, raw_len - skip)
+        let rt Parser.detect_record_type(raw, raw_len, start, cs_first, switch_at, cs_rest)
+        var blk block
+        if blk = (0 as size_t)
+            set blk: 8192 as size_t
+        ; the origin's two tables grow as the entity decodes; `contents` stays
+        ; null — a windowed source has text without having the whole buffer.
+        org.set_stream(Array[u32]^host(), Array[size_t]^host())
+        InputSource.make_stream(host, org, raw, raw_len, start, cs_first, switch_at, cs_rest, rt, blk)
+    }
+
+    ; recordType_: the first CR or LF in the entity decides it — over DECODED
+    ; chars, not raw bytes: under a fixed-width system an ASCII char's OTHER
+    ; bytes are zero and a raw scan would mistake the pieces of one char for a
+    ; record boundary.
+    function detect_record_type(raw: pointer[u8], n: size_t, from: size_t, cs_first: CodingSystem, switch_at: size_t, cs_rest: CodingSystem) returns int
+    {
+        var rt: int RT_ASIS
+        var s from
+        while s < n
+        {
+            var sch: u32 IENC_NO_CHAR
+            var slen: size_t 0
+            if s >= switch_at
+                set slen: cs_rest.decode_one(raw, n, s, &sch)
+            else
+                set slen: cs_first.decode_one(raw, n, s, &sch)
+            if slen = (0 as size_t)
+                set s: n
+            else if sch = (0x0A as u32)
+            {
+                set rt: RT_LF
+                set s: n
+            }
+            else if sch = (0x0D as u32)
+            {
+                ; a CR with nothing after it is the reference's crUnknown -> cr.
+                set rt: RT_CR
+                let s2 s + slen
+                if s2 < n
+                {
+                    var sch2: u32 IENC_NO_CHAR
+                    var slen2: size_t 0
+                    if s2 >= switch_at
+                        set slen2: cs_rest.decode_one(raw, n, s2, &sch2)
+                    else
+                        set slen2: cs_first.decode_one(raw, n, s2, &sch2)
+                    if slen2 > (0 as size_t)
+                    {
+                        if sch2 = (0x0A as u32)
+                            set rt: RT_CRLF
+                    }
+                }
+                set s: n
+            }
+            else
+                set s: s + slen
+        }
+        rt
+    }
+
+    ; ---- the EAGER form ----------------------------------------------------
+    ; Decodes the whole object up front. Kept for the CATALOG, whose parser
+    ; reads the normalized buffer directly rather than scanning it through an
+    ; InputSource (parse_catalog hands it org.get_contents()), and for the
+    ; MULTI-FILE document entity, whose storage objects are merged into one
+    ; buffer with a segment table before any of them is scanned.
     function make_char_source_block_cs(host: pointer[Page], bytes: String, org: pointer[Origin], block: size_t, cs: CodingSystem) returns pointer[InputSource]
     {
         let n bytes.get_length()
@@ -11535,51 +11622,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         CodingSystemKit.resolve_input(host, cs, raw, n, &skip, &cs_first, &switch_at, &cs_rest)
         var i skip + cs_first.bom_skip(raw + skip, n - skip)
 
-        ; recordType_: the first CR or LF in the entity decides it — over DECODED
-        ; chars, not raw bytes: under a fixed-width system an ASCII char's OTHER
-        ; bytes are zero and a raw scan would mistake the pieces of one char for
-        ; a record boundary.
-        var rt: int RT_ASIS
-        var s i
-        while s < n
-        {
-            var sch: u32 IENC_NO_CHAR
-            var slen: size_t 0
-            if s >= switch_at
-                set slen: cs_rest.decode_one(raw, n, s, &sch)
-            else
-                set slen: cs_first.decode_one(raw, n, s, &sch)
-            if slen = (0 as size_t)
-                set s: n
-            else if sch = (0x0A as u32)
-            {
-                set rt: RT_LF
-                set s: n
-            }
-            else if sch = (0x0D as u32)
-            {
-                ; a CR with nothing after it is the reference's crUnknown -> cr.
-                set rt: RT_CR
-                let s2 s + slen
-                if s2 < n
-                {
-                    var sch2: u32 IENC_NO_CHAR
-                    var slen2: size_t 0
-                    if s2 >= switch_at
-                        set slen2: cs_rest.decode_one(raw, n, s2, &sch2)
-                    else
-                        set slen2: cs_first.decode_one(raw, n, s2, &sch2)
-                    if slen2 > (0 as size_t)
-                    {
-                        if sch2 = (0x0A as u32)
-                            set rt: RT_CRLF
-                    }
-                }
-                set s: n
-            }
-            else
-                set s: s + slen
-        }
+        let rt Parser.detect_record_type(raw, n, i, cs_first, switch_at, cs_rest)
 
         ; reference read-block tracking: fill() reads 8192 RAW BYTES per
         ; block; a char whose last byte falls past the block edge is carried
@@ -11712,7 +11755,10 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let disp Path.join(base_dir, system_id)
         let dblk scaly_eio_blksize_path(disp.to_c_string()) as size_t
         org.set_file_name(StringC^host(disp.to_c_string()))
-        Parser.make_char_source_block_cs(host, bytes, org, dblk, ps.input_coding())
+        ; the streaming source decodes from these bytes for the whole parse, so
+        ; they must live on the region, not in this frame.
+        let pinned String^host(bytes)
+        Parser.make_char_source_stream_cs(host, pinned.get_buffer(), pinned.get_length(), org, dblk, ps.input_coding())
     }
 
     ; EntityManager::open for an external TEXT entity: resolve its (relative)
@@ -11742,7 +11788,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let disp Path.join(base_dir, system_id)
         let dblk scaly_eio_blksize_path(disp.to_c_string()) as size_t
         org.set_file_name(StringC^host(disp.to_c_string()))
-        Parser.make_char_source_block_cs(host, bytes, org, dblk, ps.input_coding())
+        let pinned String^host(bytes)
+        Parser.make_char_source_stream_cs(host, pinned.get_buffer(), pinned.get_length(), org, dblk, ps.input_coding())
     }
 
     ; ---- effective-system-id (FSI) opening --------------------------------
@@ -12196,7 +12243,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                     let cblk scaly_eio_blksize_path(hcand.to_c_string()) as size_t
                     org.set_file_name(StringC^host(hcand.to_c_string()))
                     set *out_found: *hcand
-                    return Parser.make_char_source_block_cs(host, bytes, org, cblk, ps.input_coding())
+                    let pinned String^host(bytes)
+                    return Parser.make_char_source_stream_cs(host, pinned.get_buffer(), pinned.get_length(), org, cblk, ps.input_coding())
                 }
                 if single and (restrict = false)
                 {
@@ -13550,8 +13598,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         }
         ps.discard_pass1_messages()
         ; (pass2Ee — the reference's offset re-skip hitting end-of-entity —
-        ; cannot occur here: the rewind re-reads the SAME in-memory buffer,
-        ; so the recorded start index is always inside it.)
+        ; cannot occur here: the re-decode covers the same bytes pass 1 read, so
+        ; the recorded start index is always reachable.)
         let start_index ps.get_pass2_start_index()
         ; the document source sits at the BOTTOM of the input stack; rebuild a
         ; fresh source over the same origin/buffer, positioned at the first
@@ -13563,12 +13611,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             set doc_src: ps.current_input()
         }
         ps.reset_for_pass2()
-        let org doc_src.get_origin()
-        let contents doc_src.get_contents()
-        let len doc_src.get_length()
-        let src host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
-        set *src: InputSource(org, contents, len)
-        src.advance_to(start_index)
+        let src InputSource.make_rewound(host, doc_src, start_index)
         ps.push_input(src)
         true
     }
@@ -19858,7 +19901,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             set *src: InputSource(org, multi_buf, multi_out)
         }
         else
-            set src: Parser.make_char_source_block_cs(host, *doc_text, org, doc_block, ps.input_coding())
+            set src: Parser.make_char_source_stream_cs(host, doc_text.get_buffer(), doc_text.get_length(), org, doc_block, ps.input_coding())
         ps.push_input(src)
 
         ; doInit's findMissingMinimum over the initial internal charset
@@ -19897,7 +19940,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 let dorg host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
                 set *dorg: Origin()
                 dorg.set_file_name(decl_name)
-                let dsrc Parser.make_char_source_cs(host, decl_text, dorg, ps.input_coding())
+                let dpin String^host(decl_text)
+                let dsrc Parser.make_char_source_stream_cs(host, dpin.get_buffer(), dpin.get_length(), dorg, 8192 as size_t, ps.input_coding())
                 ps.push_input(dsrc)
                 if parser.scan_for_sgml_decl()
                     set sd_found: true
