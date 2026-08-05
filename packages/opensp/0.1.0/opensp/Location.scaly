@@ -2,6 +2,16 @@ use scaly.memory.Page
 use scaly.containers.Array
 use opensp.StringC.StringC
 use opensp.CodingSystem.CodingSystem
+use scaly.memory.runtime.fread
+use scaly.memory.runtime.fclose
+use scaly.memory.runtime.fopen
+
+; stdio seek for the streaming raw window (SourceFill.ensure_raw). Fixed
+; prototype, so a direct extern per the shim rule. The whence argument is the
+; LITERAL 0 (SEEK_SET) at the call site, as EntityCatalog spells its 2 for
+; SEEK_END: a module-level `define` for it would be a second strong symbol for a
+; name `scaly.io.File` already defines.
+function fseek(stream: pointer[void], offset: i64, whence: int) returns int extern
 
 ; Source locations — Location.cs / InputSource.cs.
 ;
@@ -35,6 +45,15 @@ define RT_LF: int 0
 define RT_CRLF: int 1
 define RT_CR: int 2
 define RT_ASIS: int 3
+; "the record type is not decided yet" — only ever seen by the streaming OPEN
+; path, which detects the type from a PREFIX of the entity and falls back to
+; reading the whole object when the prefix holds no record boundary at all.
+define RT_UNKNOWN: int -1
+
+; The most raw bytes any of the port's coding systems consumes for ONE Char
+; (UTF-8's four, the fixed-width systems' four, EUC's three, SJIS's two) —
+; the lookahead SourceFill.ensure_raw must guarantee ahead of the cursor.
+define RAW_CHAR_MAX: size_t 8
 
 ; DocSegment — one storage object of a multi-file document entity
 ; (EntityManagerImpl::mergeSystemIds: every file argument becomes one storage
@@ -668,9 +687,22 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
 ; from byte 0 of the object (not from raw_start), because that is where the
 ; reference's fill() boundaries fall; the origin's fill_bounds records the
 ; normalized index each block starts at.
-define SourceFill (host: pointer[Page], raw: pointer[u8], raw_len: size_t, raw_start: size_t, raw_pos: size_t, cs_first: CodingSystem, switch_at: size_t, cs_rest: CodingSystem, rt: int, pending: bool, block: size_t, next_bound: size_t, win_cap: size_t)
+;
+; --- the two RAW shapes -------------------------------------------------------
+; `raw` is either the WHOLE entity in memory (`fp` null: an internal entity, a
+; literal, stdin, a merged multi-file document) or a WINDOW of a file that stays
+; on disk (`fp` non-null: PosixStorageObject::read). In the in-memory shape
+; raw_base is 0 and raw_valid is raw_len, so every index below is an entity
+; offset that indexes `raw` directly — that is why the decode loop reads
+; identically for both.
+; In the file shape `raw` is a reusable buffer of `raw_cap` bytes holding
+; raw_valid bytes of the entity starting at entity offset raw_base; ensure_raw
+; slides it. `path` is kept so a REWIND can reopen the entity after fp was
+; closed at end of entity (the fd is not held for the whole parse — a document
+; with hundreds of external entities would otherwise run the process out).
+define SourceFill (host: pointer[Page], raw: pointer[u8], raw_len: size_t, raw_start: size_t, raw_pos: size_t, cs_first: CodingSystem, switch_at: size_t, cs_rest: CodingSystem, rt: int, pending: bool, block: size_t, next_bound: size_t, win_cap: size_t, fp: pointer[void], path: String, raw_base: size_t, raw_valid: size_t, raw_cap: size_t)
 {
-    init(host: pointer[Page], raw: pointer[u8], raw_len: size_t, raw_start: size_t, raw_pos: size_t, cs_first: CodingSystem, switch_at: size_t, cs_rest: CodingSystem, rt: int, pending: bool, block: size_t, next_bound: size_t, win_cap: size_t)
+    init(host: pointer[Page], raw: pointer[u8], raw_len: size_t, raw_start: size_t, raw_pos: size_t, cs_first: CodingSystem, switch_at: size_t, cs_rest: CodingSystem, rt: int, pending: bool, block: size_t, next_bound: size_t, win_cap: size_t, fp: pointer[void], path: String, raw_base: size_t, raw_valid: size_t, raw_cap: size_t)
     {
         set this.host: host
         set this.raw: raw
@@ -685,6 +717,50 @@ define SourceFill (host: pointer[Page], raw: pointer[u8], raw_len: size_t, raw_s
         set this.block: block
         set this.next_bound: next_bound
         set this.win_cap: win_cap
+        set this.fp: fp
+        set this.path: path
+        set this.raw_base: raw_base
+        set this.raw_valid: raw_valid
+        set this.raw_cap: raw_cap
+    }
+
+    ; Make the entity bytes at [pos, pos+want) present in the raw window,
+    ; clipped to the entity end. A NO-OP for an in-memory source: its window IS
+    ; the entity, so the caller's guard never fires. For a file source this is
+    ; PosixStorageObject::read — one seek + one buffer fill; the buffer is
+    ; several read blocks wide so a per-block fill() does not mean a syscall per
+    ; block.
+    procedure ensure_raw(this: pointer[SourceFill], pos: size_t, want: size_t)
+    {
+        if this.fp = null
+            return
+        if pos >= this.raw_base
+        {
+            var need want
+            if (pos + need) > this.raw_len
+                set need: this.raw_len - pos
+            if (pos + need) <= (this.raw_base + this.raw_valid)
+                return
+        }
+        let sought fseek(this.fp, pos as i64, 0)
+        let got fread(this.raw as pointer[void], 1 as size_t, this.raw_cap, this.fp)
+        set this.raw_base: pos
+        set this.raw_valid: got
+    }
+
+    ; End of entity: give the descriptor back (the reference's StorageObject dies
+    ; with the input source). Idempotent — fill() reaches the end once, but a
+    ; rewound source can end again.
+    ; A source ABANDONED before its end (`-p` stops after the prolog; an error
+    ; limit ends the parse) keeps its descriptor until the process exits. That is
+    ; bounded by the number of entities open at once, not by their count, because
+    ; every entity a parse actually finishes closes here.
+    procedure close_raw(this: pointer[SourceFill])
+    {
+        if this.fp = null
+            return
+        let closed fclose(this.fp)
+        set this.fp: null
     }
 }
 
@@ -736,7 +812,21 @@ define InputSource (origin: pointer[Origin](null), contents: pointer[u32](null),
     function make_stream(host: pointer[Page], origin: pointer[Origin], raw: pointer[u8], raw_len: size_t, raw_start: size_t, cs_first: CodingSystem, switch_at: size_t, cs_rest: CodingSystem, rt: int, block: size_t) returns pointer[InputSource]
     {
         let f host.allocate(sizeof SourceFill, alignof SourceFill) as pointer[SourceFill]
-        set *f: SourceFill(host, raw, raw_len, raw_start, raw_start, cs_first, switch_at, cs_rest, rt, true, block, block, 0 as size_t)
+        set *f: SourceFill(host, raw, raw_len, raw_start, raw_start, cs_first, switch_at, cs_rest, rt, true, block, block, 0 as size_t, null, String(), 0 as size_t, raw_len, raw_len)
+        let src host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
+        set *src: InputSource(origin, null, 0 as size_t)
+        set src.fill_st: f
+        src
+    }
+
+    ; ...and the FILE-backed form: the entity stays on disk and `raw` is a
+    ; reusable window of `raw_cap` bytes already holding `raw_valid` bytes from
+    ; offset 0 (the prefix the caller read for the decoder/record-type
+    ; pre-passes). `path` lets a rewind reopen after end of entity closes fp.
+    function make_stream_file(host: pointer[Page], origin: pointer[Origin], raw: pointer[u8], raw_cap: size_t, raw_valid: size_t, raw_len: size_t, fp: pointer[void], path: String, raw_start: size_t, cs_first: CodingSystem, switch_at: size_t, cs_rest: CodingSystem, rt: int, block: size_t) returns pointer[InputSource]
+    {
+        let f host.allocate(sizeof SourceFill, alignof SourceFill) as pointer[SourceFill]
+        set *f: SourceFill(host, raw, raw_len, raw_start, raw_start, cs_first, switch_at, cs_rest, rt, true, block, block, 0 as size_t, fp, path, 0 as size_t, raw_valid, raw_cap)
         let src host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
         set *src: InputSource(origin, null, 0 as size_t)
         set src.fill_st: f
@@ -760,7 +850,32 @@ define InputSource (origin: pointer[Origin](null), contents: pointer[u32](null),
         }
         let org old.get_origin()
         org.reset_text()
-        let src InputSource.make_stream(host, org, f.raw, f.raw_len, f.raw_start, f.cs_first, f.switch_at, f.cs_rest, f.rt, f.block)
+        ; A file-backed source gets a FRESH descriptor and window: its own fp may
+        ; already be closed (end of entity), and two live sources sharing one file
+        ; position would have each one's fill move the other's. The pre-pass
+        ; results (decoder split, record type) are carried over, not recomputed.
+        var src: pointer[InputSource] null
+        if f.path.get_length() > (0 as size_t)
+        {
+            let rfp fopen(f.path.to_c_string(), "rb")
+            if rfp <> null
+            {
+                let rbuf host.allocate(f.raw_cap, 1 as size_t) as pointer[u8]
+                let rgot fread(rbuf as pointer[void], 1 as size_t, f.raw_cap, rfp)
+                set src: InputSource.make_stream_file(host, org, rbuf, f.raw_cap, rgot, f.raw_len, rfp, f.path, f.raw_start, f.cs_first, f.switch_at, f.cs_rest, f.rt, f.block)
+            }
+            else
+            {
+                ; the entity vanished between the two passes. `f.raw` is only a
+                ; WINDOW here, so re-decoding from it would silently parse the
+                ; wrong bytes — answer an EMPTY source instead.
+                set src: host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
+                set *src: InputSource(org, null, 0 as size_t)
+                return src
+            }
+        }
+        else
+            set src: InputSource.make_stream(host, org, f.raw, f.raw_len, f.raw_start, f.cs_first, f.switch_at, f.cs_rest, f.rt, f.block)
         ; re-get the skipped prefix. start_index tracks the cursor so the window
         ; keeps nothing: this is a discard, not a token.
         var filling true
@@ -1042,10 +1157,23 @@ define InputSource (origin: pointer[Origin](null), contents: pointer[u32](null),
                     set truncated: true
                     break
                 }
+                ; keep the next char's bytes in the raw window. No coding system
+                ; consumes more than RAW_CHAR_MAX bytes for one Char, so this is
+                ; the whole invariant the decode below needs; with it, a `len` of
+                ; 0 still means exactly what it meant when the entity was held
+                ; whole — a truncated char AT THE ENTITY END, never a window edge.
+                ; For an in-memory source the window IS the entity and the guard
+                ; never fires (one pointer test per char).
+                if f.fp <> null
+                {
+                    if (i + RAW_CHAR_MAX) > (f.raw_base + f.raw_valid)
+                        f.ensure_raw(i, RAW_CHAR_MAX)
+                }
+                let j i - f.raw_base
                 if i >= f.switch_at
-                    set len: f.cs_rest.decode_one(f.raw, n, i, &ch)
+                    set len: f.cs_rest.decode_one(f.raw, f.raw_valid, j, &ch)
                 else
-                    set len: f.cs_first.decode_one(f.raw, n, i, &ch)
+                    set len: f.cs_first.decode_one(f.raw, f.raw_valid, j, &ch)
                 if len = (0 as size_t)
                 {
                     set truncated: true
@@ -1121,6 +1249,11 @@ define InputSource (origin: pointer[Origin](null), contents: pointer[u32](null),
         }
         set f.raw_pos: i
         set f.pending: pending
+        ; end of entity: give the descriptor back here rather than holding one per
+        ; entity for the whole parse (a document with hundreds of external
+        ; entities would run the process out of them).
+        if i >= n
+            f.close_raw()
         ; noteRS for the record starts this fill wrote.
         var k out_before
         while k < out

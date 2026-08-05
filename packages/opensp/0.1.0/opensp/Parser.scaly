@@ -45,6 +45,7 @@ use opensp.CodingSystemKit.CodingSystemKit
 use opensp.EntityManager.EmConfig
 use scaly.memory.runtime.fopen
 use scaly.memory.runtime.fclose
+use scaly.memory.runtime.fread
 use opensp.ShortReferenceMap.ShortReferenceMap
 use opensp.ParserOptions.ParserOptions
 use opensp.ParserState.ParserState
@@ -107,6 +108,10 @@ function scaly_eio_errno() returns i32 extern
 ; read-block quantum whose boundaries split data tokens.
 function scaly_eio_blksize_path(path: pointer[const_char]) returns i64 extern
 function scaly_eio_blksize_fd(fd: i32) returns i64 extern
+; seek/tell for the file-backed streaming source (make_char_source_path_cs) —
+; same declarations as EntityCatalog.scaly, which must type-match.
+function fseek(stream: pointer[void], offset: i64, whence: int) returns int extern
+function ftell(stream: pointer[void]) returns i64 extern
 ; the emitter-lowered indirect ptr(ptr) call (fiber.scaly declares the same
 ; prototype) — invokes the streaming sink callback with the ParserState.
 function scaly_call_ptr(fn: pointer[void], arg: pointer[void]) returns pointer[void] extern
@@ -11683,6 +11688,109 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         rt
     }
 
+    ; ---- the FILE-BACKED streaming form (PosixStorageObject) ----------------
+    ; The entity stays on DISK: only a window of raw bytes and a window of decoded
+    ; Chars are ever in memory. This is what the reference does — its
+    ; StorageObject::read hands the parser one read block at a time and nothing
+    ; keeps the object's bytes — and it is the difference between a parse costing
+    ; ONE BYTE PER INPUT BYTE for the whole run and costing a window: measured on
+    ; the 13.7 MB corpus document, the eager form pinned the full 13.7 MB on the
+    ; run region even in prolog-only mode (`-p`), where none of the instance is
+    ; ever looked at.
+    ;
+    ; The two pre-passes (`resolve_input`'s decoder split, the record type) run on
+    ; the FIRST BUFFER instead of the whole object, and both can decline: a
+    ; decoder switch that would fall outside the prefix, or an entity with no
+    ; record boundary in it at all, returns null here and the caller reads the
+    ; object whole as before. So this is an optimization of the COMMON case with
+    ; the general case intact, not a narrowing of what the parser accepts.
+    ;
+    ; Null means "cannot stream this one" — the caller reads the object whole.
+    function make_char_source_path_cs(host: pointer[Page], path: String, org: pointer[Origin], block: size_t, cs: CodingSystem) returns pointer[InputSource]
+    {
+        var blk block
+        if blk = (0 as size_t)
+            set blk: 8192 as size_t
+        ; the raw window spans several read blocks so that a per-block fill() does
+        ; not mean a read(2) per block; it must hold one block plus the lookahead
+        ; one char may need across the block edge.
+        var cap (blk * (2 as size_t)) + RAW_CHAR_MAX
+        if cap < (65536 as size_t)
+            set cap: 65536 as size_t
+        let hpath String^host(path)
+        let fp fopen(hpath.to_c_string(), "rb")
+        if fp = null
+            return null
+        ; the entity's length, from the descriptor we already hold (2 = SEEK_END,
+        ; the literal EntityCatalog spells the same way)
+        let ended fseek(fp, 0 as i64, 2)
+        let told ftell(fp)
+        if told < (0 as i64)
+        {
+            let closed fclose(fp)
+            return null
+        }
+        let raw_len told as size_t
+        ; an EMPTY entity is handed to the whole-object path: it is a valid
+        ; zero-char source there, the pre-passes below have no bytes to judge, and
+        ; a streaming source over it would never reach the end of entity that
+        ; closes the descriptor.
+        if raw_len = (0 as size_t)
+        {
+            let closed0 fclose(fp)
+            return null
+        }
+        let rewound fseek(fp, 0 as i64, 0)
+        let buf host.allocate(cap, 1 as size_t) as pointer[u8]
+        let got fread(buf as pointer[void], 1 as size_t, cap, fp)
+
+        var skip: size_t 0
+        var cs_first CodingSystem.identity()
+        var switch_at got
+        var cs_rest CodingSystem.identity()
+        CodingSystemKit.resolve_input(host, cs, buf, got, &skip, &cs_first, &switch_at, &cs_rest)
+        ; resolve_input answers switch_at = its own `n` when there is NO switch, so
+        ; on a prefix that answer has to be re-read against the whole entity: same
+        ; decoder on both sides means no switch and the split is the entity end;
+        ; different decoders with the switch at the prefix edge means the
+        ; declaration may run past what was read — decline rather than guess.
+        if switch_at >= got
+        {
+            if cs_first.get_kind() = cs_rest.get_kind()
+                set switch_at: raw_len
+            else if got < raw_len
+            {
+                let closed fclose(fp)
+                return null
+            }
+        }
+        let start skip + cs_first.bom_skip(buf + skip, got - skip)
+        let rt Parser.detect_record_type_prefix(buf, got, raw_len, start, cs_first, switch_at, cs_rest)
+        if rt = RT_UNKNOWN
+        {
+            let closed fclose(fp)
+            return null
+        }
+        org.set_stream(Array[u32]^host(), Array[size_t]^host())
+        InputSource.make_stream_file(host, org, buf, cap, got, raw_len, fp, *hpath, start, cs_first, switch_at, cs_rest, rt, blk)
+    }
+
+    ; detect_record_type over a PREFIX of `valid` bytes of a `total`-byte entity:
+    ; the same scan, but a prefix that ends without a record boundary while the
+    ; entity goes on cannot answer `asis` — it answers RT_UNKNOWN and the caller
+    ; falls back to the whole-object form. (The reference has no such case: its
+    ; recordType_ starts `unknown` and is decided as it decodes.)
+    function detect_record_type_prefix(raw: pointer[u8], valid: size_t, total: size_t, from: size_t, cs_first: CodingSystem, switch_at: size_t, cs_rest: CodingSystem) returns int
+    {
+        let rt Parser.detect_record_type(raw, valid, from, cs_first, switch_at, cs_rest)
+        if rt <> RT_ASIS
+            return rt
+        ; `asis` from a partial read is "no boundary in the prefix", not a verdict.
+        if valid < total
+            return RT_UNKNOWN
+        rt
+    }
+
     ; ---- the EAGER form ----------------------------------------------------
     ; Decodes the whole object up front. Kept for the CATALOG, whose parser
     ; reads the normalized buffer directly rather than scanning it through an
@@ -11894,13 +12002,6 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     function load_external_subset(this: Parser, base_dir: String, system_id: String) returns pointer[InputSource]
     {
         let storage Storage.OsFile(base_dir)
-        let bytes storage.read(system_id)
-        if bytes.get_length() = (0 as size_t)
-        {
-            let emsg storage.open_error(system_id)
-            if emsg <> null
-                return null
-        }
         let org host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
         set *org: Origin()
         ; the storage id onsgmls displays for a location in this external subset:
@@ -11912,6 +12013,22 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let disp Path.join(base_dir, system_id)
         let dblk scaly_eio_blksize_path(disp.to_c_string()) as size_t
         org.set_file_name(StringC^host(disp.to_c_string()))
+        ; stream off the file when we can. The whole-object read below stays the
+        ; fallback AND the path that reports an open failure, so a missing file is
+        ; diagnosed exactly where it was: streaming just answers null for it.
+        ; `storage.resolve` — not Path.join — so the file streamed is the file the
+        ; fallback would read (they differ for an empty base_dir).
+        let rpath storage.resolve(base_dir, system_id)
+        let streamed Parser.make_char_source_path_cs(host, rpath, org, dblk, ps.input_coding())
+        if streamed <> null
+            return streamed
+        let bytes storage.read(system_id)
+        if bytes.get_length() = (0 as size_t)
+        {
+            let emsg storage.open_error(system_id)
+            if emsg <> null
+                return null
+        }
         ; the streaming source decodes from these bytes for the whole parse, so
         ; they must live on the region, not in this frame.
         let pinned String^host(bytes)
@@ -11929,13 +12046,6 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
     function open_external_text(this: Parser, base_dir: String, system_id: String, org: pointer[Origin]) returns pointer[InputSource]
     {
         let storage Storage.OsFile(base_dir)
-        let bytes storage.read(system_id)
-        if bytes.get_length() = (0 as size_t)
-        {
-            let emsg storage.open_error(system_id)
-            if emsg <> null
-                return null
-        }
         ; the storage id onsgmls displays for a location in this external text
         ; entity: its effective system id = the entity's SYSTEM literal resolved
         ; against the DECLARING file's directory (base_dir = ExternalTextEntity's
@@ -11945,6 +12055,20 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         let disp Path.join(base_dir, system_id)
         let dblk scaly_eio_blksize_path(disp.to_c_string()) as size_t
         org.set_file_name(StringC^host(disp.to_c_string()))
+        ; as in load_external_subset: stream when we can, read whole otherwise.
+        ; This is the site that carries the volume on an entity-split corpus — the
+        ; module codegens reach ~6 MB of input through external text entities.
+        let rpath storage.resolve(base_dir, system_id)
+        let streamed Parser.make_char_source_path_cs(host, rpath, org, dblk, ps.input_coding())
+        if streamed <> null
+            return streamed
+        let bytes storage.read(system_id)
+        if bytes.get_length() = (0 as size_t)
+        {
+            let emsg storage.open_error(system_id)
+            if emsg <> null
+                return null
+        }
         let pinned String^host(bytes)
         Parser.make_char_source_stream_cs(host, pinned.get_buffer(), pinned.get_length(), org, dblk, ps.input_coding())
     }
@@ -12395,11 +12519,16 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 if f <> null
                 {
                     let closed fclose(f)
-                    let bytes File.read_to_string(*hcand)
                     ; the FOUND path is the storage id diagnostics display.
                     let cblk scaly_eio_blksize_path(hcand.to_c_string()) as size_t
                     org.set_file_name(StringC^host(hcand.to_c_string()))
                     set *out_found: *hcand
+                    ; stream off the found file; read it whole only if that
+                    ; declines (see make_char_source_path_cs).
+                    let cstream Parser.make_char_source_path_cs(host, *hcand, org, cblk, ps.input_coding())
+                    if cstream <> null
+                        return cstream
+                    let bytes File.read_to_string(*hcand)
                     let pinned String^host(bytes)
                     return Parser.make_char_source_stream_cs(host, pinned.get_buffer(), pinned.get_length(), org, cblk, ps.input_coding())
                 }
@@ -19816,6 +19945,11 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ; the displayed storage id and its directory the base.
         var doc_text String^host(doc_bytes)
         var doc_id doc_name
+        ; the resolved FILE the document entity lives in, empty for stdin (which
+        ; arrives pre-read and cannot be seeked). Non-empty means the source can
+        ; stream off disk instead of holding the object's bytes for the run — the
+        ; whole-object read then happens only if streaming declines.
+        var doc_path String()
         ; the document storage object's read-block size (stdin = fd 0's).
         var doc_block: size_t scaly_eio_blksize_fd(0) as size_t
         ; the multi-file (mergeSystemIds) document's prebuilt buffer +
@@ -19896,9 +20030,8 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
                 return ps
             }
             let dpath String^host(rpath)
-            let dread File.read_to_string(*dpath)
             set doc_block: scaly_eio_blksize_path(dpath.to_c_string()) as size_t
-            set doc_text: String^host(dread)
+            set doc_path: *dpath
             set doc_id: StringC^host(dpath.to_c_string())
             let dpdir Path.get_directory_name(*dpath)
             set eff_base: String^host(dpdir)
@@ -20058,7 +20191,25 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             set *src: InputSource(org, multi_buf, multi_out)
         }
         else
-            set src: Parser.make_char_source_stream_cs(host, doc_text.get_buffer(), doc_text.get_length(), org, doc_block, ps.input_coding())
+        {
+            ; the document entity streams straight off the file when it has one
+            ; (doc_path empty = stdin, which arrives pre-read and cannot be
+            ; seeked). Only if streaming declines is the object read whole — that
+            ; order is the point of the change: on the corpus's 13.7 MB document
+            ; the eager read pinned every input byte on the run region for the
+            ; whole parse, even under -p.
+            if doc_path.get_length() > (0 as size_t)
+            {
+                set src: Parser.make_char_source_path_cs(host, doc_path, org, doc_block, ps.input_coding())
+                if src = null
+                {
+                    let dread File.read_to_string(doc_path)
+                    set doc_text: String^host(dread)
+                }
+            }
+            if src = null
+                set src: Parser.make_char_source_stream_cs(host, doc_text.get_buffer(), doc_text.get_length(), org, doc_block, ps.input_coding())
+        }
         ps.push_input(src)
 
         ; doInit's findMissingMinimum over the initial internal charset
