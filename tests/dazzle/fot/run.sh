@@ -182,4 +182,9 @@ if ! diff -q "$HERE/toy1.expected" "$WORK/doc.fot" > /dev/null; then
   echo "dazzle-fot: FAIL default-output-name"; exit 1
 fi
 
+# The one deliberate deviation of this backend — where a run of adjacent
+# <text> elements is broken. Its own script carries the full reasoning and a
+# check tight enough that only the boundary may differ.
+"$HERE/textrun-deviation.sh" "$OUT" || exit 1
+
 echo "dazzle-fot: PASS"

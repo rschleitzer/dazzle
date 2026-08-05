@@ -137,6 +137,12 @@ hdr() {
   printf -- "%s\n" "----------------------------------------------------------------------------------------------------"
 }
 
+fotnorm() { python3 -c "
+import re,sys
+d=open(sys.argv[1],encoding='utf-8',errors='surrogateescape').read()
+sys.stdout.write(re.sub(r'</text>\n?<text>','',d))
+" "$1"; }
+
 mb() { awk -v b="$1" 'BEGIN{printf "%.1f MB", b/1048576}'; }
 ratio() { awk -v a="$1" -v b="$2" 'BEGIN{if(b==0){print "n/a"}else{printf "%.2f", a/b}}'; }
 
@@ -154,7 +160,18 @@ row() {
     one "$cwd" "$envp" "$rcmd" "$TMP/ro" >/dev/null
     [ "$rest" = 1 ] && restore_generated
     if [ -n "$PART" ]; then
-      cmp -s "$PART" "$RART" || note="  ** OUTPUT MISMATCH **"
+      # `-t fot` carries ONE deliberate deviation: where a run of adjacent
+      # <text> elements is broken (the reference's break points are an artifact
+      # of its 8192-byte read blocks — see tests/dazzle/fot/textrun-deviation.sh,
+      # which pins it and proves the content identical). Join adjacent runs on
+      # both sides before comparing; NOTHING else is normalised, so any real
+      # difference still shows up here.
+      if [ "${PART##*.}" = fot ]; then
+        fotnorm "$PART" > "$TMP/pn" && fotnorm "$RART" > "$TMP/rn" \
+          && cmp -s "$TMP/pn" "$TMP/rn" || note="  ** OUTPUT MISMATCH **"
+      else
+        cmp -s "$PART" "$RART" || note="  ** OUTPUT MISMATCH **"
+      fi
     else
       cmp -s "$TMP/po" "$TMP/ro" || note="  ** OUTPUT MISMATCH **"
     fi
