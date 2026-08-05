@@ -1,0 +1,1953 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.Vector
+use scaly.containers.String
+use scaly.containers.StringBuilder
+use dazzle.Llvm.Llvm
+use dazzle.Insn.*
+use dazzle.VM.VM
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.ClosureObj
+
+; Jit — Stage 6b: native code generation for the DSSSL engine.
+;
+; ============================ THE SEAM ====================================
+; The engine's evaluator is `VM.eval(insn, display, arg)`, a threaded-code loop
+; over the `Insn` graph that `Expression.compile` produces. The JIT does not
+; replace that graph — it LOWERS it. The Insn graph is already the engine's
+; intermediate representation: stack positions are assigned, boxing decisions
+; are made, closures are laid out, and every control transfer is explicit. A
+; second front end over `Expression` would have to reproduce all of
+; `Expression.compile`'s semantics (varargs entry points, keyword arguments,
+; letrec boxing, the 800-line `make`/`style` lowering) and would mean debugging
+; port bugs and lowering bugs at once — the sequencing mistake ROADMAP-dazzle.md
+; warns about twice. Lowering the IR that already exists is what a JIT backend
+; does, and the Insn classes are what that roadmap calls "the best available
+; spec for the closure/TCO semantics the JIT must reproduce".
+;
+; ======================== THE RETURN PROTOCOL =============================
+; Every compiled region is
+;
+;     i64 region(ptr vm)
+;
+; and answers THE NEXT INSN TO EXECUTE as an integer — exactly what
+; `Insn.execute` answers, 0 for "done or failed". One convention, and it carries
+; the whole design:
+;
+;   * ★ an insn arm the code generator does not lower natively is not a hole.
+;     It is emitted as `call jit_execute(<that insn>, vm)` followed by a compare
+;     against the arm's statically known successors: equal means the interpreter
+;     did the step and the region CONTINUES natively at that successor. So a
+;     region covers a whole code body from the start, and native lowering of an
+;     individual arm is a pure optimisation on top of a correct baseline. That
+;     is the only way to land a code generator against a 469-entry ESIS corpus
+;     and twelve golden suites: byte-identity does not depend on coverage;
+;   * anything the compare does not recognise is RETURNED unchanged — a call
+;     into another body, a tail call, a call/cc unwind, an error. The
+;     trampoline in `VM.eval` then continues there, in the interpreter's own
+;     state. No unwind protocol of our own, and escape-only continuations keep
+;     working;
+;   * a DSSSL tail call therefore never grows the native stack: it leaves the
+;     region, and the trampoline re-enters at the callee. A named-let loop over
+;     a node list — THE idiom of these stylesheets — runs in bounded stack
+;     without the code generator knowing what a loop is.
+;
+; What still costs a trampoline turn is a CALL and its RETURN (two hash lookups
+; and two indirect calls per DSSSL call). Lowering a statically known closure
+; call to a native call, with the callee's answer compared against the
+; continuation the caller pushed, is the next rung and needs no new protocol —
+; the compare above IS that protocol.
+;
+; ========================= CALLING BACK IN ================================
+; Generated code reaches this binary's runtime through inttoptr CONSTANTS: the
+; address comes from `&helper` in Scaly (widened to any arity 2026-08-06,
+; `tests/regress/fn_ptr_nary.scaly`) and is baked into the IR as a literal.
+; Resolution by symbol NAME was rejected on purpose: the shipped binary is
+; linked with whole-program LTO and `hidden` visibility (tools/link-lto.sh), so
+; its Scaly symbols are not dynamically resolvable — a name-based seam would
+; work in a debug build and fail in exactly the configuration we ship. Taking
+; the address in Scaly also keeps LTO from deleting the helper.
+;
+; ★ Every helper is a module-level FREE function in this file (a concept method
+;   has no address to take) and takes/returns only pointers and integers, so its
+;   emitted signature is exactly what the generated `call` declares. A helper
+;   that needed a caller page would gain a hidden leading parameter and every
+;   argument would shift one slot — silently. `Jit.check_helper_abi` calls each
+;   helper through the generated signature at session start, so that shows up
+;   as a wrong answer at startup instead of corrupted output three suites away.
+;
+; ============================ VM LAYOUT ===================================
+; The generated code reads and writes the VM's own fields (sp, sbase, slim,
+; frame_start, closure, n_actual_args). Their offsets are MEASURED at session
+; start from a probe VM via `&probe.field`, never written down as numbers: a
+; field added to `VM` in six months must not silently move the JIT's idea of
+; `sp`. `Jit.check_layout` additionally asserts that the measured offsets are
+; 8-aligned and inside the struct.
+;
+; ============================== MEMORY ====================================
+; This slice moves the DISPATCH into native code with the value model unchanged
+; — the documented 6b entry state ("boxed ELObj values"). The generated code
+; allocates nothing of its own: it works on the VM's arena-hosted stacks and
+; calls the same helpers the interpreter calls. The frame-as-mini-region rung
+; (ROADMAP-dazzle.md, "Memory model") sits on top of this landing.
+
+; ===========================================================================
+; Runtime state
+;
+; `shared`, not `mutable`: the established dazzle convention for a cell written
+; once while single-threaded (see GROVE_MGR, and the note there about a
+; thread-local global aborting under a JIT-materialised TLV).
+; ===========================================================================
+
+; The active session, or null when the engine runs on the interpreter. This is
+; the ONLY switch: `--interp` simply never opens a session, so the interpreter
+; path is not a mode with its own code — it is the absence of this pointer.
+shared JIT_SESSION: pointer[void] null
+
+; Statistics (`--jit-stats`). Counted in the trampoline and the compiler.
+shared JIT_N_REGIONS: int 0
+shared JIT_N_MODULES: int 0
+shared JIT_N_INSNS: int 0
+shared JIT_N_NATIVE_INSNS: int 0
+shared JIT_N_ENTRIES: int 0
+shared JIT_N_INTERP_STEPS: int 0
+shared JIT_N_REJECTED: int 0
+shared JIT_DUMP: bool false
+
+; ★ HotSpot threshold: how many times a code body must be ENTERED before it is
+; worth compiling. Measured 2026-08-06 and it is the difference between a JIT
+; that helps and one that ruins the run: the DocBook print stylesheets enter
+; 3801 distinct bodies, and compiling every one of them on first sight cost
+; 6.7 s of LLVM time against a 0.5 s interpreter run — ~1.8 ms per module, all
+; of it in module setup, codegen and ORC materialisation, none of it in the
+; generated code. Almost all of those bodies run a handful of times. Same
+; doctrine as the self-scaling `for` driver, which also defers and promotes per
+; site rather than committing on first sight.
+shared JIT_THRESHOLD: int 200
+
+; ★ How many hot bodies go into ONE module. DEFAULT 1 — i.e. no batching — and
+; that is a MEASURED default, not an omission (2026-08-06, DocBook print
+; stylesheets, DAZZLE_JIT_BATCH sweep):
+;
+;     batch=1   540 regions   3.75 s
+;     batch=8  1824 regions   9.13 s
+;     batch=32 2560 regions  12.68 s
+;
+; The LLVM cost is per MODULE and nearly independent of its size (~5 ms for a
+; body of twenty blocks), so batching looks like the obvious win — and it
+; BACKFIRES, for a reason worth keeping: while a body waits for its batch it is
+; still interpreted one insn at a time, so every insn inside it accumulates its
+; own entry count and crosses the threshold on its own. Delay multiplies the
+; number of roots (540 → 2560), and each extra root is a duplicate of code
+; already compiled. An earlier attempt that batched the transitive closure of
+; the trigger body instead compiled 25 104 bodies in 126 s — amortising the
+; module cost is worthless when the batch is full of code that never runs.
+;
+; The fix that makes batching work is a different shape, not a different number:
+; ONE function per body with an entry MULTIPLEXER (`i64 f(ptr vm, ptr insn)` and
+; a switch over its blocks), so any insn of a body is a valid entry and no
+; mid-body insn ever becomes a root of its own. Recorded in PERFORMANCE.md as
+; the first of the two rungs; the knob stays so the next measurement is one env
+; variable away.
+;
+; NOTE the consequence of any batch > 1: a partly filled queue is never flushed,
+; so on a short run those bodies stay interpreted. Harmless (byte-identity does
+; not depend on coverage) but it is why the gate runs with batch 1.
+shared JIT_BATCH: int 1
+
+; The pass pipeline run over each generated module — null means the built-in
+; one, which compile_region substitutes. A string literal cannot be a global
+; INITIALIZER (only integer constants can), and a function must not RETURN a
+; `pointer[const_char]` literal either (CLAUDE.md: it segfaults at first use),
+; so the default lives at the one place that uses it. DAZZLE_JIT_PIPELINE
+; overrides it (measurement hook).
+shared JIT_PIPELINE: pointer[const_char] null
+
+; ===========================================================================
+; Runtime helpers called from generated code.
+;
+; ★ Every one of these is in HELPER TABLE order below and checked by
+;   check_helper_abi. Do not add one without extending that check.
+; ===========================================================================
+
+; The universal fallback: run ONE interpreter instruction and answer its
+; successor. This is what makes partial coverage correct rather than merely
+; incomplete.
+function jit_execute(insn: pointer[void], vm: pointer[void]) returns pointer[void]
+{
+    let i insn as pointer[Insn]
+    let v vm as pointer[VM]
+    i.execute(v) as pointer[void]
+}
+
+; VM::needStack — may reallocate the value stack, so generated code reloads
+; `sbase` after any call to it.
+procedure jit_need_stack(vm: pointer[void], n: i64)
+{
+    let v vm as pointer[VM]
+    v.need_stack(n as int)
+}
+
+; ELObj::isTrue / eqv as 0/1 integers. i64 rather than the language's `bool`
+; (which emits i1) so the generated declaration cannot disagree with the
+; emitted one over how a one-bit value travels in a register.
+function jit_is_true(v: pointer[void]) returns i64
+{
+    if v = null
+        return 0
+    let o v as pointer[ELObj]
+    if o.is_true()
+        return 1
+    0
+}
+
+function jit_eqv(a: pointer[void], b: pointer[void]) returns i64
+{
+    let x a as pointer[ELObj]
+    let y b as pointer[ELObj]
+    if ELObj.eqv(x, y)
+        return 1
+    0
+}
+
+; BoxInsn / UnboxInsn / ConsInsn: allocation on the VM's host page. None of
+; these can fail, so generated code calls them without an error check.
+function jit_box(vm: pointer[void], v: pointer[void]) returns pointer[void]
+{
+    let m vm as pointer[VM]
+    ELObj.make_box(m.get_host(), v as pointer[ELObj]) as pointer[void]
+}
+
+function jit_box_value(v: pointer[void]) returns pointer[void]
+{
+    let o v as pointer[ELObj]
+    o.box_value() as pointer[void]
+}
+
+function jit_cons(vm: pointer[void], a: pointer[void], d: pointer[void]) returns pointer[void]
+{
+    let m vm as pointer[VM]
+    ELObj.make_pair(m.get_host(), a as pointer[ELObj], d as pointer[ELObj]) as pointer[void]
+}
+
+; `--jit-stats` is reported from an atexit hook so it covers EVERY exit of the
+; CLI (each backend returns from its own tail) and cannot drift out of sync with
+; a new one. Declared here with the same signature the stdlib uses
+; (`scaly/memory/root_pages.scaly`) rather than reached across the package
+; boundary — two declarations of one C function must agree at the ABI level, and
+; tests/abi/run.sh checks exactly that.
+procedure atexit(cb: pointer[void]) returns i32 extern
+
+procedure jit_stats_atexit()
+    Jit.print_stats()
+
+; Selftest helper — the one call the ORC round trip is proved with. Kept
+; permanently: it is the difference between "the JIT is wired up" and "the JIT
+; silently produced a module nobody executed".
+function jit_selftest_double(x: i64) returns i64
+    x + x
+
+define Jit
+{
+    ; --- limits ----------------------------------------------------------
+    ; A region stops growing at this many insns. Not a correctness bound (the
+    ; leftover successors become their own regions on first use) but a bound on
+    ; one module's compile time.
+    function max_region_insns() returns int
+        3000
+
+    ; ======================================================================
+    ; PtrMap — open-addressed u64 -> u64, the insn-keyed tables (region cache
+    ; and the per-compile block map). Key 0 is the empty slot: an Insn address
+    ; is never 0.
+    ; ======================================================================
+    define PtrMap
+    (
+        host: pointer[Page]
+        keys: pointer[u64]
+        vals: pointer[u64]
+        cap: size_t
+        used: size_t
+    )
+    {
+        init(host: pointer[Page], cap: size_t)
+        {
+            set this.host: host
+            set this.cap: cap
+            set this.used: 0
+            set this.keys: host.allocate(cap * sizeof u64, alignof u64) as pointer[u64]
+            set this.vals: host.allocate(cap * sizeof u64, alignof u64) as pointer[u64]
+            var i: size_t 0
+            while i < cap
+            {
+                set *(this.keys + i): 0
+                set *(this.vals + i): 0
+                set i: i + 1
+            }
+        }
+    }
+
+    function map_make(host: pointer[Page], cap: size_t) returns pointer[PtrMap]
+        PtrMap^host(host, cap)
+
+    ; Fibonacci-ish scramble of the pointer, then linear probing. Insn records
+    ; are arena-allocated and 8-aligned, so the low bits are dead weight.
+    function map_slot(m: pointer[PtrMap], key: u64) returns size_t
+    {
+        var h key
+        set h: h >> 3
+        set h: h * 0x9E3779B97F4A7C15
+        set h: h >> 40
+        (h as size_t) & (m.cap - 1)
+    }
+
+    ; Returns the slot holding `key`, or the first free slot for it.
+    function map_probe(m: pointer[PtrMap], key: u64) returns size_t
+    {
+        var i Jit.map_slot(m, key)
+        while true
+        {
+            let k *(m.keys + i)
+            if k = key
+                return i
+            if k = 0
+                return i
+            set i: (i + 1) & (m.cap - 1)
+        }
+        0
+    }
+
+    ; The value for `key`, or `missing` when absent.
+    function map_get(m: pointer[PtrMap], key: u64, missing: u64) returns u64
+    {
+        let i Jit.map_probe(m, key)
+        if *(m.keys + i) = key
+            return *(m.vals + i)
+        missing
+    }
+
+    function map_put(m: pointer[PtrMap], key: u64, val: u64)
+    {
+        ; Grow at half load. Rehashing needs a fresh pair of buffers; the old
+        ; ones stay on the arena (they die with the run, like everything here).
+        if (m.used + m.used) >= m.cap
+            Jit.map_grow(m)
+        let i Jit.map_probe(m, key)
+        if *(m.keys + i) <> key
+        {
+            set *(m.keys + i): key
+            set m.used: m.used + 1
+        }
+        set *(m.vals + i): val
+    }
+
+    function map_grow(m: pointer[PtrMap])
+    {
+        let old_keys m.keys
+        let old_vals m.vals
+        let old_cap m.cap
+        let new_cap old_cap + old_cap
+        let h m.host
+        set m.cap: new_cap
+        set m.used: 0
+        set m.keys: h.allocate(new_cap * sizeof u64, alignof u64) as pointer[u64]
+        set m.vals: h.allocate(new_cap * sizeof u64, alignof u64) as pointer[u64]
+        var i: size_t 0
+        while i < new_cap
+        {
+            set *(m.keys + i): 0
+            set *(m.vals + i): 0
+            set i: i + 1
+        }
+        set i: 0
+        while i < old_cap
+        {
+            let k *(old_keys + i)
+            if k <> 0
+            {
+                let s Jit.map_probe(m, k)
+                set *(m.keys + s): k
+                set *(m.vals + s): *(old_vals + i)
+                set m.used: m.used + 1
+            }
+            set i: i + 1
+        }
+    }
+
+    ; ======================================================================
+    ; Session
+    ; ======================================================================
+    define Session
+    (
+        host: pointer[Page]
+        tsc: pointer[void]
+        ctx: pointer[void]
+        jit: pointer[void]
+        jd: pointer[void]
+        ; region cache: insn address -> native address, or one of the small
+        ; sentinels (see cache_rejected)
+        regions: pointer[PtrMap]
+        ; bodies that crossed the threshold and are waiting for a batch
+        queue: pointer[Array[pointer[Insn]]]
+        ; measured VM field offsets
+        off_sp: i64
+        off_sbase: i64
+        off_slim: i64
+        off_frame_start: i64
+        off_closure: i64
+        off_naa: i64
+        n_modules: int
+        ok: bool
+    )
+    {
+        init(host: pointer[Page])
+        {
+            set this.host: host
+            set this.tsc: null
+            set this.ctx: null
+            set this.jit: null
+            set this.jd: null
+            set this.regions: null
+            set this.queue: null
+            set this.off_sp: 0
+            set this.off_sbase: 0
+            set this.off_slim: 0
+            set this.off_frame_start: 0
+            set this.off_closure: 0
+            set this.off_naa: 0
+            set this.n_modules: 0
+            set this.ok: false
+        }
+    }
+
+    ; The region cache encodes three states in one u64 value, which keeps the
+    ; hot path to a single probe:
+    ;   0        absent
+    ;   2        rejected — compilation failed once, never try again
+    ;   4        queued — hot, waiting for the next batch, interpreted meanwhile
+    ;   odd      an entry COUNT, as 2*count+1 (below the HotSpot threshold)
+    ;   other even  the native code address
+    ; Code addresses are at least 4-byte aligned on every target we build for,
+    ; so "odd" can never collide with one; an odd address would be refused.
+    function cache_rejected() returns u64
+        2
+
+    function cache_queued() returns u64
+        4
+
+    ; ----------------------------------------------------------------------
+    ; Open a session. Returns null when the JIT cannot be brought up, and the
+    ; engine then stays on the interpreter: a missing or broken backend must
+    ; degrade, never abort — the whole point of keeping `--interp` is that the
+    ; engine has a path that does not depend on LLVM.
+    ; ----------------------------------------------------------------------
+    function open(host: pointer[Page]) returns pointer[Session]
+    {
+        if Jit.check_helper_abi() = false
+        {
+            scaly_eputs "dazzle JIT: helper ABI check failed, staying on the interpreter\n"
+            return null
+        }
+        Llvm.init_native_target()
+        let s Session^host(host)
+        let tsc LLVMOrcCreateNewThreadSafeContext()
+        if tsc = null
+        {
+            scaly_eputs "dazzle JIT: no thread-safe context\n"
+            return null
+        }
+        set s.tsc: tsc
+        set s.ctx: LLVMOrcThreadSafeContextGetContext(tsc)
+        var jit: pointer[void] null
+        let err LLVMOrcCreateLLJIT(&jit, null as pointer[void])
+        if Llvm.failed(err, "could not create LLJIT")
+            return null
+        if jit = null
+            return null
+        set s.jit: jit
+        set s.jd: LLVMOrcLLJITGetMainJITDylib(jit)
+        set s.regions: Jit.map_make(host, 1024)
+        set s.queue: Array[pointer[Insn]]^host()
+        if Jit.measure_layout(s) = false
+        {
+            scaly_eputs "dazzle JIT: VM layout probe failed, staying on the interpreter\n"
+            return null
+        }
+        set s.ok: true
+        s
+    }
+
+    ; ----------------------------------------------------------------------
+    ; Measure the VM field offsets from a probe instance. Never hardcode
+    ; these: a field inserted into `VM` would otherwise move `sp` under the
+    ; generated code and corrupt the value stack silently.
+    ; ----------------------------------------------------------------------
+    function measure_layout(s: pointer[Session]) returns bool
+    {
+        ; ★ Measured by SENTINEL SEARCH, not by `&probe.field`. Address-of a
+        ;   member answers the field's ADDRESS for a scalar field but the field's
+        ;   VALUE for a POINTER-typed one (measured 2026-08-06: `sp` came out 24
+        ;   and `sbase` came out `0 - page_base`, the same wrong answer as
+        ;   `closure`) — the same family as the `&arr[i]` no-op fixed 2026-08-04,
+        ;   and noted in the wish list. Writing a unique value through the field
+        ;   and finding it in the struct's bytes needs no language guarantee at
+        ;   all, and it PROVES the offset instead of trusting it: a sentinel that
+        ;   turns up twice, or not at all, is rejected.
+        let probe VM.make(s.host, null)
+        let size (sizeof VM) as i64
+        let pv probe as pointer[void]
+
+        set probe.sp: 0x51A5A5A5A5A50001
+        set probe.slim: 0x51A5A5A5A5A50002
+        set probe.frame_start: 0x51A5A5A5A5A50003
+        set probe.n_actual_args: 0x51A5A5A5A5A50004
+        set probe.sbase: 0x51A5A5A5A5A50005 as pointer[pointer[ELObj]]
+        set probe.closure: 0x51A5A5A5A5A50006 as pointer[pointer[ELObj]]
+
+        set s.off_sp: Jit.find_field(pv, size, 0x51A5A5A5A5A50001)
+        set s.off_slim: Jit.find_field(pv, size, 0x51A5A5A5A5A50002)
+        set s.off_frame_start: Jit.find_field(pv, size, 0x51A5A5A5A5A50003)
+        set s.off_naa: Jit.find_field(pv, size, 0x51A5A5A5A5A50004)
+        set s.off_sbase: Jit.find_field(pv, size, 0x51A5A5A5A5A50005)
+        set s.off_closure: Jit.find_field(pv, size, 0x51A5A5A5A5A50006)
+
+        if Jit.check_layout(s)
+            return true
+        ; ★ Report what was measured. A guard that only says "failed" would send
+        ; the next reader into the code generator; the numbers say immediately
+        ; whether the probe found the fields at all.
+        ; Each value is bound first: a cast or a parenthesised expression as the
+        ; argument of a PARENLESS call mis-parses (CLAUDE.md, "Calls &
+        ; operands"), and here that would be a diagnostic about the diagnostic.
+        let vm_size size as int
+        let o_sp s.off_sp as int
+        let o_sbase s.off_sbase as int
+        let o_slim s.off_slim as int
+        let o_frame s.off_frame_start as int
+        let o_closure s.off_closure as int
+        let o_naa s.off_naa as int
+        var sb StringBuilder()
+        sb.append "dazzle JIT: VM layout probe rejected: size "
+        sb.append vm_size
+        sb.append " sp "
+        sb.append o_sp
+        sb.append " sbase "
+        sb.append o_sbase
+        sb.append " slim "
+        sb.append o_slim
+        sb.append " frame_start "
+        sb.append o_frame
+        sb.append " closure "
+        sb.append o_closure
+        sb.append " n_actual_args "
+        sb.append o_naa
+        sb.append "\n"
+        let line sb.to_string()
+        let line_c line.to_c_string()
+        scaly_eputs line_c
+        false
+    }
+
+    ; The unique 8-aligned offset at which `sentinel` sits inside the struct, or
+    ; -1 when it is absent or appears more than once.
+    function find_field(base: pointer[void], size: i64, sentinel: u64) returns i64
+    {
+        let words base as pointer[u64]
+        var i: i64 0
+        var found: i64 0 - 1
+        var count 0
+        let n size / 8
+        while i < n
+        {
+            if *(words + i) = sentinel
+            {
+                set found: i * 8
+                set count: count + 1
+            }
+            set i: i + 1
+        }
+        if count = 1
+            return found
+        0 - 1
+    }
+
+    function check_layout(s: pointer[Session]) returns bool
+    {
+        let lim (sizeof VM) as i64
+        if Jit.off_ok(s.off_sp, lim) = false
+            return false
+        if Jit.off_ok(s.off_sbase, lim) = false
+            return false
+        if Jit.off_ok(s.off_slim, lim) = false
+            return false
+        if Jit.off_ok(s.off_frame_start, lim) = false
+            return false
+        if Jit.off_ok(s.off_closure, lim) = false
+            return false
+        if Jit.off_ok(s.off_naa, lim) = false
+            return false
+        ; every one of them is a distinct slot
+        if s.off_sp = s.off_slim
+            return false
+        if s.off_sp = s.off_frame_start
+            return false
+        if s.off_sbase = s.off_closure
+            return false
+        true
+    }
+
+    function off_ok(off: i64, lim: i64) returns bool
+    {
+        if off < 0
+            return false
+        if off >= lim
+            return false
+        if (off % 8) <> 0
+            return false
+        true
+    }
+
+    ; ----------------------------------------------------------------------
+    ; Helper ABI guard — see the header. Calls a helper exactly the way
+    ; generated code will: through its address, with the generated signature.
+    ; ----------------------------------------------------------------------
+    function check_helper_abi() returns bool
+    {
+        let addr &jit_selftest_double
+        if addr = null
+            return false
+        let fp addr as pointer[void]
+        let r fp(21 as i64)
+        if r <> 42
+            return false
+        let r2 fp(0 as i64)
+        if r2 <> 0
+            return false
+        true
+    }
+
+    ; ======================================================================
+    ; Cg — the per-region code-generation context.
+    ;
+    ; Constructed field-by-field on purpose: an `init` with 30 positional
+    ; parameters is the shape that silently degenerates into a positional tuple
+    ; when a single argument does not match (CLAUDE.md, "no matching
+    ; initializer"), and a field left holding stack garbage here would be an
+    ; LLVM handle.
+    ; ======================================================================
+    define Cg
+    (
+        s: pointer[Session]
+        b: pointer[void]
+        fn: pointer[void]
+        vm: pointer[void]
+        i8t: pointer[void]
+        i64t: pointer[void]
+        ptrt: pointer[void]
+        voidt: pointer[void]
+        nullp: pointer[void]
+        ; function types of the helpers, in helper order
+        ty_exec: pointer[void]
+        ty_need: pointer[void]
+        ty_i64_p: pointer[void]
+        ty_i64_pp: pointer[void]
+        ty_p_p: pointer[void]
+        ty_p_pp: pointer[void]
+        ty_p_ppp: pointer[void]
+        ; inttoptr constants of the helpers
+        p_exec: pointer[void]
+        p_need: pointer[void]
+        p_is_true: pointer[void]
+        p_eqv: pointer[void]
+        p_box: pointer[void]
+        p_box_value: pointer[void]
+        p_cons: pointer[void]
+        blocks: pointer[PtrMap]
+        pending: pointer[Array[pointer[Insn]]]
+        ; the batch: every code body this module gets a function for, and the
+        ; set that keeps a body from being added twice
+        roots: pointer[Array[pointer[Insn]]]
+        root_set: pointer[PtrMap]
+        n_insns: int
+        n_native: int
+    )
+    {
+        init(s: pointer[Session])
+        {
+            set this.s: s
+            set this.b: null
+            set this.fn: null
+            set this.vm: null
+            set this.i8t: null
+            set this.i64t: null
+            set this.ptrt: null
+            set this.voidt: null
+            set this.nullp: null
+            set this.ty_exec: null
+            set this.ty_need: null
+            set this.ty_i64_p: null
+            set this.ty_i64_pp: null
+            set this.ty_p_p: null
+            set this.ty_p_pp: null
+            set this.ty_p_ppp: null
+            set this.p_exec: null
+            set this.p_need: null
+            set this.p_is_true: null
+            set this.p_eqv: null
+            set this.p_box: null
+            set this.p_box_value: null
+            set this.p_cons: null
+            set this.blocks: null
+            set this.pending: null
+            set this.roots: null
+            set this.root_set: null
+            set this.n_insns: 0
+            set this.n_native: 0
+        }
+    }
+
+    ; ======================================================================
+    ; IR building helpers
+    ; ======================================================================
+
+    function c64(cg: pointer[Cg], v: i64) returns pointer[void]
+        LLVMConstInt(cg.i64t, v as u64, 0)
+
+    ; A runtime address as an IR pointer constant. This is the whole callback
+    ; mechanism: `&helper as u64` on one side, inttoptr on the other.
+    function cptr(cg: pointer[Cg], addr: u64) returns pointer[void]
+        LLVMConstIntToPtr(LLVMConstInt(cg.i64t, addr, 0), cg.ptrt)
+
+    ; A one-element LLVMValueRef array without allocating: the fixed-size stack
+    ; array decays to a pointer, which is exactly what the C API wants.
+    function gep_i8(cg: pointer[Cg], base: pointer[void], off: i64) returns pointer[void]
+    {
+        var ibuf u8[16]
+        let ip ibuf as pointer[pointer[void]]
+        set *ip: Jit.c64(cg, off)
+        LLVMBuildInBoundsGEP2(cg.b, cg.i8t, base, ip, 1, "")
+    }
+
+    ; --- VM fields --------------------------------------------------------
+    function ld_i64(cg: pointer[Cg], off: i64) returns pointer[void]
+        LLVMBuildLoad2(cg.b, cg.i64t, Jit.gep_i8(cg, cg.vm, off), "")
+
+    function st_i64(cg: pointer[Cg], off: i64, v: pointer[void])
+    {
+        let a Jit.gep_i8(cg, cg.vm, off)
+        LLVMBuildStore(cg.b, v, a)
+    }
+
+    function ld_field_ptr(cg: pointer[Cg], off: i64) returns pointer[void]
+        LLVMBuildLoad2(cg.b, cg.ptrt, Jit.gep_i8(cg, cg.vm, off), "")
+
+    function ld_sp(cg: pointer[Cg]) returns pointer[void]
+        Jit.ld_i64(cg, cg.s.off_sp)
+
+    function st_sp(cg: pointer[Cg], v: pointer[void])
+        Jit.st_i64(cg, cg.s.off_sp, v)
+
+    function ld_sbase(cg: pointer[Cg]) returns pointer[void]
+        Jit.ld_field_ptr(cg, cg.s.off_sbase)
+
+    ; --- value stack ------------------------------------------------------
+    ; slot(sbase, i) — &sbase[i]; the element type is a pointer, so the GEP
+    ; stride is one slot.
+    function slot(cg: pointer[Cg], sbase: pointer[void], idx: pointer[void]) returns pointer[void]
+    {
+        var ibuf u8[16]
+        let ip ibuf as pointer[pointer[void]]
+        set *ip: idx
+        LLVMBuildInBoundsGEP2(cg.b, cg.ptrt, sbase, ip, 1, "")
+    }
+
+    function ld_slot(cg: pointer[Cg], sbase: pointer[void], idx: pointer[void]) returns pointer[void]
+        LLVMBuildLoad2(cg.b, cg.ptrt, Jit.slot(cg, sbase, idx), "")
+
+    function st_slot(cg: pointer[Cg], sbase: pointer[void], idx: pointer[void], v: pointer[void])
+    {
+        let a Jit.slot(cg, sbase, idx)
+        LLVMBuildStore(cg.b, v, a)
+    }
+
+    function add64(cg: pointer[Cg], a: pointer[void], b: i64) returns pointer[void]
+    {
+        if b = 0
+            return a
+        LLVMBuildAdd(cg.b, a, Jit.c64(cg, b), "")
+    }
+
+    ; --- calls ------------------------------------------------------------
+    function call1(cg: pointer[Cg], ty: pointer[void], f: pointer[void], a0: pointer[void]) returns pointer[void]
+    {
+        var abuf u8[16]
+        let ap abuf as pointer[pointer[void]]
+        set *ap: a0
+        LLVMBuildCall2(cg.b, ty, f, ap, 1, "")
+    }
+
+    function call2(cg: pointer[Cg], ty: pointer[void], f: pointer[void], a0: pointer[void], a1: pointer[void]) returns pointer[void]
+    {
+        var abuf u8[24]
+        let ap abuf as pointer[pointer[void]]
+        set *ap: a0
+        set *(ap + 1): a1
+        LLVMBuildCall2(cg.b, ty, f, ap, 2, "")
+    }
+
+    function call3(cg: pointer[Cg], ty: pointer[void], f: pointer[void], a0: pointer[void], a1: pointer[void], a2: pointer[void]) returns pointer[void]
+    {
+        var abuf u8[32]
+        let ap abuf as pointer[pointer[void]]
+        set *ap: a0
+        set *(ap + 1): a1
+        set *(ap + 2): a2
+        LLVMBuildCall2(cg.b, ty, f, ap, 3, "")
+    }
+
+    ; VM::needStack, inline: the call happens only when the stack is actually
+    ; short, exactly as the interpreter's `if this.sp + n > this.slim` does.
+    ; The builder is left positioned in the continuation block, and every caller
+    ; loads `sbase` AFTER this — growing reallocates it.
+    function need_stack(cg: pointer[Cg], n: i64)
+    {
+        let sp Jit.ld_sp(cg)
+        let slim Jit.ld_i64(cg, cg.s.off_slim)
+        let want Jit.add64(cg, sp, n)
+        let short LLVMBuildICmp(cg.b, LLVM_INT_SGT, want, slim, "")
+        let grow_bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "grow")
+        let cont_bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "cont")
+        LLVMBuildCondBr(cg.b, short, grow_bb, cont_bb)
+        LLVMPositionBuilderAtEnd(cg.b, grow_bb)
+        Jit.call2(cg, cg.ty_need, cg.p_need, cg.vm, Jit.c64(cg, n))
+        LLVMBuildBr(cg.b, cont_bb)
+        LLVMPositionBuilderAtEnd(cg.b, cont_bb)
+    }
+
+    ; --- blocks -----------------------------------------------------------
+    ; The block for an insn inside this region, created (and queued for
+    ; lowering) on first mention.
+    function block_for(cg: pointer[Cg], i: pointer[Insn]) returns pointer[void]
+    {
+        let key i as u64
+        let found Jit.map_get(cg.blocks, key, 0)
+        if found <> 0
+            return found as pointer[void]
+        let bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "i")
+        Jit.map_put(cg.blocks, key, bb as u64)
+        cg.pending.add i
+        bb
+    }
+
+    ; The branch target for a successor that may be null. A null successor means
+    ; "the interpreter loop would end here", i.e. answer 0.
+    function target_block(cg: pointer[Cg], i: pointer[Insn]) returns pointer[void]
+    {
+        if i <> null
+            return Jit.block_for(cg, i)
+        let bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "done")
+        let save LLVMGetInsertBlock(cg.b)
+        LLVMPositionBuilderAtEnd(cg.b, bb)
+        LLVMBuildRet(cg.b, Jit.c64(cg, 0))
+        LLVMPositionBuilderAtEnd(cg.b, save)
+        bb
+    }
+
+    ; Leave the region, answering `r` (an Insn pointer value) to the trampoline.
+    function ret_ptr(cg: pointer[Cg], r: pointer[void])
+    {
+        let n LLVMBuildPtrToInt(cg.b, r, cg.i64t, "")
+        LLVMBuildRet(cg.b, n)
+    }
+
+    ; Branch to `i`, or leave the region when it has no block yet and the region
+    ; is already at its size cap.
+    function goto_insn(cg: pointer[Cg], i: pointer[Insn])
+    {
+        if i = null
+        {
+            LLVMBuildRet(cg.b, Jit.c64(cg, 0))
+            return
+        }
+        if cg.n_insns >= Jit.max_region_insns()
+        {
+            let key i as u64
+            if Jit.map_get(cg.blocks, key, 0) = 0
+            {
+                Jit.ret_ptr(cg, Jit.cptr(cg, key))
+                return
+            }
+        }
+        LLVMBuildBr(cg.b, Jit.block_for(cg, i))
+    }
+
+    ; ======================================================================
+    ; Static successors of an insn — the ONLY thing the generic lowering needs
+    ; to know about an arm it does not understand.
+    ;
+    ; "Static" means: a successor the Insn record itself names. A call arm names
+    ; its `next` (which is where a PRIMITIVE callee returns to), never the
+    ; callee's body — so a closure call simply leaves the region. Arms that
+    ; transfer control through the VM alone (Return, tail calls, Varargs) name
+    ; nothing.
+    ; ======================================================================
+    function insn_successors(i: pointer[Insn], s0: pointer[pointer[Insn]], s1: pointer[pointer[Insn]]) returns int
+    {
+        set *s0: null
+        set *s1: null
+        choose *i
+            when a: Constant
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: ResolveQuantities
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: Test
+            {
+                set *s0: a.consequent
+                set *s1: a.alternative
+                return 2
+            }
+            when a: Or
+            {
+                set *s0: a.next
+                set *s1: a.next_test
+                return 2
+            }
+            when a: And
+            {
+                set *s0: a.next
+                set *s1: a.next_test
+                return 2
+            }
+            when a: Case
+            {
+                set *s0: a.matched
+                set *s1: a.fail
+                return 2
+            }
+            when a: Pop
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: Cons
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: Append
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: Apply
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: FrameRef
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: StackRef
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: ClosureRef
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: TopRef
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: PopBindings
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: PrimitiveCall
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: ClosureMk
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: FunctionCall
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: SetKeyArg
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: TestNull
+            {
+                set *s0: a.if_null
+                set *s1: a.if_not_null
+                return 2
+            }
+            when a: Box
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: BoxArg
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: BoxStack
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: Unbox
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: SetBox
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: SetImmediate
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: CheckInit
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: StackSetBox
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: StackSet
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: ClosureSetBox
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: Vector
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: ListToVector
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: MakeFlowObj
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: LabelSosofo
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: SetNic
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: MakeStyle
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: PushMode
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: PopMode
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: CheckSosofo
+            {
+                set *s0: a.next
+                return 1
+            }
+            when a: UnpackMacroFlowObj
+            {
+                set *s0: a.next
+                return 1
+            }
+            else
+                return 0
+        0
+    }
+
+    ; ======================================================================
+    ; The generic lowering: let the interpreter perform the step, then rejoin
+    ; native code at whichever static successor it answered.
+    ; ======================================================================
+    function emit_generic(cg: pointer[Cg], i: pointer[Insn])
+    {
+        let r Jit.call2(cg, cg.ty_exec, cg.p_exec, Jit.cptr(cg, i as u64), cg.vm)
+        var succ0: pointer[Insn] null
+        var succ1: pointer[Insn] null
+        let n Jit.insn_successors(i, &succ0, &succ1)
+        if n > 0
+            Jit.emit_rejoin(cg, r, succ0)
+        if n > 1
+            Jit.emit_rejoin(cg, r, succ1)
+        ; Anything else — a call into another body, a tail call, an unwind, an
+        ; error — goes back to the trampoline unchanged.
+        Jit.ret_ptr(cg, r)
+    }
+
+    ; `if r = succ: continue there` — and the builder is left in the block that
+    ; runs when it was not.
+    function emit_rejoin(cg: pointer[Cg], r: pointer[void], succ: pointer[Insn])
+    {
+        if succ = null
+            return
+        if cg.n_insns >= Jit.max_region_insns()
+        {
+            ; At the cap, only rejoin a successor that is already in the region.
+            if Jit.map_get(cg.blocks, succ as u64, 0) = 0
+                return
+        }
+        let eq LLVMBuildICmp(cg.b, LLVM_INT_EQ, r, Jit.cptr(cg, succ as u64), "")
+        let hit Jit.block_for(cg, succ)
+        let miss LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "chk")
+        LLVMBuildCondBr(cg.b, eq, hit, miss)
+        LLVMPositionBuilderAtEnd(cg.b, miss)
+    }
+
+    ; ======================================================================
+    ; Native lowering of the hot arms.
+    ;
+    ; Every one of these is a literal transcription of the matching arm of
+    ; `Insn.execute` — read them side by side. They are what the JIT actually
+    ; buys: the interpreter pays a call plus a 46-way dispatch per instruction
+    ; to do what these do in three or four machine instructions.
+    ;
+    ; Returns false when the arm is not lowered here; the caller then emits the
+    ; generic form, which is equally correct.
+    ; ======================================================================
+    function emit_native(cg: pointer[Cg], i: pointer[Insn]) returns bool
+    {
+        choose *i
+            when a: Constant
+            {
+                Jit.need_stack(cg, 1)
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                Jit.st_slot(cg, sb, sp, Jit.cptr(cg, a.value as u64))
+                Jit.st_sp(cg, Jit.add64(cg, sp, 1))
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: Pop
+            {
+                let sp Jit.ld_sp(cg)
+                Jit.st_sp(cg, Jit.add64(cg, sp, 0 - 1))
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: FrameRef
+            {
+                Jit.need_stack(cg, 1)
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let fs Jit.ld_i64(cg, cg.s.off_frame_start)
+                let v Jit.ld_slot(cg, sb, Jit.add64(cg, fs, a.index as i64))
+                Jit.st_slot(cg, sb, sp, v)
+                Jit.st_sp(cg, Jit.add64(cg, sp, 1))
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: StackRef
+            {
+                Jit.need_stack(cg, 1)
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let v Jit.ld_slot(cg, sb, Jit.add64(cg, sp, a.index as i64))
+                Jit.st_slot(cg, sb, sp, v)
+                Jit.st_sp(cg, Jit.add64(cg, sp, 1))
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: ClosureRef
+            {
+                Jit.need_stack(cg, 1)
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let cl Jit.ld_field_ptr(cg, cg.s.off_closure)
+                let v Jit.ld_slot(cg, cl, Jit.c64(cg, a.index as i64))
+                Jit.st_slot(cg, sb, sp, v)
+                Jit.st_sp(cg, Jit.add64(cg, sp, 1))
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: PopBindings
+            {
+                ; sp -= n; sbase[sp-1] = sbase[sp+n-1]
+                let sb Jit.ld_sbase(cg)
+                let sp0 Jit.ld_sp(cg)
+                let sp1 Jit.add64(cg, sp0, 0 - (a.n as i64))
+                Jit.st_sp(cg, sp1)
+                let v Jit.ld_slot(cg, sb, Jit.add64(cg, sp1, (a.n as i64) - 1))
+                Jit.st_slot(cg, sb, Jit.add64(cg, sp1, 0 - 1), v)
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: SetImmediate
+            {
+                let sb Jit.ld_sbase(cg)
+                let sp0 Jit.ld_sp(cg)
+                let sp1 Jit.add64(cg, sp0, 0 - 1)
+                Jit.st_sp(cg, sp1)
+                let v Jit.ld_slot(cg, sb, sp1)
+                Jit.st_slot(cg, sb, Jit.add64(cg, sp1, 0 - (a.n as i64)), v)
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: SetKeyArg
+            {
+                let sb Jit.ld_sbase(cg)
+                let sp0 Jit.ld_sp(cg)
+                let val Jit.ld_slot(cg, sb, Jit.add64(cg, sp0, 0 - 1))
+                let sp1 Jit.add64(cg, sp0, 0 - 1)
+                Jit.st_sp(cg, sp1)
+                Jit.st_slot(cg, sb, Jit.add64(cg, sp1, a.offset as i64), val)
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: StackSet
+            {
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let at Jit.add64(cg, sp, a.index as i64)
+                let top Jit.add64(cg, sp, 0 - 1)
+                let tem Jit.ld_slot(cg, sb, at)
+                let v Jit.ld_slot(cg, sb, top)
+                Jit.st_slot(cg, sb, at, v)
+                Jit.st_slot(cg, sb, top, tem)
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: Unbox
+            {
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let top Jit.add64(cg, sp, 0 - 1)
+                let v Jit.ld_slot(cg, sb, top)
+                let nv Jit.call1(cg, cg.ty_p_p, cg.p_box_value, v)
+                Jit.st_slot(cg, sb, top, nv)
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: Box
+            {
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let top Jit.add64(cg, sp, 0 - 1)
+                let v Jit.ld_slot(cg, sb, top)
+                let nv Jit.call2(cg, cg.ty_p_pp, cg.p_box, cg.vm, v)
+                Jit.st_slot(cg, sb, top, nv)
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: BoxStack
+            {
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let at Jit.add64(cg, sp, a.n as i64)
+                let v Jit.ld_slot(cg, sb, at)
+                let nv Jit.call2(cg, cg.ty_p_pp, cg.p_box, cg.vm, v)
+                Jit.st_slot(cg, sb, at, nv)
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: BoxArg
+            {
+                ; idx = sp + n - nActualArgs
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let naa Jit.ld_i64(cg, cg.s.off_naa)
+                let base Jit.add64(cg, sp, a.n as i64)
+                let at LLVMBuildSub(cg.b, base, naa, "")
+                let v Jit.ld_slot(cg, sb, at)
+                let nv Jit.call2(cg, cg.ty_p_pp, cg.p_box, cg.vm, v)
+                Jit.st_slot(cg, sb, at, nv)
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: Cons
+            {
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let car Jit.ld_slot(cg, sb, Jit.add64(cg, sp, 0 - 1))
+                let cdr_at Jit.add64(cg, sp, 0 - 2)
+                let cdr Jit.ld_slot(cg, sb, cdr_at)
+                let pr Jit.call3(cg, cg.ty_p_ppp, cg.p_cons, cg.vm, car, cdr)
+                Jit.st_slot(cg, sb, cdr_at, pr)
+                Jit.st_sp(cg, Jit.add64(cg, sp, 0 - 1))
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: Test
+            {
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let top Jit.add64(cg, sp, 0 - 1)
+                let v Jit.ld_slot(cg, sb, top)
+                Jit.st_sp(cg, top)
+                let t Jit.call1(cg, cg.ty_i64_p, cg.p_is_true, v)
+                let c LLVMBuildICmp(cg.b, LLVM_INT_NE, t, Jit.c64(cg, 0), "")
+                let yes Jit.target_block(cg, a.consequent)
+                let no Jit.target_block(cg, a.alternative)
+                LLVMBuildCondBr(cg.b, c, yes, no)
+                return true
+            }
+            when a: Or
+            {
+                ; true keeps the value and goes to next; false pops and retests
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let v Jit.ld_slot(cg, sb, Jit.add64(cg, sp, 0 - 1))
+                let t Jit.call1(cg, cg.ty_i64_p, cg.p_is_true, v)
+                let c LLVMBuildICmp(cg.b, LLVM_INT_NE, t, Jit.c64(cg, 0), "")
+                let yes Jit.target_block(cg, a.next)
+                let pop_bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "orpop")
+                LLVMBuildCondBr(cg.b, c, yes, pop_bb)
+                LLVMPositionBuilderAtEnd(cg.b, pop_bb)
+                let sp2 Jit.ld_sp(cg)
+                Jit.st_sp(cg, Jit.add64(cg, sp2, 0 - 1))
+                Jit.goto_insn(cg, a.next_test)
+                return true
+            }
+            when a: And
+            {
+                ; false keeps the value and goes to next; true pops and retests
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let v Jit.ld_slot(cg, sb, Jit.add64(cg, sp, 0 - 1))
+                let t Jit.call1(cg, cg.ty_i64_p, cg.p_is_true, v)
+                let c LLVMBuildICmp(cg.b, LLVM_INT_EQ, t, Jit.c64(cg, 0), "")
+                let no Jit.target_block(cg, a.next)
+                let pop_bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "andpop")
+                LLVMBuildCondBr(cg.b, c, no, pop_bb)
+                LLVMPositionBuilderAtEnd(cg.b, pop_bb)
+                let sp2 Jit.ld_sp(cg)
+                Jit.st_sp(cg, Jit.add64(cg, sp2, 0 - 1))
+                Jit.goto_insn(cg, a.next_test)
+                return true
+            }
+            when a: Case
+            {
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let v Jit.ld_slot(cg, sb, Jit.add64(cg, sp, 0 - 1))
+                let t Jit.call2(cg, cg.ty_i64_pp, cg.p_eqv, v, Jit.cptr(cg, a.obj as u64))
+                let c LLVMBuildICmp(cg.b, LLVM_INT_NE, t, Jit.c64(cg, 0), "")
+                let hit_bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "casehit")
+                let miss Jit.target_block(cg, a.fail)
+                LLVMBuildCondBr(cg.b, c, hit_bb, miss)
+                LLVMPositionBuilderAtEnd(cg.b, hit_bb)
+                let sp2 Jit.ld_sp(cg)
+                Jit.st_sp(cg, Jit.add64(cg, sp2, 0 - 1))
+                Jit.goto_insn(cg, a.matched)
+                return true
+            }
+            when a: TestNull
+            {
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let v Jit.ld_slot(cg, sb, Jit.add64(cg, sp, a.offset as i64))
+                let c LLVMBuildICmp(cg.b, LLVM_INT_EQ, v, cg.nullp, "")
+                let yes Jit.target_block(cg, a.if_null)
+                let no Jit.target_block(cg, a.if_not_null)
+                LLVMBuildCondBr(cg.b, c, yes, no)
+                return true
+            }
+            else
+                return false
+        false
+    }
+
+
+    ; ======================================================================
+    ; Batch collection.
+    ;
+    ; ★ WHY BATCHES EXIST, measured 2026-08-06: a module per code body cost
+    ;   ~3.6 ms in ORC materialisation plus ~0.9 ms in the pass pipeline —
+    ;   539 hot bodies of the DocBook print stylesheets came to 2.4 s of LLVM
+    ;   time against a 0.6 s interpreter run. The cost is per MODULE and almost
+    ;   independent of its size, so the answer is to put many bodies in one.
+    ;
+    ; A batch is the transitive closure of the trigger body over the edges the
+    ; Insn graph names but a region cannot follow inside itself: a lambda body
+    ; (ClosureMk.code), a varargs entry point, and the body of a statically
+    ; known closure at a call site. That is "the part of the stylesheet reachable
+    ; from this rule" — compiled once, entered forever.
+    ; ----------------------------------------------------------------------
+    function note_root(cg: pointer[Cg], i: pointer[Insn])
+    {
+        if i = null
+            return
+        let key i as u64
+        if Jit.map_get(cg.root_set, key, 0) <> 0
+            return
+        if cg.roots.get_length() >= Jit.max_batch_roots()
+            return
+        Jit.map_put(cg.root_set, key, 1)
+        cg.roots.add i
+    }
+
+    function max_batch_roots() returns size_t
+        512
+
+    ; The code body of a callable, when it is a closure whose body is known at
+    ; compile time. Anything else (a primitive, apply, call/cc, a continuation)
+    ; has no Insn body to compile.
+    function callable_code(o: pointer[ELObj]) returns pointer[Insn]
+    {
+        if o = null
+            return null
+        choose *o
+            when c: Closure
+                return c.code
+            else
+                return null
+        null
+    }
+
+    ; ======================================================================
+    ; The batch compiler: one LLVM module, one function per queued code body.
+    ; ======================================================================
+    ; Compile every queued body into ONE module. Nothing is added to the batch
+    ; that has not crossed the threshold on its own.
+    procedure compile_queue(s: pointer[Session])
+    {
+        let ctx s.ctx
+        let h s.host
+        let batch s.n_modules
+        set s.n_modules: batch + 1
+        set JIT_N_MODULES: JIT_N_MODULES + 1
+
+        ; module name: dazzle_jit_bN, function names dazzle_jit_bN_rK
+        var mb StringBuilder()
+        mb.append "dazzle_jit_b"
+        mb.append batch
+        let mname mb.to_string()
+        let mname_c mname.to_c_string()
+
+        let mod LLVMModuleCreateWithNameInContext(mname_c, ctx)
+        if mod = null
+            return
+        let dl LLVMOrcLLJITGetDataLayoutStr(s.jit)
+        if dl <> null
+            LLVMSetDataLayout(mod, dl)
+
+        let i8t LLVMInt8TypeInContext(ctx)
+        let i64t LLVMInt64TypeInContext(ctx)
+        let ptrt LLVMPointerTypeInContext(ctx, 0)
+        let voidt LLVMVoidTypeInContext(ctx)
+
+        ; the type buffers: at most three parameters anywhere in this file
+        var tbuf u8[32]
+        let tp tbuf as pointer[pointer[void]]
+        set *tp: ptrt
+        set *(tp + 1): ptrt
+        set *(tp + 2): ptrt
+        let ty_p_p LLVMFunctionType(ptrt, tp, 1, 0)
+        let ty_p_pp LLVMFunctionType(ptrt, tp, 2, 0)
+        let ty_p_ppp LLVMFunctionType(ptrt, tp, 3, 0)
+        let ty_i64_p LLVMFunctionType(i64t, tp, 1, 0)
+        let ty_i64_pp LLVMFunctionType(i64t, tp, 2, 0)
+        let ty_region LLVMFunctionType(i64t, tp, 1, 0)
+        ; void(ptr, i64)
+        var tbuf2 u8[32]
+        let tp2 tbuf2 as pointer[pointer[void]]
+        set *tp2: ptrt
+        set *(tp2 + 1): i64t
+        let ty_need LLVMFunctionType(voidt, tp2, 2, 0)
+
+        let b LLVMCreateBuilderInContext(ctx)
+        let cg Cg^h(s)
+        set cg.b: b
+        set cg.i8t: i8t
+        set cg.i64t: i64t
+        set cg.ptrt: ptrt
+        set cg.voidt: voidt
+        set cg.ty_exec: ty_p_pp
+        set cg.ty_need: ty_need
+        set cg.ty_i64_p: ty_i64_p
+        set cg.ty_i64_pp: ty_i64_pp
+        set cg.ty_p_p: ty_p_p
+        set cg.ty_p_pp: ty_p_pp
+        set cg.ty_p_ppp: ty_p_ppp
+        set cg.nullp: LLVMConstIntToPtr(LLVMConstInt(i64t, 0, 0), ptrt)
+        set cg.p_exec: Jit.const_addr(cg, &jit_execute)
+        set cg.p_need: Jit.const_addr(cg, &jit_need_stack)
+        set cg.p_is_true: Jit.const_addr(cg, &jit_is_true)
+        set cg.p_eqv: Jit.const_addr(cg, &jit_eqv)
+        set cg.p_box: Jit.const_addr(cg, &jit_box)
+        set cg.p_box_value: Jit.const_addr(cg, &jit_box_value)
+        set cg.p_cons: Jit.const_addr(cg, &jit_cons)
+        set cg.roots: Array[pointer[Insn]]^h()
+        set cg.root_set: Jit.map_make(h, 1024)
+        var qi: size_t 0
+        while qi < s.queue.get_length()
+        {
+            let qpp s.queue.get qi
+            if qpp <> null
+            {
+                let q *qpp
+                Jit.note_root(cg, q)
+            }
+            set qi: qi + 1
+        }
+        ; the queue is consumed; a fresh one collects the next batch (Array does
+        ; not shrink, and these live on the run arena anyway)
+        set s.queue: Array[pointer[Insn]]^h()
+
+        ; One function per root. The roots list grows while we walk it — a
+        ; lambda body found inside root K becomes root K+n and lands in this same
+        ; module, which is the entire point of the batch.
+        var ri: size_t 0
+        while ri < cg.roots.get_length()
+        {
+            let rpp cg.roots.get ri
+            if rpp <> null
+            {
+                let rt *rpp
+                let fname Jit.region_fn_name(h, batch, ri)
+                let fn LLVMAddFunction(mod, fname, ty_region)
+                set cg.fn: fn
+                set cg.vm: LLVMGetParam(fn, 0)
+                set cg.blocks: Jit.map_make(h, 256)
+                set cg.pending: Array[pointer[Insn]]^h()
+                set cg.n_insns: 0
+                let entry_bb LLVMAppendBasicBlockInContext(ctx, fn, "entry")
+                LLVMPositionBuilderAtEnd(b, entry_bb)
+                let root_bb Jit.block_for(cg, rt)
+                LLVMBuildBr(b, root_bb)
+
+                ; Worklist over the pending blocks. `block_for` appends while we
+                ; walk, which IS the graph traversal — a cursor, because Array
+                ; does not shrink.
+                var cursor: size_t 0
+                while cursor < cg.pending.get_length()
+                {
+                    let ipp cg.pending.get cursor
+                    set cursor: cursor + 1
+                    if ipp <> null
+                    {
+                        let ins *ipp
+                        let key ins as u64
+                        let bb Jit.map_get(cg.blocks, key, 0)
+                        if bb <> 0
+                        {
+                            LLVMPositionBuilderAtEnd(b, bb as pointer[void])
+                            set cg.n_insns: cg.n_insns + 1
+                            set JIT_N_INSNS: JIT_N_INSNS + 1
+                            if Jit.emit_native(cg, ins)
+                            {
+                                set cg.n_native: cg.n_native + 1
+                                set JIT_N_NATIVE_INSNS: JIT_N_NATIVE_INSNS + 1
+                            }
+                            else
+                                Jit.emit_generic(cg, ins)
+                        }
+                    }
+                }
+            }
+            set ri: ri + 1
+        }
+        LLVMDisposeBuilder(b)
+
+        ; ★ The literal is passed DIRECTLY at the call. Binding it to a
+        ;   `pointer[const_char]` local first produced GARBAGE — LLVM answered
+        ;   `unknown pass name ' \xd6j'` and the pipeline silently did nothing
+        ;   (measured 2026-08-06). Same family as "a function must not RETURN a
+        ;   pointer[const_char] literal"; passing a literal into a call works.
+        ;   Without the pipeline the lowering's per-insn loads and stores of
+        ;   `sp`/`sbase` all survive into machine code.
+        let pb_opts LLVMCreatePassBuilderOptions()
+        var opt_err: pointer[void] null
+        if JIT_PIPELINE = null
+            set opt_err: LLVMRunPasses(mod, "function(sroa,early-cse,instcombine,simplifycfg,gvn,instcombine,simplifycfg)", null as pointer[void], pb_opts)
+        else
+            set opt_err: LLVMRunPasses(mod, JIT_PIPELINE, null as pointer[void], pb_opts)
+        LLVMDisposePassBuilderOptions(pb_opts)
+        if opt_err <> null
+        {
+            ; Not fatal — ORC gets the unoptimised module — but LOUD: a silently
+            ; skipped pipeline is a JIT that quietly runs slower than the
+            ; interpreter, which is what the pipeline exists to prevent.
+            Llvm.failed(opt_err, "pass pipeline failed")
+        }
+
+        if JIT_DUMP
+        {
+            let ir LLVMPrintModuleToString(mod)
+            if ir <> null
+            {
+                let ir_c ir as pointer[const_char]
+                scaly_eputs ir_c
+                LLVMDisposeMessage(ir)
+            }
+        }
+
+        ; ★ Verify every module. A malformed region is OUR bug, and an
+        ;   unverified module handed to ORC is a crash somewhere else entirely.
+        var vmsg: pointer[char] null
+        if LLVMVerifyModule(mod, LLVM_VERIFIER_RETURN_STATUS, &vmsg) <> 0
+        {
+            scaly_eputs "dazzle JIT: generated module does not verify: "
+            if vmsg <> null
+            {
+                let vmsg_c vmsg as pointer[const_char]
+                scaly_eputs vmsg_c
+                LLVMDisposeMessage(vmsg)
+            }
+            scaly_eputs "\n"
+            Jit.reject_batch(s, cg)
+            return
+        }
+
+        let tsm LLVMOrcCreateNewThreadSafeModule(mod, s.tsc)
+        if tsm = null
+        {
+            Jit.reject_batch(s, cg)
+            return
+        }
+        let add_err LLVMOrcLLJITAddLLVMIRModule(s.jit, s.jd, tsm)
+        if Llvm.failed(add_err, "could not add region module")
+        {
+            Jit.reject_batch(s, cg)
+            return
+        }
+
+        ; Resolve every function of the batch and cache it against its body.
+        var rj: size_t 0
+        while rj < cg.roots.get_length()
+        {
+            let rpp2 cg.roots.get rj
+            if rpp2 <> null
+            {
+                let rt2 *rpp2
+                let fname2 Jit.region_fn_name(h, batch, rj)
+                var addr: u64 0
+                let look_err LLVMOrcLLJITLookup(s.jit, &addr, fname2)
+                var ok false
+                if look_err <> null
+                    Llvm.failed(look_err, "region lookup failed")
+                else
+                {
+                    if addr <> 0
+                        if (addr & 1) = 0
+                            set ok: true
+                }
+                if ok
+                {
+                    Jit.map_put(s.regions, rt2 as u64, addr)
+                    set JIT_N_REGIONS: JIT_N_REGIONS + 1
+                }
+                else
+                {
+                    ; never try this body again — it stays interpreted
+                    Jit.map_put(s.regions, rt2 as u64, Jit.cache_rejected())
+                    set JIT_N_REJECTED: JIT_N_REJECTED + 1
+                }
+            }
+            set rj: rj + 1
+        }
+    }
+
+    ; A batch that could not be built leaves every one of its bodies on the
+    ; interpreter, permanently — never queued again, so a broken module cannot
+    ; turn into an endless compile loop.
+    procedure reject_batch(s: pointer[Session], cg: pointer[Cg])
+    {
+        var i: size_t 0
+        while i < cg.roots.get_length()
+        {
+            let rpp cg.roots.get i
+            if rpp <> null
+            {
+                let rt *rpp
+                Jit.map_put(s.regions, rt as u64, Jit.cache_rejected())
+                set JIT_N_REJECTED: JIT_N_REJECTED + 1
+            }
+            set i: i + 1
+        }
+    }
+
+    ; dazzle_jit_b<batch>_r<index> — on the caller's page, so the c-string
+    ; outlives the call that consumes it.
+    function region_fn_name(host: pointer[Page], batch: int, index: size_t) returns pointer[const_char]
+    {
+        var sb StringBuilder()
+        sb.append "dazzle_jit_b"
+        sb.append batch
+        sb.append "_r"
+        sb.append index
+        let nm sb.to_string()
+        nm.to_c_string()
+    }
+
+    ; A Scaly function address as an IR pointer constant.
+    function const_addr(cg: pointer[Cg], fp: pointer[void]) returns pointer[void]
+        Jit.cptr(cg, fp as u64)
+
+    ; ======================================================================
+    ; The trampoline seam
+    ; ======================================================================
+
+    ; The native region for `i`, or 0 when the caller should interpret this
+    ; step — because the body is still cold, or because compiling it failed.
+    function region_for(s: pointer[Session], i: pointer[Insn]) returns u64
+    {
+        let key i as u64
+        let v Jit.map_get(s.regions, key, 0)
+        if v = 2
+            return 0
+        if v = 4
+            return 0
+        if v <> 0
+            if (v & 1) = 0
+                return v
+        ; entries INCLUDING this one; a threshold of 1 queues on first sight.
+        var count: u64 1
+        if v <> 0
+            set count: (v >> 1) + 1
+        let limit JIT_THRESHOLD as u64
+        if count < limit
+        {
+            Jit.map_put(s.regions, key, (count + count) + 1)
+            return 0
+        }
+        ; Hot. Queue it, and compile the whole queue once it is worth a module.
+        Jit.map_put(s.regions, key, Jit.cache_queued())
+        s.queue.add i
+        if s.queue.get_length() < (JIT_BATCH as size_t)
+            return 0
+        Jit.compile_queue(s)
+        ; compile_queue fills the cache; this body is hot from here on.
+        let after Jit.map_get(s.regions, key, 0)
+        if after = 4
+            return 0
+        if after = 2
+            return 0
+        if (after & 1) <> 0
+            return 0
+        after
+    }
+
+    ; Advance from `i` as far as native code can, and answer where the
+    ; interpreter should continue. This is the ONE function `VM.eval` calls; with
+    ; no session open it is the interpreter's own step, which is why `--interp`
+    ; needs no second loop.
+    function step(i: pointer[Insn], vm: pointer[VM]) returns pointer[Insn]
+    {
+        let sess JIT_SESSION
+        if sess = null
+            return i.execute(vm)
+        let s sess as pointer[Session]
+        let addr Jit.region_for(s, i)
+        if addr = 0
+        {
+            set JIT_N_INTERP_STEPS: JIT_N_INTERP_STEPS + 1
+            return i.execute(vm)
+        }
+        set JIT_N_ENTRIES: JIT_N_ENTRIES + 1
+        let fp addr as pointer[void]
+        let r fp(vm as pointer[void])
+        r as pointer[Insn]
+    }
+
+    function enabled() returns bool
+    {
+        if JIT_SESSION = null
+            return false
+        true
+    }
+
+    ; Open the session for this run. False means the engine stays on the
+    ; interpreter — reported by the caller, never fatal.
+    function enable(host: pointer[Page]) returns bool
+    {
+        if JIT_SESSION <> null
+            return true
+        let s Jit.open(host)
+        if s = null
+            return false
+        set JIT_SESSION: s as pointer[void]
+        true
+    }
+
+    procedure set_dump(on: bool)
+        set JIT_DUMP: on
+
+    ; DAZZLE_JIT_THRESHOLD overrides the HotSpot threshold; 0 means "compile on
+    ; first sight". Present so the threshold is a MEASURED number and not a
+    ; guess that nobody can re-check.
+    procedure set_threshold(n: int)
+        set JIT_THRESHOLD: n
+
+    procedure set_pipeline(p: pointer[const_char])
+        set JIT_PIPELINE: p
+
+    ; DAZZLE_JIT_BATCH overrides the batch size; 1 compiles each hot body on its
+    ; own, which is the shape to compare any batching against.
+    procedure set_batch(n: int)
+    {
+        if n < 1
+            return
+        set JIT_BATCH: n
+    }
+
+    ; Ask for the `--jit-stats` line at exit.
+    procedure request_stats()
+        atexit(&jit_stats_atexit)
+
+    ; ======================================================================
+    ; --jit-stats
+    ; ======================================================================
+    procedure print_stats()
+    {
+        var sb StringBuilder()
+        sb.append "dazzle JIT: "
+        if JIT_SESSION = null
+            sb.append "interpreter (no session)"
+        else
+        {
+            let n_regions JIT_N_REGIONS
+            let n_insns JIT_N_INSNS
+            let n_native JIT_N_NATIVE_INSNS
+            let n_stepped JIT_N_INSNS - JIT_N_NATIVE_INSNS
+            let n_entries JIT_N_ENTRIES
+            let n_interp JIT_N_INTERP_STEPS
+            let n_rejected JIT_N_REJECTED
+            sb.append n_regions
+            sb.append " regions, "
+            sb.append n_insns
+            sb.append " insns lowered ("
+            sb.append n_native
+            sb.append " native, "
+            sb.append n_stepped
+            sb.append " via the interpreter step), "
+            sb.append n_entries
+            sb.append " region entries, "
+            sb.append n_interp
+            sb.append " interpreted steps, "
+            sb.append n_rejected
+            sb.append " rejected roots"
+        }
+        sb.append "\n"
+        let line sb.to_string()
+        let line_c line.to_c_string()
+        scaly_eputs line_c
+    }
+
+    ; ======================================================================
+    ; Self-test: build one module, JIT it, call it, and let the generated code
+    ; call back into this binary. Proves the whole chain everything else rests
+    ; on — context, module, inttoptr callback, ORC add, lookup, and the n-ary
+    ; indirect call back from Scaly.
+    ;
+    ; Generated:  i64 @dazzle_jit_selftest(i64 %x) { ret i64 (double(%x) + 1) }
+    ; ======================================================================
+    function selftest(host: pointer[Page]) returns int
+    {
+        if Jit.check_helper_abi() = false
+            return 1
+        let s Jit.open(host)
+        if s = null
+            return 2
+        let ctx s.ctx
+        let mod LLVMModuleCreateWithNameInContext("dazzle_jit_selftest_mod", ctx)
+        if mod = null
+            return 3
+        let dl LLVMOrcLLJITGetDataLayoutStr(s.jit)
+        if dl <> null
+            LLVMSetDataLayout(mod, dl)
+
+        let i64t LLVMInt64TypeInContext(ctx)
+        let ptrt LLVMPointerTypeInContext(ctx, 0)
+        var tbuf u8[16]
+        let tp tbuf as pointer[pointer[void]]
+        set *tp: i64t
+        let fn_ty LLVMFunctionType(i64t, tp, 1, 0)
+        let fn LLVMAddFunction(mod, "dazzle_jit_selftest", fn_ty)
+        let entry_bb LLVMAppendBasicBlockInContext(ctx, fn, "entry")
+        let b LLVMCreateBuilderInContext(ctx)
+        LLVMPositionBuilderAtEnd(b, entry_bb)
+
+        let helper_addr &jit_selftest_double
+        let helper_c LLVMConstInt(i64t, helper_addr as u64, 0)
+        let helper_p LLVMConstIntToPtr(helper_c, ptrt)
+        var abuf u8[16]
+        let ap abuf as pointer[pointer[void]]
+        set *ap: LLVMGetParam(fn, 0)
+        let doubled LLVMBuildCall2(b, fn_ty, helper_p, ap, 1, "dbl")
+        let one LLVMConstInt(i64t, 1, 0)
+        let sum LLVMBuildAdd(b, doubled, one, "sum")
+        LLVMBuildRet(b, sum)
+        LLVMDisposeBuilder(b)
+
+        var vmsg: pointer[char] null
+        if LLVMVerifyModule(mod, LLVM_VERIFIER_RETURN_STATUS, &vmsg) <> 0
+        {
+            scaly_eputs "dazzle JIT selftest: module does not verify\n"
+            return 4
+        }
+        let tsm LLVMOrcCreateNewThreadSafeModule(mod, s.tsc)
+        if tsm = null
+            return 5
+        let add_err LLVMOrcLLJITAddLLVMIRModule(s.jit, s.jd, tsm)
+        if Llvm.failed(add_err, "could not add selftest module")
+            return 6
+        var addr: u64 0
+        let look_err LLVMOrcLLJITLookup(s.jit, &addr, "dazzle_jit_selftest")
+        if Llvm.failed(look_err, "selftest symbol lookup failed")
+            return 7
+        if addr = 0
+            return 8
+        let entry_fn addr as pointer[void]
+        let answer entry_fn(20 as i64)
+        if answer <> 41
+            return 9
+        let answer2 entry_fn(0 as i64)
+        if answer2 <> 1
+            return 10
+        ; and the layout probe, which the code generator depends on
+        if Jit.check_layout(s) = false
+            return 11
+        0
+    }
+}

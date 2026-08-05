@@ -429,3 +429,47 @@ Decisions:
 - RBMM: everything on the builder's page, per the S67 rule — the whole
   document model has to survive until commit anyway, so the reference's
   `delete`s simply vanish.
+
+## Stage 6b — the JIT (2026-08-06)
+
+`dazzle/Jit.scaly` lowers the `Insn` graph to LLVM IR and executes it through the
+ORC JIT; `dazzle/Llvm.scaly` holds the package's own LLVM-C/ORC bindings. It is
+opt-in (`--jit`), the interpreter stays the default, and the measured reason for
+that is in the "Stage 6b GEMESSEN" section of `tests/dazzle/PERFORMANCE.md`. What
+belongs in a design note is the four decisions:
+
+- **The IR is the `Insn` graph, not `Expression`.** The graph already carries
+  everything a code generator needs — stack positions assigned, boxing decided,
+  closures laid out, every control transfer explicit. Lowering `Expression`
+  instead would mean a second implementation of `Expression.compile`'s semantics
+  (varargs entry points, keyword arguments, letrec boxing, the 800-line
+  `make`/`style` lowering) and would put port bugs and lowering bugs in the same
+  debugging session — the sequencing mistake ROADMAP-dazzle.md warns about twice.
+- **The return protocol carries everything.** A region is `i64 region(ptr vm)`
+  and answers the NEXT INSN, exactly as `Insn.execute` does. An arm the generator
+  does not know natively becomes `call jit_execute(insn, vm)` plus a compare
+  against the arm's statically known successors, so the region continues natively
+  when the interpreter took the expected step. Consequences, all of them free:
+  byte-identity does not depend on coverage (which is why a code generator could
+  be landed against 469 corpus entries and twelve golden suites at all); a tail
+  call, a `call/cc` unwind and an error are all "an answer the compare does not
+  recognise" and are propagated unchanged; and a DSSSL tail call cannot grow the
+  native stack, so the named-let-over-node-list idiom runs in bounded stack
+  without the generator knowing what a loop is.
+- **Generated code calls back through inttoptr CONSTANTS, never by symbol name.**
+  The address comes from `&helper` in Scaly. Name resolution was rejected on
+  purpose: the shipped binary is linked with whole-program LTO and `hidden`
+  visibility (`tools/link-lto.sh`), so its Scaly symbols are not dynamically
+  resolvable — a name-based seam would work in a debug build and fail in exactly
+  the configuration we ship. Every helper is a module-level free function taking
+  and returning only pointers and integers, and `Jit.check_helper_abi` calls one
+  through the generated signature at session start: a helper that grew the
+  implicit caller-page parameter would otherwise shift every argument by one slot
+  silently.
+- **The VM layout is MEASURED, by sentinel search.** `Jit.measure_layout` writes
+  a unique value through each field it needs and finds it in the struct's bytes.
+  This is not defensive style — `&probe.field` answers the field's ADDRESS for a
+  scalar field and the field's VALUE for a POINTER-typed one (measured; same
+  family as the `&arr[i]` no-op fixed 2026-08-04), and the sentinel search needs
+  no language guarantee at all while additionally PROVING each offset: a sentinel
+  found twice, or not at all, is rejected and the JIT declines to open.
