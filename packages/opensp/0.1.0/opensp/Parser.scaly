@@ -2,6 +2,7 @@ use scaly.memory.Page
 use scaly.containers.Array
 use scaly.containers.String
 use scaly.io.Path
+use opensp.XcharMap.XcharMap
 use opensp.CodingSystemKit.OutputEncoder
 use opensp.StringC.StringC
 use opensp.ISet.ISet
@@ -6552,6 +6553,116 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         dd
     }
 
+    ; Parser::compileNormalMap (parseMode.cxx:406) — the map `extend_data`
+    ; scans. 1 = this character cannot BEGIN any token in mconnetMode, so a
+    ; data run may swallow it without consulting the recognizer; 0 = the run
+    ; ends here. Built once per instance, right after the instance recognizers,
+    ; because it depends on the syntax AND on the current DTD's short
+    ; references.
+    ;
+    ; ★The reference clears the case variants of every stop character through
+    ; `generalSubstTable()->inverse(c)`. This port has no inverse table, so the
+    ; equivalent set is computed FORWARD once at setup: a character whose fold
+    ; lands on a stop character is itself a stop. Same set, one 64 K sweep at
+    ; parse start instead of a table.
+    function compile_normal_map(this: Parser, table: pointer[Array[PackedTokenInfo]], sdv: Sd, synv: Syntax, dtd: pointer[Dtd])
+    {
+        let map XcharMap.make(host, 0 as u8)
+        let sc synv.char_set(setSgmlChar)
+        let ns sc.get_count()
+        var i: size_t 0
+        while i < ns
+        {
+            map.set_range(sc.range_min(i), sc.range_max(i), 1 as u8)
+            set i: i + 1
+        }
+        let stops ISet^host()
+        let mi ModeInfo^host(mconnetMode, sdv, table)
+        var t TokenInfo()
+        while mi.next_token(&t)
+        {
+            if (t.kind = TT_DELIM) or (t.kind = TT_DELIMDELIM) or (t.kind = TT_DELIMSET)
+            {
+                if synv.delim_general_len(t.delim1) > (0 as size_t)
+                    stops.add(synv.delim_general_char(t.delim1, 0 as size_t))
+            }
+            if t.kind = TT_SET
+            {
+                if t.token <> tokenChar
+                {
+                    let st synv.char_set(t.set_idx)
+                    let nst st.get_count()
+                    var k: size_t 0
+                    while k < nst
+                    {
+                        stops.add_range(st.range_min(k), st.range_max(k))
+                        set k: k + 1
+                    }
+                }
+            }
+            if t.kind = TT_FUNCTION
+            {
+                if t.token <> tokenChar
+                    stops.add(synv.standard_function(t.func_idx))
+            }
+        }
+        ; the short references of the CURRENT dtd: a B-initial delimiter stops
+        ; the run on the whole blank set, any other on its first character.
+        if dtd <> null
+        {
+            let nsr dtd.n_shortref()
+            var r: size_t 0
+            while r < nsr
+            {
+                let str dtd.shortref(r)
+                if str.get_size() > (0 as size_t)
+                {
+                    let c0 str.get(0 as size_t)
+                    if c0 = sdv.exec_to_internal(66 as u8)
+                    {
+                        let bl synv.char_set(setBlank)
+                        let nbl bl.get_count()
+                        var k: size_t 0
+                        while k < nbl
+                        {
+                            stops.add_range(bl.range_min(k), bl.range_max(k))
+                            set k: k + 1
+                        }
+                    }
+                    else
+                        stops.add(c0)
+                }
+                set r: r + 1
+            }
+        }
+        ; the stop characters themselves, by RANGE — the sweep below must not
+        ; pay a set lookup for each of 64 K characters (measured: 5 M
+        ; instructions per parse, +13 % on a 25 K document).
+        let nstops stops.get_count()
+        var q: size_t 0
+        while q < nstops
+        {
+            map.set_range(stops.range_min(q), stops.range_max(q), 0 as u8)
+            set q: q + 1
+        }
+        ; ...and their case variants. Only a character whose fold MOVES it can
+        ; be one, which is a handful in any real syntax, so the set lookup runs
+        ; only for those.
+        var c: u32 0
+        let hi XCHARMAP_HI as u32
+        while c <= hi
+        {
+            let f synv.fold(c)
+            if f <> c
+            {
+                if stops.contains(f)
+                    map.set_char(c, 0 as u8)
+            }
+            set c: c + (1 as u32)
+        }
+        ps.set_normal_map(map)
+    }
+
     ; ---- mode setup: install the recognizers the decl parser drives -------
     function install_recognizers(this: Parser, table: pointer[Array[PackedTokenInfo]])
     {
@@ -6615,6 +6726,7 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
             this.report_mode_ambiguities(amb, m)
             set i: i + 1
         }
+        this.compile_normal_map(table, sdv, synv, null)
     }
 
     ; ======================================================================
@@ -9072,8 +9184,44 @@ define Parser (host: pointer[Page], ps: pointer[ParserState])
         ps.pcdata_recover()
     }
 
+    ; Parser::extendData (parseInstance.cxx:1181) — grow the data token over the
+    ; whole run of NORMAL characters. The reference calls this "one of the
+    ; parser's inner loops, so it needs to be fast", and it is the difference
+    ; between one data event per RUN and one per CHARACTER.
+    ;
+    ; ★Measured 2026-08-05, before this existed: a 1 MB text run produced
+    ; 1 000 000 data events, 5.0 allocations and 214 bytes of region churn PER
+    ; INPUT BYTE. On the large-model tier (6.16 MB in, 17 files out) that
+    ; was 19.3 M allocations and 865 MB of churn — the reason that tier was the
+    ; port's worst instruction ratio against openjade (4.1x).
+    ;
+    ; The scan deliberately reads ONE character too far (the non-normal one that
+    ; ends the run) and `end_token` puts it back: cur = start + length, exactly
+    ; as InputSource::endToken does.
+    function extend_data(this: Parser)
+    {
+        let map ps.get_normal_map()
+        if map = null
+            return
+        let ins ps.current_input()
+        if ins = null
+            return
+        var length ins.current_token_length()
+        var scanning true
+        while scanning
+        {
+            let c ins.token_char_in_buffer()
+            if map.get(c) = (0 as u8)
+                set scanning: false
+            else
+                set length: length + (1 as size_t)
+        }
+        ins.end_token(length)
+    }
+
     function parse_pcdata(this: Parser)
     {
+        this.extend_data()
         let ins ps.current_input()
         let ts ins.current_token_string()
         ; the data token's START (the reference's currentLocation()) — an
