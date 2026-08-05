@@ -196,6 +196,7 @@ run_case vec1 doc6.sgml vec1.experr -2
 run_case ent1 entdoc.sgml
 run_case num4 numdoc.sgml
 run_case num5 numdoc.sgml
+run_case num6 doc.sgml
 run_case proc1 procdoc.sgml proc1.experr
 
 # proc2 runs on `-t fot`, which needs -o and has the capture seam the
