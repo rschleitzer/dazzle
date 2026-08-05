@@ -73,6 +73,15 @@
 # whose fold three other primitives turned out to be missing:
 # element-with-id, process-element-with-id and the GI matching here all
 # resolve a lowercase name against upper-cased element storage.
+# num5 (numdoc.sgml): the NUMBERING CACHE's state machine (NumberCache.cxx).
+# num4 pins what the numbering primitives ANSWER; num5 pins that they answer
+# the SAME when the cache carries state from an earlier query — the same node
+# twice, a node BEFORE the cached position (the walk has to restart at the
+# document element rather than run off the end), two GIs interleaved, and
+# element-number-list mixed in, which keys its entry by the RESET gi and
+# stores a sub-position the plain form clears. ★Every value here is
+# order-independent by construction, so a cache that answers from a stale
+# position shows up as a wrong NUMBER, not as a crash.
 # proc1 (procdoc.sgml) + proc2 (procdoc.sgml, `-t fot`): the PROCESS /
 # SOSOFO / STYLE cluster — process-first-descendant, process-matching-
 # children, sosofo-label, sosofo-discard-labeled, merge-style, style?,
@@ -186,6 +195,7 @@ run_case dsssl2 doc5.sgml dsssl2.experr -2
 run_case vec1 doc6.sgml vec1.experr -2
 run_case ent1 entdoc.sgml
 run_case num4 numdoc.sgml
+run_case num5 numdoc.sgml
 run_case proc1 procdoc.sgml proc1.experr
 
 # proc2 runs on `-t fot`, which needs -o and has the capture seam the

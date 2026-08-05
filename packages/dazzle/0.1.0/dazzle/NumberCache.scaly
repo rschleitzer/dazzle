@@ -1,0 +1,344 @@
+; NumberCache (style/NumberCache.cxx) — the per-GI cache behind `element-number`
+; and `element-number-list`. The reference makes it a base class of Interpreter
+; (style/Interpreter.h:303), so `interp.elementNumber(node, gi)` is the only
+; entry point the primitives ever see; this port keeps that seam.
+;
+; What it is for: `element-number` answers "how many elements with this GI come
+; at or before this one, in document order". Computed honestly that is a walk
+; from the document element to the node — O(document) per call, and a stylesheet
+; that numbers as it walks makes the whole run QUADRATIC. The reference keeps,
+; per GI, the last node it answered for and its count, and continues the walk
+; from THERE; styling runs in document order, so the continuation is normally a
+; handful of elements. (Clark's own comment on the limit: the scheme "will be
+; defeated (but not disastrously so) by numbering both notes and footnotes, say,
+; per chapter" — the cache holds ONE position per GI.)
+;
+; ★The one thing the reference has and this grove does not: `advance` is
+; `NodePtr::assignNextChunkAfter`, an O(1) step along the chunk chain. Our nodes
+; carry parent/children arrays and no document-order successor. Supplying that
+; missing step is what `GroveInfo.elem_order_of` does — the per-grove vector of
+; every element in document order, built once on first use. It is the chunk
+; chain, not a different algorithm: `element_index` (GroveBuilder assigns it at
+; every start tag, Grove.scaly:2403) IS the position in that vector, so the step
+; is an index increment. The builder VERIFIES that identity while collecting and
+; answers null if it ever fails to hold, and a null vector (hand-made unit-test
+; groves have no GroveInfo and no indices) falls back to the honest walk below —
+; same discipline as the hashed id index in GroveBuilder.
+;
+; Everything else here is the reference line by line, including the parts that
+; look redundant: the `use_subnode` gate, the early `return 0` when the node IS
+; the last reset element, and the rule that `element_number` stores an entry
+; only when the count came out non-zero.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use dazzle.NameTable.NameTable
+use dazzle.Grove.GroveNode
+use dazzle.Grove.GroveInfo
+
+; NumberCache::ElementEntry — `node`/`num` is the reset-GI position for the
+; `elementNumberAfter` form and the plain position for `elementNumber`;
+; `sub_node`/`sub_num` is the inner (numbered-GI) position the after-form adds.
+define NumberEntry (node: pointer[GroveNode], num: int, sub_node: pointer[GroveNode], sub_num: int)
+{
+    function make(host: pointer[Page]) returns pointer[NumberEntry]
+    {
+        let e host.allocate(sizeof NumberEntry, alignof NumberEntry) as pointer[NumberEntry]
+        set e.node: null
+        set e.num: 0
+        set e.sub_node: null
+        set e.sub_num: 0
+        e
+    }
+}
+
+define NumberCache (element_numbers: pointer[NameTable])
+{
+    function make(host: pointer[Page]) returns pointer[NumberCache]
+    {
+        let c host.allocate(sizeof NumberCache, alignof NumberCache) as pointer[NumberCache]
+        set c.element_numbers: NameTable.make(host, 16 as size_t)
+        c
+    }
+
+    ; NumberCache::advance — assignNextChunkAfter, over the document-order
+    ; element vector. Null at the end of the grove.
+    function advance(order: pointer[Array[pointer[GroveNode]]], cur: pointer[GroveNode]) returns pointer[GroveNode]
+    {
+        let i cur.get_element_index()
+        if i < 0
+            return null
+        let k (i + 1) as size_t
+        if k >= order.get_length()
+            return null
+        *(order.get_buffer() + k)
+    }
+
+    ; getGroveRoot + getDocumentElement: the first element in document order.
+    function document_element(order: pointer[Array[pointer[GroveNode]]]) returns pointer[GroveNode]
+    {
+        if order.get_length() = (0 as size_t)
+            return null
+        *(order.get_buffer() + (0 as size_t))
+    }
+
+    ; the entry for a GI, created on first use like `elementNumbers_.insert`.
+    ; The key is a copy on the CACHE's page, never the caller's StringC — that
+    ; one may be a stack temporary whose buffer dies with the expression.
+    function entry_for(this: pointer[NumberCache], host: pointer[Page], gi: StringC) returns pointer[NumberEntry]
+    {
+        let hit this.element_numbers.lookup(gi)
+        if hit <> null
+            return hit as pointer[NumberEntry]
+        let e NumberEntry.make(host)
+        let key StringC^host(gi.data_ptr(), gi.get_size())
+        this.element_numbers.insert(host, *key, e as pointer[void])
+        e
+    }
+
+    function entry_if_present(this: pointer[NumberCache], gi: StringC) returns pointer[NumberEntry]
+    {
+        let hit this.element_numbers.lookup(gi)
+        if hit = null
+            return null
+        hit as pointer[NumberEntry]
+    }
+
+    ; NumberCache::elementNumber
+    function element_number(this: pointer[NumberCache], host: pointer[Page], node: pointer[GroveNode], gi: StringC) returns int
+    {
+        let order GroveInfo.elem_order_of(host, node)
+        if order = null
+            return NumberCache.walk_upto(node, gi, null)
+        if node.get_element_index() < 0
+            return NumberCache.walk_upto(node, gi, null)
+
+        var start: pointer[GroveNode] null
+        var last_match: pointer[GroveNode] null
+        var count 0
+        let entry this.entry_if_present(gi)
+        if entry <> null
+        {
+            if entry.node <> null
+            {
+                if entry.node = node
+                    return entry.num
+                let entry_index entry.node.get_element_index()
+                let node_index node.get_element_index()
+                if entry_index < node_index
+                {
+                    if GroveInfo.index_of(node) = GroveInfo.index_of(entry.node)
+                    {
+                        set last_match: entry.node
+                        set start: NumberCache.advance(order, entry.node)
+                        set count: entry.num
+                    }
+                }
+            }
+        }
+        if start = null
+            set start: NumberCache.document_element(order)
+
+        var cur start
+        var found false
+        while cur <> null
+        {
+            let tem cur.get_gi()
+            if tem.equals(gi)
+            {
+                set last_match: cur
+                set count: count + 1
+            }
+            if cur = node
+            {
+                set found: true
+                set cur: null
+            }
+            else
+                set cur: NumberCache.advance(order, cur)
+        }
+        ; the walk ran off the end without meeting the node: the cached entry
+        ; was AFTER it (the reference cannot get here — its elementIndex test
+        ; already excluded that case — but a grove whose indices are not the
+        ; vector positions would, and then the honest walk is the answer).
+        if found = false
+            return NumberCache.walk_upto(node, gi, null)
+
+        if count <> 0
+        {
+            let e this.entry_for(host, gi)
+            set e.node: last_match
+            set e.sub_node: null
+            set e.sub_num: 0
+            set e.num: count
+        }
+        count
+    }
+
+    ; NumberCache::elementNumberAfter — elements with `gi` at or before `node`
+    ; that come after the last `reset_gi` element at or before it.
+    function element_number_after(this: pointer[NumberCache], host: pointer[Page], node: pointer[GroveNode], gi: StringC, reset_gi: StringC) returns int
+    {
+        let order GroveInfo.elem_order_of(host, node)
+        if order = null
+            return NumberCache.walk_upto(node, gi, &reset_gi)
+        if node.get_element_index() < 0
+            return NumberCache.walk_upto(node, gi, &reset_gi)
+
+        var start: pointer[GroveNode] null
+        var last_match: pointer[GroveNode] null
+        var reset_count 0
+        var count 0
+        let entry this.entry_if_present(reset_gi)
+        if entry <> null
+        {
+            let node_index node.get_element_index()
+            var use_subnode true
+            if entry.node <> null
+            {
+                if entry.node = node
+                    return 0
+                let entry_index entry.node.get_element_index()
+                if entry_index < node_index
+                {
+                    if GroveInfo.index_of(node) = GroveInfo.index_of(entry.node)
+                    {
+                        set last_match: entry.node
+                        set start: NumberCache.advance(order, entry.node)
+                        set reset_count: entry.num
+                    }
+                    else
+                        set use_subnode: false
+                }
+                else
+                    set use_subnode: false
+            }
+            if entry.sub_node <> null
+            {
+                if use_subnode
+                {
+                    let sg entry.sub_node.get_gi()
+                    if sg.equals(gi)
+                    {
+                        if entry.sub_node = node
+                            return entry.sub_num
+                        let sub_index entry.sub_node.get_element_index()
+                        if sub_index < node_index
+                        {
+                            if GroveInfo.index_of(node) = GroveInfo.index_of(entry.sub_node)
+                            {
+                                set start: NumberCache.advance(order, entry.sub_node)
+                                set count: entry.sub_num
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if start = null
+            set start: NumberCache.document_element(order)
+
+        var cur start
+        var found false
+        while cur <> null
+        {
+            let tem cur.get_gi()
+            if tem.equals(reset_gi)
+            {
+                set last_match: cur
+                set reset_count: reset_count + 1
+                set count: 0
+            }
+            else if tem.equals(gi)
+                set count: count + 1
+            if cur = node
+            {
+                set found: true
+                set cur: null
+            }
+            else
+                set cur: NumberCache.advance(order, cur)
+        }
+        if found = false
+            return NumberCache.walk_upto(node, gi, &reset_gi)
+
+        let e this.entry_for(host, reset_gi)
+        set e.node: last_match
+        set e.num: reset_count
+        set e.sub_node: node
+        set e.sub_num: count
+        count
+    }
+
+    ; the uncached answer — the document-order pre-order walk from the document
+    ; element up to and including `target`, counting elements whose GI is `gi`.
+    ; A non-null `reset` zeroes the count at every occurrence of THAT gi. This
+    ; is what the port did everywhere before the cache; it stays as the answer
+    ; for groves without a document-order vector (hand-made test trees).
+    function walk_upto(target: pointer[GroveNode], gi: StringC, reset: pointer[StringC]) returns int
+    {
+        var root target
+        var rp root.get_parent()
+        while rp <> null
+        {
+            set root: rp
+            set rp: root.get_parent()
+        }
+        var count 0
+        let kids root.get_children()
+        if kids <> null
+        {
+            var ki: size_t 0
+            var done false
+            while ki < kids.get_length()
+            {
+                if done = false
+                {
+                    let k *(kids.get_buffer() + ki)
+                    if k.get_class() = GN_ELEMENT
+                    {
+                        if NumberCache.walk(k, target, gi, reset, &count)
+                            set done: true
+                    }
+                }
+                set ki: ki + (1 as size_t)
+            }
+        }
+        count
+    }
+
+    function walk(cur: pointer[GroveNode], target: pointer[GroveNode], gi: StringC, reset: pointer[StringC], count: pointer[int]) returns bool
+    {
+        if cur.get_class() = GN_ELEMENT
+        {
+            let cg cur.get_gi()
+            var counted false
+            if reset <> null
+            {
+                if cg.equals(*reset)
+                {
+                    set *count: 0
+                    set counted: true
+                }
+            }
+            if counted = false
+            {
+                if cg.equals(gi)
+                    set *count: *count + 1
+            }
+        }
+        if cur = target
+            return true
+        let n cur.child_count()
+        var i 0
+        while i < n
+        {
+            let c cur.child_at(i)
+            if NumberCache.walk(c, target, gi, reset, count)
+                return true
+            set i: i + 1
+        }
+        false
+    }
+}
