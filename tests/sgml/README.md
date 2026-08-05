@@ -43,6 +43,24 @@ anything pulled from another repo.*
 CI and a fresh checkout only have `corpus/`; `run.sh` simply reports the
 public count. To light up the full gate locally, populate the private tier.
 
+### The discovery gate
+
+`run.sh` also checks HOW MANY models it found, against `expected-models`
+(committed for the public tier, written by `fetch-private.sh`/`freeze-private.sh`
+for the private one), and fails on **any** difference — fewer *or* more. Growing
+the corpus therefore means editing that file, deliberately, in the same commit.
+
+The reason is a failure this suite could not previously report: `N of M
+ESIS-identical` says nothing about `M`. A renamed directory, a manifest that lost
+its `DOC`, an unfetched private tier — and the run prints `366 of 366` with exit 0
+while a hundred models have silently stopped running. The counterpart failure is
+just as quiet: on 2026-08-05 the port broke seven models and the number 469/469
+kept being quoted from memory in `PERFORMANCE.md` (nine places) while the suite
+was reporting 462 and exiting 1. Whoever cites a corpus run as a gate cites the
+number the run PRINTED.
+
+`--filter` skips the gate — a filtered run is a selection, not a corpus.
+
 ## Bootstrapping the private tier
 
     cp tests/sgml/corpus.map.example tests/sgml/corpus-private/corpus.map

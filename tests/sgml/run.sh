@@ -21,6 +21,14 @@
 #   corpus/          public, committed — Scaly's own SGML + synthetic fixtures
 #   corpus-private/  gitignored further documents (fetch-private.sh)
 #
+# ★The count is GATED (see the discovery gate at the bottom): the number of
+# models found must equal `expected-models` — the public tier's is committed, the
+# private tier's is written by fetch/freeze. A number nobody checks is a number
+# that drifts: "469/469" was quoted in PERFORMANCE.md at nine places while the
+# suite was reporting 462, and the reverse failure (a tier that silently stops
+# being discovered, so M shrinks and N/M still reads "all green") had nothing
+# watching it at all. Both directions fail here.
+#
 # Per-entry layout: a directory with a `manifest` and golden `expected.esis` +
 # `expected.exit`. The manifest is sourced and may set:
 #   DOC=<file>            document passed to the binary (required)
@@ -69,9 +77,16 @@ trap 'rm -rf "$TMP"' EXIT
 norm_err() { sed 's/^[^:]*://'; }
 
 total=0; ok=0; failed=""
+pub_seen=0; priv_seen=0
 for entry in "$HERE"/corpus/*/ "$HERE"/corpus-private/*/; do
   [ -f "$entry/manifest" ] || continue
   name="$(basename "$entry")"
+  # Count what EXISTS before the filter, so the discovery gate below judges the
+  # corpus and not the selection.
+  case "$entry" in
+    "$HERE"/corpus-private/*) priv_seen=$((priv_seen + 1)) ;;
+    *)                        pub_seen=$((pub_seen + 1)) ;;
+  esac
   case "$name" in $FILTER) ;; *) continue ;; esac
 
   DOC=""; BASE="entry"; SP_ENV=""; EXTRA_ARGS=""; WORKDIR=""; RAST=0
@@ -166,10 +181,54 @@ if [ "$stdin_rc" -ne 0 ] || [ "$stdin_got" != "$stdin_want" ]; then
 fi
 
 echo
+
+# --- the DISCOVERY gate ------------------------------------------------------
+# "N of M ESIS-identical" only means something if M is the corpus we expect. A
+# shrinking M is invisible in that line — a renamed directory, a manifest that
+# lost its DOC, an unfetched private tier, and the suite happily reports
+# "366 of 366" with rc 0 while a hundred models silently stopped running. So the
+# expected count is written down and compared in BOTH directions: fewer is a
+# corpus that fell out, more is a corpus that grew, and both must be a deliberate
+# edit of the file rather than a number nobody reads.
+#
+# The public tier is committed, so its count is committed too. The private tier is
+# gitignored and optional (CI has none): its expectation lives in the tier itself,
+# written by fetch/freeze, and is only checked when the tier is present.
+#
+# Skipped under --filter: a filtered run is a selection, not a corpus.
+gate_rc=0
+if [ "$FILTER" = '*' ]; then
+  pub_want_file="$HERE/expected-models"
+  if [ -f "$pub_want_file" ]; then
+    pub_want="$(tr -dc '0-9' < "$pub_want_file")"
+    if [ "$pub_seen" != "$pub_want" ]; then
+      echo "  CORPUS public tier has $pub_seen models, expected $pub_want"
+      echo "  (if that change is intended, edit tests/sgml/expected-models)"
+      gate_rc=1
+    fi
+  else
+    echo "  CORPUS no tests/sgml/expected-models — discovery is ungated"
+    gate_rc=1
+  fi
+  priv_want_file="$HERE/corpus-private/expected-models"
+  if [ -f "$priv_want_file" ]; then
+    priv_want="$(tr -dc '0-9' < "$priv_want_file")"
+    if [ "$priv_seen" != "$priv_want" ]; then
+      echo "  CORPUS private tier has $priv_seen models, expected $priv_want"
+      echo "  (if that change is intended, edit tests/sgml/corpus-private/expected-models)"
+      gate_rc=1
+    fi
+  elif [ "$priv_seen" -gt 0 ]; then
+    echo "  CORPUS private tier present ($priv_seen models) but not gated —"
+    echo "  write the count to tests/sgml/corpus-private/expected-models"
+  fi
+fi
+
 if [ "$BLESS" -eq 1 ]; then
   echo "blessed $ok of $total models"
 else
   echo "$ok of $total models ESIS-identical"
   if [ -n "$failed" ]; then echo "failed:$failed"; exit 1; fi
 fi
+[ "$gate_rc" -eq 0 ] || exit 1
 exit 0
