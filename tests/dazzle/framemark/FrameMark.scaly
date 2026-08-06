@@ -76,6 +76,9 @@ shared fm_publish_stack: bool false
 ; the byte-identity gates — they diff STDERR against the golden, so the probe's
 ; own report reads as 48 failures with every generated tree actually correct.
 shared fm_quiet: bool false
+; the multi-page rewind (DZ_FRAME_MARK_SINGLE_PAGE=1 turns it off, which is how
+; its contribution is measured)
+shared fm_multipage: bool true
 ; the innermost live frame's index
 shared fm_top: i64 -1
 
@@ -107,6 +110,8 @@ shared fm_publishes: i64 0
 ; stores into a pre-existing object that were SAFE because the target sits in
 ; the innermost frame's own range (so a rewind discards both)
 shared fm_stores_local: i64 0
+shared fm_rewound_multi: i64 0
+shared fm_pages_freed: i64 0
 ; which primitive ids are TRUSTED not to publish (index = id, 1 = trusted)
 shared fm_trusted: pointer[i64] null
 
@@ -152,6 +157,9 @@ define FrameMark
         let t getenv("DZ_FRAME_MARK_TRUST_PRIMS")
         if t <> null
             set fm_trust_prims: true
+        let sp1 getenv("DZ_FRAME_MARK_SINGLE_PAGE")
+        if sp1 <> null
+            set fm_multipage: false
         let q getenv("DZ_FRAME_MARK_QUIET")
         if q <> null
             set fm_quiet: true
@@ -287,14 +295,17 @@ define FrameMark
             set fm_b_publish: fm_b_publish + 1
             return
         }
-        ; 2. ONE PAGE
-        let t FrameMark.tail()
-        if (t as i64) <> *(fm_page + idx)
-        {
-            set fm_b_page: fm_b_page + 1
-            return
-        }
-        ; 3. EXCLUSIVE
+        ; 3. EXCLUSIVE — the region head's list. ★It is checked on the HEAD
+        ; because that is where a frame-hosted oversized allocation lands
+        ; (`allocate` forwards to allocate_oversized on the page it was called
+        ; on, and a frame allocates on its host = the head). The residual is
+        ; named at `store`: an oversized block requested through Page.get(obj)
+        ; for an obj on an INTERMEDIATE page attaches to THAT page's list, and
+        ; its PageNode is bump-allocated in our range. The multi-page rewind
+        ; below refuses any chain that carries such a list, which closes it for
+        ; every page the rewind touches; a surviving intermediate page is the
+        ; part that stays open (measured rare: 4185 frames of 82 M touched an
+        ; exclusive list at all).
         let eh FrameMark.excl_head()
         if eh <> *(fm_excl_at + idx)
         {
@@ -302,6 +313,15 @@ define FrameMark
             return
         }
         let mark *(fm_off + idx)
+        let mp *(fm_page + idx) as pointer[size_t]
+        ; 2. THE CHAIN — the mark page is still the tail (the cheap, common
+        ; case: one store), or the frame appended pages and we hand them back.
+        let t FrameMark.tail()
+        if (t as i64) <> (mp as i64)
+        {
+            FrameMark.pop_multipage(idx, mp, mark, result)
+            return
+        }
         let now *t as i64
         ; 4. RESULT — does the returned value lie above the mark? The range is
         ; inside ONE page by condition 2, so this is an address comparison.
@@ -321,6 +341,91 @@ define FrameMark
         set fm_bytes: fm_bytes + d
         if FrameMark.live()
             set *t: mark as size_t
+    }
+
+    ; ★The MULTI-PAGE rewind. Everything from `mp.next_page` onward was appended
+    ; by this frame — `allocate` only ever appends at the region's tail — so the
+    ; whole tail of the chain goes back to the heap bucket and `mp` becomes the
+    ; tail again. Worth having because the PAGE blocker is not about frame size
+    ; (99.7 % of frames allocate under 4 KB) but about where the bump pointer
+    ; happened to stand at entry: measured, it blocked 19 % of all frames.
+    ;
+    ; Two passes on purpose: VALIDATE the whole chain first, then release. A page
+    ; carrying an exclusive-page list must not be dropped — its PageNode was
+    ; bump-allocated in our own range, so the list head would dangle — and
+    ; finding that out half way through the release would leave the region in
+    ; pieces.
+    procedure pop_multipage(idx: i64, mp: pointer[size_t], mark: i64, result: pointer[void])
+    {
+        if fm_multipage = false
+        {
+            set fm_b_page: fm_b_page + 1
+            return
+        }
+        ; ★★★Condition 4 (RESULT) has to be re-asked HERE, over the whole chain —
+        ; and forgetting it is exactly what happened on the first attempt: the
+        ; single-page path checks the result AFTER the chain test, so the
+        ; multi-page branch returned before ever looking at it and freed the
+        ; value the frame was returning. The engine said so within one run
+        ; ("1st argument for primitive reverse of wrong type ... not a list",
+        ; with unknown objects at plausible addresses). The DRY numbers had looked
+        ; excellent — accounting cannot catch a missing condition, only running
+        ; can.
+        let rp Page.get(result) as i64
+        if rp = (mp as i64)
+        {
+            if (result as i64) >= mark
+            {
+                set fm_b_result: fm_b_result + 1
+                return
+            }
+        }
+        var p *(mp + 2) as pointer[size_t]
+        var bytes (*mp as i64) - mark
+        var pages: i64 0
+        while p <> null
+        {
+            if *(p + 3) <> 0
+            {
+                ; an exclusive-page list hangs off this page
+                set fm_b_excl: fm_b_excl + 1
+                return
+            }
+            if rp = (p as i64)
+            {
+                ; the returned value lives on a page we would hand back
+                set fm_b_result: fm_b_result + 1
+                return
+            }
+            set bytes: bytes + ((*p as i64) - (p as i64))
+            set pages: pages + 1
+            set p: *(p + 2) as pointer[size_t]
+        }
+        if bytes <= 0
+            return
+        set fm_rewound: fm_rewound + 1
+        set fm_rewound_multi: fm_rewound_multi + 1
+        set fm_bytes: fm_bytes + bytes
+        set fm_pages_freed: fm_pages_freed + pages
+        if FrameMark.live() = false
+            return
+        var q *(mp + 2) as pointer[size_t]
+        while q <> null
+        {
+            let nxt *(q + 2) as pointer[size_t]
+            Page.release_page(q as pointer[Page])
+            set q: nxt
+        }
+        ; mp is the tail again: cut the chain, restore the head's tail pointer
+        ; (null when the head IS the tail — that is what `allocate` expects, it
+        ; creates the first extension on demand) and put the bump pointer back.
+        set *(mp + 2): 0 as size_t
+        let h fm_head as pointer[size_t]
+        if (mp as i64) = (fm_head as i64)
+            set *(h + 1): 0 as size_t
+        else
+            set *(h + 1): mp as size_t
+        set *mp: mark as size_t
     }
 
     ; a frame left by a path that reports no result (continuations, call/cc
@@ -482,6 +587,12 @@ define FrameMark
         scaly_eputs " per mille), "
         scaly_eputi fm_bytes
         scaly_eputs " bytes reclaimed"
+        scaly_eputnl()
+        scaly_eputs "framemark: "
+        scaly_eputi fm_rewound_multi
+        scaly_eputs " of those spanned pages, "
+        scaly_eputi fm_pages_freed
+        scaly_eputs " extension pages handed back"
         scaly_eputnl()
         scaly_eputs "framemark: blocked by  publish "
         scaly_eputi fm_b_publish
