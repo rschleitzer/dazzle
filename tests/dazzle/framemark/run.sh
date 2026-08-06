@@ -194,11 +194,42 @@ patch('/packages/dazzle/0.1.0/dazzle/Primitive.scaly', [
     ("use dazzle.GroveManager.GroveManager",
      "use dazzle.FrameMark.FrameMark\nuse dazzle.GroveManager.GroveManager"),
     ("    {\n        let host interp.get_host()\n        let a0 *args",
-     "    {\n        let host interp.get_host()\n"
-     "        ; DZ_FRAME_MARK: a primitive publishes unless it has been audited\n"
-     "        ; not to store into anything it did not allocate itself.\n"
+     "    {\n"
+     "        ; DZ_FRAME_MARK: the host DECISION (rung 3) — F for a frame-local\n"
+     "        ; call, P for a tail call whose arguments do not live in F. Without\n"
+     "        ; the arena flag this answers interp.get_host() unchanged.\n"
+     "        let ihost interp.get_host()\n"
+     "        let phost interp.get_perm_host()\n"
+     "        let host FrameMark.prim_host(n_args, args as pointer[pointer[void]], ihost, phost)\n"
+     "        ; a primitive publishes unless it has been audited not to store into\n"
+     "        ; anything it did not allocate itself.\n"
      "        FrameMark.prim(id)\n"
      "        let a0 *args")])
+
+# note_tail: which position the primitive is called from. The three Scaly sites
+# plus the JIT's PrimitiveCall helper (always non-tail).
+patch('/packages/dazzle/0.1.0/dazzle/Insn.scaly', [
+    ("            when pc: PrimitiveCall\n            {\n                if pc.n_args = 0",
+     "            when pc: PrimitiveCall\n            {\n"
+     "                FrameMark.note_tail(false)\n                if pc.n_args = 0")])
+
+patch('/packages/dazzle/0.1.0/dazzle/ELObj.scaly', [
+    # prim_call_return — the value stays in the caller's frame
+    ("        if naa = 0\n            vm.need_stack(1)\n        let argp vm.get_sp() - naa",
+     "        if naa = 0\n            vm.need_stack(1)\n"
+     "        FrameMark.note_tail(false)\n        let argp vm.get_sp() - naa"),
+    # prim_tail_call — the value IS the frame's result
+    ("        let naa vm.get_n_actual_args()\n        let argp vm.get_sp() - naa",
+     "        let naa vm.get_n_actual_args()\n"
+     "        FrameMark.note_tail(true)\n        let argp vm.get_sp() - naa")])
+
+# the JIT's native PrimitiveCall arm — always the non-tail position
+patch('/packages/dazzle/0.1.0/dazzle/Jit.scaly', [
+    ("function jit_prim_call(insn: pointer[void], vm: pointer[void]) returns pointer[void]\n{\n"
+     "    let i insn as pointer[Insn]",
+     "function jit_prim_call(insn: pointer[void], vm: pointer[void]) returns pointer[void]\n{\n"
+     "    FrameMark.note_tail(false)\n"
+     "    let i insn as pointer[Insn]")])
 
 patch('/packages/dazzle/0.1.0/dazzle/Interpreter.scaly', [
     ("use dazzle.NameTable.NameTable",

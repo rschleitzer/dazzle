@@ -124,6 +124,32 @@ shared fm_trusted: pointer[i64] null
 shared fm_last_prim: i64 -1
 shared fm_result_by_prim: pointer[i64] null
 
+; ★★★THE SECOND ARENA (rung 3, DZ_FRAME_MARK_ARENA=1). Up to here the mark lived
+; IN the eval region, which is why 37 % of frames were blocked by their own
+; RESULT: in one bump space "outward" means lower addresses, and those are
+; occupied. So the frame-local allocation moves to an arena of its OWN — F, a
+; region taken from the PERM host on first use and rewound per frame — while
+; everything that must outlive the frame keeps going to the eval region P.
+;
+; ★The rule that decides F or P per call, and it needs no retention summaries:
+; a primitive in TAIL position produces the frame's return value, so its result
+; must go to P — but only if every POINTER ARGUMENT already lies outside F's
+; live range. Otherwise the result could retain something F is about to reclaim
+; (`PairObj` holds car/cdr, `StrCatObj` holds parts, a select view holds its
+; source), and it goes to F instead, exactly as before. **Testing the arguments
+; substitutes for knowing whether the primitive retains them** — which is what
+; made this rung buildable without the Insn-graph dataflow.
+;
+; A non-tail primitive keeps allocating in F: its value is frame-local unless it
+; later reaches a Return (condition 4 still catches that) or is published
+; (condition 5).
+shared fm_arena: bool false
+shared fm_p_host: pointer[Page] null
+shared fm_tail_call: bool false
+shared fm_to_p: i64 0
+shared fm_to_f: i64 0
+shared fm_to_f_argdeps: i64 0
+
 function fm_report_hook()
     FrameMark.report()
 
@@ -169,6 +195,9 @@ define FrameMark
         let t getenv("DZ_FRAME_MARK_TRUST_PRIMS")
         if t <> null
             set fm_trust_prims: true
+        let ar getenv("DZ_FRAME_MARK_ARENA")
+        if ar <> null
+            set fm_arena: true
         let sp1 getenv("DZ_FRAME_MARK_SINGLE_PAGE")
         if sp1 <> null
             set fm_multipage: false
@@ -552,6 +581,86 @@ define FrameMark
         set *(fm_result_by_prim + i): *(fm_result_by_prim + i) + 1
     }
 
+    ; the escaping host: the eval region as the engine would have used it
+    function p_host(interp_host: pointer[Page]) returns pointer[Page]
+    {
+        if fm_p_host <> null
+            return fm_p_host
+        interp_host
+    }
+
+    ; F, created on first use from the perm host and never handed back (one page
+    ; plus whatever it grows; a frame pop returns the growth).
+    function f_arena(perm: pointer[Page]) returns pointer[Page]
+    {
+        if fm_head <> null
+            return fm_head as pointer[Page]
+        let a perm.allocate_exclusive_page()
+        set fm_head: a as pointer[void]
+        a
+    }
+
+    ; ★★★Is `v` in F AT ALL? Not "in the innermost frame's range" — that was the
+    ; first version and it SIGSEGVed on the first live run. F holds nothing but
+    ; frame-local data, so every byte of it dies at SOME frame pop; an argument
+    ; belonging to an OUTER frame's range is just as fatal for a result placed in
+    ; P, only later. The sound test is therefore the REGION, not the range: a P
+    ; object may never reference F.
+    function in_arena(v: pointer[void]) returns bool
+    {
+        if v = null
+            return false
+        if fm_head = null
+            return false
+        let pg Page.get(v) as pointer[size_t]
+        ; Page.region — the head of the region this address belongs to
+        let reg *(pg + 4) as pointer[void]
+        if reg = fm_head
+            return true
+        ; the arena's own head page reports itself as its region
+        if (pg as pointer[void]) = fm_head
+            return true
+        false
+    }
+
+    ; ★ THE HOST DECISION for one primitive call (rung 3). Called from
+    ; Primitive.dispatch in place of `interp.get_host()`.
+    function prim_host(n_args: int, args: pointer[pointer[void]], interp_host: pointer[Page], perm: pointer[Page]) returns pointer[Page]
+    {
+        if FrameMark.on() = false
+            return interp_host
+        if fm_arena = false
+            return interp_host
+        if fm_tail_call = false
+        {
+            set fm_to_f: fm_to_f + 1
+            return FrameMark.f_arena(perm)
+        }
+        ; tail position: the result IS the frame's value, so it wants P — unless
+        ; an argument lives in F and the result might retain it.
+        var i 0
+        while i < n_args
+        {
+            let a *(args + i)
+            if FrameMark.in_arena(a)
+            {
+                set fm_to_f_argdeps: fm_to_f_argdeps + 1
+                set fm_to_f: fm_to_f + 1
+                return FrameMark.f_arena(perm)
+            }
+            set i: i + 1
+        }
+        set fm_to_p: fm_to_p + 1
+        FrameMark.p_host(interp_host)
+    }
+
+    procedure note_tail(t: bool)
+    {
+        if FrameMark.on() = false
+            return
+        set fm_tail_call: t
+    }
+
     procedure publish()
     {
         if FrameMark.on() = false
@@ -582,6 +691,16 @@ define FrameMark
     {
         if FrameMark.on() = false
             return
+        ; with the second arena the marked region is F, which a bracket switch
+        ; does NOT replace — only the escaping host P changes. Frames nest
+        ; inside brackets, so an outer frame's F allocations must survive the
+        ; inner bracket: F is reset by frame pops only.
+        if fm_arena
+        {
+            set fm_p_host: p
+            set fm_gen: fm_gen + 1
+            return
+        }
         let np p as pointer[void]
         if np = fm_head
             return
@@ -643,6 +762,17 @@ define FrameMark
         scaly_eputi fm_stores_local
         scaly_eputs " stores kept local"
         scaly_eputnl()
+        if fm_arena
+        {
+            scaly_eputs "framemark: arena split — "
+            scaly_eputi fm_to_p
+            scaly_eputs " calls to P, "
+            scaly_eputi fm_to_f
+            scaly_eputs " to F (of those "
+            scaly_eputi fm_to_f_argdeps
+            scaly_eputs " tail calls held back by an argument in F)"
+            scaly_eputnl()
+        }
         FrameMark.report_result_prims()
     }
 
