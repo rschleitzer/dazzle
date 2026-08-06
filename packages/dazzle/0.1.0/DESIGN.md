@@ -433,10 +433,12 @@ Decisions:
 ## Stage 6b — the JIT (2026-08-06)
 
 `dazzle/Jit.scaly` lowers the `Insn` graph to LLVM IR and executes it through the
-ORC JIT; `dazzle/Llvm.scaly` holds the package's own LLVM-C/ORC bindings. It is
-opt-in (`--jit`), the interpreter stays the default, and the measured reason for
-that is in the "Stage 6b GEMESSEN" section of `tests/dazzle/PERFORMANCE.md`. What
-belongs in a design note is the four decisions:
+ORC JIT; `dazzle/Llvm.scaly` holds the package's own LLVM-C/ORC bindings. It
+landed opt-in and became the DEFAULT the next day, once the two measured rungs
+were worked off (`--interp` opts out); the numbers are in "Die zwei Sprossen
+GELANDET" in `tests/dazzle/PERFORMANCE.md`. What belongs in a design note is the
+six decisions — the four the generator was built on, and the two that made it
+worth defaulting to:
 
 - **The IR is the `Insn` graph, not `Expression`.** The graph already carries
   everything a code generator needs — stack positions assigned, boxing decided,
@@ -445,8 +447,9 @@ belongs in a design note is the four decisions:
   (varargs entry points, keyword arguments, letrec boxing, the 800-line
   `make`/`style` lowering) and would put port bugs and lowering bugs in the same
   debugging session — the sequencing mistake ROADMAP-dazzle.md warns about twice.
-- **The return protocol carries everything.** A region is `i64 region(ptr vm)`
-  and answers the NEXT INSN, exactly as `Insn.execute` does. An arm the generator
+- **The return protocol carries everything.** A region is
+  `i64 region(ptr vm, ptr insn)` and answers the NEXT INSN, exactly as
+  `Insn.execute` does. An arm the generator
   does not know natively becomes `call jit_execute(insn, vm)` plus a compare
   against the arm's statically known successors, so the region continues natively
   when the interpreter took the expected step. Consequences, all of them free:
@@ -473,3 +476,27 @@ belongs in a design note is the four decisions:
   family as the `&arr[i]` no-op fixed 2026-08-04), and the sentinel search needs
   no language guarantee at all while additionally PROVING each offset: a sentinel
   found twice, or not at all, is rejected and the JIT declines to open.
+
+And the two that made the JIT worth defaulting to (2026-08-06, both measured):
+
+- **A body is entered at ANY of its insns — the entry multiplexer.** The second
+  parameter above is the entry selector: the function opens with a `switch` over
+  it. Without that, a single fixed entry meant every insn the trampoline arrived
+  at (a call's continuation, a return point) accumulated its own entry count and
+  was compiled a SECOND time as the root of a duplicate region — 540 roots where
+  172 do the same work. ★And the correct case set is NOT every block: a case makes
+  its block reachable from `entry`, so the block loses its dominance relation to
+  the root and the optimizer can forward nothing into it. With a case per block
+  the whole pass pipeline was worth 0 ms of run time. Cases are the real re-entry
+  points only — the root, and the continuation of any arm that can hand control to
+  another body (`note_entry`).
+- **The HotSpot threshold is a break-even calculation, not a taste.** Compiling
+  one body costs ~4 ms of LLVM; a compiled body runs ~11 % faster than the
+  interpreter (that is the honest size of the dispatch win while the value model
+  is unchanged). So a body pays for itself only after tens of thousands of
+  entries, and the threshold is 20000 — three orders of magnitude above the 200
+  the generator shipped with. A lower threshold is not more JIT, it is more LLVM:
+  measured, the long run is WORSE at 200 than at 20000 while compiling five times
+  as much code. The same reasoning picks the backend opt level (2, not 0: the
+  cheap one optimises the case where the JIT should not have engaged) and rejects
+  batching (the cost is per function, not per module — 19 %, not 5x).

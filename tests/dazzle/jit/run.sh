@@ -23,11 +23,13 @@
 #      ZERO rejected bodies. A code generator that quietly compiled nothing
 #      would otherwise pass check 2 perfectly.
 #
-# Why the JIT is not the default (and why this suite says so): measured
-# 2026-08-06 the compiled path is byte-identical and SLOWER — see the Stage-6b
-# section of tests/dazzle/PERFORMANCE.md. The gate is here so the code generator
-# stays correct while the two measured rungs (per-module LLVM cost, native
-# lowering of the call/return/primitive arms) are worked off.
+# The JIT is the DEFAULT since 2026-08-06 (both measured rungs landed: the entry
+# multiplexer and the natively lowered hot arms — ~4 % cost on a short run, ~9 %
+# gain on a long one, see tests/dazzle/PERFORMANCE.md). That does NOT make this
+# suite redundant, it makes it load-bearing: the interpreter is still the
+# reference implementation of every arm, so a differential against it is how a
+# lowering bug is caught at all. Note that the interpreter half runs with
+# DAZZLE_JIT=0, which now DISABLES rather than merely not-enabling.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"

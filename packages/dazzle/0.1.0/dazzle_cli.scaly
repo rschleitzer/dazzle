@@ -818,6 +818,29 @@ function default_output_name(last_file: String, ext: String) returns String
 ; JadeApp::processOption 't': PREFIX match against outputTypeNames up to the
 ; first '-'; the '-'-separated tail splits into backend output options.
 ; Unknown prefix -> unknownType (type unchanged). Returns the new type or -1.
+; A decimal environment value, or -1 when it is empty or holds anything but
+; digits. The four DAZZLE_JIT_* measurement knobs all read through here rather
+; than repeating the loop — a fourth copy is how one of them ends up parsing
+; differently from the other three.
+function parse_env_decimal(v: pointer[const_char]) returns int
+{
+    if v = null
+        return 0 - 1
+    var value 0
+    var i: size_t 0
+    while ((*(v + i)) as u32) <> 0
+    {
+        let ch (*(v + i)) as u32
+        if (ch < 0x30) or (ch > 0x39)
+            return 0 - 1
+        set value: (value * 10) + ((ch - 0x30) as int)
+        set i: i + 1
+    }
+    if i = 0
+        return 0 - 1
+    value
+}
+
 function parse_type_arg(a: pointer[char], out_opts: pointer[Array[String]]) returns int
 {
     ; length up to the first '-' (or NUL)
@@ -982,18 +1005,31 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
     var restrict_reading false
     var error_file: pointer[char] null
     var want_usage false
-    ; ★ MODE. The Insn/VM interpreter is the DEFAULT and `--jit` opts into the
-    ; Stage-6b code generator; `--interp` names the default explicitly. The
-    ; roadmap's end state is the other way round, and this is not that state
-    ; yet — measured 2026-08-06 on the DocBook print stylesheets, JIT-compiled
-    ; execution is byte-identical but SLOWER (0.59 s interpreted against 3.75 s
-    ; with every hot body compiled, of which ~3.0 s is LLVM at ~5 ms per
-    ; module), so making it the default would be a real regression for a
-    ; drop-in tool. tests/dazzle/PERFORMANCE.md has the table and the two
-    ; measured rungs that have to land before the default flips. Both flags
-    ; exist so flipping it is one line.
+    ; ★★ MODE. The Stage-6b code generator is the DEFAULT since 2026-08-06 (the
+    ; day after it landed as `--jit`); `--interp` opts back out and `--jit` names
+    ; the default explicitly. Both flags stay, permanently: the interpreter is the
+    ; reference implementation of every arm, the fallback on a box where LLVM
+    ; cannot come up, and one half of the differential gate.
+    ;
+    ; What the default flip rests on (measured, byte-identical in every row —
+    ; the table is in tests/dazzle/PERFORMANCE.md):
+    ;
+    ;   workload                          interp     --jit
+    ;   a trivial run (50 of them)          8 ms      8 ms   (no session cost)
+    ;   ClaML transform, 1.27 MB out       0.39 s    0.40 s
+    ;   DocBook print styling, -t fot      0.53 s    0.55 s   -4 %
+    ;   a 1804-file real-world codegen    13.71 s   12.49 s   +9 %
+    ;
+    ; i.e. it costs a few per cent on runs too short for any JIT to amortise and
+    ; wins on the runs the tool exists for. The two rungs that got it here —
+    ; the entry multiplexer and the natively lowered hot arms — are in Jit.scaly;
+    ; what makes the win only 9 % rather than a multiple is the value model, which
+    ; is the next rung (ROADMAP-dazzle.md, "Memory model") and not this one.
     var want_interp false
-    var want_jit false
+    var want_jit true
+    ; whether `--jit` / DAZZLE_JIT was passed, as opposed to the default — see
+    ; the fallback message below
+    var want_jit_explicit false
     var want_jit_stats false
     var want_jit_selftest false
     var want_jit_dump false
@@ -1237,7 +1273,10 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
         else if c = 0x100
             set want_interp: true
         else if c = 0x104
+        {
             set want_jit: true
+            set want_jit_explicit: true
+        }
         else if c = 0x101
             set want_jit_stats: true
         else if c = 0x102
@@ -1268,10 +1307,10 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
         return st_rc
     }
 
-    ; Open the JIT for this run unless --interp asked for the interpreter. A
-    ; failure to open is NOT fatal: the engine falls back to the interpreter and
-    ; says so, because a drop-in tool must still transform documents on a box
-    ; where the JIT cannot come up.
+    ; Open the JIT for this run — the default — unless --interp asked for the
+    ; interpreter. A failure to open is NOT fatal: the engine falls back to the
+    ; interpreter and says so, because a drop-in tool must still transform
+    ; documents on a box where the JIT cannot come up.
     ; DAZZLE_INTERP=1 is `--interp` from the environment. It exists so the
     ; differential gate (tests/dazzle/jit/run.sh) can run an EXISTING suite in
     ; interpreter mode without every suite growing a flag of its own — the
@@ -1282,53 +1321,41 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
     ; in either mode without every suite growing a flag of its own — the goldens
     ; there are minted from the C++ reference, so passing them in both modes is a
     ; stronger statement than comparing the two modes to each other.
+    ; ★ DAZZLE_JIT=0 has to DISABLE, not merely fail to enable: since the JIT is
+    ; the default, "not enabling" is no longer the same thing as "off", and the
+    ; gate runs its interpreter half with exactly DAZZLE_JIT=0.
     let jit_env getenv("DAZZLE_JIT")
     if jit_env <> null
-        if ((*jit_env) as u32) <> 0x30
+    {
+        if ((*jit_env) as u32) = 0x30
+            set want_jit: false
+        else
+        {
             set want_jit: true
+            set want_jit_explicit: true
+        }
+    }
     let interp_env getenv("DAZZLE_INTERP")
     if interp_env <> null
         if ((*interp_env) as u32) <> 0
             set want_interp: true
     ; DAZZLE_JIT_THRESHOLD: the HotSpot threshold, for measurement.
+    ; each environment value is bound to a local first — a call as the argument
+    ; of another call is the shape CLAUDE.md warns about
     let thr_env getenv("DAZZLE_JIT_THRESHOLD")
-    if thr_env <> null
-    {
-        var tv 0
-        var ti: size_t 0
-        var tok true
-        while ((*(thr_env + ti)) as u32) <> 0
-        {
-            let ch (*(thr_env + ti)) as u32
-            if (ch >= 0x30) and (ch <= 0x39)
-                set tv: (tv * 10) + ((ch - 0x30) as int)
-            else
-                set tok: false
-            set ti: ti + 1
-        }
-        if tok
-            if ti > 0
-                Jit.set_threshold(tv)
-    }
+    let thr_v parse_env_decimal(thr_env)
+    if thr_v >= 0
+        Jit.set_threshold(thr_v)
+    ; DAZZLE_JIT_BATCH: how many hot bodies share one module.
     let batch_env getenv("DAZZLE_JIT_BATCH")
-    if batch_env <> null
-    {
-        var bv 0
-        var bi: size_t 0
-        var bok true
-        while ((*(batch_env + bi)) as u32) <> 0
-        {
-            let bch (*(batch_env + bi)) as u32
-            if (bch >= 0x30) and (bch <= 0x39)
-                set bv: (bv * 10) + ((bch - 0x30) as int)
-            else
-                set bok: false
-            set bi: bi + 1
-        }
-        if bok
-            if bi > 0
-                Jit.set_batch(bv)
-    }
+    let batch_v parse_env_decimal(batch_env)
+    if batch_v >= 0
+        Jit.set_batch(batch_v)
+    ; DAZZLE_JIT_CODEGEN: the LLVM backend opt level for the JIT'd modules.
+    let cg_env getenv("DAZZLE_JIT_CODEGEN")
+    let cg_v parse_env_decimal(cg_env)
+    if cg_v >= 0
+        Jit.set_codegen_level(cg_v)
     let pipe_env getenv("DAZZLE_JIT_PIPELINE")
     if pipe_env <> null
         if ((*pipe_env) as u32) <> 0
@@ -1342,7 +1369,16 @@ function main(argc: int, argv: pointer[pointer[char]]) returns int
     if want_jit
     {
         if Jit.enable(host) = false
-            scaly_eputs "dazzle: JIT unavailable, running the interpreter\n"
+        {
+            ; ★ Only an EXPLICITLY requested JIT complains. Now that it is the
+            ; default, a box whose LLVM cannot come up would otherwise add a line
+            ; to the stderr of EVERY run — and byte-identical stderr is half of
+            ; what "drop-in" means here. A default that cannot engage degrades
+            ; silently; a `--jit` that cannot engage is a wrong answer to a
+            ; question the caller asked.
+            if want_jit_explicit
+                scaly_eputs "dazzle: JIT unavailable, running the interpreter\n"
+        }
     }
 
     ; processOptions epilogue: `if (!outputCodingSystem_) outputCodingSystem_

@@ -8,6 +8,12 @@ use dazzle.Insn.*
 use dazzle.VM.VM
 use dazzle.ELObj.ELObj
 use dazzle.ELObj.ClosureObj
+; the hot-arm helpers below reach these three: the identifier a TopRef resolves,
+; the interpreter that answers is_error / carries the next location, and the
+; Location a primitive call is reported at.
+use dazzle.ELObj.Identifier
+use dazzle.Interpreter.Interpreter
+use opensp.Location.Location
 
 ; Jit — Stage 6b: native code generation for the DSSSL engine.
 ;
@@ -52,11 +58,15 @@ use dazzle.ELObj.ClosureObj
 ;     a node list — THE idiom of these stylesheets — runs in bounded stack
 ;     without the code generator knowing what a loop is.
 ;
-; What still costs a trampoline turn is a CALL and its RETURN (two hash lookups
-; and two indirect calls per DSSSL call). Lowering a statically known closure
-; call to a native call, with the callee's answer compared against the
-; continuation the caller pushed, is the next rung and needs no new protocol —
-; the compare above IS that protocol.
+; What still costs a trampoline turn is a CALL and its RETURN (a hash lookup and
+; an indirect call each, ~11 insns per region entry measured). Lowering a
+; statically known closure call to a native call, with the callee's answer
+; compared against the continuation the caller pushed, is the next rung and needs
+; no new protocol — the compare above IS that protocol.
+;
+; ★ Region entry takes the insn as a second parameter and switches on it, so ANY
+; insn of a body is a valid entry: see build_entry for why that is what made the
+; JIT worth defaulting to, and note_entry for why only SOME insns get a case.
 ;
 ; ========================= CALLING BACK IN ================================
 ; Generated code reaches this binary's runtime through inttoptr CONSTANTS: the
@@ -72,9 +82,11 @@ use dazzle.ELObj.ClosureObj
 ;   has no address to take) and takes/returns only pointers and integers, so its
 ;   emitted signature is exactly what the generated `call` declares. A helper
 ;   that needed a caller page would gain a hidden leading parameter and every
-;   argument would shift one slot — silently. `Jit.check_helper_abi` calls each
-;   helper through the generated signature at session start, so that shows up
-;   as a wrong answer at startup instead of corrupted output three suites away.
+;   argument would shift one slot — silently. `Jit.check_helper_abi` calls ONE
+;   helper (`jit_selftest_double`) through the generated signature at session
+;   start: the hazard is a property of the CONVENTION, not of an individual
+;   helper, so one call through it proves that a module-level free function of
+;   pointers and integers still arrives with its arguments in place.
 ;
 ; ============================ VM LAYOUT ===================================
 ; The generated code reads and writes the VM's own fields (sp, sbase, slim,
@@ -109,50 +121,74 @@ shared JIT_N_REGIONS: int 0
 shared JIT_N_MODULES: int 0
 shared JIT_N_INSNS: int 0
 shared JIT_N_NATIVE_INSNS: int 0
+; entry points cached on top of the roots (rung 1) — every one of these is a
+; region that did NOT have to be compiled a second time.
+shared JIT_N_ENTRY_POINTS: int 0
+; ★ CPU microseconds spent inside compile_queue (IR building + pass pipeline +
+; ORC materialisation). Measured rather than estimated on purpose: the whole
+; 2026-08-06 landing hinged on the split between "LLVM is slow" and "the
+; generated code is slow", and the first estimate of the per-module cost was
+; wrong by 5x. `--jit-stats` prints it, so the split is one run away.
+shared JIT_COMPILE_USEC: int 0
 shared JIT_N_ENTRIES: int 0
 shared JIT_N_INTERP_STEPS: int 0
 shared JIT_N_REJECTED: int 0
 shared JIT_DUMP: bool false
+; ★ The two counters above are PER INSN, i.e. a read-modify-write of a process
+; global on the hottest path in the engine — worth measuring, not worth paying
+; for when nobody asked. `--jit-stats` turns them on; without it the flag test is
+; a load and a not-taken branch.
+shared JIT_STATS: bool false
 
-; ★ HotSpot threshold: how many times a code body must be ENTERED before it is
-; worth compiling. Measured 2026-08-06 and it is the difference between a JIT
-; that helps and one that ruins the run: the DocBook print stylesheets enter
-; 3801 distinct bodies, and compiling every one of them on first sight cost
-; 6.7 s of LLVM time against a 0.5 s interpreter run — ~1.8 ms per module, all
-; of it in module setup, codegen and ORC materialisation, none of it in the
-; generated code. Almost all of those bodies run a handful of times. Same
-; doctrine as the self-scaling `for` driver, which also defers and promotes per
-; site rather than committing on first sight.
-shared JIT_THRESHOLD: int 200
+; ★★★ HotSpot threshold: how many times a code body must be ENTERED before it is
+; worth compiling. This is THE number of the whole JIT, and it is derived from a
+; break-even calculation, not chosen (measured 2026-08-06, after the two rungs):
+;
+;   * compiling one body costs ~4 ms of LLVM (see JIT_CODEGEN_LEVEL);
+;   * the compiled body then runs ~11 % faster than the interpreter — that is the
+;     honest size of the dispatch win with the value model unchanged;
+;   * so a body pays for itself only after ~4 ms / 0.11 = ~36 ms of interpreted
+;     time in it, i.e. a few million insns, i.e. tens of thousands of entries.
+;
+; Measured against both ends of the range, byte-identical in every row:
+;
+;   threshold |  a 0.53 s styling run   |  a 13.7 s codegen run
+;   ----------|-------------------------|------------------------
+;        200  |  0.75 s  (172 regions)  |  13.84 s  (412 regions)
+;       5000  |     —                   |  12.73 s  (161 regions)
+;      20000  |  0.55 s   (14 regions)  |  12.49 s   (81 regions)
+;      50000  |     —                   |  12.58 s   (57 regions)
+;
+; 20000 is where the short run costs ~4 % and the long run gains ~9 %. A LOWER
+; threshold is not "more JIT", it is more LLVM: at 200 the long run compiles five
+; times as much code for a WORSE total. Same doctrine as the self-scaling `for`
+; driver, which also defers and promotes per site rather than committing on first
+; sight — and the same lesson, that the cost of deciding to optimise is part of
+; the optimisation.
+shared JIT_THRESHOLD: int 20000
 
-; ★ How many hot bodies go into ONE module. DEFAULT 1 — i.e. no batching — and
-; that is a MEASURED default, not an omission (2026-08-06, DocBook print
-; stylesheets, DAZZLE_JIT_BATCH sweep):
+; ★★ How many hot bodies go into ONE module. DEFAULT 1 — i.e. no batching — and
+; that stays the default even now that rung 1 has made batching SAFE, because the
+; premise batching rested on turned out to be false.
 ;
-;     batch=1   540 regions   3.75 s
-;     batch=8  1824 regions   9.13 s
-;     batch=32 2560 regions  12.68 s
+; The premise was "the LLVM cost is per MODULE and nearly independent of its
+; size", from which 540 modules at ~5 ms each explained the whole 2026-08-06 gap.
+; Once compile time was actually measured instead of inferred (JIT_COMPILE_USEC),
+; the cost turned out to be per FUNCTION: 172 bodies in 172 modules cost 783 ms,
+; and the same 128 bodies in ONE module cost 520 ms — 4.6 ms vs 4.1 ms per body.
+; Batching buys ~19 %, not 5x. ★The lesson is the older one from this file's own
+; history: a per-unit cost inferred from a total is a guess; instrument it.
 ;
-; The LLVM cost is per MODULE and nearly independent of its size (~5 ms for a
-; body of twenty blocks), so batching looks like the obvious win — and it
-; BACKFIRES, for a reason worth keeping: while a body waits for its batch it is
-; still interpreted one insn at a time, so every insn inside it accumulates its
-; own entry count and crosses the threshold on its own. Delay multiplies the
-; number of roots (540 → 2560), and each extra root is a duplicate of code
-; already compiled. An earlier attempt that batched the transitive closure of
-; the trigger body instead compiled 25 104 bodies in 126 s — amortising the
-; module cost is worthless when the batch is full of code that never runs.
+; What DID move the number was rung 1 (see build_entry/queue_body): 540 roots
+; became 172 for the same run, because a mid-body insn is now found compiled
+; instead of counted and recompiled as a root of its own. That is also what makes
+; batch > 1 correct rather than catastrophic — the measured 540 → 2560 root
+; explosion at batch 32 is gone. It is simply not worth much.
 ;
-; The fix that makes batching work is a different shape, not a different number:
-; ONE function per body with an entry MULTIPLEXER (`i64 f(ptr vm, ptr insn)` and
-; a switch over its blocks), so any insn of a body is a valid entry and no
-; mid-body insn ever becomes a root of its own. Recorded in PERFORMANCE.md as
-; the first of the two rungs; the knob stays so the next measurement is one env
-; variable away.
-;
-; NOTE the consequence of any batch > 1: a partly filled queue is never flushed,
-; so on a short run those bodies stay interpreted. Harmless (byte-identity does
-; not depend on coverage) but it is why the gate runs with batch 1.
+; And batch > 1 keeps one real defect: a partly filled queue is never flushed, so
+; a run that never accumulates a full batch compiles NOTHING (measured: batch 32
+; at threshold 5000 compiled 0 bodies). With the threshold now at 20000 that is
+; the common case, which settles it. The knob stays for measurement.
 shared JIT_BATCH: int 1
 
 ; The pass pipeline run over each generated module — null means the built-in
@@ -163,11 +199,29 @@ shared JIT_BATCH: int 1
 ; overrides it (measurement hook).
 shared JIT_PIPELINE: pointer[const_char] null
 
+; ★ The LLVM BACKEND opt level for the JIT'd modules (LLVMCodeGenOptLevel);
+; DAZZLE_JIT_CODEGEN overrides it. 2 = LLJIT's own default, and it is the right
+; default here for a reason worth writing down, because the cheap-looking option
+; is a trap. Measured 2026-08-06, per compiled body:
+;
+;   level 0:  ~1.4 ms of LLVM, generated code ~4 % faster than the interpreter
+;   level 2:  ~4.1 ms of LLVM, generated code ~11 % faster
+;
+; On a SHORT run level 0 wins (less LLVM to amortise), and on the styling
+; workload it looked like a 0.72 s vs 1.01 s landslide. On a long run it loses
+; outright: the 13.7 s codegen case is 12.5 s at level 2 and 13.2 s at level 0,
+; because 7 % of thirteen seconds dwarfs 2.7 ms times eighty bodies. A JIT is for
+; the long run — level 0 optimises the case where the JIT should not have engaged
+; at all, which is what the HotSpot threshold is for.
+shared JIT_CODEGEN_LEVEL: i32 2
+
 ; ===========================================================================
 ; Runtime helpers called from generated code.
 ;
-; ★ Every one of these is in HELPER TABLE order below and checked by
-;   check_helper_abi. Do not add one without extending that check.
+; ★ Every one of these must be a module-level FREE function taking and returning
+;   only pointers and integers — see the CALLING BACK IN note above. A concept
+;   method has no address to take, and anything needing a caller page would shift
+;   every argument by one slot silently.
 ; ===========================================================================
 
 ; The universal fallback: run ONE interpreter instruction and answer its
@@ -238,8 +292,120 @@ function jit_cons(vm: pointer[void], a: pointer[void], d: pointer[void]) returns
 ; tests/abi/run.sh checks exactly that.
 procedure atexit(cb: pointer[void]) returns i32 extern
 
+; clock() — CPU time in CLOCKS_PER_SEC units, which is 1 000 000 on every target
+; this builds for, so the value IS microseconds. `clock_t` is a 64-bit integer on
+; macOS (unsigned long) and on glibc (long), so `int` is the correct width here
+; — a 32-bit read would wrap after 35 minutes of CPU time.
+function clock() returns int extern
+
 procedure jit_stats_atexit()
     Jit.print_stats()
+
+; ===========================================================================
+; The HOT-ARM helpers (rung 2, 2026-08-06). Each one is the body of an
+; `Insn.execute` arm minus the parts the code generator emits natively, and each
+; exists for one reason: an arm reached through `jit_execute` costs TWO calls
+; plus the 46-way dispatch (generated code → jit_execute → Insn.execute →
+; jump table → arm), while these cost ONE. Measured, the five arms below are
+; 57 % of the lowered insns.
+;
+; ★ Read each against the matching `when` arm of `Insn.execute` — they are
+;   transcriptions, and the arm is the specification. The stack arithmetic and
+;   the successor comparison stay in the generated code (see emit_native), so
+;   what is left here is exactly the part that cannot be expressed in IR: a
+;   virtual dispatch on an ELObj, or a message through the Interpreter.
+; ===========================================================================
+
+; ReturnInsn's frame pop (VM::popFrame). Everything else in that arm — reading
+; the result, the two sp updates, writing the result back — is native.
+function jit_pop_frame(vm: pointer[void]) returns pointer[void]
+{
+    let v vm as pointer[VM]
+    v.pop_frame() as pointer[void]
+}
+
+; PrimitiveCallInsn::execute, whole. The primitive itself dwarfs the arm's
+; bookkeeping, so there is nothing to win by splitting it — the win is the call
+; and the dispatch that no longer happen in front of it.
+function jit_prim_call(insn: pointer[void], vm: pointer[void]) returns pointer[void]
+{
+    let i insn as pointer[Insn]
+    let v vm as pointer[VM]
+    choose *i
+        when pc: PrimitiveCall
+        {
+            if pc.n_args = 0
+                v.need_stack(1)
+            let argp v.get_sp() - pc.n_args
+            let itp v.get_interp()
+            let result pc.prim.prim_call(pc.n_args, v.sbase_at(argp), v, itp, pc.loc)
+            v.stack_set(argp, result)
+            v.set_sp(argp + 1)
+            if itp.is_error(result)
+            {
+                v.set_sp(0 - 1)
+                return null
+            }
+            return pc.next as pointer[void]
+        }
+        else
+            return null
+    null
+}
+
+; FunctionCallInsn::execute minus `setNActualArgs`, which is one native store.
+function jit_function_call(insn: pointer[void], vm: pointer[void]) returns pointer[void]
+{
+    let i insn as pointer[Insn]
+    let v vm as pointer[VM]
+    choose *i
+        when fc: FunctionCall
+            return fc.func.call(v, fc.loc, fc.next) as pointer[void]
+        else
+            return null
+    null
+}
+
+; TopRefInsn::execute's value computation. null means "the arm failed" — which
+; folds both of the interpreter's failure tests (a null value and an error
+; object) into the one comparison the generated code already has to make.
+function jit_top_ref_value(insn: pointer[void], vm: pointer[void]) returns pointer[void]
+{
+    let i insn as pointer[Insn]
+    let v vm as pointer[VM]
+    choose *i
+        when tr: TopRef
+        {
+            let itp v.get_interp()
+            let tem tr.ident.compute_value(true, itp)
+            if tem = null
+                return null
+            if itp.is_error(tem)
+                return null
+            return tem as pointer[void]
+        }
+        else
+            return null
+    null
+}
+
+; CheckInitInsn::execute's FAILURE tail only — the test itself is a native
+; compare against null, so this is called on the path that ends the run.
+function jit_check_init_fail(insn: pointer[void], vm: pointer[void]) returns pointer[void]
+{
+    let i insn as pointer[Insn]
+    let v vm as pointer[VM]
+    choose *i
+        when ck: CheckInit
+        {
+            let itp v.get_interp()
+            itp.set_next_location(ck.loc)
+            v.set_sp(0 - 1)
+        }
+        else
+            v.set_sp(0 - 1)
+    null
+}
 
 ; Selftest helper — the one call the ORC round trip is proved with. Kept
 ; permanently: it is the difference between "the JIT is wired up" and "the JIT
@@ -389,6 +555,9 @@ define Jit
         regions: pointer[PtrMap]
         ; bodies that crossed the threshold and are waiting for a batch
         queue: pointer[Array[pointer[Insn]]]
+        ; every insn marked `queued` while its body waits for the batch, so the
+        ; marks can be lifted again from whatever the compile did not cover
+        marks: pointer[Array[pointer[Insn]]]
         ; measured VM field offsets
         off_sp: i64
         off_sbase: i64
@@ -409,6 +578,7 @@ define Jit
             set this.jd: null
             set this.regions: null
             set this.queue: null
+            set this.marks: null
             set this.off_sp: 0
             set this.off_sbase: 0
             set this.off_slim: 0
@@ -459,7 +629,14 @@ define Jit
         set s.tsc: tsc
         set s.ctx: LLVMOrcThreadSafeContextGetContext(tsc)
         var jit: pointer[void] null
-        let err LLVMOrcCreateLLJIT(&jit, null as pointer[void])
+        ; ★ An LLJIT built on OUR TargetMachine, so the backend runs at the opt
+        ; level Jit.codegen_level names — see the note in Llvm.scaly. A null
+        ; builder (the default LLJIT) runs the backend aggressively, which
+        ; measured 2026-08-06 is most of the JIT's whole cost. `build_lljit_opts`
+        ; answers null when the host cannot be detected, and then this falls back
+        ; to the default builder rather than refusing to open a session.
+        let bld Jit.build_lljit_builder()
+        let err LLVMOrcCreateLLJIT(&jit, bld)
         if Llvm.failed(err, "could not create LLJIT")
             return null
         if jit = null
@@ -468,6 +645,7 @@ define Jit
         set s.jd: LLVMOrcLLJITGetMainJITDylib(jit)
         set s.regions: Jit.map_make(host, 1024)
         set s.queue: Array[pointer[Insn]]^host()
+        set s.marks: Array[pointer[Insn]]^host()
         if Jit.measure_layout(s) = false
         {
             scaly_eputs "dazzle JIT: VM layout probe failed, staying on the interpreter\n"
@@ -475,6 +653,45 @@ define Jit
         }
         set s.ok: true
         s
+    }
+
+    ; ----------------------------------------------------------------------
+    ; The LLJITBuilder that pins the BACKEND opt level, or null to let LLJIT
+    ; pick its own (which is the aggressive default). Every failure on the way
+    ; answers null: a JIT with a slower backend is a performance question, a JIT
+    ; that refuses to open is a functional one.
+    ; ----------------------------------------------------------------------
+    function build_lljit_builder() returns pointer[void]
+    {
+        let triple LLVMGetDefaultTargetTriple()
+        if triple = null
+            return null
+        let triple_c triple as pointer[const_char]
+        var target: pointer[void] null
+        var terr: pointer[char] null
+        if LLVMGetTargetFromTriple(triple_c, &target, &terr) <> 0
+            return null
+        if target = null
+            return null
+        let cpu LLVMGetHostCPUName()
+        let feat LLVMGetHostCPUFeatures()
+        var cpu_c: pointer[const_char] null
+        var feat_c: pointer[const_char] null
+        if cpu <> null
+            set cpu_c: cpu as pointer[const_char]
+        if feat <> null
+            set feat_c: feat as pointer[const_char]
+        let tm LLVMCreateTargetMachine(target, triple_c, cpu_c, feat_c, JIT_CODEGEN_LEVEL, LLVM_RELOC_PIC, LLVM_CODE_MODEL_JIT_DEFAULT)
+        if tm = null
+            return null
+        let tmb LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(tm)
+        if tmb = null
+            return null
+        let bld LLVMOrcCreateLLJITBuilder()
+        if bld = null
+            return null
+        LLVMOrcLLJITBuilderSetJITTargetMachineBuilder(bld, tmb)
+        bld
     }
 
     ; ----------------------------------------------------------------------
@@ -641,6 +858,12 @@ define Jit
         b: pointer[void]
         fn: pointer[void]
         vm: pointer[void]
+        ; the entry multiplexer of the function being built: parameter 1 (the
+        ; insn the trampoline entered with) and the `switch` over it. A case is
+        ; added by block_for the moment a block appears, so the multiplexer is
+        ; complete by construction.
+        insn_p: pointer[void]
+        sw: pointer[void]
         i8t: pointer[void]
         i64t: pointer[void]
         ptrt: pointer[void]
@@ -662,12 +885,27 @@ define Jit
         p_box: pointer[void]
         p_box_value: pointer[void]
         p_cons: pointer[void]
+        p_pop_frame: pointer[void]
+        p_prim_call: pointer[void]
+        p_function_call: pointer[void]
+        p_top_ref: pointer[void]
+        p_check_init_fail: pointer[void]
         blocks: pointer[PtrMap]
         pending: pointer[Array[pointer[Insn]]]
+        ; the insns of THIS function the trampoline can arrive at — see note_entry
+        entry_set: pointer[PtrMap]
         ; the batch: every code body this module gets a function for, and the
         ; set that keeps a body from being added twice
         roots: pointer[Array[pointer[Insn]]]
         root_set: pointer[PtrMap]
+        ; ★ Rung 1's registry: every insn that got a BLOCK, and the root whose
+        ; function that block lives in. After the ORC lookup, each of these is
+        ; cached as an entry point of its function — that is what stops a
+        ; mid-body insn from ever crossing the threshold on its own and being
+        ; compiled a second time as a root of its own.
+        cur_root: pointer[Insn]
+        all_insns: pointer[Array[pointer[Insn]]]
+        all_roots: pointer[Array[pointer[Insn]]]
         n_insns: int
         n_native: int
     )
@@ -678,6 +916,8 @@ define Jit
             set this.b: null
             set this.fn: null
             set this.vm: null
+            set this.insn_p: null
+            set this.sw: null
             set this.i8t: null
             set this.i64t: null
             set this.ptrt: null
@@ -697,10 +937,19 @@ define Jit
             set this.p_box: null
             set this.p_box_value: null
             set this.p_cons: null
+            set this.p_pop_frame: null
+            set this.p_prim_call: null
+            set this.p_function_call: null
+            set this.p_top_ref: null
+            set this.p_check_init_fail: null
             set this.blocks: null
             set this.pending: null
+            set this.entry_set: null
             set this.roots: null
             set this.root_set: null
+            set this.cur_root: null
+            set this.all_insns: null
+            set this.all_roots: null
             set this.n_insns: 0
             set this.n_native: 0
         }
@@ -824,6 +1073,40 @@ define Jit
         LLVMPositionBuilderAtEnd(cg.b, cont_bb)
     }
 
+    ; --- the entry multiplexer --------------------------------------------
+    ; ★ RUNG 1 (2026-08-06). A compiled body is entered at whichever insn the
+    ; trampoline arrives with, not only at the body's first one:
+    ;
+    ;     i64 f(ptr vm, ptr insn) {
+    ;     entry: switch (i64)insn [ <insn1> -> %i1, <insn2> -> %i2, ... ]
+    ;     deflt: ret (i64)jit_execute(insn, vm)      ; unreachable in practice
+    ;
+    ; Why this is the shape that matters, measured 2026-08-06: with a single
+    ; fixed entry, every insn REACHED from the trampoline (a call's continuation,
+    ; a return point) accumulated its own entry count, crossed the threshold on
+    ; its own, and was compiled a SECOND time as the root of a duplicate region.
+    ; That is what made batching backfire — a body waiting for its batch turned
+    ; into dozens of roots (540 -> 2560 with batch 32). With the multiplexer,
+    ; compile_queue caches EVERY insn of the body against this function, so a
+    ; mid-body insn is found compiled instead of counted, and batching becomes
+    ; the lever it looked like all along.
+    ;
+    ; The default arm cannot be reached through the cache (only insns that got a
+    ; case are cached against this function), so it is pure defence — and it is
+    ; a SAFE default: one interpreter step, then the successor, which guarantees
+    ; progress. Answering `insn` unchanged would spin the trampoline forever.
+    function build_entry(cg: pointer[Cg])
+    {
+        let entry_bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "entry")
+        let deflt_bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "deflt")
+        LLVMPositionBuilderAtEnd(cg.b, deflt_bb)
+        let r Jit.call2(cg, cg.ty_exec, cg.p_exec, cg.insn_p, cg.vm)
+        Jit.ret_ptr(cg, r)
+        LLVMPositionBuilderAtEnd(cg.b, entry_bb)
+        let key LLVMBuildPtrToInt(cg.b, cg.insn_p, cg.i64t, "")
+        set cg.sw: LLVMBuildSwitch(cg.b, key, deflt_bb, 16)
+    }
+
     ; --- blocks -----------------------------------------------------------
     ; The block for an insn inside this region, created (and queued for
     ; lowering) on first mention.
@@ -837,6 +1120,58 @@ define Jit
         Jit.map_put(cg.blocks, key, bb as u64)
         cg.pending.add i
         bb
+    }
+
+    ; ★ Note that the trampoline can arrive at `i`, so `i` must become a case of
+    ; the entry multiplexer (rung 1).
+    ;
+    ; ★★ NOT every block — measured 2026-08-06, and this is the whole difference
+    ; between rung 1 helping and rung 1 hurting. A case makes its block reachable
+    ; from `entry`, so the block is no longer DOMINATED by the root and the
+    ; optimizer can forward nothing into it: with a case per block the pass
+    ; pipeline was worth exactly 0 ms of run time (183 ms of compile time for
+    ; nothing), because every insn had to reload `sp` and `sbase` from the VM.
+    ; With only the real re-entry points as cases, the straight-line stretches
+    ; between calls are dominated again and the loads fold.
+    ;
+    ; The real re-entry points are: the body's own root (a call into it), and the
+    ; CONTINUATION of any arm that can hand control to another body — a call
+    ; arm's `next`, which is what the callee's Return answers. An insn that is
+    ; only ever reached from inside the region needs no case; and missing one is
+    ; not a correctness question (the default arm handles any insn, and an insn
+    ; with no case simply becomes its own root later) — only a missed
+    ; opportunity.
+    procedure note_entry(cg: pointer[Cg], i: pointer[Insn])
+    {
+        if i = null
+            return
+        Jit.map_put(cg.entry_set, i as u64, 1)
+    }
+
+    ; Wire the noted entry points into the multiplexer, once the blocks exist.
+    procedure wire_entries(cg: pointer[Cg])
+    {
+        var i: size_t 0
+        while i < cg.pending.get_length()
+        {
+            let ipp cg.pending.get i
+            if ipp <> null
+            {
+                let ins *ipp
+                let key ins as u64
+                if Jit.map_get(cg.entry_set, key, 0) <> 0
+                {
+                    let bb Jit.map_get(cg.blocks, key, 0)
+                    if bb <> 0
+                    {
+                        LLVMAddCase(cg.sw, Jit.c64(cg, key as i64), bb as pointer[void])
+                        cg.all_insns.add ins
+                        cg.all_roots.add cg.cur_root
+                    }
+                }
+            }
+            set i: i + 1
+        }
     }
 
     ; The branch target for a successor that may be null. A null successor means
@@ -1116,6 +1451,13 @@ define Jit
         var succ0: pointer[Insn] null
         var succ1: pointer[Insn] null
         let n Jit.insn_successors(i, &succ0, &succ1)
+        ; An arm we do not lower is an arm whose behaviour we do not model, so
+        ; assume its successors CAN be re-entered from outside (Apply and the
+        ; primitive-driven arms genuinely are).
+        if n > 0
+            Jit.note_entry(cg, succ0)
+        if n > 1
+            Jit.note_entry(cg, succ1)
         if n > 0
             Jit.emit_rejoin(cg, r, succ0)
         if n > 1
@@ -1392,6 +1734,93 @@ define Jit
                 LLVMBuildCondBr(cg.b, c, yes, no)
                 return true
             }
+            ; ==================================================================
+            ; The five HOT arms (rung 2, 2026-08-06). Each replaces two calls
+            ; plus the interpreter's jump table with ONE call to the helper of
+            ; the same name, and lowers everything around it — the stack
+            ; arithmetic, the null tests, the branch to the static successor —
+            ; into IR. CheckInit's fast path ends up with no call at all.
+            ; ==================================================================
+            when a: Return
+            {
+                ; ReturnInsn::execute. `jit_pop_frame` reads the VM's sp (that
+                ; is where the restored frame_start comes from), so sp is stored
+                ; BEFORE the call; it does not touch sbase, so the pointer
+                ; loaded before the call stays valid after it.
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let result Jit.ld_slot(cg, sb, Jit.add64(cg, sp, 0 - 1))
+                let sp1 Jit.add64(cg, sp, (0 - 1) - (a.total_args as i64))
+                Jit.st_sp(cg, sp1)
+                let nxt Jit.call1(cg, cg.ty_p_p, cg.p_pop_frame, cg.vm)
+                Jit.st_slot(cg, sb, sp1, result)
+                Jit.st_sp(cg, Jit.add64(cg, sp1, 1))
+                ; The successor is the frame's, i.e. dynamic: a Return always
+                ; leaves the region and the trampoline re-enters at the caller's
+                ; continuation — which rung 1 makes a valid native entry.
+                Jit.ret_ptr(cg, nxt)
+                return true
+            }
+            when a: PrimitiveCall
+            {
+                ; a primitive can push a frame and hand control to a closure
+                ; (ELObj.prim_call_return), so its continuation is re-enterable
+                Jit.note_entry(cg, a.next)
+                let r Jit.call2(cg, cg.ty_p_pp, cg.p_prim_call, Jit.cptr(cg, i as u64), cg.vm)
+                Jit.emit_rejoin(cg, r, a.next)
+                Jit.ret_ptr(cg, r)
+                return true
+            }
+            when a: FunctionCall
+            {
+                ; VM::setNActualArgs is one store; the dispatch on the callee
+                ; object is what the helper is for.
+                ; THE re-entry point of the whole design: the callee's Return
+                ; answers exactly this insn, so it must be a multiplexer case.
+                Jit.note_entry(cg, a.next)
+                Jit.st_i64(cg, cg.s.off_naa, Jit.c64(cg, a.n_args as i64))
+                let r Jit.call2(cg, cg.ty_p_pp, cg.p_function_call, Jit.cptr(cg, i as u64), cg.vm)
+                Jit.emit_rejoin(cg, r, a.next)
+                Jit.ret_ptr(cg, r)
+                return true
+            }
+            when a: TopRef
+            {
+                let v Jit.call2(cg, cg.ty_p_pp, cg.p_top_ref, Jit.cptr(cg, i as u64), cg.vm)
+                let bad LLVMBuildICmp(cg.b, LLVM_INT_EQ, v, cg.nullp, "")
+                let err_bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "trerr")
+                let ok_bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "trok")
+                LLVMBuildCondBr(cg.b, bad, err_bb, ok_bb)
+                LLVMPositionBuilderAtEnd(cg.b, err_bb)
+                Jit.st_sp(cg, Jit.c64(cg, 0 - 1))
+                LLVMBuildRet(cg.b, Jit.c64(cg, 0))
+                LLVMPositionBuilderAtEnd(cg.b, ok_bb)
+                ; the value computation can evaluate a top-level definition,
+                ; which grows the value stack — so sbase is loaded AFTER it.
+                Jit.need_stack(cg, 1)
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                Jit.st_slot(cg, sb, sp, v)
+                Jit.st_sp(cg, Jit.add64(cg, sp, 1))
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
+            when a: CheckInit
+            {
+                let sb Jit.ld_sbase(cg)
+                let sp Jit.ld_sp(cg)
+                let v Jit.ld_slot(cg, sb, Jit.add64(cg, sp, 0 - 1))
+                let bad LLVMBuildICmp(cg.b, LLVM_INT_EQ, v, cg.nullp, "")
+                let err_bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "ckerr")
+                let ok_bb LLVMAppendBasicBlockInContext(cg.s.ctx, cg.fn, "ckok")
+                LLVMBuildCondBr(cg.b, bad, err_bb, ok_bb)
+                LLVMPositionBuilderAtEnd(cg.b, err_bb)
+                Jit.call2(cg, cg.ty_p_pp, cg.p_check_init_fail, Jit.cptr(cg, i as u64), cg.vm)
+                LLVMBuildRet(cg.b, Jit.c64(cg, 0))
+                LLVMPositionBuilderAtEnd(cg.b, ok_bb)
+                Jit.goto_insn(cg, a.next)
+                return true
+            }
             else
                 return false
         false
@@ -1403,15 +1832,18 @@ define Jit
     ;
     ; ★ WHY BATCHES EXIST, measured 2026-08-06: a module per code body cost
     ;   ~3.6 ms in ORC materialisation plus ~0.9 ms in the pass pipeline —
-    ;   539 hot bodies of the DocBook print stylesheets came to 2.4 s of LLVM
-    ;   time against a 0.6 s interpreter run. The cost is per MODULE and almost
-    ;   independent of its size, so the answer is to put many bodies in one.
+    ;   540 hot bodies of the DocBook print stylesheets came to 2.5 s of LLVM
+    ;   time against a 0.5 s interpreter run, i.e. the ENTIRE gap between the two
+    ;   modes was module setup. The cost is per MODULE and almost independent of
+    ;   its size, so the answer is to put many bodies in one.
     ;
-    ; A batch is the transitive closure of the trigger body over the edges the
-    ; Insn graph names but a region cannot follow inside itself: a lambda body
-    ; (ClosureMk.code), a varargs entry point, and the body of a statically
-    ; known closure at a call site. That is "the part of the stylesheet reachable
-    ; from this rule" — compiled once, entered forever.
+    ; A batch is simply the bodies that crossed the HotSpot threshold since the
+    ; last module was built — `s.queue`. Nothing else is pulled in: an earlier
+    ; attempt to batch the transitive closure of the trigger body over the
+    ; ClosureMk/varargs/call edges compiled 25 104 bodies in 126 s, because
+    ; amortising the module cost is worthless when the batch is full of code that
+    ; never runs. What made the simple form work is rung 1, not a bigger batch:
+    ; see queue_body and build_entry.
     ; ----------------------------------------------------------------------
     function note_root(cg: pointer[Cg], i: pointer[Insn])
     {
@@ -1430,11 +1862,103 @@ define Jit
         512
 
     ; ======================================================================
+    ; Queueing a hot body (rung 1's other half).
+    ;
+    ; ★ The reason this exists: between crossing the threshold and being
+    ;   compiled, a body keeps being interpreted one insn at a time — so without
+    ;   marking, every insn inside it accumulates its OWN entry count, crosses
+    ;   the threshold on its own, and arrives in the same batch as the root of a
+    ;   duplicate region. That is the whole mechanism behind the measured
+    ;   540 -> 2560 root explosion at batch 32 (PERFORMANCE.md). Marking the
+    ;   statically reachable set as `queued` when the root is queued stops the
+    ;   counting; compile_queue then replaces each mark with the function's
+    ;   address, and clear_marks lifts whatever the region walk did not cover
+    ;   (the size cap can cut it short) so those insns start counting again.
+    ; ======================================================================
+    procedure queue_body(s: pointer[Session], root: pointer[Insn])
+    {
+        let h s.host
+        let work Array[pointer[Insn]]^h()
+        Jit.mark_queued(s, work, root)
+        var cursor: size_t 0
+        while cursor < work.get_length()
+        {
+            if work.get_length() >= (Jit.max_region_insns() as size_t)
+                break
+            let pp work.get cursor
+            set cursor: cursor + 1
+            if pp <> null
+            {
+                let ins *pp
+                var succ0: pointer[Insn] null
+                var succ1: pointer[Insn] null
+                let n Jit.insn_successors(ins, &succ0, &succ1)
+                if n > 0
+                    Jit.mark_queued(s, work, succ0)
+                if n > 1
+                    Jit.mark_queued(s, work, succ1)
+            }
+        }
+        s.queue.add root
+    }
+
+    ; Mark one insn as queued, unless it already has a real address, is rejected,
+    ; or is already marked. Marked insns are remembered for clear_marks.
+    procedure mark_queued(s: pointer[Session], work: pointer[Array[pointer[Insn]]], i: pointer[Insn])
+    {
+        if i = null
+            return
+        let key i as u64
+        let v Jit.map_get(s.regions, key, 0)
+        if v = Jit.cache_queued()
+            return
+        if v = Jit.cache_rejected()
+            return
+        if v <> 0
+            if (v & 1) = 0
+                return
+        Jit.map_put(s.regions, key, Jit.cache_queued())
+        s.marks.add i
+        work.add i
+    }
+
+    ; Lift every mark the compile did not turn into an entry point. Value 0 in
+    ; the cache reads as absent, so the insn simply starts counting again.
+    procedure clear_marks(s: pointer[Session])
+    {
+        var i: size_t 0
+        while i < s.marks.get_length()
+        {
+            let pp s.marks.get i
+            if pp <> null
+            {
+                let ins *pp
+                let key ins as u64
+                if Jit.map_get(s.regions, key, 0) = Jit.cache_queued()
+                    Jit.map_put(s.regions, key, 0)
+            }
+            set i: i + 1
+        }
+        let h s.host
+        set s.marks: Array[pointer[Insn]]^h()
+    }
+
+    ; ======================================================================
     ; The batch compiler: one LLVM module, one function per queued code body.
     ; ======================================================================
     ; Compile every queued body into ONE module. Nothing is added to the batch
     ; that has not crossed the threshold on its own.
+    ;
+    ; The wrapper exists only to time the whole thing, including every early
+    ; return — see JIT_COMPILE_USEC.
     procedure compile_queue(s: pointer[Session])
+    {
+        let t0 clock()
+        Jit.compile_queue_inner(s)
+        set JIT_COMPILE_USEC: JIT_COMPILE_USEC + (clock() - t0)
+    }
+
+    procedure compile_queue_inner(s: pointer[Session])
     {
         let ctx s.ctx
         let h s.host
@@ -1472,7 +1996,9 @@ define Jit
         let ty_p_ppp LLVMFunctionType(ptrt, tp, 3, 0)
         let ty_i64_p LLVMFunctionType(i64t, tp, 1, 0)
         let ty_i64_pp LLVMFunctionType(i64t, tp, 2, 0)
-        let ty_region LLVMFunctionType(i64t, tp, 1, 0)
+        ; ★ Rung 1: the region signature is `i64 f(ptr vm, ptr insn)`. The second
+        ; parameter is the entry multiplexer's selector — see build_entry.
+        let ty_region LLVMFunctionType(i64t, tp, 2, 0)
         ; void(ptr, i64)
         var tbuf2 u8[32]
         let tp2 tbuf2 as pointer[pointer[void]]
@@ -1502,8 +2028,15 @@ define Jit
         set cg.p_box: Jit.const_addr(cg, &jit_box)
         set cg.p_box_value: Jit.const_addr(cg, &jit_box_value)
         set cg.p_cons: Jit.const_addr(cg, &jit_cons)
+        set cg.p_pop_frame: Jit.const_addr(cg, &jit_pop_frame)
+        set cg.p_prim_call: Jit.const_addr(cg, &jit_prim_call)
+        set cg.p_function_call: Jit.const_addr(cg, &jit_function_call)
+        set cg.p_top_ref: Jit.const_addr(cg, &jit_top_ref_value)
+        set cg.p_check_init_fail: Jit.const_addr(cg, &jit_check_init_fail)
         set cg.roots: Array[pointer[Insn]]^h()
         set cg.root_set: Jit.map_make(h, 1024)
+        set cg.all_insns: Array[pointer[Insn]]^h()
+        set cg.all_roots: Array[pointer[Insn]]^h()
         var qi: size_t 0
         while qi < s.queue.get_length()
         {
@@ -1533,13 +2066,17 @@ define Jit
                 let fn LLVMAddFunction(mod, fname, ty_region)
                 set cg.fn: fn
                 set cg.vm: LLVMGetParam(fn, 0)
+                set cg.insn_p: LLVMGetParam(fn, 1)
                 set cg.blocks: Jit.map_make(h, 256)
                 set cg.pending: Array[pointer[Insn]]^h()
+                set cg.entry_set: Jit.map_make(h, 64)
+                set cg.cur_root: rt
                 set cg.n_insns: 0
-                let entry_bb LLVMAppendBasicBlockInContext(ctx, fn, "entry")
-                LLVMPositionBuilderAtEnd(b, entry_bb)
-                let root_bb Jit.block_for(cg, rt)
-                LLVMBuildBr(b, root_bb)
+                Jit.build_entry(cg)
+                ; the root is always an entry: that is how a call into this body
+                ; arrives. Every other case is noted while lowering (note_entry).
+                Jit.note_entry(cg, rt)
+                Jit.block_for(cg, rt)
 
                 ; Worklist over the pending blocks. `block_for` appends while we
                 ; walk, which IS the graph traversal — a cursor, because Array
@@ -1569,6 +2106,9 @@ define Jit
                         }
                     }
                 }
+                ; the multiplexer's cases, once every block of this function
+                ; exists and every arm has said where it can be re-entered
+                Jit.wire_entries(cg)
             }
             set ri: ri + 1
         }
@@ -1637,7 +2177,11 @@ define Jit
             return
         }
 
-        ; Resolve every function of the batch and cache it against its body.
+        ; Resolve every function of the batch. The addresses go into a map of
+        ; their own first: the second pass reads them while WRITING the region
+        ; cache, and a root that is also a mid-body insn of another function
+        ; would otherwise be read back after being overwritten.
+        let addrs Jit.map_make(h, 1024)
         var rj: size_t 0
         while rj < cg.roots.get_length()
         {
@@ -1659,6 +2203,7 @@ define Jit
                 }
                 if ok
                 {
+                    Jit.map_put(addrs, rt2 as u64, addr)
                     Jit.map_put(s.regions, rt2 as u64, addr)
                     set JIT_N_REGIONS: JIT_N_REGIONS + 1
                 }
@@ -1671,6 +2216,41 @@ define Jit
             }
             set rj: rj + 1
         }
+
+        ; ★ Rung 1: cache every insn that got a block as an entry of its
+        ; function. The first mapping wins — an insn covered by two functions of
+        ; this batch is a valid entry of both, and picking one is enough.
+        var ai: size_t 0
+        while ai < cg.all_insns.get_length()
+        {
+            let ipp2 cg.all_insns.get ai
+            let rpp3 cg.all_roots.get ai
+            if ipp2 <> null
+            {
+                if rpp3 <> null
+                {
+                    let ins2 *ipp2
+                    let own *rpp3
+                    let a2 Jit.map_get(addrs, own as u64, 0)
+                    if a2 <> 0
+                    {
+                        let had Jit.map_get(s.regions, ins2 as u64, 0)
+                        var take true
+                        if had <> 0
+                            if (had & 1) = 0
+                                if had <> Jit.cache_queued()
+                                    set take: false
+                        if take
+                        {
+                            Jit.map_put(s.regions, ins2 as u64, a2)
+                            set JIT_N_ENTRY_POINTS: JIT_N_ENTRY_POINTS + 1
+                        }
+                    }
+                }
+            }
+            set ai: ai + 1
+        }
+        Jit.clear_marks(s)
     }
 
     ; A batch that could not be built leaves every one of its bodies on the
@@ -1690,6 +2270,9 @@ define Jit
             }
             set i: i + 1
         }
+        ; the bodies stay interpreted, so their insns must count again rather
+        ; than sit marked `queued` forever
+        Jit.clear_marks(s)
     }
 
     ; dazzle_jit_b<batch>_r<index> — on the caller's page, so the c-string
@@ -1715,30 +2298,58 @@ define Jit
 
     ; The native region for `i`, or 0 when the caller should interpret this
     ; step — because the body is still cold, or because compiling it failed.
+    ; ★ ONE probe for the whole hot path, read and updated in place. This runs on
+    ; EVERY insn the interpreter executes while a session is open, and measured
+    ; 2026-08-06 that cost alone was 0.11 s on a 0.51 s run — 21 %, and the
+    ; single biggest obstacle to the JIT ever being the default. The earlier
+    ; shape called map_get and then map_put, i.e. hashed and probed the table
+    ; TWICE per interpreted insn.
     function region_for(s: pointer[Session], i: pointer[Insn]) returns u64
     {
+        let m s.regions
         let key i as u64
-        let v Jit.map_get(s.regions, key, 0)
-        if v = 2
-            return 0
-        if v = 4
-            return 0
-        if v <> 0
-            if (v & 1) = 0
-                return v
+        var slot Jit.map_probe(m, key)
         ; entries INCLUDING this one; a threshold of 1 queues on first sight.
         var count: u64 1
-        if v <> 0
-            set count: (v >> 1) + 1
+        if *(m.keys + slot) = key
+        {
+            let v *(m.vals + slot)
+            if (v & 1) = 0
+            {
+                if v = Jit.cache_rejected()
+                    return 0
+                if v = Jit.cache_queued()
+                    return 0
+                ; 0 is a slot whose mark was lifted again (clear_marks) — it
+                ; reads as absent, so counting restarts at 1.
+                if v <> 0
+                    return v
+            }
+            else
+                set count: (v >> 1) + 1
+        }
+        else
+        {
+            ; first sight of this insn: claim the slot. Growing rehashes, so the
+            ; slot has to be found again afterwards.
+            if (m.used + m.used) >= m.cap
+            {
+                Jit.map_grow(m)
+                set slot: Jit.map_probe(m, key)
+            }
+            set *(m.keys + slot): key
+            set m.used: m.used + 1
+        }
         let limit JIT_THRESHOLD as u64
         if count < limit
         {
-            Jit.map_put(s.regions, key, (count + count) + 1)
+            set *(m.vals + slot): (count + count) + 1
             return 0
         }
-        ; Hot. Queue it, and compile the whole queue once it is worth a module.
-        Jit.map_put(s.regions, key, Jit.cache_queued())
-        s.queue.add i
+        ; Hot. Queue it — together with every insn statically reachable from it,
+        ; so nothing inside the body becomes a root of its own while it waits —
+        ; and compile the whole queue once it is worth a module.
+        Jit.queue_body(s, i)
         if s.queue.get_length() < (JIT_BATCH as size_t)
             return 0
         Jit.compile_queue(s)
@@ -1766,12 +2377,16 @@ define Jit
         let addr Jit.region_for(s, i)
         if addr = 0
         {
-            set JIT_N_INTERP_STEPS: JIT_N_INTERP_STEPS + 1
+            if JIT_STATS
+                set JIT_N_INTERP_STEPS: JIT_N_INTERP_STEPS + 1
             return i.execute(vm)
         }
-        set JIT_N_ENTRIES: JIT_N_ENTRIES + 1
+        if JIT_STATS
+            set JIT_N_ENTRIES: JIT_N_ENTRIES + 1
         let fp addr as pointer[void]
-        let r fp(vm as pointer[void])
+        ; the insn IS the entry selector — the multiplexer in the compiled body
+        ; switches on it (rung 1)
+        let r fp(vm as pointer[void], i as pointer[void])
         r as pointer[Insn]
     }
 
@@ -1807,6 +2422,17 @@ define Jit
     procedure set_pipeline(p: pointer[const_char])
         set JIT_PIPELINE: p
 
+    ; DAZZLE_JIT_CODEGEN=0..3 — the backend opt level (measurement hook; 0 is the
+    ; measured default).
+    procedure set_codegen_level(n: int)
+    {
+        if n < 0
+            return
+        if n > 3
+            return
+        set JIT_CODEGEN_LEVEL: n as i32
+    }
+
     ; DAZZLE_JIT_BATCH overrides the batch size; 1 compiles each hot body on its
     ; own, which is the shape to compare any batching against.
     procedure set_batch(n: int)
@@ -1816,9 +2442,14 @@ define Jit
         set JIT_BATCH: n
     }
 
-    ; Ask for the `--jit-stats` line at exit.
+    ; Ask for the `--jit-stats` line at exit. This also switches on the two
+    ; per-insn counters — so a `--jit-stats` run is measurably slower than the
+    ; run it measures, which is exactly the right trade for a diagnostic.
     procedure request_stats()
+    {
+        set JIT_STATS: true
         atexit(&jit_stats_atexit)
+    }
 
     ; ======================================================================
     ; --jit-stats
@@ -1838,6 +2469,8 @@ define Jit
             let n_entries JIT_N_ENTRIES
             let n_interp JIT_N_INTERP_STEPS
             let n_rejected JIT_N_REJECTED
+            let n_modules JIT_N_MODULES
+            let n_entry_points JIT_N_ENTRY_POINTS
             sb.append n_regions
             sb.append " regions, "
             sb.append n_insns
@@ -1851,7 +2484,14 @@ define Jit
             sb.append n_interp
             sb.append " interpreted steps, "
             sb.append n_rejected
-            sb.append " rejected roots"
+            sb.append " rejected roots, "
+            sb.append n_modules
+            sb.append " modules, "
+            sb.append n_entry_points
+            sb.append " extra entry points, "
+            let ms JIT_COMPILE_USEC / 1000
+            sb.append ms
+            sb.append " ms compiling"
         }
         sb.append "\n"
         let line sb.to_string()
