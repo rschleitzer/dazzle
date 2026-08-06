@@ -1,0 +1,431 @@
+use scaly.memory.Page
+
+; ---- the frame MARK: DZ_FRAME_MARK ---------------------------------------
+; Sprosse (ii) of stage 6b — "frame = mini region" — in the shape the
+; measurement picked (tests/dazzle/framevol, and the section "Die Frames
+; GEZÄHLT" in ../PERFORMANCE.md): NOT a region per frame (82 M frames × the
+; ~20-40 ns an exclusive page costs = the whole win), but a BUMP MARK on the
+; region the frame already allocates from. Entering a frame saves
+; `next_object`; leaving it restores it, and everything the frame allocated is
+; gone for the price of one store.
+;
+; A rewind is only sound if nothing above the mark is reachable afterwards, so
+; the whole design is in the CONSERVATIVE test that decides it. Five conditions,
+; all of them O(1), and the frame is rewound only when every one holds:
+;
+;   1. VALID    — the mark was taken in the eval bracket that is still current
+;                 (a bracket switch replaces the region under us).
+;   2. ONE PAGE — the region's tail page is still the page the mark points into.
+;                 Restricting the rewind to frames that never crossed a page
+;                 boundary costs almost nothing (measured: 99.7 % of frames
+;                 allocate under 4 KB) and buys two things — the rewind is a
+;                 single store, and no extension page has to be handed back.
+;   3. EXCLUSIVE— the region's exclusive-page list is unchanged, so no oversized
+;                 allocation happened that the bump pointer does not describe
+;                 (measured: 4185 frames of 82 M, so nothing is lost by giving
+;                 up on them).
+;   4. RESULT   — the value the frame RETURNS does not lie above the mark. This
+;                 is the one escape route the frame itself owns, and it is an
+;                 address comparison rather than a graph walk.
+;   5. QUIET    — nothing PUBLISHED while the frame was running.
+;
+; ★★★Condition 5 is the whole trick, and it is one global counter. A frame's
+; lifetime is exactly the window in which only IT and its DESCENDANTS run (a
+; sibling runs after the pop), and every ancestor's rewind range CONTAINS this
+; frame's. So "no publication happened anywhere between my push and my pop" is
+; both necessary in the conservative reading and sufficient — and it needs no
+; propagation to ancestors, just `epoch` compared against `epoch_at_push`.
+; Publication is any store that could put a pointer into memory above some
+; mark: `SetBox`, a control-stack unwind (call/cc), a frame popped by a path
+; that reports no result, and — by default — EVERY primitive. A primitive may
+; only be trusted not to publish after an audit; `DZ_FRAME_MARK_TRUST_PRIMS=1`
+; trusts them all AT ONCE, which is not sound and is not meant to be: it is the
+; CEILING measurement, the answer to "what could this rule ever reclaim if the
+; audit went perfectly?" against the FLOOR that the default (trust nothing)
+; measures. Building the live mode before knowing that pair would be the same
+; mistake the two JIT dispatch rungs were.
+;
+; Modes: DZ_FRAME_MARK=dry accounts only and never writes the bump pointer
+; (completely safe — this is what the floor/ceiling pair is measured with);
+; DZ_FRAME_MARK=1 actually rewinds. Unset, every hook is a load and a
+; not-taken branch.
+;
+; The region is read and written through the documented Page byte offsets
+; (Page.scaly keeps the first four slots as load-bearing offsets: next_object,
+; current_page, next_page, exclusive_pages.head) — Page is one of the
+; runtime-opaque structs, and this instrument has no business making the dazzle
+; package lay it out. When this graduates into the engine it wants a proper
+; `Page.mark`/`Page.rewind` pair in the stdlib instead.
+
+function getenv(name: pointer[const_char]) returns pointer[const_char] extern
+function atol(s: pointer[const_char]) returns i64 extern
+function calloc(count: size_t, size: size_t) returns pointer[void] extern
+procedure atexit(cb: pointer[void]) returns i32 extern
+procedure scaly_eputs(s: pointer[const_char]) extern
+procedure scaly_eputi(value: i64) extern
+procedure scaly_eputnl() extern
+
+define FM_MAX_DEPTH: i64 65536
+define FM_MAX_PRIMS: i64 1024
+
+; 0 = not yet asked, 1 = dry, 2 = live, 3 = off
+shared fm_mode: int 0
+shared fm_trust_prims: bool false
+shared fm_publish_stack: bool false
+
+; the region we are marking, and the bracket generation
+shared fm_head: pointer[void] null
+shared fm_gen: i64 0
+; the publication counter — condition 5
+shared fm_epoch: i64 0
+
+; per-frame columns
+shared fm_page: pointer[i64] null       ; the tail page the mark points into
+shared fm_off: pointer[i64] null        ; next_object at push
+shared fm_gen_at: pointer[i64] null
+shared fm_epoch_at: pointer[i64] null
+shared fm_excl_at: pointer[i64] null
+
+; results
+shared fm_frames: i64 0
+shared fm_rewound: i64 0
+shared fm_bytes: i64 0
+shared fm_b_invalid: i64 0
+shared fm_b_page: i64 0
+shared fm_b_excl: i64 0
+shared fm_b_result: i64 0
+shared fm_b_publish: i64 0
+shared fm_b_noresult: i64 0
+shared fm_b_deep: i64 0
+shared fm_publishes: i64 0
+; which primitive ids are TRUSTED not to publish (index = id, 1 = trusted)
+shared fm_trusted: pointer[i64] null
+
+function fm_report_hook()
+    FrameMark.report()
+
+define FrameMark
+{
+    function on() returns bool
+    {
+        if fm_mode = 0
+            FrameMark.setup()
+        fm_mode < 3
+    }
+
+    function live() returns bool
+        fm_mode = 2
+
+    procedure setup()
+    {
+        set fm_mode: 3
+        let e getenv("DZ_FRAME_MARK")
+        if e = null
+            return
+        set fm_page: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
+        set fm_off: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
+        set fm_gen_at: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
+        set fm_epoch_at: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
+        set fm_excl_at: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
+        set fm_trusted: calloc(FM_MAX_PRIMS as size_t, 8) as pointer[i64]
+        if fm_page = null
+            return
+        if fm_off = null
+            return
+        if fm_gen_at = null
+            return
+        if fm_epoch_at = null
+            return
+        if fm_excl_at = null
+            return
+        if fm_trusted = null
+            return
+        let t getenv("DZ_FRAME_MARK_TRUST_PRIMS")
+        if t <> null
+            set fm_trust_prims: true
+        let ps getenv("DZ_FRAME_MARK_PUBLISH_STACK")
+        if ps <> null
+            set fm_publish_stack: true
+        ; a comma-free list of decimal ids, e.g. "12 40 41" — the audited set
+        let w getenv("DZ_FRAME_MARK_TRUSTED_IDS")
+        if w <> null
+            FrameMark.parse_ids(w)
+        atexit(&fm_report_hook)
+        ; "dry" is anything whose first byte is not '1'
+        let one "1" as char
+        if ((*e) as u32) = (one as u32)
+            set fm_mode: 2
+        else
+            set fm_mode: 1
+    }
+
+    procedure parse_ids(s: pointer[const_char])
+    {
+        var p s as pointer[u8]
+        var cur: i64 0 - 1
+        repeat
+        {
+            let c *p as i64
+            if c >= 48
+            {
+                if c <= 57
+                {
+                    if cur < 0
+                        set cur: 0
+                    set cur: (cur * 10) + (c - 48)
+                }
+            }
+            if c < 48
+                set cur: FrameMark.flush_id(cur)
+            if c > 57
+                set cur: FrameMark.flush_id(cur)
+            if c = 0
+                break
+            set p: p + 1
+        }
+    }
+
+    function flush_id(cur: i64) returns i64
+    {
+        if cur < 0
+            return 0 - 1
+        if cur < FM_MAX_PRIMS
+            set *(fm_trusted + cur): 1
+        0 - 1
+    }
+
+    ; --- the region, by documented offset ---------------------------------
+    ; 0 next_object, 1 current_page (null while the head IS the tail),
+    ; 2 next_page, 3 exclusive_pages.head
+    function tail() returns pointer[size_t]
+    {
+        let h fm_head as pointer[size_t]
+        let t *(h + 1) as pointer[size_t]
+        if t = null
+            return h
+        t
+    }
+
+    function excl_head() returns i64
+    {
+        if fm_head = null
+            return 0
+        let h fm_head as pointer[size_t]
+        *(h + 3) as i64
+    }
+
+    ; --- hooks -------------------------------------------------------------
+
+    ; VM.push_frame, after csp was incremented: the new frame's index is csp-1
+    procedure push(csp: int)
+    {
+        if FrameMark.on() = false
+            return
+        let idx (csp - 1) as i64
+        set fm_frames: fm_frames + 1
+        if idx < 0
+            return
+        if idx >= FM_MAX_DEPTH
+        {
+            set fm_b_deep: fm_b_deep + 1
+            return
+        }
+        if fm_head = null
+        {
+            ; outside any eval bracket the run page is the host, and that is
+            ; never rewound — mark the slot unusable
+            set *(fm_gen_at + idx): 0 - 1
+            return
+        }
+        let t FrameMark.tail()
+        set *(fm_page + idx): t as i64
+        set *(fm_off + idx): *t as i64
+        set *(fm_gen_at + idx): fm_gen
+        set *(fm_epoch_at + idx): fm_epoch
+        set *(fm_excl_at + idx): FrameMark.excl_head()
+    }
+
+    ; The ReturnInsn arm, before VM.pop_frame — `csp` is still the leaving
+    ; frame's, so its index is csp-1, and `result` is the value it yields.
+    procedure pop(csp: int, result: pointer[void])
+    {
+        if FrameMark.on() = false
+            return
+        let idx (csp - 1) as i64
+        if idx < 0
+            return
+        if idx >= FM_MAX_DEPTH
+            return
+        if fm_head = null
+        {
+            set fm_b_invalid: fm_b_invalid + 1
+            return
+        }
+        ; 1. VALID
+        if *(fm_gen_at + idx) <> fm_gen
+        {
+            set fm_b_invalid: fm_b_invalid + 1
+            return
+        }
+        ; 5. QUIET (checked early — it is the cheapest and the most common no)
+        if *(fm_epoch_at + idx) <> fm_epoch
+        {
+            set fm_b_publish: fm_b_publish + 1
+            return
+        }
+        ; 2. ONE PAGE
+        let t FrameMark.tail()
+        if (t as i64) <> *(fm_page + idx)
+        {
+            set fm_b_page: fm_b_page + 1
+            return
+        }
+        ; 3. EXCLUSIVE
+        let eh FrameMark.excl_head()
+        if eh <> *(fm_excl_at + idx)
+        {
+            set fm_b_excl: fm_b_excl + 1
+            return
+        }
+        let mark *(fm_off + idx)
+        let now *t as i64
+        ; 4. RESULT — does the returned value lie above the mark? The range is
+        ; inside ONE page by condition 2, so this is an address comparison.
+        let r result as i64
+        if r >= mark
+        {
+            if r < now
+            {
+                set fm_b_result: fm_b_result + 1
+                return
+            }
+        }
+        let d now - mark
+        if d <= 0
+            return
+        set fm_rewound: fm_rewound + 1
+        set fm_bytes: fm_bytes + d
+        if FrameMark.live()
+            set *t: mark as size_t
+    }
+
+    ; a frame left by a path that reports no result (continuations, call/cc
+    ; unwinds): nothing may be rewound and nothing above ANY live mark can be
+    ; trusted, so this publishes.
+    procedure pop_unknown()
+    {
+        if FrameMark.on() = false
+            return
+        set fm_b_noresult: fm_b_noresult + 1
+        FrameMark.publish()
+    }
+
+    ; Primitive.dispatch — every primitive publishes unless it is trusted.
+    procedure prim(id: int)
+    {
+        if FrameMark.on() = false
+            return
+        if fm_trust_prims
+            return
+        let i id as i64
+        if i >= 0
+        {
+            if i < FM_MAX_PRIMS
+            {
+                if *(fm_trusted + i) <> 0
+                    return
+            }
+        }
+        FrameMark.publish()
+    }
+
+    procedure publish()
+    {
+        if FrameMark.on() = false
+            return
+        set fm_epoch: fm_epoch + 1
+        set fm_publishes: fm_publishes + 1
+    }
+
+    ; ★ The insns that write the VM's VALUE STACK (`StackSet`, `SetImmediate`)
+    ; rather than an ELObj. The value stack does not live in the eval region at
+    ; all, and their offsets address the RUNNING frame's own locals, which die
+    ; at its Return — so on that reading they cannot publish. That reading is an
+    ; ASSUMPTION, not a proof, so it is switchable: DZ_FRAME_MARK_PUBLISH_STACK=1
+    ; treats them as publications too, and the difference between the two runs is
+    ; exactly what the assumption is worth. Boxes are a different matter and
+    ; always publish — a box can belong to any enclosing frame.
+    procedure publish_stack()
+    {
+        if FrameMark.on() = false
+            return
+        if fm_publish_stack = false
+            return
+        FrameMark.publish()
+    }
+
+    ; Interpreter.set_eval_region — the region under every live mark changes
+    procedure region(p: pointer[Page])
+    {
+        if FrameMark.on() = false
+            return
+        let np p as pointer[void]
+        if np = fm_head
+            return
+        set fm_head: np
+        set fm_gen: fm_gen + 1
+    }
+
+    procedure report()
+    {
+        if fm_mode > 2
+            return
+        scaly_eputs "framemark: mode "
+        if fm_mode = 2
+            scaly_eputs "LIVE"
+        else
+            scaly_eputs "dry"
+        if fm_trust_prims
+            scaly_eputs ", ALL primitives trusted (ceiling, not sound)"
+        if fm_publish_stack
+            scaly_eputs ", value-stack writes publish too"
+        scaly_eputnl()
+        scaly_eputs "framemark: "
+        scaly_eputi fm_frames
+        scaly_eputs " frames, "
+        scaly_eputi fm_rewound
+        scaly_eputs " rewound ("
+        let rp FrameMark.permille(fm_rewound, fm_frames)
+        scaly_eputi rp
+        scaly_eputs " per mille), "
+        scaly_eputi fm_bytes
+        scaly_eputs " bytes reclaimed"
+        scaly_eputnl()
+        scaly_eputs "framemark: blocked by  publish "
+        scaly_eputi fm_b_publish
+        scaly_eputs "  result "
+        scaly_eputi fm_b_result
+        scaly_eputs "  page "
+        scaly_eputi fm_b_page
+        scaly_eputs "  bracket "
+        scaly_eputi fm_b_invalid
+        scaly_eputs "  exclusive "
+        scaly_eputi fm_b_excl
+        scaly_eputs "  no-result "
+        scaly_eputi fm_b_noresult
+        scaly_eputs "  too-deep "
+        scaly_eputi fm_b_deep
+        scaly_eputnl()
+        scaly_eputs "framemark: "
+        scaly_eputi fm_publishes
+        scaly_eputs " publications"
+        scaly_eputnl()
+    }
+
+    function permille(n: i64, total: i64) returns i64
+    {
+        if total <= 0
+            return 0
+        (n * 1000) / total
+    }
+}
