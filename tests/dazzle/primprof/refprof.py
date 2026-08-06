@@ -18,9 +18,25 @@ import sys
 LINE = re.compile(r'^(\s*[|+!:\s]*?)(\d+) (.+?)  \(in ([^)]*)\)')
 
 
+# ★`sample` emits THREE more sections after the call graph, and two of them
+# list `<count> <symbol>  (in <lib>)` — the same shape as a tree line. Parsing
+# them as tree nodes attributes every one of them to the outermost frame:
+# measured on a reference profile, `start` went to -777 self time while the
+# positive self times summed to 1052 against a true total of 275, i.e. the
+# whole table inflated ~3.8x. Stop at the first of these headers.
+END_OF_GRAPH = re.compile(r'^(Total number in stack|Sort by top of stack|Binary Images)')
+
+
 def parse(path, self_time, total):
     stack = []  # (depth, remaining, symbol)
+    in_graph = False
     for raw in open(path, errors='replace'):
+        if not in_graph:
+            if raw.startswith('Call graph:'):
+                in_graph = True
+            continue
+        if END_OF_GRAPH.match(raw):
+            break
         m = LINE.match(raw)
         if not m:
             continue
@@ -53,7 +69,12 @@ def main():
         parse(p, self_time, total)
     tot = total[0] or 1
     rows = sorted(self_time.items(), key=lambda kv: -kv[1])
-    print("refprof: %d samples over %d file(s)" % (tot, len(args)))
+    # ★The sum of the printed rows MUST equal the sampled total. It is printed
+    # so a parse defect cannot hide: a recursive symbol whose children are
+    # mis-nested shows up here as a sum that overshoots, which is exactly how
+    # the section-boundary bug above was found.
+    print("refprof: %d samples over %d file(s), rows sum to %d (must match)"
+          % (tot, len(args), sum(self_time.values())))
     print("refprof: %8s %10s  %s" % ("cpu%", "samples", "symbol"))
     for sym, n in rows:
         if n <= 0:
