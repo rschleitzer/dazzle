@@ -11,7 +11,7 @@ use dazzle.Interpreter.Interpreter
 ; frame is unaffordable and unnecessary, while a mark costs a store.
 ;
 ; A rewind is only sound if nothing above the mark is reachable afterwards, so
-; everything here is the CONSERVATIVE test that decides it. Five conditions, all
+; everything here is the CONSERVATIVE test that decides it. Six conditions, all
 ; O(1), and a frame is rewound only when every one holds:
 ;
 ;   1. VALID     — the mark was taken in the eval bracket that is still current.
@@ -25,6 +25,12 @@ use dazzle.Interpreter.Interpreter
 ;                  the one escape route the frame owns, and it is an address
 ;                  comparison rather than a graph walk.
 ;   5. QUIET     — nothing PUBLISHED while the frame was running.
+;   6. BACKFILL  — the region HEAD served no allocation while the frame ran.
+;                  `Page.allocate` bumps the page it was CALLED ON when that
+;                  page still has room, and every `ELObj.make_*` calls it on the
+;                  head — so the frontier is not the tail alone. See the block
+;                  above `below_sum`; this is the condition the memo seam's three
+;                  wrong codegens were pointing at.
 ;
 ; ★★★Condition 5 is the whole trick, and it is ONE global counter. A frame's
 ; lifetime is exactly the window in which only IT and its DESCENDANTS run (a
@@ -49,13 +55,15 @@ use dazzle.Interpreter.Interpreter
 ;
 ; ★Off by default, and the reason is honest: the rule's completeness rests on a
 ; SWEEP over the engine's store sites (all 29 `Page.get(` sites plus the mutating
-; calls a primitive can reach), which is empirically gated — 48 real-world
-; codegens byte-identical with the rewind live — and not proven. The proof
+; calls a primitive can reach) plus condition 6, which is empirically gated — 48
+; real-world codegens byte-identical with the rewind live, and the general form
+; of condition 6 run exhaustively over one of them — and not proven. The proof
 ; belongs in the compiler, as the escape analysis of ROADMAP-dazzle.md's "Memory
 ; model". Until then `DAZZLE_FRAME_MARK=1` opts in and
 ; tests/dazzle/framemark/run.sh runs both modes against the same goldens.
-; Measured on the heaviest codegen: peak footprint 6266 -> 4104 MB (-34.5 %),
-; max RSS -42 %, 10.03 GB reclaimed, +4.1 % cpu.
+; Measured on the heaviest codegen, with the memo seam that follows the mark
+; (Interpreter.memo_host): peak footprint 5968 -> 3463 MB (-42.0 %), max RSS
+; 5310 -> 3154 MB (-40.6 %), 17.22 GB reclaimed, cpu -0.6 % (noise).
 ;
 ; ★What was tried and MEASURED AWAY — do not rebuild it: a second arena for
 ; frame-local values with the escaping result placed in the eval region. Sound
@@ -98,6 +106,9 @@ shared fm_excl: pointer[i64] null
 shared fm_hexcl: pointer[i64] null
 shared fm_gen_at: pointer[i64] null
 shared fm_epoch_at: pointer[i64] null
+; condition 6 — see BACKFILL below
+shared fm_below: pointer[i64] null
+shared fm_head_at: pointer[i64] null
 
 ; --- the HUNT for the store the sweep does not hook (DZ_FRAME_MARK_LIMIT/SCAN) -
 ;
@@ -121,7 +132,21 @@ shared fm_scan: i64 0 - 1
 ; debugger can watch the word a later store corrupts — at the pop it is too
 ; late, and the arena base moves between runs, so an address from a previous run
 ; is worthless. The pop prints the sequence number, the push traps on it.
+;
+; ★★DZ_FRAME_MARK_TRAP_POP=<seq> is the OTHER half, and without it a watchpoint
+; proves nothing: the word below a mark is recycled after every rewind, so a hit
+; only implicates the frame under investigation when it falls inside ITS window.
+; The push trap opens the window, this one closes it, and the last hit in
+; between is the writer. DZ_FRAME_MARK_WATCH=<bytes> makes the push trap print
+; the address that many bytes BELOW the mark — the referrer the SCAN found,
+; computed in THIS run, because the arena base moves between runs.
 shared fm_trap: i64 0 - 1
+shared fm_trap_pop: i64 0 - 1
+shared fm_watch: i64 1040
+; the push trap parks the computed address here so a debugger can read it out of
+; a SYMBOL instead of scraping stderr — the instrument globals carry no debug
+; info, but they are symbols, and the arena base moves between runs
+shared fm_watch_at: i64 0
 shared fm_seq: pointer[i64] null
 ; ★★★DZ_FRAME_MARK_VERIFY=1 — the check the store sweep never had. Before EVERY
 ; rewind, scan the marked region for a word below the mark that points into the
@@ -145,6 +170,15 @@ shared fm_b_refused: i64 0
 shared fm_b_deep: i64 0
 shared fm_publishes: i64 0
 shared fm_pages: i64 0
+shared fm_b_below: i64 0
+; DZ_FRAME_MARK_BACKFILL=N — run the general form of condition 6 on every Nth
+; rewind. N=1 is exhaustive and costs 27x on the reproducer; a stride is what
+; makes the heaviest codegen (81.8 M frames) reachable at all.
+shared fm_backfill: i64 0
+shared fm_below_missed: i64 0
+shared fm_below_checked: i64 0
+shared fm_walk: i64 0
+shared fm_walk_max: i64 0
 
 ; the atexit entry point: a bare module-level function name is a function
 ; pointer value, which a concept static is not.
@@ -175,6 +209,8 @@ define FrameMark
         set fm_off: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
         set fm_excl: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
         set fm_hexcl: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
+        set fm_below: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
+        set fm_head_at: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
         set fm_gen_at: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
         set fm_epoch_at: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
         set fm_seq: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
@@ -185,6 +221,10 @@ define FrameMark
         if fm_excl = null
             return
         if fm_hexcl = null
+            return
+        if fm_below = null
+            return
+        if fm_head_at = null
             return
         if fm_gen_at = null
             return
@@ -199,9 +239,18 @@ define FrameMark
         let tr getenv("DZ_FRAME_MARK_TRAP")
         if tr <> null
             set fm_trap: FrameMark.parse_i64(tr)
+        let tp getenv("DZ_FRAME_MARK_TRAP_POP")
+        if tp <> null
+            set fm_trap_pop: FrameMark.parse_i64(tp)
+        let wa getenv("DZ_FRAME_MARK_WATCH")
+        if wa <> null
+            set fm_watch: FrameMark.parse_i64(wa)
         let vf getenv("DZ_FRAME_MARK_VERIFY")
         if vf <> null
             set fm_verify: true
+        let bf getenv("DZ_FRAME_MARK_BACKFILL")
+        if bf <> null
+            set fm_backfill: FrameMark.parse_i64(bf)
         let s getenv("DAZZLE_FRAME_MARK_STATS")
         if s <> null
         {
@@ -427,6 +476,70 @@ define FrameMark
         *(w + i) as i64
     }
 
+    ; --- condition 6: BACKFILL ------------------------------------------------
+    ;
+    ; ★★★The store the sweep never hooked was not a store at all — it is the
+    ; ALLOCATOR. `Page.allocate` serves from the page it was CALLED ON whenever
+    ; that page still has room (`capacity < size` is what sends a request to the
+    ; region's tail), and the engine calls it on the region HEAD (`host.allocate`
+    ; in every `ELObj.make_*`) and on arbitrary pages of the chain (the
+    ; `Page.get(object)` / `^this` / container-growth idiom). So the frontier is
+    ; NOT the tail alone: a page below the mark that kept a few free bytes serves
+    ; small requests forever, BELOW every live mark.
+    ;
+    ; That breaks the span's defining property. Measured on the reproducer:
+    ; `ELObj.make_string` got its 40-byte ELObj from the head's 56-byte remainder
+    ; — below the mark — and the string buffer it then allocates no longer fitted
+    ; there, so it came off the tail, ABOVE the mark. The rewind freed the buffer
+    ; and left the object holding a pointer into it: 150 characters of generated
+    ; output turned into garbage bytes in one file of 278. Found with
+    ; DZ_FRAME_MARK_TRAP + DZ_FRAME_MARK_TRAP_POP and a watchpoint on the word the
+    ; SCAN named, which is the only way to attribute a write to a frame's window
+    ; — the word is recycled after every rewind.
+    ;
+    ; The test that ships is ONE comparison: the region HEAD's bump pointer must
+    ; be the same at the pop as it was at the push. Bump pointers only move
+    ; forward and no page before the mark's is released while the frame runs, so
+    ; equality means the head served nothing during the window. No propagation is
+    ; needed — an ancestor's window contains its descendants', exactly as for
+    ; condition 5.
+    ;
+    ; ★★★Why the HEAD and not every page below the mark: `this` is the head for
+    ; every allocation the engine makes from a page it did not derive from an
+    ; object (`host.allocate`, and `host` IS `interp.get_host()` = the eval
+    ; region head). A MIDDLE page can only become `this` through
+    ; `Page.get(object)` on a PRE-EXISTING object — and that is precisely the set
+    ; of sites the store sweep hooks, so such an allocation already publishes and
+    ; is stopped by condition 5. Head test plus store sweep is the whole rule.
+    ;
+    ; ★★And the general test was MEASURED AWAY rather than assumed away, because
+    ; the first version of this condition was the general one: sum the bumps of
+    ; every page below the mark. It is correct and it costs **27x** — 2.9 billion
+    ; page steps on the 278-file reproducer, because the eval region is not short
+    ; (chains of 13 536 pages below a mark with the memo probe, 20 324 without).
+    ; The run went 2.18 s -> 59.6 s. It survives as the VERIFIER
+    ; `DZ_FRAME_MARK_BACKFILL=1`, which counts the rewinds the general test would
+    ; refuse ON TOP of the head test — that number is what gates the paragraph
+    ; above, and it is 0 across the corpus.
+    function below_sum(mp: i64) returns i64
+    {
+        var s: i64 0
+        var n: i64 0
+        var p fm_head as i64
+        while p <> 0
+        {
+            if p = mp
+                break
+            set s: s + FrameMark.slot(p as pointer[void], 0)
+            set n: n + 1
+            set p: FrameMark.slot(p as pointer[void], 2)
+        }
+        set fm_walk: fm_walk + n
+        if n > fm_walk_max
+            set fm_walk_max: n
+        s
+    }
+
     ; the END of the marked region's extension chain
     function tail() returns pointer[void]
     {
@@ -587,9 +700,12 @@ define FrameMark
                 scaly_eputi fm_frames
                 scaly_eputs ", mark page "
                 scaly_eputi(t as i64)
-                scaly_eputs ", watch word at page+4040 = "
-                scaly_eputi((t as i64) + 4040)
+                scaly_eputs ", mark "
+                scaly_eputi b
+                scaly_eputs ", WATCH "
+                scaly_eputi(b - fm_watch)
                 scaly_eputnl()
+                set fm_watch_at: b - fm_watch
                 raise(5)
             }
         }
@@ -601,6 +717,17 @@ define FrameMark
             set *(fm_off + idx): b
             set *(fm_excl + idx): FrameMark.slot(t, 3)
             set *(fm_hexcl + idx): FrameMark.slot(fm_head as pointer[void], 3)
+            set *(fm_head_at + idx): FrameMark.slot(fm_head as pointer[void], 0)
+            ; the general verifier samples by FRAME, so that the walk is
+            ; strided on the push side too — at the push there is no rewind
+            ; number yet, and walking on every push is what makes stride 1
+            ; unaffordable on a workload with 81.8 M frames
+            if fm_backfill > 0
+            {
+                set *(fm_below + idx): 0 - 1
+                if (fm_frames % fm_backfill) = 0
+                    set *(fm_below + idx): FrameMark.below_sum(t as i64)
+            }
             set *(fm_gen_at + idx): fm_gen
             set *(fm_epoch_at + idx): fm_epoch
         }
@@ -622,6 +749,20 @@ define FrameMark
             return
         if idx >= FM_MAX_DEPTH
             return
+        ; the closing half of the watch window — see DZ_FRAME_MARK_TRAP_POP
+        if fm_trap_pop >= 0
+        {
+            if fm_seq <> null
+            {
+                if *(fm_seq + idx) = fm_trap_pop
+                {
+                    scaly_eputs "frame-mark: TRAP at pop of frame seq "
+                    scaly_eputi fm_trap_pop
+                    scaly_eputnl()
+                    raise(5)
+                }
+            }
+        }
         if fm_head = null
         {
             set fm_b_invalid: fm_b_invalid + 1
@@ -644,6 +785,33 @@ define FrameMark
         {
             set fm_b_result: fm_b_result + 1
             return
+        }
+        ; 6. BACKFILL — the region head served nothing while the frame ran.
+        ; ★Only when the head is NOT the mark's page: on a single-page region the
+        ; head's bump IS the span's, so testing it there refuses everything
+        ; (measured: 92 refusals instead of 3, and the 89 are all this case).
+        if *(fm_page + idx) <> (fm_head as i64)
+        {
+            if FrameMark.slot(fm_head as pointer[void], 0) <> *(fm_head_at + idx)
+            {
+                set fm_b_below: fm_b_below + 1
+                return
+            }
+        }
+        ; the general form of condition 6, opt-in: every page below the mark.
+        ; Counts what the head test alone would let through — see below_sum.
+        if fm_backfill > 0
+        {
+            let snap *(fm_below + idx)
+            if snap <> (0 - 1)
+            {
+                set fm_below_checked: fm_below_checked + 1
+                if FrameMark.below_sum(*(fm_page + idx)) <> snap
+                {
+                    set fm_below_missed: fm_below_missed + 1
+                    return
+                }
+            }
         }
         ; the hunt's two switches (see the block above)
         if fm_limit >= 0
@@ -788,10 +956,26 @@ define FrameMark
         scaly_eputi fm_b_invalid
         scaly_eputs "  too-deep "
         scaly_eputi fm_b_deep
+        scaly_eputs "  backfill "
+        scaly_eputi fm_b_below
         scaly_eputs "  ("
         scaly_eputi fm_publishes
         scaly_eputs " publications)"
         scaly_eputnl()
+        if fm_backfill > 0
+        {
+            scaly_eputs "frame-mark: BACKFILL "
+            scaly_eputi fm_below_checked
+            scaly_eputs " rewinds checked (stride "
+            scaly_eputi fm_backfill
+            scaly_eputs "), missed by the head test "
+            scaly_eputi fm_below_missed
+            scaly_eputs ", pages walked "
+            scaly_eputi fm_walk
+            scaly_eputs ", deepest chain below a mark "
+            scaly_eputi fm_walk_max
+            scaly_eputnl()
+        }
         if fm_verify
         {
             scaly_eputs "frame-mark: VERIFY "
