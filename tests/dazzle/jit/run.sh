@@ -23,13 +23,15 @@
 #      ZERO rejected bodies. A code generator that quietly compiled nothing
 #      would otherwise pass check 2 perfectly.
 #
-# The JIT is the DEFAULT since 2026-08-06 (both measured rungs landed: the entry
-# multiplexer and the natively lowered hot arms — ~4 % cost on a short run, ~9 %
-# gain on a long one, see tests/dazzle/PERFORMANCE.md). That does NOT make this
-# suite redundant, it makes it load-bearing: the interpreter is still the
-# reference implementation of every arm, so a differential against it is how a
-# lowering bug is caught at all. Note that the interpreter half runs with
-# DAZZLE_JIT=0, which now DISABLES rather than merely not-enabling.
+# The JIT is OPT-IN (`--jit` / DAZZLE_JIT=1). It was the default for one day
+# (2026-08-06) and the remeasurement took it back: +2.5 % and +17 MB on anything
+# short, -5.0 % on the heaviest real-world codegen, so the caller names the shape
+# (tests/dazzle/PERFORMANCE.md, "Der Styling-Pfad, nachgemessen"). That makes
+# this suite MORE load-bearing, not less: the mode nobody runs by default is the
+# one that rots, and the interpreter is still the reference implementation of
+# every arm, so a differential against it is how a lowering bug is caught at all.
+# Both halves are explicit — DAZZLE_JIT=0 disables, DAZZLE_JIT=1 enables — so the
+# gate does not depend on which way the default points.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
