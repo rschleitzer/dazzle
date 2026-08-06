@@ -1,4 +1,5 @@
 use scaly.memory.Page
+use dazzle.Interpreter.Interpreter
 
 ; ---- the FRAME MARK ------------------------------------------------------
 ; Frame-granular reclamation for the DSSSL evaluator. `ProcessContext` brackets a
@@ -68,6 +69,8 @@ function getenv(name: pointer[const_char]) returns pointer[const_char] extern
 function calloc(count: size_t, size: size_t) returns pointer[void] extern
 procedure atexit(cb: pointer[void]) returns i32 extern
 procedure scaly_eputs(s: pointer[const_char]) extern
+; SIGTRAP, so a debugger stops exactly at the push named by DZ_FRAME_MARK_TRAP
+procedure raise(sig: i32) returns i32 extern
 procedure scaly_eputi(value: i64) extern
 procedure scaly_eputnl() extern
 
@@ -95,6 +98,41 @@ shared fm_excl: pointer[i64] null
 shared fm_hexcl: pointer[i64] null
 shared fm_gen_at: pointer[i64] null
 shared fm_epoch_at: pointer[i64] null
+
+; --- the HUNT for the store the sweep does not hook (DZ_FRAME_MARK_LIMIT/SCAN) -
+;
+; The memo-host probe (`DZ_MEMO_PERM=1`, Interpreter.memo_host) removes 17.5 M
+; publications and makes 3 of the 48 real-world codegens write garbage — so a
+; publication nobody meant as protection was covering a store this file never
+; hooked. These two switches are how that store gets found instead of guessed:
+;
+;   DZ_FRAME_MARK_LIMIT=N  perform only the first N rewinds. The run with limit N
+;                          is IDENTICAL to the unlimited run up to its Nth rewind
+;                          (the prefix is deterministic), so a binary search on N
+;                          converges on the exact rewind that corrupts.
+;   DZ_FRAME_MARK_SCAN=N   at rewind N, before releasing anything, scan the
+;                          marked region and the run arena for a word pointing
+;                          INTO the span about to be reclaimed — that word is the
+;                          referrer, and its region says which store wrote it.
+shared fm_limit: i64 0 - 1
+shared fm_scan: i64 0 - 1
+; DZ_FRAME_MARK_TRAP=<seq>: SIGTRAP at the PUSH of the frame with that sequence
+; number, having printed its mark page. That is the only moment at which a
+; debugger can watch the word a later store corrupts — at the pop it is too
+; late, and the arena base moves between runs, so an address from a previous run
+; is worthless. The pop prints the sequence number, the push traps on it.
+shared fm_trap: i64 0 - 1
+shared fm_seq: pointer[i64] null
+; ★★★DZ_FRAME_MARK_VERIFY=1 — the check the store sweep never had. Before EVERY
+; rewind, scan the marked region for a word below the mark that points into the
+; span about to be reclaimed. A hit is a rewind that frees live data, i.e. a
+; store the sweep does not hook. The marked region is two pages on this
+; workload, so the scan is cheap enough to run over a whole codegen — which
+; turns "empirically gated" into "checked", and answers the question that
+; matters: does the DEFAULT configuration have violations too?
+shared fm_verify: bool false
+shared fm_violations: i64 0
+shared fm_verified: i64 0
 
 ; counters (DAZZLE_FRAME_MARK_STATS)
 shared fm_frames: i64 0
@@ -139,6 +177,7 @@ define FrameMark
         set fm_hexcl: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
         set fm_gen_at: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
         set fm_epoch_at: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
+        set fm_seq: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
         if fm_page = null
             return
         if fm_off = null
@@ -151,6 +190,18 @@ define FrameMark
             return
         if fm_epoch_at = null
             return
+        let lim getenv("DZ_FRAME_MARK_LIMIT")
+        if lim <> null
+            set fm_limit: FrameMark.parse_i64(lim)
+        let sc getenv("DZ_FRAME_MARK_SCAN")
+        if sc <> null
+            set fm_scan: FrameMark.parse_i64(sc)
+        let tr getenv("DZ_FRAME_MARK_TRAP")
+        if tr <> null
+            set fm_trap: FrameMark.parse_i64(tr)
+        let vf getenv("DZ_FRAME_MARK_VERIFY")
+        if vf <> null
+            set fm_verify: true
         let s getenv("DAZZLE_FRAME_MARK_STATS")
         if s <> null
         {
@@ -158,6 +209,195 @@ define FrameMark
             atexit(&fm_stats_atexit)
         }
         set fm_state: 1
+    }
+
+    function parse_i64(t: pointer[const_char]) returns i64
+    {
+        var v: i64 0
+        var p t as pointer[u8]
+        let zero "0" as char
+        while (*p) <> 0
+        {
+            let d (*p as i64) - (zero as i64)
+            if d < 0
+                return v
+            if d > 9
+                return v
+            set v: (v * 10) + d
+            set p: p + 1
+        }
+        v
+    }
+
+    ; ★The referrer scan: every 8-byte word of the marked region and of the run
+    ; arena that points INTO [lo, hi) — the span this rewind is about to reclaim.
+    ; A hit in the run arena means a long-lived object holds it; a hit in the
+    ; marked region BELOW the mark means an older frame does. Either way the
+    ; address identifies the record, and the record identifies the store.
+    procedure scan_for_refs(lo: i64, hi: i64)
+    {
+        scaly_eputs "frame-mark: SCAN span ["
+        scaly_eputi lo
+        scaly_eputs ", "
+        scaly_eputi hi
+        scaly_eputs ") = "
+        scaly_eputi(hi - lo)
+        scaly_eputs " bytes"
+        scaly_eputnl()
+        var hits: i64 0
+        set hits: hits + FrameMark.scan_region(fm_head as i64, lo, hi, "marked-region")
+        let perm Interpreter.perm_page()
+        if perm <> null
+        {
+            if (perm as i64) <> (fm_head as i64)
+                set hits: hits + FrameMark.scan_region(perm as i64, lo, hi, "run-arena")
+        }
+        scaly_eputs "frame-mark: SCAN total referrers "
+        scaly_eputi hits
+        scaly_eputnl()
+    }
+
+    ; ★The referrer's identity, printed as OFFSETS (stable across runs — the
+    ; arena base is not) plus the neighbourhood of both ends. A record is
+    ; recognised by its shape: an `Array` shows {vector, length} with a small
+    ; length, a `StringC` shows {data, size}, and the target's bytes as text
+    ; usually name the value outright.
+    procedure report_ref(what: pointer[const_char], at: i64, val: i64, page: i64)
+    {
+        scaly_eputs "frame-mark: SCAN ref in "
+        scaly_eputs what
+        scaly_eputs " at page+"
+        scaly_eputi(at - page)
+        scaly_eputs " -> page+"
+        scaly_eputi(val - page)
+        scaly_eputnl()
+        scaly_eputs "frame-mark: SCAN   words around the referrer (it is the 5th):"
+        FrameMark.dump_words(at - 64, 17)
+        scaly_eputs "frame-mark: SCAN   words at the target:"
+        FrameMark.dump_words(val, 8)
+        scaly_eputs "frame-mark: SCAN   target as text: ["
+        FrameMark.dump_text(val, 40)
+        scaly_eputs "]"
+        scaly_eputnl()
+        scaly_eputs "frame-mark: SCAN   referrer as text: ["
+        FrameMark.dump_text(at - 64, 80)
+        scaly_eputs "]"
+        scaly_eputnl()
+    }
+
+    procedure dump_words(from: i64, n: int)
+    {
+        var i 0
+        while i < n
+        {
+            scaly_eputs " "
+            scaly_eputi(*((from + ((i as i64) * 8)) as pointer[i64]))
+            set i: i + 1
+        }
+        scaly_eputnl()
+    }
+
+    ; printable bytes only, so a string inside the record shows up as itself
+    procedure dump_text(from: i64, n: int)
+    {
+        var buf u8[96]
+        let b buf as pointer[u8]
+        var i 0
+        while i < n
+        {
+            let c *((from + (i as i64)) as pointer[u8])
+            var ch c
+            if (c as u32) < 32
+                set ch: 46 as u8
+            if (c as u32) > 126
+                set ch: 46 as u8
+            set *(b + i): ch
+            set i: i + 1
+        }
+        set *(b + n): 0 as u8
+        scaly_eputs(b as pointer[const_char])
+    }
+
+    ; the silent form of scan_region, over the marked region only
+    function count_refs(lo: i64, hi: i64) returns i64
+    {
+        var hits: i64 0
+        var p fm_head as i64
+        while p <> 0
+        {
+            let end FrameMark.slot(p as pointer[void], 0)
+            var q p + 40
+            while (q + 8) <= end
+            {
+                var outside true
+                if q >= lo
+                {
+                    if q < hi
+                        set outside: false
+                }
+                if outside
+                {
+                    let v *(q as pointer[i64])
+                    if v >= lo
+                    {
+                        if v < hi
+                            set hits: hits + 1
+                    }
+                }
+                set q: q + 8
+            }
+            set p: FrameMark.slot(p as pointer[void], 2)
+        }
+        hits
+    }
+
+    function scan_region(head: i64, lo: i64, hi: i64, what: pointer[const_char]) returns i64
+    {
+        if head = 0
+            return 0
+        var hits: i64 0
+        var pages: i64 0
+        var p head
+        while p <> 0
+        {
+            set pages: pages + 1
+            let end FrameMark.slot(p as pointer[void], 0)
+            var q p + 40
+            while (q + 8) <= end
+            {
+                ; skip the span itself — it pointing into itself is expected
+                var outside true
+                if q >= lo
+                {
+                    if q < hi
+                        set outside: false
+                }
+                if outside
+                {
+                    let v *(q as pointer[i64])
+                    if v >= lo
+                    {
+                        if v < hi
+                        {
+                            set hits: hits + 1
+                            if hits < 6
+                                FrameMark.report_ref(what, q, v, p)
+                        }
+                    }
+                }
+                set q: q + 8
+            }
+            set p: FrameMark.slot(p as pointer[void], 2)
+        }
+        scaly_eputs "frame-mark: SCAN "
+        scaly_eputs what
+        scaly_eputs ": "
+        scaly_eputi pages
+        scaly_eputs " pages, "
+        scaly_eputi hits
+        scaly_eputs " referrers"
+        scaly_eputnl()
+        hits
     }
 
     ; --- the region, read and written by documented OFFSET ------------------
@@ -337,6 +577,22 @@ define FrameMark
         }
         let t FrameMark.tail()
         let b FrameMark.slot(t, 0)
+        if fm_seq <> null
+            set *(fm_seq + idx): fm_frames
+        if fm_trap >= 0
+        {
+            if fm_frames = fm_trap
+            {
+                scaly_eputs "frame-mark: TRAP at push of frame seq "
+                scaly_eputi fm_frames
+                scaly_eputs ", mark page "
+                scaly_eputi(t as i64)
+                scaly_eputs ", watch word at page+4040 = "
+                scaly_eputi((t as i64) + 4040)
+                scaly_eputnl()
+                raise(5)
+            }
+        }
         if b = 0
             set *(fm_gen_at + idx): 0 - 1
         else
@@ -388,6 +644,35 @@ define FrameMark
         {
             set fm_b_result: fm_b_result + 1
             return
+        }
+        ; the hunt's two switches (see the block above)
+        if fm_limit >= 0
+        {
+            if fm_rewound >= fm_limit
+            {
+                set fm_b_refused: fm_b_refused + 1
+                return
+            }
+        }
+        if fm_scan >= 0
+        {
+            if fm_rewound = fm_scan
+            {
+                let mp *(fm_page + idx) as pointer[void]
+                scaly_eputs "frame-mark: SCAN frame seq "
+                scaly_eputi(*(fm_seq + idx))
+                scaly_eputs ", mark page "
+                scaly_eputi(mp as i64)
+                scaly_eputnl()
+                FrameMark.scan_for_refs(*(fm_off + idx), FrameMark.slot(mp, 0))
+            }
+        }
+        if fm_verify
+        {
+            let mp2 *(fm_page + idx) as pointer[void]
+            set fm_verified: fm_verified + 1
+            if FrameMark.count_refs(*(fm_off + idx), FrameMark.slot(mp2, 0)) > 0
+                set fm_violations: fm_violations + 1
         }
         ; 2. THE CHAIN and 3. EXCLUSIVE both live in `rewind`, which changes
         ; nothing when it cannot honour the mark.
@@ -507,5 +792,14 @@ define FrameMark
         scaly_eputi fm_publishes
         scaly_eputs " publications)"
         scaly_eputnl()
+        if fm_verify
+        {
+            scaly_eputs "frame-mark: VERIFY "
+            scaly_eputi fm_verified
+            scaly_eputs " rewinds checked, "
+            scaly_eputi fm_violations
+            scaly_eputs " freed live data"
+            scaly_eputnl()
+        }
     }
 }
