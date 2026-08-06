@@ -1118,6 +1118,17 @@ define NNL_DOC_ENTITIES: int 8
 ; versions did (the reference wraps itself in a MapNodeListObj for a
 ; non-singleton argument), so `cursor` is the position in `src` and the
 ; per-source-node walk state sits in `cur`/`walk`/`sub`/`sub2`/`stop`/`path`.
+; ★★A child axis this narrow is cheaper MATERIALIZED than viewed, and the
+; number is measured rather than guessed: on the heaviest real-world codegen
+; the four axes are asked 11 525 091 times and answer 21 797 328 members —
+; 1.9 per call. At that size the generator record and the memo-hosted buffer
+; cost more than the members, and the buffer is worse than that: the memo seam
+; puts it on the RUN arena, so a view that dies immediately is never given
+; back (measured with the frame mark on: +28 % peak). The bound is what keeps
+; the asymptotics — anything wider stays lazy, so the complexity screen's rows
+; are unaffected (they run 500 to 4000 siblings).
+define AXIS_EAGER_MAX: int 8
+
 define GEN_SELECT: int 0
 define GEN_CONCAT: int 1
 define GEN_CHILDREN: int 2
@@ -2480,19 +2491,116 @@ define ELObj union
     ; the STORE and not of the primitive.
     function make_axis_node_list(host: pointer[Page], interp: pointer[Interpreter], src: pointer[ELObj], kind: int) returns pointer[ELObj]
     {
+        ; a narrow child axis is materialized instead of viewed, see
+        ; AXIS_EAGER_MAX. Only `children` takes this path: it is the one axis
+        ; whose answer size is known in O(1) before anything is walked.
+        if kind = GEN_CHILDREN
+        {
+            if ELObj.children_fit_eager(src)
+                return ELObj.make_children_eager(host, src)
+        }
         let mh Interpreter.memo_host(host)
         let out Array[pointer[GroveNode]]^mh()
-        let prefix Array[int]^mh()
-        prefix.add(0)
+        ; ★no expansion index — see gen_make_prefix. A view whose members all
+        ; stand for exactly one position needs none at all, and that is almost
+        ; all of them (measured on the heaviest real-world codegen: ONE view of
+        ; 11 525 091 ever grew one). The eager form this replaces allocated the
+        ; array for every single view.
         var path: pointer[Array[int]] null
         ; only the descendants walk keeps a stack, and it is one int per level
         ; of the subtree, not one per member
         if kind = GEN_DESCENDANTS
             set path: Array[int]^mh()
-        let g SelectGen.make(host, kind, src, null, null, interp, out, prefix, path)
+        let g SelectGen.make(host, kind, src, null, null, interp, out, null, path)
         let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
-        set *p: ELObj.NodeList(NodeListObj(out, 0, prefix, NNL_NONE, g))
+        set *p: ELObj.NodeList(NodeListObj(out, 0, null, NNL_NONE, g))
         p
+    }
+
+    ; Whether the whole child axis of `src` is at most AXIS_EAGER_MAX members.
+    ; Asked only of a source that is already materialized — asking a lazy one
+    ; would force it, which is the opposite of the point.
+    ;
+    ; ★The count runs over MEMBERS rather than flat positions, and the two
+    ; agree here: only an element has a child axis, and an element is always a
+    ; one-position member. Walking flat positions would materialize a character
+    ; view per character of a data source to ask it for children it cannot
+    ; have.
+    function children_fit_eager(src: pointer[ELObj]) returns bool
+    {
+        choose *src
+            when nl: NodeList
+            {
+                if nl.gen <> null
+                    return false
+            }
+            else
+                return false
+        let c src.node_list_member_count()
+        if c > AXIS_EAGER_MAX
+            return false
+        var total 0
+        var i 0
+        while i < c
+        {
+            let node src.node_list_member(i)
+            if node <> null
+                set total: total + node.axis_child_count()
+            if total > AXIS_EAGER_MAX
+                return false
+            set i: i + 1
+        }
+        true
+    }
+
+    ; the child axis of a source node-list, materialized — with the same rule
+    ; about the expansion index as the lazy form: no array at all unless some
+    ; member stands for more than one position.
+    function make_children_eager(host: pointer[Page], src: pointer[ELObj]) returns pointer[ELObj]
+    {
+        let out Array[pointer[GroveNode]]^host()
+        var prefix: pointer[Array[int]] null
+        var total 0
+        var j 0
+        let c src.node_list_member_count()
+        var i 0
+        while i < c
+        {
+            let node src.node_list_member(i)
+            if node <> null
+            {
+                let m node.axis_child_count()
+                var k 0
+                while k < m
+                {
+                    let ch node.axis_child_at(k)
+                    out.add(ch)
+                    let sp GroveNode.member_span(ch)
+                    set total: total + sp
+                    if prefix = null
+                    {
+                        if sp > 1
+                        {
+                            let p Array[int]^host()
+                            var q 0
+                            while q <= j
+                            {
+                                p.add(q)
+                                set q: q + 1
+                            }
+                            set prefix: p
+                            p.add(total)
+                        }
+                    }
+                    else
+                        prefix.add(total)
+                    set j: j + 1
+                    set k: k + 1
+                }
+            }
+            set i: i + 1
+        }
+        ELObj.make_node_list_prefix(host, out, 0, prefix)
     }
 
     ; the CHUNK a node-list member stands for, and the member's character
@@ -2631,9 +2739,53 @@ define ELObj union
     {
         let out g.out
         out.add(node)
-        set g.total: g.total + GroveNode.member_span(node)
-        let prefix g.prefix
+        let span GroveNode.member_span(node)
+        set g.total: g.total + span
+        var prefix g.prefix
+        if prefix = null
+        {
+            if span = 1
+                return
+            set prefix: ELObj.gen_make_prefix(g, out.get_length() as int)
+        }
         prefix.add(g.total)
+    }
+
+    ; The character-expansion index, built the moment a member arrives that
+    ; stands for more than one position. Everything appended before it spanned
+    ; exactly one, so those entries are 0, 1, 2, … and the caller appends the
+    ; new total as the sentinel. `m` is the buffer length INCLUDING the member
+    ; being appended.
+    ;
+    ; ★A null prefix and a prefix of all-ones mean exactly the same thing to
+    ; every accessor (the invariant make_node_list_expanded already states:
+    ; "Members whose span is 1 make this identical in meaning to the plain
+    ; form"), which is what lets the array be skipped rather than deferred.
+    ; ★Its home is the memo seam's, like `out` — it is grown by whichever frame
+    ; asks first, not by the one that built the view.
+    function gen_make_prefix(g: pointer[SelectGen], m: int) returns pointer[Array[int]]
+    {
+        let mh Interpreter.memo_host(g.host)
+        let p Array[int]^mh()
+        FrameMark.store(p as pointer[void])
+        var k 0
+        while k < m
+        {
+            p.add(k)
+            set k: k + 1
+        }
+        set g.prefix: p
+        p
+    }
+
+    ; the expansion index of a node-list: the GENERATOR's whenever there is
+    ; one, because a lazy view may grow one after the ELObj was built (and
+    ; node_list_rest hands the generator, not the array, to its tail).
+    function prefix_of(gen: pointer[SelectGen], own: pointer[Array[int]]) returns pointer[Array[int]]
+    {
+        if gen <> null
+            return gen.prefix
+        own
     }
 
     ; the CHILDREN AXIS (Node::firstChild), not the structural child list:
@@ -2644,7 +2796,7 @@ define ELObj union
     {
         let all need_flat < 0
         let out g.out
-        let prefix g.prefix
+        var prefix g.prefix
         repeat
         {
             if all = false
@@ -2673,8 +2825,18 @@ define ELObj union
             {
                 let c node.axis_child_at(j)
                 out.add(c)
-                set total: total + GroveNode.member_span(c)
-                prefix.add(total)
+                let sp GroveNode.member_span(c)
+                set total: total + sp
+                if prefix = null
+                {
+                    if sp > 1
+                    {
+                        set prefix: ELObj.gen_make_prefix(g, out.get_length() as int)
+                        prefix.add(total)
+                    }
+                }
+                else
+                    prefix.add(total)
                 set j: j + 1
                 if all = false
                 {
@@ -2951,9 +3113,10 @@ define ELObj union
                 if nl.nodes = null
                     return 0
                 let m nl.nodes.get_length() as int
-                if nl.prefix = null
+                let pfx ELObj.prefix_of(nl.gen, nl.prefix)
+                if pfx = null
                     return m - nl.start
-                return *(nl.prefix.get_buffer() + m) - nl.start
+                return *(pfx.get_buffer() + m) - nl.start
             }
             else
                 return 0
@@ -2991,21 +3154,23 @@ define ELObj union
                 if nl.gen <> null
                 {
                     var have nl.nodes.get_length() as int
-                    if nl.prefix <> null
-                        set have: *(nl.prefix.get_buffer() + have)
+                    let p0 nl.gen.prefix
+                    if p0 <> null
+                        set have: *(p0.get_buffer() + have)
                     if have <= idx
                         ELObj.force_gen(nl.gen, idx + 1, 0)
                 }
                 if nl.nodes = null
                     return null
                 let m nl.nodes.get_length() as int
-                if nl.prefix = null
+                let pfx ELObj.prefix_of(nl.gen, nl.prefix)
+                if pfx = null
                 {
                     if idx >= m
                         return null
                     return *(nl.nodes.get_buffer() + idx)
                 }
-                let pb nl.prefix.get_buffer()
+                let pb pfx.get_buffer()
                 if idx >= *(pb + m)
                     return null
                 let k ELObj.locate_member(pb, m, idx)
@@ -3092,9 +3257,10 @@ define ELObj union
                 if nl.nodes = null
                     return true
                 let m nl.nodes.get_length() as int
-                if nl.prefix = null
+                let pfx ELObj.prefix_of(nl.gen, nl.prefix)
+                if pfx = null
                     return (m - nl.start) = 0
-                return (*(nl.prefix.get_buffer() + m) - nl.start) = 0
+                return (*(pfx.get_buffer() + m) - nl.start) = 0
             }
             else
                 return true
@@ -3105,7 +3271,7 @@ define ELObj union
     {
         choose *this
             when nl: NodeList
-                return nl.prefix
+                return ELObj.prefix_of(nl.gen, nl.prefix)
             else
                 return null
         null
@@ -3128,13 +3294,14 @@ define ELObj union
                 if nl.nodes = null
                     return 0
                 let m nl.nodes.get_length() as int
-                if nl.prefix = null
+                let pfx ELObj.prefix_of(nl.gen, nl.prefix)
+                if pfx = null
                 {
                     if nl.start >= m
                         return 0
                     return m - nl.start
                 }
-                let pb nl.prefix.get_buffer()
+                let pb pfx.get_buffer()
                 if nl.start >= *(pb + m)
                     return 0
                 return m - ELObj.locate_member(pb, m, nl.start)
@@ -3160,9 +3327,10 @@ define ELObj union
                     return null
                 let m nl.nodes.get_length() as int
                 var base nl.start
-                if nl.prefix <> null
+                let pfx ELObj.prefix_of(nl.gen, nl.prefix)
+                if pfx <> null
                 {
-                    let pb nl.prefix.get_buffer()
+                    let pb pfx.get_buffer()
                     if nl.start >= *(pb + m)
                         return null
                     set base: ELObj.locate_member(pb, m, nl.start)
@@ -3186,10 +3354,11 @@ define ELObj union
             {
                 if nl.nodes = null
                     return 0
-                if nl.prefix = null
+                let pfx ELObj.prefix_of(nl.gen, nl.prefix)
+                if pfx = null
                     return 0
                 let m nl.nodes.get_length() as int
-                let pb nl.prefix.get_buffer()
+                let pb pfx.get_buffer()
                 if nl.start >= *(pb + m)
                     return 0
                 let k ELObj.locate_member(pb, m, nl.start)
