@@ -133,7 +133,49 @@ patch('/packages/dazzle/0.1.0/dazzle/ELObj.scaly', [
     # region Page.get(this) resolves to the region TAIL.
     ("                let tmp host.allocate(n * (sizeof u32), alignof u32) as pointer[u32]",
      "                FrameMark.store(this as pointer[void])\n"
-     "                let tmp host.allocate(n * (sizeof u32), alignof u32) as pointer[u32]")])
+     "                let tmp host.allocate(n * (sizeof u32), alignof u32) as pointer[u32]"),
+    # Identifier's lazy `builtin` — allocates on Page.get(this) and stores into
+    # `this`. Identifiers are interned on the PERM host, so the region test will
+    # find it out of scope; hooked so the TEST decides that, not the reading.
+    ("        let host Page.get(this as pointer[void])\n"
+     "        let b Identifier.make(host, this.name)",
+     "        FrameMark.store(this as pointer[void])\n"
+     "        let host Page.get(this as pointer[void])\n"
+     "        let b Identifier.make(host, this.name)")])
+
+patch('/packages/dazzle/0.1.0/dazzle/Grove.scaly', [
+    # set_sdata_view and attr_views — the remaining two grove-side stores that
+    # allocate on the target's own page. Grove region, so quiet by the test.
+    ("        let gpage Page.get(this as pointer[void])\n"
+     "        set this.gi: StringC^gpage(&v, 1)",
+     "        FrameMark.store(this as pointer[void])\n"
+     "        let gpage Page.get(this as pointer[void])\n"
+     "        set this.gi: StringC^gpage(&v, 1)"),
+    ("        let gpage Page.get(elem as pointer[void])",
+     "        FrameMark.store(elem as pointer[void])\n"
+     "        let gpage Page.get(elem as pointer[void])")])
+
+# The three VM setters a primitive can reach. The main VM lives on the run page
+# (another region, so quiet); a per-member VM from node-list-map is allocated on
+# the eval scratch and BELOW every mark, so those publish — conservatively, the
+# test does not look at what is stored.
+# All three are single-expression bodies, so adding a statement needs BRACES.
+patch('/packages/dazzle/0.1.0/dazzle/VM.scaly', [
+    ("    procedure set_current_language(this: pointer[VM], l: pointer[ELObj])\n"
+     "        set this.current_language: l",
+     "    procedure set_current_language(this: pointer[VM], l: pointer[ELObj])\n    {\n"
+     "        FrameMark.store(this as pointer[void])\n"
+     "        set this.current_language: l\n    }"),
+    ("    function set_current_node(this: pointer[VM], n: pointer[GroveNode])\n"
+     "        set this.current_node: n",
+     "    function set_current_node(this: pointer[VM], n: pointer[GroveNode])\n    {\n"
+     "        FrameMark.store(this as pointer[void])\n"
+     "        set this.current_node: n\n    }"),
+    ("    function set_processing_mode(this: pointer[VM], m: pointer[void])\n"
+     "        set this.processing_mode: m",
+     "    function set_processing_mode(this: pointer[VM], m: pointer[void])\n    {\n"
+     "        FrameMark.store(this as pointer[void])\n"
+     "        set this.processing_mode: m\n    }")])
 
 patch('/packages/dazzle/0.1.0/dazzle/Grove.scaly', [
     ("use scaly.memory.Page", "use scaly.memory.Page\nuse dazzle.FrameMark.FrameMark"),
