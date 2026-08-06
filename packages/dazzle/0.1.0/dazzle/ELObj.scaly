@@ -1098,13 +1098,32 @@ define NNL_DOC_ENTITIES: int 8
 ; `host` is the page the node-list itself lives on, so the deferred matches
 ; land in exactly the region the eager version used; `src` is a value the
 ; primitive received, hence never in a region younger than that page.
-; The two lazy node-list views, both driven through ELObj.force_gen.
+; The lazy node-list views, all driven through ELObj.force_gen.
 ; GEN_SELECT: `select-elements` — SelectElementsNodeListObj, `pat` filters `src`.
 ; GEN_CONCAT: `(node-list a b …)` — the reference's PairNodeListObj (ELObj.cxx
 ;   :1201), which is a two-pointer cell and copies NOTHING. `src`/`src2` are the
 ;   two operands; `pat` is unused.
+;
+; The four AXIS views below are the same mechanism over the four axes that used
+; to materialize a full array at construction time. The reference has a lazy
+; object for each (style/primitive.cxx): DescendantsNodeListObj for
+; `descendants`, SiblingNodeListObj for `preced`/`follow`, and the child axis
+; comes straight off the node. `node-list-first` or `node-list-empty?` on one of
+; them cost O(1) here instead of O(width of the sibling group), which is what
+; the nsweep complexity screen measured as a port defect
+; (tests/dazzle/nsweep/README.md: four rows at x3.9 per doubling against the
+; reference's x2).
+;
+; ★All four map over the MEMBERS of their source node-list exactly as the eager
+; versions did (the reference wraps itself in a MapNodeListObj for a
+; non-singleton argument), so `cursor` is the position in `src` and the
+; per-source-node walk state sits in `cur`/`walk`/`sub`/`sub2`/`stop`/`path`.
 define GEN_SELECT: int 0
 define GEN_CONCAT: int 1
+define GEN_CHILDREN: int 2
+define GEN_DESCENDANTS: int 3
+define GEN_PRECED: int 4
+define GEN_FOLLOW: int 5
 
 ; A lazy node-list generator. Both kinds live in ONE record rather than in two
 ; ELObj union arms on purpose: the union's arm size is paid by EVERY ELObj
@@ -1120,28 +1139,62 @@ define SelectGen
     host: pointer[Page]
     out: pointer[Array[pointer[GroveNode]]]
     cursor: int
+    prefix: pointer[Array[int]]
+    total: int
+    cur: pointer[GroveNode]
+    walk: pointer[GroveNode]
+    sub: int
+    sub2: int
+    stop: int
+    path: pointer[Array[int]]
+    depth: int
 )
 {
-    ; Every field gets a PARAMETER, in field order, `cursor` included. This
-    ; shape found a planner bug: because `out` is a local bound to
-    ; `Array[…]^host()`, the construction below did not resolve to an init at
-    ; all (the local carries the VALUE type, the parameter is a pointer), so
-    ; the planner emitted a positional TUPLE over the fields — a 5-argument
-    ; init that set `cursor` itself left three of four construction sites with
-    ; a random cursor, and the view silently answered "no matches"
-    ; (tests/dazzle/grove axis1). Fixed 2026-08-02 in
-    ; Planner.region_value_matches_pointer; the explicit form stays because it
-    ; cannot go wrong either way.
-    init(kind: int, src: pointer[ELObj], src2: pointer[ELObj], pat: pointer[Pattern], interp: pointer[Interpreter], host: pointer[Page], out: pointer[Array[pointer[GroveNode]]], cursor: int)
+    ; The record has NO `init` and every construction goes through `make`,
+    ; which writes all eighteen fields by name — the shape MacroDef and
+    ; GroveNode use. Why not an init: an init is selected by argument COUNT,
+    ; and a construction that misses one compiles in silence with garbage in
+    ; the field. The 8-field version of this record already paid that once —
+    ; because `out` is a local bound to `Array[…]^host()`, the construction did
+    ; not resolve to an init at all (the local carries the VALUE type, the
+    ; parameter is a pointer), the planner emitted a positional TUPLE over the
+    ; fields, and three of four sites got a random cursor and answered "no
+    ; matches" (tests/dazzle/grove axis1; fixed 2026-08-02 in
+    ; Planner.region_value_matches_pointer, and diagnosed loudly since).
+    ;
+    ; The walk state, per generator kind:
+    ;   SELECT/CONCAT  cursor = the next member of `src` still to test
+    ;   every AXIS     cursor = the next flat position of `src` to expand,
+    ;                  `cur`  = the source node being expanded (null: fetch the
+    ;                           next one), `prefix`/`total` the character-
+    ;                           expansion index grown in lockstep with `out`
+    ;   CHILDREN       sub    = the next child index of `cur`
+    ;   DESCENDANTS    walk   = the last node emitted (null: not started),
+    ;                  path/depth = the child index at each level of the walk
+    ;   PRECED/FOLLOW  sub    = the next index in the sibling group,
+    ;                  stop   = the group's end, walk = the member HOLDING the
+    ;                  node, sub2 = the character cursor inside it
+    function make(host: pointer[Page], kind: int, src: pointer[ELObj], src2: pointer[ELObj], pat: pointer[Pattern], interp: pointer[Interpreter], out: pointer[Array[pointer[GroveNode]]], prefix: pointer[Array[int]], path: pointer[Array[int]]) returns pointer[SelectGen]
     {
-        set this.kind: kind
-        set this.src: src
-        set this.src2: src2
-        set this.pat: pat
-        set this.interp: interp
-        set this.host: host
-        set this.out: out
-        set this.cursor: cursor
+        let g host.allocate(sizeof SelectGen, alignof SelectGen) as pointer[SelectGen]
+        set g.kind: kind
+        set g.src: src
+        set g.src2: src2
+        set g.pat: pat
+        set g.interp: interp
+        set g.host: host
+        set g.out: out
+        set g.cursor: 0
+        set g.prefix: prefix
+        set g.total: 0
+        set g.cur: null
+        set g.walk: null
+        set g.sub: 0
+        set g.sub2: 0
+        set g.stop: 0
+        set g.path: path
+        set g.depth: 0
+        g
     }
 }
 
@@ -2278,8 +2331,7 @@ define ELObj union
         ; that function for why the region end is the wrong home for it
         let mh Interpreter.memo_host(host)
         let out Array[pointer[GroveNode]]^mh()
-        let g host.allocate(sizeof SelectGen, alignof SelectGen) as pointer[SelectGen]
-        set *g: SelectGen(GEN_SELECT, src, null, pat, interp, host, out, 0)
+        let g SelectGen.make(host, GEN_SELECT, src, null, pat, interp, out, null, null)
         let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
         set *p: ELObj.NodeList(NodeListObj(out, 0, null, NNL_NONE, g))
         p
@@ -2303,8 +2355,7 @@ define ELObj union
     {
         let mh Interpreter.memo_host(host)
         let out Array[pointer[GroveNode]]^mh()
-        let g host.allocate(sizeof SelectGen, alignof SelectGen) as pointer[SelectGen]
-        set *g: SelectGen(GEN_CONCAT, a, b, null, interp, host, out, 0)
+        let g SelectGen.make(host, GEN_CONCAT, a, b, null, interp, out, null, null)
         let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
         set *p: ELObj.NodeList(NodeListObj(out, 0, null, NNL_NONE, g))
         p
@@ -2411,6 +2462,450 @@ define ELObj union
         set g.cursor: i
     }
 
+    ; --- the lazy AXIS views (children / descendants / preced / follow) -----
+    ;
+    ; One constructor per axis, all the same shape: an EMPTY member buffer, a
+    ; prefix index holding just its sentinel, and the generator that extends
+    ; both on demand. `src` is the node-list the primitive was handed, and the
+    ; view maps over its members exactly as the eager array did.
+    ;
+    ; ★Where the storage lives is the load-bearing part. `out`/`prefix`/`path`
+    ; are MEMO storage — they are extended by whatever frame first asks a
+    ; question, which is normally NOT the frame that built the view — so they
+    ; go on the memo seam's host (Interpreter.memo_host), like the select and
+    ; concat views. Hosting them at the view's own region END would put them
+    ; above every live frame mark and make the mark unsound; with the mark off
+    ; the seam answers with the region itself and nothing changes. Each fill
+    ; additionally hooks FrameMark.store, because publication is a property of
+    ; the STORE and not of the primitive.
+    function make_axis_node_list(host: pointer[Page], interp: pointer[Interpreter], src: pointer[ELObj], kind: int) returns pointer[ELObj]
+    {
+        let mh Interpreter.memo_host(host)
+        let out Array[pointer[GroveNode]]^mh()
+        let prefix Array[int]^mh()
+        prefix.add(0)
+        var path: pointer[Array[int]] null
+        ; only the descendants walk keeps a stack, and it is one int per level
+        ; of the subtree, not one per member
+        if kind = GEN_DESCENDANTS
+            set path: Array[int]^mh()
+        let g SelectGen.make(host, kind, src, null, null, interp, out, prefix, path)
+        let p host.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+        set *p: ELObj.NodeList(NodeListObj(out, 0, prefix, NNL_NONE, g))
+        p
+    }
+
+    ; the CHUNK a node-list member stands for, and the member's character
+    ; offset — a character VIEW stands for one character of its chunk, every
+    ; other node for itself. The sibling views need both to truncate the one
+    ; member that HOLDS the node.
+    function member_chunk(node: pointer[GroveNode]) returns pointer[GroveNode]
+    {
+        if node.get_class() <> GN_DATA
+            return node
+        node.data_chunk()
+    }
+
+    function member_offset(node: pointer[GroveNode]) returns int
+    {
+        if node.get_class() <> GN_DATA
+            return 0
+        node.get_char_index()
+    }
+
+    ; The single entry point every accessor goes through. `need_flat` is a
+    ; count of FLAT (character-expanded) positions, `need_members` a count of
+    ; buffer MEMBERS; -1 on either means "to the end". A caller states the one
+    ; it knows and passes 0 for the other, which is why the two cannot be
+    ; folded into one number: on an expanded view a member may stand for a
+    ; whole data run, so "enough characters" does not imply "enough members".
+    ; The select and concat views have no expansion — one member is one
+    ; position — so for them the larger of the two IS the old single `need`.
+    function force_gen(g: pointer[SelectGen], need_flat: int, need_members: int)
+    {
+        if g.kind >= GEN_CHILDREN
+        {
+            ELObj.force_axis(g, need_flat, need_members)
+            return
+        }
+        var need need_flat
+        if need_members > need
+            set need: need_members
+        if need_flat < 0
+            set need: 0 - 1
+        ELObj.force_select(g, need)
+    }
+
+    function gen_satisfied(g: pointer[SelectGen], need_flat: int, need_members: int) returns bool
+    {
+        if need_flat < 0
+            return false
+        if g.total < need_flat
+            return false
+        if need_members < 0
+            return false
+        let out g.out
+        if (out.get_length() as int) < need_members
+            return false
+        true
+    }
+
+    ; Extend an axis view until it holds `need_flat` character positions and
+    ; `need_members` members, or until the axis is exhausted. `cursor` < 0
+    ; marks exhaustion, so a repeated full force costs one compare.
+    function force_axis(g: pointer[SelectGen], need_flat: int, need_members: int)
+    {
+        if g.cursor < 0
+            return
+        ; ★the satisfied test comes BEFORE the hooks: an accessor that is already
+        ; covered must cost one compare, not two frame-mark probes. The lazy
+        ; form is asked far more often than the eager array was written.
+        if ELObj.gen_satisfied(g, need_flat, need_members)
+            return
+        ; ★★GEOMETRIC over-forcing, and it is what makes a full WALK of a lazy
+        ; view as cheap as the array it replaced. A caller stepping member by
+        ; member (force_select over a source list, node-list-rest) pays the
+        ; whole entry path per member otherwise — measured at +20 % on the
+        ; select-elements row of the complexity screen. Doubling keeps the
+        ; total work O(members) while the FIRST question still forces exactly
+        ; what it asked (2 x 0 = 0), so `node-list-first` stays O(1) — that is
+        ; the whole point of the view and must not be traded away.
+        ; ★Only the AXIS views do this: producing an axis member is a pointer
+        ; step, while a select view's step runs a PATTERN, and "stop at the
+        ; first match" is that view's documented contract.
+        var nf need_flat
+        var nm need_members
+        if nf >= 0
+        {
+            let d g.total * 2
+            if d > nf
+                set nf: d
+        }
+        if nm >= 0
+        {
+            let out0 g.out
+            let l (out0.get_length() as int) * 2
+            if l > nm
+                set nm: l
+        }
+        ; both arrays grow at their region's end, which is inside the running
+        ; frame's span whenever the memo seam hands back the view's own region
+        FrameMark.store(g.out as pointer[void])
+        FrameMark.store(g.prefix as pointer[void])
+        ; ★The child axis gets its own loop rather than going through the
+        ; generic driver, and that is a MEASUREMENT, not taste: the guardrail
+        ; row (`node-list-length (children …)`, where the port is 27x cheaper
+        ; than openjade and must stay so) paid +54 % for three calls per member
+        ; through axis_next/axis_emit/emit_child plus an axis_child_count per
+        ; step. Lifting the dispatch out of the loop and hoisting the count
+        ; into `stop` gave it back — the same lesson as the eval loop's
+        ; switches.
+        if g.kind = GEN_CHILDREN
+        {
+            ELObj.fill_children(g, nf, nm)
+            return
+        }
+        ; a full force needs no per-member test at all
+        let all nf < 0
+        repeat
+        {
+            if all = false
+            {
+                if ELObj.gen_satisfied(g, nf, nm)
+                    return
+            }
+            let node ELObj.axis_next(g)
+            if node = null
+            {
+                set g.cursor: 0 - 1
+                return
+            }
+            ELObj.gen_append(g, node)
+        }
+    }
+
+    ; one member: the buffer plus its slot in the character-expansion index.
+    ; `prefix` holds one entry per member plus the total sentinel, so appending
+    ; the new total keeps that invariant at every point a caller can observe.
+    procedure gen_append(g: pointer[SelectGen], node: pointer[GroveNode])
+    {
+        let out g.out
+        out.add(node)
+        set g.total: g.total + GroveNode.member_span(node)
+        let prefix g.prefix
+        prefix.add(g.total)
+    }
+
+    ; the CHILDREN AXIS (Node::firstChild), not the structural child list:
+    ; `children` of the sgml-document node is EMPTY in the reference (the class
+    ; has no children property at all — its subnodes are prolog /
+    ; document-element / epilog).
+    function fill_children(g: pointer[SelectGen], need_flat: int, need_members: int)
+    {
+        let all need_flat < 0
+        let out g.out
+        let prefix g.prefix
+        repeat
+        {
+            if all = false
+            {
+                if ELObj.gen_satisfied(g, need_flat, need_members)
+                    return
+            }
+            if g.cur = null
+            {
+                if ELObj.axis_begin(g) = false
+                {
+                    set g.cursor: 0 - 1
+                    return
+                }
+            }
+            ; ★the walk state moves into LOCALS for the run over one source
+            ; node's children. Left in the generator record it is reloaded and
+            ; stored per member — nothing can prove `out.add` does not touch
+            ; it — and that alone was the guardrail row's remaining +35 %
+            ; against the eager array it replaced.
+            let node g.cur
+            let m g.stop
+            var j g.sub
+            var total g.total
+            while j < m
+            {
+                let c node.axis_child_at(j)
+                out.add(c)
+                set total: total + GroveNode.member_span(c)
+                prefix.add(total)
+                set j: j + 1
+                if all = false
+                {
+                    if total >= need_flat
+                    {
+                        if (out.get_length() as int) >= need_members
+                            break
+                    }
+                }
+            }
+            set g.sub: j
+            set g.total: total
+            if j >= m
+                set g.cur: null
+        }
+    }
+
+    ; the next member of the axis, or null when every source node is spent
+    function axis_next(g: pointer[SelectGen]) returns pointer[GroveNode]
+    {
+        repeat
+        {
+            if g.cur = null
+            {
+                if ELObj.axis_begin(g) = false
+                    return null
+            }
+            let node ELObj.axis_emit(g)
+            if node <> null
+                return node
+            set g.cur: null
+        }
+        null
+    }
+
+    ; move to the next source node and initialize the per-node walk state
+    function axis_begin(g: pointer[SelectGen]) returns bool
+    {
+        let src g.src
+        let node src.node_list_node(g.cursor)
+        if node = null
+            return false
+        set g.cursor: g.cursor + 1
+        set g.cur: node
+        set g.sub: 0
+        set g.sub2: 0 - 1
+        set g.stop: 0
+        set g.walk: null
+        set g.depth: 0
+        if g.kind = GEN_CHILDREN
+            set g.stop: node.axis_child_count()
+        else if g.kind >= GEN_PRECED
+        {
+            ; the sibling group, with its own root rule (Grove.sibling_range_*):
+            ; the document element has none, and each prolog/epilog PI group is
+            ; siblings among itself. A node with no structural parent has no
+            ; group at all — the eager collect_expanded_siblings returned early
+            ; there, and an empty [0, 0) range says the same thing.
+            if node.get_parent() <> null
+            {
+                set g.sub: node.sibling_range_begin()
+                set g.stop: node.sibling_range_end()
+            }
+            set g.walk: ELObj.member_chunk(node)
+        }
+        true
+    }
+
+    function axis_emit(g: pointer[SelectGen]) returns pointer[GroveNode]
+    {
+        if g.kind = GEN_DESCENDANTS
+            return ELObj.emit_descendant(g)
+        if g.kind = GEN_PRECED
+            return ELObj.emit_preced(g)
+        ELObj.emit_follow(g)
+    }
+
+    ; DescendantsNodeListObj::advance (style/primitive.cxx:5400): descend into
+    ; the first child, else step to the next sibling, else climb until one
+    ; exists — the same pre-order walk the eager collect_descendants recursed,
+    ; and the children AXIS too, so `descendants` of the sgml-document node is
+    ; empty. The reference's `depth` counter is a stack here because its nodes
+    ; know their next sibling and ours do not: `path` carries the child index
+    ; at every level, so the climb is O(1) per step rather than a search.
+    function emit_descendant(g: pointer[SelectGen]) returns pointer[GroveNode]
+    {
+        var cur g.walk
+        if cur = null
+        {
+            let root g.cur
+            if root.axis_child_count() = 0
+                return null
+            ELObj.path_push(g, 0)
+            let c root.axis_child_at(0)
+            set g.walk: c
+            return c
+        }
+        ; a DATA chunk is a member but never a parent (collect_descendants
+        ; recursed on everything else, and everything else without a child axis
+        ; answers 0 anyway)
+        if cur.get_class() <> GN_DATA
+        {
+            if cur.axis_child_count() > 0
+            {
+                ELObj.path_push(g, 0)
+                let c cur.axis_child_at(0)
+                set g.walk: c
+                return c
+            }
+        }
+        repeat
+        {
+            if g.depth = 0
+                return null
+            let par cur.get_parent()
+            if par = null
+                return null
+            let path g.path
+            let idx (g.depth - 1) as size_t
+            let i *(path.get_buffer() + idx) + 1
+            if i < par.axis_child_count()
+            {
+                path.put(idx, i)
+                let c par.axis_child_at(i)
+                set g.walk: c
+                return c
+            }
+            set g.depth: g.depth - 1
+            set cur: par
+        }
+        null
+    }
+
+    ; push one level of the descendants walk. The stack never shrinks — a pop
+    ; only lowers `depth` — so a deep subtree pays its levels once.
+    procedure path_push(g: pointer[SelectGen], v: int)
+    {
+        let path g.path
+        FrameMark.store(path as pointer[void])
+        if (g.depth as size_t) < path.get_length()
+            path.put(g.depth as size_t, v)
+        else
+            path.add(v)
+        set g.depth: g.depth + 1
+    }
+
+    ; SiblingNodeListObj from firstSibling up to the node (DEFPRIMITIVE Preced).
+    ; The members are chunk-level; only the member HOLDING the node is
+    ; truncated, and only that one materializes character views — a prefix
+    ; index cannot express a partial trailing member.
+    ;
+    ; DOCUMENTED DEVIATION: with a CHAR NODE as the argument the reference
+    ; ABORTS (SiblingNodeListObj::nodeListChunkRest hits CANNOT_HAPPEN,
+    ; style/primitive.cxx:5695, because nextChunkSibling fails on a mid-chunk
+    ; node). Aborting a library call is not worth reproducing, so we answer the
+    ; consistent count: the characters before it in its chunk plus the expanded
+    ; siblings before that chunk. See COMPLETENESS.md.
+    function emit_preced(g: pointer[SelectGen]) returns pointer[GroveNode]
+    {
+        let node g.cur
+        let tc g.walk
+        if g.sub2 >= 0
+        {
+            ; inside the truncated member: its characters before the node
+            if g.sub2 >= ELObj.member_offset(node)
+                return null
+            let v GroveNode.char_view(tc, g.sub2)
+            set g.sub2: g.sub2 + 1
+            return v
+        }
+        if g.sub >= g.stop
+            return null
+        let s node.sibling_group_at(g.sub)
+        ; the member holding the node ends the walk — it contributes only the
+        ; characters before the node, and nothing after it does
+        if s = tc
+        {
+            set g.sub2: 0
+            return ELObj.emit_preced(g)
+        }
+        set g.sub: g.sub + 1
+        s
+    }
+
+    ; BaseNode::follow — the FOLLOWING siblings, the exact mirror of preced
+    ; (nextSibling, then a SiblingNodeList from there). `sub2` runs -1 (still
+    ; looking for the member holding the node) -> >= 0 (emitting that member's
+    ; character tail) -> -2 (everything after it).
+    function emit_follow(g: pointer[SelectGen]) returns pointer[GroveNode]
+    {
+        let node g.cur
+        let tc g.walk
+        if g.sub2 >= 0
+        {
+            if g.sub2 < tc.chunk_char_count()
+            {
+                let v GroveNode.char_view(tc, g.sub2)
+                set g.sub2: g.sub2 + 1
+                return v
+            }
+            set g.sub2: 0 - 2
+            set g.sub: g.sub + 1
+        }
+        repeat
+        {
+            if g.sub >= g.stop
+                return null
+            let s node.sibling_group_at(g.sub)
+            if g.sub2 = (0 - 2)
+            {
+                set g.sub: g.sub + 1
+                return s
+            }
+            if s = tc
+            {
+                if s.get_class() = GN_DATA
+                {
+                    set g.sub2: ELObj.member_offset(node) + 1
+                    return ELObj.emit_follow(g)
+                }
+                ; the member holding the node is never itself a member of
+                ; `follow`; everything after it is
+                set g.sub2: 0 - 2
+                set g.sub: g.sub + 1
+                return ELObj.emit_follow(g)
+            }
+            set g.sub: g.sub + 1
+        }
+        null
+    }
+
     ; a singleton node-list over one node
     function make_node_singleton(host: pointer[Page], node: pointer[GroveNode]) returns pointer[ELObj]
     {
@@ -2437,7 +2932,7 @@ define ELObj union
             when nl: NodeList
             {
                 if nl.gen <> null
-                    ELObj.force_select(nl.gen, 0 - 1)
+                    ELObj.force_gen(nl.gen, 0 - 1, 0 - 1)
                 if nl.nodes = null
                     return 0
                 let m nl.nodes.get_length() as int
@@ -2472,8 +2967,20 @@ define ELObj union
                 let idx nl.start + i
                 if idx < 0
                     return null
+                ; ★the coverage test is INLINE here and in node_list_member,
+                ; and it is not premature: a walk over a lazy view asks once
+                ; per member and the answer is normally "already there", so the
+                ; force path is three calls of pure overhead — measured at
+                ; +4.6 % on the complexity screen's select-elements row, which
+                ; walks a children view member by member.
                 if nl.gen <> null
-                    ELObj.force_select(nl.gen, idx + 1)
+                {
+                    var have nl.nodes.get_length() as int
+                    if nl.prefix <> null
+                        set have: *(nl.prefix.get_buffer() + have)
+                    if have <= idx
+                        ELObj.force_gen(nl.gen, idx + 1, 0)
+                }
                 if nl.nodes = null
                     return null
                 let m nl.nodes.get_length() as int
@@ -2523,7 +3030,7 @@ define ELObj union
             when nl: NodeList
             {
                 if nl.gen <> null
-                    ELObj.force_select(nl.gen, 0 - 1)
+                    ELObj.force_gen(nl.gen, 0 - 1, 0 - 1)
                 return nl.nodes
             }
             else
@@ -2566,7 +3073,7 @@ define ELObj union
                 ; match number start+1 exists — forcing just 1 would call a
                 ; half-walked list empty as soon as node-list-rest moved on.
                 if nl.gen <> null
-                    ELObj.force_select(nl.gen, nl.start + 1)
+                    ELObj.force_gen(nl.gen, nl.start + 1, 0)
                 if nl.nodes = null
                     return true
                 let m nl.nodes.get_length() as int
@@ -2602,7 +3109,7 @@ define ELObj union
             when nl: NodeList
             {
                 if nl.gen <> null
-                    ELObj.force_select(nl.gen, 0 - 1)
+                    ELObj.force_gen(nl.gen, 0 - 1, 0 - 1)
                 if nl.nodes = null
                     return 0
                 let m nl.nodes.get_length() as int
@@ -2629,7 +3136,11 @@ define ELObj union
             when nl: NodeList
             {
                 if nl.gen <> null
-                    ELObj.force_select(nl.gen, nl.start + k + 1)
+                {
+                    let need nl.start + k + 1
+                    if (nl.nodes.get_length() as int) < need
+                        ELObj.force_gen(nl.gen, 0, need)
+                }
                 if nl.nodes = null
                     return null
                 let m nl.nodes.get_length() as int
