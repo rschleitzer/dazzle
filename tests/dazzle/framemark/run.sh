@@ -109,6 +109,45 @@ patch('/packages/dazzle/0.1.0/dazzle/Insn.scaly', [
      "            when ss: StackSet\n            {\n"
      "                FrameMark.publish_stack()\n                let tem vm.stack_ref(vm.get_sp() + ss.index)")])
 
+# ★ The AUDIT's hooks: the stores into PRE-EXISTING objects that the five
+# audited primitives can reach. All five are pure producers in themselves; what
+# they reach is lazy memoisation, and `FrameMark.store` decides per store
+# whether it publishes (target in OUR region and below the innermost mark) or
+# not (target in the grove's region, or inside the frame's own range).
+patch('/packages/dazzle/0.1.0/dazzle/ELObj.scaly', [
+    # force_select — `out.add` grows an Array allocated WITH the view, and the
+    # growth lands at the eval region's tail, i.e. inside the running frame.
+    ("    function force_select(g: pointer[SelectGen], need: int)\n    {\n"
+     "        if g.cursor < 0\n            return",
+     "    function force_select(g: pointer[SelectGen], need: int)\n    {\n"
+     "        if g.cursor < 0\n            return\n"
+     "        FrameMark.store(g.out as pointer[void])"),
+    ("    procedure concat_fill(list: pointer[ELObj], out: pointer[Array[pointer[GroveNode]]])\n    {\n"
+     "        if list = null\n            return",
+     "    procedure concat_fill(list: pointer[ELObj], out: pointer[Array[pointer[GroveNode]]])\n    {\n"
+     "        if list = null\n            return\n"
+     "        FrameMark.store(out as pointer[void])"),
+    # the string rope's flatten-and-memoise-in-place. Its comment already says
+    # the memoised Str must outlive the caller's host — which is right for
+    # BRACKET granularity and not enough for a frame mark, because within one
+    # region Page.get(this) resolves to the region TAIL.
+    ("                let tmp host.allocate(n * (sizeof u32), alignof u32) as pointer[u32]",
+     "                FrameMark.store(this as pointer[void])\n"
+     "                let tmp host.allocate(n * (sizeof u32), alignof u32) as pointer[u32]")])
+
+patch('/packages/dazzle/0.1.0/dazzle/Grove.scaly', [
+    ("use scaly.memory.Page", "use scaly.memory.Page\nuse dazzle.FrameMark.FrameMark"),
+    # the two grove-side lazy view arrays. Both host on Page.get(node), i.e. the
+    # GROVE's region, so `store` will find them out of scope and stay quiet —
+    # they are hooked anyway, because that is a property of the grove living in
+    # another region, not of the call site.
+    ("        let gpage Page.get(chunk as pointer[void])",
+     "        FrameMark.store(chunk as pointer[void])\n"
+     "        let gpage Page.get(chunk as pointer[void])"),
+    ("        let gpage Page.get(asgn as pointer[void])",
+     "        FrameMark.store(asgn as pointer[void])\n"
+     "        let gpage Page.get(asgn as pointer[void])")])
+
 patch('/packages/dazzle/0.1.0/dazzle/Primitive.scaly', [
     ("use dazzle.GroveManager.GroveManager",
      "use dazzle.FrameMark.FrameMark\nuse dazzle.GroveManager.GroveManager"),
