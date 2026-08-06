@@ -43,15 +43,66 @@
 #define PP_MAX 256            /* ids run 0..231 today (226 defined) */
 #define PP_SLOTS (PP_MAX + 1) /* slot i+1 is id i; slot 0 is "outside" */
 #define PP_NAMELEN 56
+#define PP_DEPTH 8192         /* primitive nesting (apply, sort, node-list-map) */
 
 static volatile sig_atomic_t pp_cur;      /* id + 1, 0 = outside a primitive */
 static long pp_hist[PP_SLOTS];            /* samples, written by the handler */
 static long pp_count[PP_SLOTS];           /* calls,   written by the engine   */
+static long pp_bytes[PP_SLOTS];           /* SELF bytes bump-allocated        */
+static long pp_crossed[PP_SLOTS];         /* dispatches that changed page     */
 static char pp_name[PP_SLOTS][PP_NAMELEN];
 static long pp_samples;
 static long pp_overflow;                  /* ids outside the table, if any */
 static long pp_period_usec = 1000;        /* the sample period, for ns/call */
 static int  pp_on;
+
+/* --- the exact column: bump delta of the eval region per dispatch ---------
+ *
+ * Same mechanism as Escape.tick/tock, which is in real-world use and whose
+ * region reading is the documented one: a Page's first two words are
+ * `next_object` and `current_page` (FrameMark.scaly names the four
+ * load-bearing offsets). Reading by offset rather than through Page's fields
+ * is deliberate — Page is a runtime-opaque struct and a probe has no business
+ * making anyone lay it out.
+ *
+ * ★Two limits, both reported rather than guessed at:
+ *   * a dispatch whose CURRENT PAGE changed is counted in `crossed` and
+ *     contributes 0 bytes. Guessing across a page boundary would need the
+ *     page list walked on the hot path.
+ *   * BACKFILL is invisible. `Page.allocate` serves from the page it was
+ *     called ON, so a multi-page arena has as many frontiers as it has pages
+ *     with room (CLAUDE.md: "region end is not allocation frontier"). An
+ *     allocation that lands in an earlier page's remainder does not move the
+ *     frontier we read, so these numbers are a LOWER bound.
+ */
+static long pp_bump_of(void *host)
+{
+    long *w = (long *)host;
+    long cp;
+    if (!host) return 0;
+    cp = w[1];
+    if (!cp) return w[0];
+    return ((long *)cp)[0];
+}
+
+static long pp_page_of(void *host)
+{
+    long *w = (long *)host;
+    long cp;
+    if (!host) return 0;
+    cp = w[1];
+    return cp ? cp : (long)host;
+}
+
+/* One frame per live dispatch. `kids` collects what nested dispatches spent,
+ * so what a primitive is charged is its SELF allocation — the same split the
+ * sampled column makes with save/restore. */
+static long pp_st_id[PP_DEPTH];
+static long pp_st_page[PP_DEPTH];
+static long pp_st_bump[PP_DEPTH];
+static long pp_st_kids[PP_DEPTH];
+static long pp_sp;
+static long pp_too_deep;
 
 static void pp_report(void);
 
@@ -71,18 +122,48 @@ static void pp_tick(int sig)
  * the number SELF time: `sort` running a comparator, or `apply` re-entering
  * the VM, spends that time in bucket 0 or in the inner primitive, not in
  * itself. */
-long pp_enter(long id)
+long pp_enter(long id, void *host)
 {
     long prev = (long)pp_cur;
-    if (id < 0 || id >= PP_MAX) { pp_overflow++; return prev; }
-    pp_count[id + 1]++;
-    pp_cur = (sig_atomic_t)(id + 1);
+    if (id < 0 || id >= PP_MAX) { pp_overflow++; id = -1; }
+    else {
+        pp_count[id + 1]++;
+        pp_cur = (sig_atomic_t)(id + 1);
+    }
+    /* pushed unconditionally when armed, even for an id we cannot attribute,
+     * so that enter and exit stay paired — an unpaired push desyncs every
+     * later frame's parent, which would be silent. */
+    if (pp_on) {
+        if (pp_sp >= 0 && pp_sp < PP_DEPTH) {
+            pp_st_id[pp_sp]   = id;
+            pp_st_page[pp_sp] = pp_page_of(host);
+            pp_st_bump[pp_sp] = pp_bump_of(host);
+            pp_st_kids[pp_sp] = 0;
+        } else if (pp_sp == PP_DEPTH) pp_too_deep++;
+        pp_sp++;
+    }
     return prev;
 }
 
-void pp_exit(long prev)
+void pp_exit(long prev, void *host)
 {
+    long id, total, self;
     pp_cur = (sig_atomic_t)prev;
+    if (!pp_on || pp_sp <= 0) return;
+    pp_sp--;
+    if (pp_sp >= PP_DEPTH) return;          /* deeper than the stack: not recorded */
+    id = pp_st_id[pp_sp];
+    if (pp_page_of(host) != pp_st_page[pp_sp]) {
+        if (id >= 0) pp_crossed[id + 1]++;
+        total = 0;
+    } else {
+        total = pp_bump_of(host) - pp_st_bump[pp_sp];
+        if (total < 0) total = 0;           /* the region was rewound under us */
+    }
+    self = total - pp_st_kids[pp_sp];
+    if (self < 0) self = 0;
+    if (id >= 0) pp_bytes[id + 1] += self;
+    if (pp_sp > 0) pp_st_kids[pp_sp - 1] += total;
 }
 
 /* Called from Interpreter.install_primitive / install_x_primitive, so the
@@ -131,7 +212,7 @@ void pp_start(void)
 static void pp_report(void)
 {
     long order[PP_SLOTS];
-    long i, j, n = 0, calls = 0, prim_samples = 0;
+    long i, j, n = 0, calls = 0, prim_samples = 0, tot_bytes = 0, tot_crossed = 0;
     struct itimerval off;
 
     if (!pp_on) return;
@@ -140,45 +221,60 @@ static void pp_report(void)
 
     for (i = 0; i < PP_SLOTS; i++) {
         if (pp_hist[i] || pp_count[i]) order[n++] = i;
-        if (i > 0) { calls += pp_count[i]; prim_samples += pp_hist[i]; }
+        if (i > 0) {
+            calls += pp_count[i]; prim_samples += pp_hist[i];
+            tot_bytes += pp_bytes[i]; tot_crossed += pp_crossed[i];
+        }
     }
-    /* selection sort, descending by samples then by calls — n is ~230 */
+    /* selection sort, descending by BYTES (the exact column) then by calls —
+     * n is ~230, so the quadratic is 26k compares once at exit. */
     for (i = 0; i < n; i++) {
         long best = i;
         for (j = i + 1; j < n; j++) {
             long a = order[j], b = order[best];
-            if (pp_hist[a] > pp_hist[b] ||
-                (pp_hist[a] == pp_hist[b] && pp_count[a] > pp_count[b])) best = j;
+            if (pp_bytes[a] > pp_bytes[b] ||
+                (pp_bytes[a] == pp_bytes[b] && pp_count[a] > pp_count[b])) best = j;
         }
         { long t = order[i]; order[i] = order[best]; order[best] = t; }
     }
 
     fprintf(stderr,
-        "primprof: %ld samples (ITIMER_PROF), %ld primitive calls, "
-        "%ld samples in primitives (%.1f %% of cpu)\n",
-        pp_samples, calls, prim_samples,
+        "primprof: %ld primitive calls, %ld bytes self-allocated, "
+        "%ld page-crossing dispatches (%.2f %%)\n",
+        calls, tot_bytes, tot_crossed, calls ? 100.0 * tot_crossed / calls : 0.0);
+    fprintf(stderr,
+        "primprof: %ld samples (ITIMER_PROF), %ld in primitives (%.1f %%) "
+        "— ★BIASED toward allocating code, see README\n",
+        pp_samples, prim_samples,
         pp_samples ? 100.0 * prim_samples / pp_samples : 0.0);
+    if (pp_sp != 0)
+        fprintf(stderr, "primprof: ★STACK UNBALANCED at exit (%ld) — the byte "
+                        "column is WRONG, an enter/exit pair was broken\n", pp_sp);
+    if (pp_too_deep)
+        fprintf(stderr, "primprof: %ld dispatches deeper than %d "
+                        "(bytes NOT attributed — widen PP_DEPTH)\n",
+                        pp_too_deep, PP_DEPTH);
     if (pp_overflow)
         fprintf(stderr, "primprof: %ld calls with an id outside 0..%d "
                         "(NOT profiled — widen PP_MAX)\n", pp_overflow, PP_MAX - 1);
-    fprintf(stderr, "primprof: %8s %10s %14s %10s  %s\n",
-            "cpu%", "samples", "calls", "ns/call", "primitive");
+    fprintf(stderr, "primprof: %7s %14s %9s %14s %8s %9s %9s  %s\n",
+            "bytes%", "bytes", "B/call", "calls", "cpu%~", "samples", "crossed",
+            "primitive");
     for (i = 0; i < n; i++) {
         long s = order[i];
-        double pct = pp_samples ? 100.0 * pp_hist[s] / pp_samples : 0.0;
+        double bpct = tot_bytes ? 100.0 * pp_bytes[s] / tot_bytes : 0.0;
+        double pct  = pp_samples ? 100.0 * pp_hist[s] / pp_samples : 0.0;
+        double bpc  = pp_count[s] ? (double)pp_bytes[s] / pp_count[s] : 0.0;
         char id[16];
         const char *nm;
-        /* one sample == the timer period; report it as ns spent per call */
-        double nspc = pp_count[s]
-            ? (double)pp_hist[s] * (double)pp_period_usec * 1000.0 / pp_count[s]
-            : 0.0;
         snprintf(id, sizeof id, "#%ld", s - 1);
         nm = pp_name[s][0] ? pp_name[s] : id;
         /* every row that was entered or sampled is printed — a primitive with
-         * many calls and no samples is a finding too (it is cheap), and a
-         * truncated table reads as "that was all of them" */
-        fprintf(stderr, "primprof: %7.2f%% %10ld %14ld %10.0f  %s\n",
-                pct, pp_hist[s], pp_count[s], nspc, nm);
+         * many calls and no bytes is a finding too (it allocates nothing), and
+         * a truncated table reads as "that was all of them" */
+        fprintf(stderr, "primprof: %6.2f%% %14ld %9.1f %14ld %7.2f%% %9ld %9ld  %s\n",
+                bpct, pp_bytes[s], bpc, pp_count[s], pct, pp_hist[s],
+                pp_crossed[s], nm);
     }
     fflush(stderr);
 }

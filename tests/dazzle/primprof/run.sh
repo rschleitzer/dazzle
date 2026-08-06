@@ -58,12 +58,13 @@ patch('/packages/dazzle/0.1.0/dazzle/ELObj.scaly', [
     ("use dazzle.Primitive.Primitive",
      "use dazzle.Primitive.Primitive\nuse dazzle.PrimProf.PrimProf"),
     ("                return Primitive.dispatch(p.prim_id, nm, n_args, args, ctx, interp, loc)",
-     "                ; DZ_PRIM_PROF: publish which primitive is running, so the\n"
-     "                ; ITIMER_PROF sampler can attribute cpu to it. The previous\n"
-     "                ; occupant is restored, which makes the figure SELF time.\n"
-     "                let pp_prev PrimProf.enter(p.prim_id)\n"
+     "                ; DZ_PRIM_PROF: publish which primitive is running and take\n"
+     "                ; the eval region's bump position, so the sampler can\n"
+     "                ; attribute cpu and the BYTE column is exact. The previous\n"
+     "                ; occupant is restored, which makes both figures SELF.\n"
+     "                let pp_prev PrimProf.enter(p.prim_id, interp.get_host() as pointer[void])\n"
      "                let pp_res Primitive.dispatch(p.prim_id, nm, n_args, args, ctx, interp, loc)\n"
-     "                PrimProf.leave(pp_prev)\n"
+     "                PrimProf.leave(pp_prev, interp.get_host() as pointer[void])\n"
      "                return pp_res")])
 
 # 3. names for the report + arming the timer once, at engine setup.

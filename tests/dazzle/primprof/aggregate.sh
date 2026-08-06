@@ -4,11 +4,13 @@
 #
 #   aggregate.sh <n-runs> <usec> <cwd> -- <command...>
 #
-# One run of the styling workload yields ~500 samples at the 1 ms default,
-# which ranks the top three and nothing below them. Summing N runs at a finer
-# period is the cheap way to a ranking that holds still: the estimator is
-# unbiased per run, so the sum is the same profile with N times the samples.
-# The ns/call column is recomputed from the summed samples and calls.
+# The BYTE column is exact and needs no aggregation for significance — one run
+# already gives it in full. Summing runs is for the SAMPLED column, which at
+# the 1 ms default yields ~500 samples per styling run and ranks three rows.
+# Both are summed here so the two can be read side by side; the ranking is by
+# bytes, because that is the column that holds still (see README, "Die
+# Eichung": the sampler over-weights allocating code by ~an order of
+# magnitude).
 set -u
 N="$1"; USEC="$2"; DIR="$3"; shift 3; [ "${1:-}" = "--" ] && shift
 
@@ -20,19 +22,29 @@ for i in $(seq 1 "$N"); do
      >/dev/null 2>>"$TMP/all.log" || { echo "aggregate: FAIL (run $i)"; exit 1; }
 done
 
+grep -q "STACK UNBALANCED" "$TMP/all.log" && \
+  echo "aggregate: ★the byte column is INVALID — see the unbalanced-stack line"
+
 awk -v n="$N" -v usec="$USEC" '
-  /^primprof: *[0-9]+ samples/ { tot += $2; calls += $4; next }
+  /^primprof: [0-9]+ primitive calls/ { calls += $2; bytes += $5; crossed += $8; next }
+  /^primprof: [0-9]+ samples/         { tot += $2; next }
   /^primprof: +[0-9.]+%/ {
-      key = ""; for (i = 6; i <= NF; i++) key = key (i > 6 ? " " : "") $i
-      S[key] += $3; C[key] += $4; seen[key] = 1
+      # bytes% bytes B/call calls cpu%~ samples crossed name...
+      key = ""; for (i = 9; i <= NF; i++) key = key (i > 9 ? " " : "") $i
+      B[key] += $3; C[key] += $5; S[key] += $7; X[key] += $8; seen[key] = 1
   }
   END {
-      printf "primprof-agg: %d runs at %d us -> %d samples, %d primitive calls\n", n, usec, tot, calls
-      printf "primprof-agg: %8s %11s %14s %9s  %s\n", "cpu%", "samples", "calls", "ns/call", "primitive"
+      printf "primprof-agg: %d runs, %d primitive calls, %.1f MB self-allocated, %d page-crossing (%.2f %%)\n",
+             n, calls, bytes/1048576.0, crossed, calls ? 100.0*crossed/calls : 0
+      printf "primprof-agg: %d samples at %d us — the cpu%% column is BIASED, rank by bytes\n", tot, usec
+      printf "primprof-agg: %7s %12s %9s %14s %8s %9s  %s\n",
+             "bytes%", "MB", "B/call", "calls", "cpu%~", "crossed", "primitive"
       for (k in seen) {
-          pct  = tot  ? 100.0 * S[k] / tot : 0
-          nspc = C[k] ? S[k] * usec * 1000.0 / C[k] : 0
-          printf "%012.5f\tprimprof-agg: %7.3f%% %11d %14d %9.1f  %s\n", pct, pct, S[k], C[k], nspc, k
+          bp   = bytes ? 100.0 * B[k] / bytes : 0
+          pct  = tot   ? 100.0 * S[k] / tot   : 0
+          bpc  = C[k]  ? B[k] / C[k] : 0
+          printf "%012.5f\tprimprof-agg: %6.2f%% %12.1f %9.1f %14d %7.2f%% %9d  %s\n",
+                 bp, bp, B[k]/1048576.0, bpc, C[k], pct, X[k], k
       }
   }
 ' "$TMP/all.log" > "$TMP/out"
