@@ -82,6 +82,14 @@
 # stores a sub-position the plain form clears. ★Every value here is
 # order-independent by construction, so a cache that answers from a stale
 # position shows up as a wrong NUMBER, not as a crash.
+# num7 (numdoc.sgml): the same treatment for the SECOND cache — child-number's
+# per-LEVEL, per-GI entry (NumberCache::childNumber) and the grove's one-entry
+# sibling hint (GroveNode.group_index), which last-sibling? and
+# absolute-last-sibling? start their forward walk from. ★The level dimension
+# is the one num5 has no counterpart for: `p` appears both as a chapter child
+# and as a section child, so a single shared entry would resume the count in
+# the wrong group, and the fixture asks the two levels alternately. The
+# sibling half asks across groups and backwards for the same reason.
 # proc1 (procdoc.sgml) + proc2 (procdoc.sgml, `-t fot`): the PROCESS /
 # SOSOFO / STYLE cluster — process-first-descendant, process-matching-
 # children, sosofo-label, sosofo-discard-labeled, merge-style, style?,
@@ -196,6 +204,7 @@ run_case vec1 doc6.sgml vec1.experr -2
 run_case ent1 entdoc.sgml
 run_case num4 numdoc.sgml
 run_case num5 numdoc.sgml
+run_case num7 numdoc.sgml
 run_case num6 doc.sgml
 run_case proc1 procdoc.sgml proc1.experr
 
