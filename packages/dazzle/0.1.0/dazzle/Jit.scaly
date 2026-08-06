@@ -215,6 +215,25 @@ shared JIT_PIPELINE: pointer[const_char] null
 ; at all, which is what the HotSpot threshold is for.
 shared JIT_CODEGEN_LEVEL: i32 2
 
+; ★ Let a statically known callee PULL its body into the calling region
+; (rejoin_callee), so the call becomes a native branch instead of a trampoline
+; turn. Measured 2026-08-06 on the 1804-file real-world codegen: 30 % fewer
+; trampoline turns (187 M -> 130 M) for 2.2x the IR (1353 -> 3011 insns lowered)
+; and 1.75x the LLVM time (230 -> 403 ms) — NET −0.7 % on top of the native arms'
+; −0.5 %, i.e. **−1.2 % together**, medians of 7 interleaved runs whose spreads
+; barely overlap. On the 0.53 s styling run it is neutral in both directions
+; (few enough bodies that neither the turns nor the IR matter).
+;
+; ★★That is the whole size of it, and the profile says why: `sample` over the
+; long run puts the ENTIRE trampoline (`Jit.region_for` + `Jit.step`) at 3.5 %
+; and the arm helpers at 4.3 %, against 32 % memory management. Amdahl on 30 %
+; of 3.5 % is 1 %. Restricting the rejoin to bodies ALREADY in the region was
+; tried and removes the win completely — the static callees here are other
+; top-level bodies, not self-recursion (a named let's callee is a runtime
+; closure value, so its insn carries no compile-time object at all).
+; DAZZLE_JIT_INLINE_CALLEE=0 turns it off, which is how those numbers were taken.
+shared JIT_INLINE_CALLEE: bool true
+
 ; ===========================================================================
 ; Runtime helpers called from generated code.
 ;
@@ -231,6 +250,8 @@ function jit_execute(insn: pointer[void], vm: pointer[void]) returns pointer[voi
 {
     let i insn as pointer[Insn]
     let v vm as pointer[VM]
+    if JIT_STATS
+        Jit.count_generic(i)
     i.execute(v) as pointer[void]
 }
 
@@ -407,6 +428,95 @@ function jit_check_init_fail(insn: pointer[void], vm: pointer[void]) returns poi
     null
 }
 
+; ===========================================================================
+; The four arms the DYNAMIC distribution named (rung 3, 2026-08-06). The static
+; count said 319 of 1353 lowered insns still took an interpreter step; the
+; per-arm histogram (`--jit-stats`) said something else entirely — on the
+; 1804-file real-world codegen those steps happen 212 M times and FOUR arms are
+; 94 % of them:
+;
+;     ResolveQuantities 37 %   FunctionTailCall 33 %   Apply 16 %   TailApply 8 %
+;
+; None of them was lowered, so each cost the full generic path: generated code →
+; jit_execute → Insn.execute → the 46-way jump table → the arm. These helpers
+; are the same transcription the five hot arms got — the arm's body verbatim,
+; reached with ONE call and no jump table.
+;
+; ★ Why THESE four and not the ones the static count ranks: a body compiled once
+; contributes one static insn no matter how often it runs. The static ranking
+; measures the code generator's coverage; only the dynamic one measures time.
+; ===========================================================================
+
+; ResolveQuantitiesInsn::execute, whole. Cannot transfer control anywhere: it
+; answers `next` or fails, which is why its successor is NOT noted as an entry
+; point (see emit_native) — one case fewer, one block more dominated.
+function jit_resolve_quantities(insn: pointer[void], vm: pointer[void]) returns pointer[void]
+{
+    let i insn as pointer[Insn]
+    let v vm as pointer[VM]
+    choose *i
+        when rq: ResolveQuantities
+        {
+            let sp v.get_sp()
+            let top v.stack_ref(sp - 1)
+            let itp v.get_interp()
+            let tem top.resolve_quantities(true, itp, rq.loc)
+            if itp.is_error(tem)
+            {
+                v.set_sp(0 - 1)
+                return null
+            }
+            v.stack_set(sp - 1, tem)
+            return rq.next as pointer[void]
+        }
+        else
+            return null
+    null
+}
+
+; FunctionTailCallInsn::execute minus `setNActualArgs`, which is one native
+; store — the same split FunctionCall gets. A tail call always leaves the
+; region, so there is nothing to rejoin: the trampoline re-enters at the callee,
+; and that is exactly what keeps the native stack bounded.
+function jit_function_tail_call(insn: pointer[void], vm: pointer[void]) returns pointer[void]
+{
+    let i insn as pointer[Insn]
+    let v vm as pointer[VM]
+    choose *i
+        when ft: FunctionTailCall
+            return ft.func.tail_call(v, ft.loc, ft.n_caller_args) as pointer[void]
+        else
+            return null
+    null
+}
+
+; ApplyInsn::execute. `apply` hands control to the applied function, so its
+; `next` IS a genuine re-entry point and stays a multiplexer case.
+function jit_apply(insn: pointer[void], vm: pointer[void]) returns pointer[void]
+{
+    let i insn as pointer[Insn]
+    let v vm as pointer[VM]
+    choose *i
+        when ap: Apply
+            return Insn.exec_apply(v, ap.n_args, ap.loc, ap.next) as pointer[void]
+        else
+            return null
+    null
+}
+
+; TailApplyInsn::execute — no successor of its own, like every tail transfer.
+function jit_tail_apply(insn: pointer[void], vm: pointer[void]) returns pointer[void]
+{
+    let i insn as pointer[Insn]
+    let v vm as pointer[VM]
+    choose *i
+        when ta: TailApply
+            return Insn.exec_tail_apply(v, ta.n_caller_args, ta.n_args, ta.loc) as pointer[void]
+        else
+            return null
+    null
+}
+
 ; Selftest helper — the one call the ORC round trip is proved with. Kept
 ; permanently: it is the difference between "the JIT is wired up" and "the JIT
 ; silently produced a module nobody executed".
@@ -565,6 +675,20 @@ define Jit
         off_frame_start: i64
         off_closure: i64
         off_naa: i64
+        ; ★ per-ARM histograms (`--jit-stats` only), N_ARMS slots each. The
+        ; static count of lowered insns is not the ranking — what an
+        ; optimisation is worth is decided by the DYNAMIC distribution, and
+        ; these three populations are the three different questions:
+        ;   arm_entry  — the arm the trampoline RE-ENTERS a compiled region at.
+        ;                That is what a native call to a known callee removes.
+        ;   arm_generic— the arm a compiled region takes an interpreter step
+        ;                for (`jit_execute`). That is the "more arms native"
+        ;                ranking.
+        ;   arm_interp — the arm an insn OUTSIDE any compiled region takes.
+        ;                Nothing in the code generator touches those.
+        arm_entry: pointer[u64]
+        arm_generic: pointer[u64]
+        arm_interp: pointer[u64]
         n_modules: int
         ok: bool
     )
@@ -585,6 +709,9 @@ define Jit
             set this.off_frame_start: 0
             set this.off_closure: 0
             set this.off_naa: 0
+            set this.arm_entry: null
+            set this.arm_generic: null
+            set this.arm_interp: null
             set this.n_modules: 0
             set this.ok: false
         }
@@ -599,6 +726,139 @@ define Jit
     ;   other even  the native code address
     ; Code addresses are at least 4-byte aligned on every target we build for,
     ; so "odd" can never collide with one; an odd address would be refused.
+    ; ======================================================================
+    ; Per-arm histograms — the DYNAMIC distribution (`--jit-stats` only).
+    ; ======================================================================
+
+    ; One more than the largest index arm_index answers.
+    function n_arms() returns int
+        48
+
+    function make_hist(host: pointer[Page]) returns pointer[u64]
+    {
+        let p host.allocate((Jit.n_arms() as size_t) * sizeof u64, alignof u64) as pointer[u64]
+        var i 0
+        while i < Jit.n_arms()
+        {
+            set *(p + i): 0
+            set i: i + 1
+        }
+        p
+    }
+
+    procedure bump(h: pointer[u64], i: pointer[Insn])
+    {
+        if h = null
+            return
+        let k Jit.arm_index(i)
+        set *(h + k): *(h + k) + 1
+    }
+
+    ; The insn's arm as an index, in the declaration order of `define Insn
+    ; union`. A 48-way dispatch to count one event — which is why every caller
+    ; is behind `JIT_STATS`.
+    function arm_index(i: pointer[Insn]) returns int
+    {
+        choose *i
+            when a: Error
+                return 0
+            when a: CondFail
+                return 1
+            when a: CaseFail
+                return 2
+            when a: Constant
+                return 3
+            when a: ResolveQuantities
+                return 4
+            when a: Test
+                return 5
+            when a: Or
+                return 6
+            when a: And
+                return 7
+            when a: Case
+                return 8
+            when a: Pop
+                return 9
+            when a: Cons
+                return 10
+            when a: Append
+                return 11
+            when a: Apply
+                return 12
+            when a: TailApply
+                return 13
+            when a: FrameRef
+                return 14
+            when a: StackRef
+                return 15
+            when a: ClosureRef
+                return 16
+            when a: TopRef
+                return 17
+            when a: PopBindings
+                return 18
+            when a: Return
+                return 19
+            when a: PrimitiveCall
+                return 20
+            when a: ClosureMk
+                return 21
+            when a: FunctionCall
+                return 22
+            when a: FunctionTailCall
+                return 23
+            when a: Varargs
+                return 24
+            when a: SetKeyArg
+                return 25
+            when a: TestNull
+                return 26
+            when a: Box
+                return 27
+            when a: BoxArg
+                return 28
+            when a: BoxStack
+                return 29
+            when a: Unbox
+                return 30
+            when a: SetBox
+                return 31
+            when a: SetImmediate
+                return 32
+            when a: CheckInit
+                return 33
+            when a: StackSetBox
+                return 34
+            when a: StackSet
+                return 35
+            when a: ClosureSetBox
+                return 36
+            when a: Vector
+                return 37
+            when a: ListToVector
+                return 38
+            when a: MakeFlowObj
+                return 39
+            when a: LabelSosofo
+                return 40
+            when a: SetNic
+                return 41
+            when a: MakeStyle
+                return 42
+            when a: PushMode
+                return 43
+            when a: PopMode
+                return 44
+            when a: CheckSosofo
+                return 45
+            when a: UnpackMacroFlowObj
+                return 46
+            else
+                return 47
+        47
+    }
+
     function cache_rejected() returns u64
         2
 
@@ -646,6 +906,9 @@ define Jit
         set s.regions: Jit.map_make(host, 1024)
         set s.queue: Array[pointer[Insn]]^host()
         set s.marks: Array[pointer[Insn]]^host()
+        set s.arm_entry: Jit.make_hist(host)
+        set s.arm_generic: Jit.make_hist(host)
+        set s.arm_interp: Jit.make_hist(host)
         if Jit.measure_layout(s) = false
         {
             scaly_eputs "dazzle JIT: VM layout probe failed, staying on the interpreter\n"
@@ -890,6 +1153,10 @@ define Jit
         p_function_call: pointer[void]
         p_top_ref: pointer[void]
         p_check_init_fail: pointer[void]
+        p_resolve_q: pointer[void]
+        p_function_tail_call: pointer[void]
+        p_apply: pointer[void]
+        p_tail_apply: pointer[void]
         blocks: pointer[PtrMap]
         pending: pointer[Array[pointer[Insn]]]
         ; the insns of THIS function the trampoline can arrive at — see note_entry
@@ -942,6 +1209,10 @@ define Jit
             set this.p_function_call: null
             set this.p_top_ref: null
             set this.p_check_init_fail: null
+            set this.p_resolve_q: null
+            set this.p_function_tail_call: null
+            set this.p_apply: null
+            set this.p_tail_apply: null
             set this.blocks: null
             set this.pending: null
             set this.entry_set: null
@@ -1442,6 +1713,62 @@ define Jit
     }
 
     ; ======================================================================
+    ; ★ The STATICALLY KNOWN CALLEE (rung 4, 2026-08-06).
+    ;
+    ; `FunctionCallInsn` and `FunctionTailCallInsn` name their callee ELObj at
+    ; COMPILE time — `Expression.compile` resolved it. When that object is a
+    ; Closure, `ELObj.call` / `ELObj.tail_call` answer its `code` after setting
+    ; up the frame, so the insn the region will continue at is known before the
+    ; call is even emitted.
+    ;
+    ; That makes the callee a successor like any other, and it needs NO new
+    ; protocol: the compare `emit_rejoin` already emits IS the protocol. A
+    ; static guess is only a HINT — if the answer is anything else (the object
+    ; was rebuilt, a continuation intervened, the callee errored) the compare
+    ; misses and the region returns to the trampoline exactly as before. That is
+    ; also why nothing here has to reason about whether an ELObj can be mutated
+    ; in place: correctness never depends on the guess being right.
+    ;
+    ; For a TAIL call this turns a trampoline turn into a native BRANCH, and a
+    ; SELF tail call — the named-let-over-node-list idiom of these stylesheets —
+    ; into a plain loop inside one function. The native stack cannot grow: a
+    ; branch is not a call, so the bounded-stack property the whole design rests
+    ; on is untouched.
+    ; ======================================================================
+    function static_callee_code(func: pointer[ELObj]) returns pointer[Insn]
+    {
+        if func = null
+            return null
+        choose *func
+            when c: Closure
+                return c.code
+            else
+                return null
+        null
+    }
+
+    ; The callee to rejoin at, or null. ★ Only a body ALREADY in this region:
+    ; `block_for` would otherwise pull the callee's whole body in behind the
+    ; rejoin, and measured that costs more LLVM than the saved trampoline turns
+    ; are worth (the region grew 2.2x and compile time went 230 ms -> 403 ms for
+    ; the same work). What survives the restriction is the case that matters and
+    ; costs nothing: a SELF tail call, whose target is this body's own root — the
+    ; named-let-over-node-list loop, which becomes a plain branch.
+    ; JIT_INLINE_CALLEE lifts the restriction, which is how the 2.2x was
+    ; measured; it is off because that measurement said so.
+    function rejoin_callee(cg: pointer[Cg], func: pointer[ELObj]) returns pointer[Insn]
+    {
+        let cc Jit.static_callee_code(func)
+        if cc = null
+            return null
+        if JIT_INLINE_CALLEE
+            return cc
+        if Jit.map_get(cg.blocks, cc as u64, 0) = 0
+            return null
+        cc
+    }
+
+    ; ======================================================================
     ; The generic lowering: let the interpreter perform the step, then rejoin
     ; native code at whichever static successor it answered.
     ; ======================================================================
@@ -1780,6 +2107,18 @@ define Jit
                 Jit.note_entry(cg, a.next)
                 Jit.st_i64(cg, cg.s.off_naa, Jit.c64(cg, a.n_args as i64))
                 let r Jit.call2(cg, cg.ty_p_pp, cg.p_function_call, Jit.cptr(cg, i as u64), cg.vm)
+                ; rung 4: for a statically known Closure callee the helper's
+                ; answer IS its body, so try that compare FIRST — `a.next` is
+                ; only what a PRIMITIVE or a continuation answers here. This
+                ; removes the outbound trampoline turn of a call; the inbound
+                ; one stays, because a Return's target is the frame's, i.e.
+                ; dynamic.
+                let cc Jit.rejoin_callee(cg, a.func)
+                if cc <> null
+                {
+                    Jit.note_entry(cg, cc)
+                    Jit.emit_rejoin(cg, r, cc)
+                }
                 Jit.emit_rejoin(cg, r, a.next)
                 Jit.ret_ptr(cg, r)
                 return true
@@ -1803,6 +2142,51 @@ define Jit
                 Jit.st_slot(cg, sb, sp, v)
                 Jit.st_sp(cg, Jit.add64(cg, sp, 1))
                 Jit.goto_insn(cg, a.next)
+                return true
+            }
+            ; ==================================================================
+            ; The four arms the DYNAMIC step histogram named (rung 3). Each is
+            ; the generic shape with `jit_execute` replaced by the arm's own
+            ; helper — one call instead of two plus the 46-way jump table. See
+            ; the helper block at the top of this file for the measurement.
+            ; ==================================================================
+            when a: ResolveQuantities
+            {
+                ; ★ NO note_entry: this arm answers `next` or fails, so the
+                ; trampoline can never arrive at `next` through it. One case
+                ; fewer is one block more dominated (see note_entry).
+                let r Jit.call2(cg, cg.ty_p_pp, cg.p_resolve_q, Jit.cptr(cg, i as u64), cg.vm)
+                Jit.emit_rejoin(cg, r, a.next)
+                Jit.ret_ptr(cg, r)
+                return true
+            }
+            when a: FunctionTailCall
+            {
+                Jit.st_i64(cg, cg.s.off_naa, Jit.c64(cg, a.n_args as i64))
+                let r Jit.call2(cg, cg.ty_p_pp, cg.p_function_tail_call, Jit.cptr(cg, i as u64), cg.vm)
+                ; rung 4: a statically known Closure callee is a native branch,
+                ; and a SELF tail call is then a loop in one function.
+                let cc Jit.rejoin_callee(cg, a.func)
+                if cc <> null
+                {
+                    Jit.note_entry(cg, cc)
+                    Jit.emit_rejoin(cg, r, cc)
+                }
+                Jit.ret_ptr(cg, r)
+                return true
+            }
+            when a: Apply
+            {
+                Jit.note_entry(cg, a.next)
+                let r Jit.call2(cg, cg.ty_p_pp, cg.p_apply, Jit.cptr(cg, i as u64), cg.vm)
+                Jit.emit_rejoin(cg, r, a.next)
+                Jit.ret_ptr(cg, r)
+                return true
+            }
+            when a: TailApply
+            {
+                let r Jit.call2(cg, cg.ty_p_pp, cg.p_tail_apply, Jit.cptr(cg, i as u64), cg.vm)
+                Jit.ret_ptr(cg, r)
                 return true
             }
             when a: CheckInit
@@ -2033,6 +2417,10 @@ define Jit
         set cg.p_function_call: Jit.const_addr(cg, &jit_function_call)
         set cg.p_top_ref: Jit.const_addr(cg, &jit_top_ref_value)
         set cg.p_check_init_fail: Jit.const_addr(cg, &jit_check_init_fail)
+        set cg.p_resolve_q: Jit.const_addr(cg, &jit_resolve_quantities)
+        set cg.p_function_tail_call: Jit.const_addr(cg, &jit_function_tail_call)
+        set cg.p_apply: Jit.const_addr(cg, &jit_apply)
+        set cg.p_tail_apply: Jit.const_addr(cg, &jit_tail_apply)
         set cg.roots: Array[pointer[Insn]]^h()
         set cg.root_set: Jit.map_make(h, 1024)
         set cg.all_insns: Array[pointer[Insn]]^h()
@@ -2296,6 +2684,17 @@ define Jit
     ; The trampoline seam
     ; ======================================================================
 
+    ; Called from `jit_execute`, i.e. from inside a compiled region: the arm the
+    ; code generator did not lower natively.
+    procedure count_generic(i: pointer[Insn])
+    {
+        let sess JIT_SESSION
+        if sess = null
+            return
+        let s sess as pointer[Session]
+        Jit.bump(s.arm_generic, i)
+    }
+
     ; The native region for `i`, or 0 when the caller should interpret this
     ; step — because the body is still cold, or because compiling it failed.
     ; ★ ONE probe for the whole hot path, read and updated in place. This runs on
@@ -2378,11 +2777,17 @@ define Jit
         if addr = 0
         {
             if JIT_STATS
+            {
                 set JIT_N_INTERP_STEPS: JIT_N_INTERP_STEPS + 1
+                Jit.bump(s.arm_interp, i)
+            }
             return i.execute(vm)
         }
         if JIT_STATS
+        {
             set JIT_N_ENTRIES: JIT_N_ENTRIES + 1
+            Jit.bump(s.arm_entry, i)
+        }
         let fp addr as pointer[void]
         ; the insn IS the entry selector — the multiplexer in the compiled body
         ; switches on it (rung 1)
@@ -2432,6 +2837,10 @@ define Jit
             return
         set JIT_CODEGEN_LEVEL: n as i32
     }
+
+    ; DAZZLE_JIT_INLINE_CALLEE=1 — measurement hook; see JIT_INLINE_CALLEE.
+    procedure set_inline_callee(on: bool)
+        set JIT_INLINE_CALLEE: on
 
     ; DAZZLE_JIT_BATCH overrides the batch size; 1 compiles each hot body on its
     ; own, which is the shape to compare any batching against.
@@ -2497,6 +2906,186 @@ define Jit
         let line sb.to_string()
         let line_c line.to_c_string()
         scaly_eputs line_c
+        if JIT_SESSION <> null
+        {
+            let s JIT_SESSION as pointer[Session]
+            Jit.print_hist("  entries at   ", s.arm_entry)
+            Jit.print_hist("  generic step ", s.arm_generic)
+            Jit.print_hist("  interp step  ", s.arm_interp)
+        }
+    }
+
+    ; One histogram line per population: the arms in descending count, down to
+    ; 1 % of the total. Selection sort by repeated max scan — 48 slots, printed
+    ; once at exit.
+    procedure print_hist(title: pointer[const_char], h: pointer[u64])
+    {
+        if h = null
+            return
+        var total: u64 0
+        var i 0
+        while i < Jit.n_arms()
+        {
+            set total: total + *(h + i)
+            set i: i + 1
+        }
+        if total = 0
+            return
+        scaly_eputs title
+        var sb StringBuilder()
+        sb.append total
+        let head sb.to_string()
+        let head_c head.to_c_string()
+        scaly_eputs head_c
+        scaly_eputs ":"
+        var shown 0
+        let cutoff total / 100
+        var more true
+        while more
+        {
+            if shown >= 14
+                set more: false
+            if more
+            {
+                var best 0 - 1
+                var best_n: u64 0
+                set i: 0
+                while i < Jit.n_arms()
+                {
+                    let v *(h + i)
+                    if v > best_n
+                    {
+                        set best_n: v
+                        set best: i
+                    }
+                    set i: i + 1
+                }
+                if best < 0
+                    set more: false
+                if best_n <= cutoff
+                    set more: false
+                if more
+                {
+                    scaly_eputs " "
+                    Jit.eput_arm_name(best)
+                    let pct (best_n * 100) / total
+                    var nb StringBuilder()
+                    nb.append " "
+                    nb.append pct
+                    nb.append "%"
+                    let ns nb.to_string()
+                    let ns_c ns.to_c_string()
+                    scaly_eputs ns_c
+                    set *(h + best): 0
+                    set shown: shown + 1
+                }
+            }
+        }
+        scaly_eputs "\n"
+    }
+
+    ; The arm names, as literals passed STRAIGHT into the call — a
+    ; `pointer[const_char]` bound to a variable first arrives as garbage
+    ; (CLAUDE.md, "Calls & operands"). Flat `if`s rather than an `else if`
+    ; chain: 48 nested arms would be ~700 KB of planner stack for nothing.
+    procedure eput_arm_name(k: int)
+    {
+        if k = 0
+            scaly_eputs "Error"
+        if k = 1
+            scaly_eputs "CondFail"
+        if k = 2
+            scaly_eputs "CaseFail"
+        if k = 3
+            scaly_eputs "Constant"
+        if k = 4
+            scaly_eputs "ResolveQuantities"
+        if k = 5
+            scaly_eputs "Test"
+        if k = 6
+            scaly_eputs "Or"
+        if k = 7
+            scaly_eputs "And"
+        if k = 8
+            scaly_eputs "Case"
+        if k = 9
+            scaly_eputs "Pop"
+        if k = 10
+            scaly_eputs "Cons"
+        if k = 11
+            scaly_eputs "Append"
+        if k = 12
+            scaly_eputs "Apply"
+        if k = 13
+            scaly_eputs "TailApply"
+        if k = 14
+            scaly_eputs "FrameRef"
+        if k = 15
+            scaly_eputs "StackRef"
+        if k = 16
+            scaly_eputs "ClosureRef"
+        if k = 17
+            scaly_eputs "TopRef"
+        if k = 18
+            scaly_eputs "PopBindings"
+        if k = 19
+            scaly_eputs "Return"
+        if k = 20
+            scaly_eputs "PrimitiveCall"
+        if k = 21
+            scaly_eputs "ClosureMk"
+        if k = 22
+            scaly_eputs "FunctionCall"
+        if k = 23
+            scaly_eputs "FunctionTailCall"
+        if k = 24
+            scaly_eputs "Varargs"
+        if k = 25
+            scaly_eputs "SetKeyArg"
+        if k = 26
+            scaly_eputs "TestNull"
+        if k = 27
+            scaly_eputs "Box"
+        if k = 28
+            scaly_eputs "BoxArg"
+        if k = 29
+            scaly_eputs "BoxStack"
+        if k = 30
+            scaly_eputs "Unbox"
+        if k = 31
+            scaly_eputs "SetBox"
+        if k = 32
+            scaly_eputs "SetImmediate"
+        if k = 33
+            scaly_eputs "CheckInit"
+        if k = 34
+            scaly_eputs "StackSetBox"
+        if k = 35
+            scaly_eputs "StackSet"
+        if k = 36
+            scaly_eputs "ClosureSetBox"
+        if k = 37
+            scaly_eputs "Vector"
+        if k = 38
+            scaly_eputs "ListToVector"
+        if k = 39
+            scaly_eputs "MakeFlowObj"
+        if k = 40
+            scaly_eputs "LabelSosofo"
+        if k = 41
+            scaly_eputs "SetNic"
+        if k = 42
+            scaly_eputs "MakeStyle"
+        if k = 43
+            scaly_eputs "PushMode"
+        if k = 44
+            scaly_eputs "PopMode"
+        if k = 45
+            scaly_eputs "CheckSosofo"
+        if k = 46
+            scaly_eputs "UnpackMacroFlowObj"
+        if k = 47
+            scaly_eputs "?"
     }
 
     ; ======================================================================

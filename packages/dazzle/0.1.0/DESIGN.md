@@ -434,11 +434,12 @@ Decisions:
 
 `dazzle/Jit.scaly` lowers the `Insn` graph to LLVM IR and executes it through the
 ORC JIT; `dazzle/Llvm.scaly` holds the package's own LLVM-C/ORC bindings. It
-landed opt-in and became the DEFAULT the next day, once the two measured rungs
+landed opt-in and became the DEFAULT the same day, once the two measured rungs
 were worked off (`--interp` opts out); the numbers are in "Die zwei Sprossen
-GELANDET" in `tests/dazzle/PERFORMANCE.md`. What belongs in a design note is the
-six decisions — the four the generator was built on, and the two that made it
-worth defaulting to:
+GELANDET" and "Die dritte und vierte Sprosse" in `tests/dazzle/PERFORMANCE.md`.
+What belongs in a design note is the decisions — the four the generator was
+built on, the two that made it worth defaulting to, and the three the two
+follow-up rungs settled:
 
 - **The IR is the `Insn` graph, not `Expression`.** The graph already carries
   everything a code generator needs — stack positions assigned, boxing decided,
@@ -490,6 +491,33 @@ And the two that made the JIT worth defaulting to (2026-08-06, both measured):
   the whole pass pipeline was worth 0 ms of run time. Cases are the real re-entry
   points only — the root, and the continuation of any arm that can hand control to
   another body (`note_entry`).
+- **A statically known callee is a successor like any other.** `FunctionCallInsn`
+  and `FunctionTailCallInsn` name their callee ELObj at COMPILE time, so when it
+  is a Closure the answer the call helper will give is known before the call is
+  emitted — and the compare `emit_rejoin` already emits is the whole mechanism.
+  A tail call becomes a native BRANCH, not a call, so the bounded-stack property
+  is untouched; and correctness never depends on the guess, because a miss goes
+  back to the trampoline unchanged. Measured: 30 % fewer trampoline turns for
+  2.2x the IR. ★The restriction that looks free — rejoin only to a body already
+  in the region, so nothing is pulled in — removes the win entirely: a named
+  let's callee is a runtime closure VALUE, so its call insn carries no
+  compile-time object at all, and the statically known callees here are other
+  top-level bodies.
+- **The arm ranking that matters is the DYNAMIC one.** `--jit-stats` prints a
+  per-arm histogram of three separate populations (region entries, generic steps
+  inside a region, interpreted steps outside one). The static coverage count had
+  the ranking wrong: four arms nobody had lowered were 94 % of 212 M generic
+  steps. An arm appears once in a static count however often it runs.
+- ★★★**And the honest size of all of it: the whole trampoline is 3.5 % of the
+  run** (`sample`, 1804-file codegen), the arm helpers another 4.3 %, against
+  32 % memory management. Removing 94 % of the generic steps bought 0.5 %;
+  removing 30 % of the trampoline turns bought 0.7 %. **Measure the share before
+  optimising the mechanism** — both rungs were built before anyone knew the
+  ceiling was 3.5 %. What is left for a factor is the value model, and the
+  frameprobe measurement says which half: 98.5 % of the hot primitives' bytes
+  die at one frame boundary, while the allocation itself is node lists and
+  strings, not boxed scalars — so frame-as-mini-region is the lever and unboxing
+  is cosmetic on this workload.
 - **The HotSpot threshold is a break-even calculation, not a taste.** Compiling
   one body costs ~4 ms of LLVM; a compiled body runs ~11 % faster than the
   interpreter (that is the honest size of the dispatch win while the value model
