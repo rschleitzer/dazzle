@@ -73,6 +73,18 @@ use dazzle.Sdata.Sdata
 ; global, so no promoted loop can race this cell.
 shared eval_region: pointer[Page] null
 
+; The run arena page, as a cell, so the MEMO host seam below can be reached
+; without an Interpreter in hand — a lazy flatten deep in ELObj has the object
+; and a transient host, not the interpreter. One Interpreter per run, set in
+; `make`, same race discipline as `eval_region`.
+shared perm_cell: pointer[Page] null
+; 0 = not asked yet, 1 = the run arena, 2 = the object's own region (default)
+shared memo_perm: int 0
+; which memo FAMILY the run-arena host applies to — DZ_MEMO_SITES=n|r|nr. Only
+; for bisecting a difference to one of the two; the shipped setting is both.
+shared memo_sites_nl: bool true
+shared memo_sites_rope: bool true
+
 ; argv0 for the MessageReporter prefix (`<argv0>:<file>:<line>:<col>:<sev>: …`,
 ; exactly the reference where the app object IS the Messenger). The CLI driver
 ; sets this once before processing; unset (unit tests, --jit suite) the prefix
@@ -116,6 +128,9 @@ define UNIT_COMPUTED_ERROR: int 4
 ; strtod(3) — fixed-prototype, non-variadic, errno-free use: direct extern
 ; per the containment rule.
 function strtod(s: pointer[const_char], endp: pointer[pointer[u8]]) returns double extern
+
+; the memo-host seam's one switch (DZ_MEMO_PERM)
+function getenv(name: pointer[const_char]) returns pointer[const_char] extern
 
 ; A named-character-table entry (Interpreter::CharPart): the char plus the
 ; index of the defining part (unsigned(-1) = predefined).
@@ -517,6 +532,7 @@ define Interpreter
     {
         let interp host.allocate(sizeof Interpreter, alignof Interpreter) as pointer[Interpreter]
         set interp.host: host
+        set perm_cell: host
         set interp.units_per_inch: units_per_inch
         set interp.debug_mode: debug_mode
         set interp.dsssl2: dsssl2
@@ -634,6 +650,129 @@ define Interpreter
     ; the eval bracket (interning, forced Identifier values).
     function get_perm_host(this: Interpreter) returns pointer[Page]
         host
+
+    ; --- the LAZY MEMO host (DZ_MEMO_PERM) ----------------------------------
+    ;
+    ; ★★★Where a lazy MEMOISATION puts its storage: the array a node-list view
+    ; fills on demand, the flattened buffer of a string rope. Until now that was
+    ; `Page.get(the object)` — the END of the object's own region — with the
+    ; documented reason that the memo must live exactly as long as the object,
+    ; and a caller's host can be shorter-lived. Right against BRACKET
+    ; granularity, and the class that shaped both the frame mark's store sweep
+    ; and the escape audit: within ONE region the region's end is above every
+    ; live frame mark, so the memo of an outer frame's object is younger than the
+    ; object. Two consequences, both measured: memoisation PUBLISHES under the
+    ; mark (10.5 M frames blocked), and every node-list and string-rope primitive
+    ; has to stay conservative in the escape analysis (its 8.8x gate).
+    ;
+    ; This makes the choice a seam instead of an idiom: on the RUN arena the memo
+    ; is older than every frame and every bracket, so neither problem can arise —
+    ; at the price of memo storage that outlives the bracket it was filled in.
+    ; The elements stored are grove nodes (permanent) or the rope's own flattened
+    ; buffer, so nothing here can create a pointer from the run arena into a
+    ; shorter-lived region.
+    ;
+    ; ★★★OFF by default, and the reason is the most valuable thing this seam
+    ; produced. With the frame mark it looks like a large win, because
+    ; memoisation stops PUBLISHING: 18.9 M publications become 1.4 M, 6.8 M more
+    ; frames are rewound, 10.03 -> 17.22 GB reclaimed, peak 3908 -> 3461 MB
+    ; (-11.4 %). Without the mark the same change is pure retention and costs
+    ; +18 % peak (5966 -> 7047 MB), so it only ever made sense together with it.
+    ;
+    ; ★★★And together with it, it is WRONG: 3 of the 48 real-world codegens DIFFER —
+    ; `server/Search/*.cs` come out with garbage bytes. The three-way control says
+    ; where the fault is NOT: mark + memo on the object's region is identical, and
+    ; memo on the run arena WITHOUT the mark is identical, and it still differs
+    ; with the multi-page rewind disabled. So the placement is sound and the extra
+    ; REWINDS are not — the frame mark has a store its sweep never hooked, and
+    ; memoisation's publications were masking it. Its own record says that sweep
+    ; is "empirically gated and not proven"; this is the counterexample, and the
+    ; reproducer is one 278-file codegen.
+    ;
+    ; So `DZ_MEMO_PERM=1` is a PROBE, not a setting: it reproduces the win and the
+    ; three failures in one run, which is what a hunt for the missing hook needs.
+    ; `DZ_MEMO_SITES=n|r` narrows it to the node-list or the rope family (both
+    ; fail alone — further evidence that the fault is not in either of them).
+    ; Turning this on for real-world means finding that store first.
+    function memo_host(own: pointer[Page]) returns pointer[Page]
+    {
+        if memo_perm = 0
+            Interpreter.memo_setup()
+        if memo_perm = 1
+        {
+            if memo_sites_nl
+            {
+                if perm_cell <> null
+                    return perm_cell
+            }
+        }
+        own
+    }
+
+    ; the string rope's flattened buffer — same seam, separate switch so a
+    ; difference can be attributed to ONE of the two families
+    function memo_host_rope(own: pointer[Page]) returns pointer[Page]
+    {
+        if memo_perm = 0
+            Interpreter.memo_setup()
+        if memo_perm = 1
+        {
+            if memo_sites_rope
+            {
+                if perm_cell <> null
+                    return perm_cell
+            }
+        }
+        own
+    }
+
+    ; A memo that lives on the run arena needs no publication hook: the store
+    ; puts an OLDER pointer into a younger object, which no frame mark has to
+    ; hear about. Call sites whose target is the memoised object itself (the
+    ; rope) ask this before hooking.
+    function memo_is_perm() returns bool
+    {
+        if memo_perm = 0
+            Interpreter.memo_setup()
+        if memo_perm <> 1
+            return false
+        if memo_sites_rope = false
+            return false
+        perm_cell <> null
+    }
+
+    procedure memo_setup()
+    {
+        set memo_perm: 2
+        let e getenv("DZ_MEMO_PERM")
+        if e = null
+            return
+        if (*e as u32) = 0
+            return
+        let zero "0" as char
+        if (*e as u32) = (zero as u32)
+            return
+        set memo_perm: 1
+        let w getenv("DZ_MEMO_SITES")
+        if w <> null
+        {
+            let n "n" as char
+            let r "r" as char
+            var have_n false
+            var have_r false
+            var q w as pointer[u8]
+            while (*q) <> 0
+            {
+                if (*q as u32) = (n as u32)
+                    set have_n: true
+                if (*q as u32) = (r as u32)
+                    set have_r: true
+                set q: q + 1
+            }
+            set memo_sites_nl: have_n
+            set memo_sites_rope: have_r
+        }
+    }
 
     function get_eval_region(this: Interpreter) returns pointer[Page]
         eval_region
