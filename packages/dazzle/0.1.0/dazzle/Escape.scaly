@@ -1,0 +1,2358 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use dazzle.Insn.*
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.ClosureObj
+use dazzle.ELObj.PrimitiveObj
+use dazzle.Interpreter.Interpreter
+use dazzle.Jit.Jit
+use dazzle.VM.VM
+
+; ---- THE ESCAPE ANALYSIS over the Insn graph --------------------------------
+;
+; What it answers, per ALLOCATION SITE in the compiled DSSSL program: can the
+; value this site produces still be reachable after the VM frame that produced
+; it has been popped? A site for which the answer is NO may allocate in a
+; per-frame arena that is reclaimed unconditionally at the pop; a site for which
+; it is YES must keep allocating in the eval region.
+;
+; ★★★Why this is the piece the frame mark was missing, and why it is not more of
+; the same. `FrameMark` decides at RUNTIME, per frame, whether the whole frame
+; may be rewound — so ONE escaping value disqualifies every byte that frame
+; allocated. Measured (tests/dazzle/PERFORMANCE.md, "Die Marke GEBAUT"): the
+; frame's own RESULT blocks 37 % of frames, and the ceiling of the whole
+; mechanism is 45 % of the frame bytes, against the 98.5 % that `frameprobe`
+; measured to die at one frame boundary. That gap is not the precision of the
+; test, it is GRANULARITY: the decision belongs to the SITE, not to the frame.
+; A per-site decision cannot be taken at runtime either — "Sprosse 3 GEBAUT und
+; VERWORFEN" built exactly that and measured it away, because a runtime test on
+; the ARGUMENTS is self-reinforcing (13 754 of 14 028 tail calls held back). It
+; has to be known at the PRODUCER, which means before the run: here.
+;
+; ============================ THE ANALYSIS ================================
+; The Insn graph is a threaded-code stack machine, so the analysis is an
+; abstract interpretation of the VALUE STACK, per body, over node ids:
+;
+;   * node 0 is EXTERNAL — a constant, a global, a closure-display slot, or the
+;     result of an arm this pass does not track. It is never placed in a frame
+;     arena, so nothing that holds it can dangle.
+;   * nodes 1..arity are the body's PARAMETERS, which is what makes a callee
+;     summary possible at all.
+;   * every tracked allocation site gets a node; a control-flow join whose two
+;     incoming stacks disagree in a slot gets a PHI node, created once per
+;     (insn, slot) so that merging terminates.
+;
+; Edges mean "if u escapes then v escapes": from a container to what it retains
+; (`cons` -> car/cdr), from a PHI to its inputs, and — the same direction, which
+; is why one bit covers both cases — from an accessor's result to the argument
+; it came out of (`car`'s result IS part of its argument's structure).
+;
+; Two escape ROOT sets are propagated separately, because they mean different
+; things to a CALLER:
+;
+;   * RET — the value may be, or may be reachable from, the frame's result. Such
+;     a site must allocate outward: the result outlives the frame by definition.
+;   * PUB — the value may be stored into something the frame does not own: a box
+;     belonging to an enclosing frame, a flow object, a style, a sosofo, or
+;     anything an unaudited primitive does with its arguments.
+;
+; A site escapes if it is in RET or PUB. A PARAMETER in RET means "the result may
+; retain argument i", which the caller turns into an edge; a parameter in PUB
+; means "argument i escapes at the call", full stop. Those two masks are the
+; body's SUMMARY, and the call graph is solved by least fixpoint from the empty
+; masks — a may-analysis is a reachability question, so the least solution is the
+; sound one, and the masks only grow, so it converges.
+;
+; ★Coverage is a MEASUREMENT, not a correctness condition. A body containing an
+; arm whose stack depth this pass does not model exactly (Apply's dynamic callee,
+; a macro unpack whose push count is decided at runtime, the `make` family's slot
+; arithmetic) is ABANDONED whole: its sites are forced to ESCAPE, so they keep
+; allocating exactly where they do today. `es_bail_*` counts why, so the next arm
+; to model is chosen by number rather than by guess — the same discipline the
+; JIT's generic lowering follows.
+;
+; ★★And the depth model is CHECKED rather than believed: DAZZLE_ESCAPE_VERIFY=1
+; compares the modelled depth of every insn against the interpreter's real
+; `sp - frame_start` as it runs. A wrong depth is the one mistake in here that
+; silently mislabels sites instead of crashing, and it is exactly the kind of
+; thing reading the arm twice does not catch.
+;
+; ============================== SOUNDNESS =================================
+; The rule the placement rests on: NOTHING THAT SURVIVES A FRAME MAY POINT INTO
+; THAT FRAME'S ARENA. Three obligations, all discharged here:
+;
+;   1. the frame's result — the RET root set;
+;   2. a store into a pre-existing object — the PUB roots: the three SetBox
+;      arms, the flow-object/style/sosofo constructors, and every primitive not
+;      audited otherwise;
+;   3. an object growing storage off one of its arguments — the `Page.get(x)`
+;      idiom, which is the class the frame mark's store sweep had to hook by
+;      hand. It falls out of (2): a primitive that grows storage off an argument
+;      it did not allocate in this call is UNKNOWN, so its arguments escape and
+;      can never be in an arena in the first place. That is what will lift the
+;      sweep from an empirically gated list of hooks to a property of the
+;      placement. ★NOT YET, and deliberately not: without a second arena there is
+;      no frame-local region whose pointers a verifier could catch, so the store
+;      hooks stay where the frame mark put them. The verifier belongs to the
+;      placement rung, and that ORDER is measured rather than chosen — see
+;      PERFORMANCE.md: explicit memo hosting first (worth up to 3.9 GB), then
+;      placement, then the verifier.
+;
+; The audit's cost is separable from the analysis's precision on purpose:
+; DAZZLE_ESCAPE_TRUST_PRIMS=1 treats every primitive as if it were audited
+; (UNSOUND — a measurement mode only, exactly like the frame mark's "Decke" row),
+; so the gap between the two numbers is what the audit is worth.
+
+function getenv(name: pointer[const_char]) returns pointer[const_char] extern
+procedure atexit(cb: pointer[void]) returns i32 extern
+procedure scaly_eputs(s: pointer[const_char]) extern
+procedure scaly_eputi(value: i64) extern
+procedure scaly_eputnl() extern
+
+; --- primitive summary classes ----------------------------------------------
+; 0 is the conservative default on purpose: an id nobody audited publishes, and
+; its result may alias its arguments, so nothing it touches reaches an arena.
+define ES_PRIM_UNKNOWN: int 0
+; the result shares NOTHING with the arguments, and the primitive stores into
+; nothing it did not allocate in this call
+define ES_PRIM_FRESH: int 1
+; no such store, but the result may retain or alias an argument
+define ES_PRIM_CONNECTED: int 2
+
+; --- verdicts (0 = absent from the map = no verdict = allocate as today) -----
+define ES_V_LOCAL: u64 1
+define ES_V_ESCAPE: u64 2
+; "outward because the body could not be modelled" — the same placement as
+; ES_V_ESCAPE, a different DIAGNOSIS. Keeping them apart is what turns "the
+; analysis buys 18 %" into "and here is which half of that is coverage".
+define ES_V_ABANDON: u64 3
+
+; --- node flags -------------------------------------------------------------
+define ES_F_SITE: int 1
+define ES_F_PHI: int 2
+define ES_F_RET: int 4
+define ES_F_PUB: int 8
+
+; --- bail reasons -----------------------------------------------------------
+define ES_BAIL_ARM: int 0
+define ES_BAIL_DEPTH: int 1
+define ES_BAIL_SLOT: int 2
+define ES_BAIL_REGION: int 3
+define ES_BAIL_ARITY: int 4
+define ES_BAIL_SIZE: int 5
+; the unmodelled arms, split so the next one to model is picked by number
+define ES_BAIL_APPLY: int 6
+define ES_BAIL_UNPACK: int 7
+define ES_BAIL_BOXARG: int 8
+define ES_BAIL_VARARGS: int 9
+define ES_N_BAIL: int 10
+
+define ES_MAX_DEPTH: i64 1024
+define ES_MAX_INSNS: i64 200000
+define ES_MAX_ITER: int 16
+define ES_MAX_PARAMS: int 62
+
+; 0 = not asked yet, 1 = on, 2 = off
+shared es_state: int 0
+shared es_stats: bool false
+shared es_verify: bool false
+shared es_trust: bool false
+
+; the analysis' own arena and the code region it is allowed to reason about
+shared es_host: pointer[Page] null
+shared es_code_region: i64 0
+
+; insn address -> ES_V_LOCAL / ES_V_ESCAPE
+shared g_es_verdicts: pointer[EsMap] null
+; insn address -> modelled frame-relative depth + 1 (verify mode)
+shared g_es_depths: pointer[EsMap] null
+; body root address -> body index + 1
+shared g_es_bodies: pointer[EsMap] null
+; the per-body insn marks: insn address -> index + 1
+shared g_es_seen: pointer[EsMap] null
+; prim id -> ES_PRIM_*
+shared g_es_prim: pointer[Array[int]] null
+
+; the body table
+shared g_es_b_root: pointer[Array[int]] null
+shared g_es_b_arity: pointer[Array[int]] null
+shared g_es_b_pub: pointer[Array[int]] null
+shared g_es_b_ret: pointer[Array[int]] null
+shared g_es_b_ok: pointer[Array[int]] null
+; ★Every insn discovery found in the body, as a slice of one flat array. Kept
+; because ABANDONING a body has to force its WHOLE reach outward, not just what
+; the abstract interpretation had interned before it gave up: an insn can belong
+; to two bodies (the entry points of one variadic lambda share their tail), and a
+; verdict left over from the body that succeeded would then answer for a frame
+; nobody analysed.
+shared g_es_b_ins: pointer[Array[int]] null
+shared g_es_b_off: pointer[Array[int]] null
+shared g_es_b_len: pointer[Array[int]] null
+
+; the per-body workspace, reused across bodies (cleared, never re-allocated)
+shared g_es_i_addr: pointer[Array[int]] null
+shared g_es_i_depth: pointer[Array[int]] null
+shared g_es_i_soff: pointer[Array[int]] null
+shared g_es_stack: pointer[Array[int]] null
+shared g_es_work: pointer[Array[int]] null
+shared g_es_cur: pointer[Array[int]] null
+shared g_es_nd_flags: pointer[Array[int]] null
+shared g_es_nd_insn: pointer[Array[int]] null
+shared g_es_nd_owner: pointer[Array[int]] null
+shared g_es_nd_ehead: pointer[Array[int]] null
+shared g_es_ed_to: pointer[Array[int]] null
+shared g_es_ed_next: pointer[Array[int]] null
+shared g_es_prop: pointer[Array[int]] null
+
+; the current body's state
+shared es_bailed: bool false
+; the final (verdict-writing) pass, so the per-site counters count SITES rather
+; than the fixpoint's visits to them
+shared es_writing: bool false
+shared es_d: i64 0
+
+; counters
+shared es_n_roots: i64 0
+shared es_n_bodies: i64 0
+shared es_n_ok: i64 0
+shared es_n_sites: i64 0
+shared es_n_local: i64 0
+; why a site had to go outward — the number that says where the precision goes
+shared es_n_ret: i64 0
+shared es_n_pub: i64 0
+shared es_n_both: i64 0
+shared es_n_unaudited: i64 0
+shared g_es_bail: pointer[Array[int]] null
+shared es_iters: i64 0
+
+; dynamic accounting (stats mode): calls and bytes by verdict
+shared es_dyn_calls_local: i64 0
+shared es_dyn_calls_esc: i64 0
+shared es_dyn_calls_none: i64 0
+shared es_dyn_calls_aband: i64 0
+shared es_dyn_bytes_aband: i64 0
+shared es_dyn_bytes_local: i64 0
+shared es_dyn_bytes_esc: i64 0
+shared es_dyn_bytes_none: i64 0
+shared es_dyn_crossed: i64 0
+shared es_tick_class: int 0
+shared es_tick_page: i64 0
+shared es_tick_bump: i64 0
+shared es_depth_checks: i64 0
+shared es_depth_bad: i64 0
+
+; the atexit entry point — a bare module-level function name is a function
+; pointer value, which a concept static is not.
+function es_report_atexit()
+    Escape.report()
+
+; EsMap — open-addressed u64 -> u64 keyed by an Insn address, the same shape as
+; the JIT's region cache (key 0 is the empty slot; an Insn address is never 0).
+; Its own copy rather than a shared one: this file must not depend on the JIT's
+; internals, and the whole thing is forty lines.
+define EsMap
+(
+    host: pointer[Page]
+    keys: pointer[u64]
+    vals: pointer[u64]
+    cap: size_t
+    used: size_t
+)
+{
+    init(host: pointer[Page], cap: size_t)
+    {
+        set this.host: host
+        set this.cap: cap
+        set this.used: 0
+        set this.keys: host.allocate(cap * sizeof u64, alignof u64) as pointer[u64]
+        set this.vals: host.allocate(cap * sizeof u64, alignof u64) as pointer[u64]
+        var i: size_t 0
+        while i < cap
+        {
+            set *(this.keys + i): 0
+            set *(this.vals + i): 0
+            set i: i + 1
+        }
+    }
+}
+
+define Escape
+{
+    function map_make(host: pointer[Page], cap: size_t) returns pointer[EsMap]
+        EsMap^host(host, cap)
+
+    function map_slot(m: pointer[EsMap], key: u64) returns size_t
+    {
+        var h key
+        set h: h >> 3
+        set h: h * 0x9E3779B97F4A7C15
+        set h: h >> 40
+        (h as size_t) & (m.cap - 1)
+    }
+
+    function map_probe(m: pointer[EsMap], key: u64) returns size_t
+    {
+        var i Escape.map_slot(m, key)
+        while true
+        {
+            let k *(m.keys + i)
+            if k = key
+                return i
+            if k = 0
+                return i
+            set i: (i + 1) & (m.cap - 1)
+        }
+        0
+    }
+
+    function map_get(m: pointer[EsMap], key: u64, missing: u64) returns u64
+    {
+        let i Escape.map_probe(m, key)
+        if *(m.keys + i) = key
+            return *(m.vals + i)
+        missing
+    }
+
+    procedure map_put(m: pointer[EsMap], key: u64, val: u64)
+    {
+        if (m.used + m.used) >= m.cap
+            Escape.map_grow(m)
+        let i Escape.map_probe(m, key)
+        if *(m.keys + i) <> key
+        {
+            set *(m.keys + i): key
+            set m.used: m.used + 1
+        }
+        set *(m.vals + i): val
+    }
+
+    procedure map_grow(m: pointer[EsMap])
+    {
+        let old_keys m.keys
+        let old_vals m.vals
+        let old_cap m.cap
+        let new_cap old_cap + old_cap
+        let h m.host
+        set m.cap: new_cap
+        set m.used: 0
+        set m.keys: h.allocate(new_cap * sizeof u64, alignof u64) as pointer[u64]
+        set m.vals: h.allocate(new_cap * sizeof u64, alignof u64) as pointer[u64]
+        var i: size_t 0
+        while i < new_cap
+        {
+            set *(m.keys + i): 0
+            set *(m.vals + i): 0
+            set i: i + 1
+        }
+        set i: 0
+        while i < old_cap
+        {
+            let k *(old_keys + i)
+            if k <> 0
+            {
+                let s Escape.map_probe(m, k)
+                set *(m.keys + s): k
+                set *(m.vals + s): *(old_vals + i)
+                set m.used: m.used + 1
+            }
+            set i: i + 1
+        }
+    }
+
+    ; Drop one key. Open addressing cannot simply blank a slot without breaking
+    ; the probe chains that run through it, so re-insert the run that follows.
+    ; (The per-body `seen` table is cleared by forgetting exactly the keys it was
+    ; given, which beats zeroing a grown table once per body.)
+    procedure map_forget(m: pointer[EsMap], key: u64)
+    {
+        let i Escape.map_probe(m, key)
+        if *(m.keys + i) <> key
+            return
+        set *(m.keys + i): 0
+        set *(m.vals + i): 0
+        set m.used: m.used - 1
+        var j (i + 1) & (m.cap - 1)
+        while *(m.keys + j) <> 0
+        {
+            let k *(m.keys + j)
+            let v *(m.vals + j)
+            set *(m.keys + j): 0
+            set *(m.vals + j): 0
+            set m.used: m.used - 1
+            let s Escape.map_probe(m, k)
+            set *(m.keys + s): k
+            set *(m.vals + s): v
+            set m.used: m.used + 1
+            set j: (j + 1) & (m.cap - 1)
+        }
+    }
+
+    ; --- setup --------------------------------------------------------------
+
+    function on() returns bool
+        es_state = 1
+
+    ; read by VM.eval's loop: a global of THIS module cannot be read from a
+    ; module declared earlier, so the flag travels as a call
+    function verify_on() returns bool
+    {
+        if es_state <> 1
+            return false
+        es_verify
+    }
+
+    procedure setup(interp: pointer[Interpreter])
+    {
+        if es_state <> 0
+            return
+        set es_state: 2
+        let e getenv("DAZZLE_ESCAPE")
+        if e = null
+            return
+        if (*e as u32) = 0
+            return
+        let zero "0" as char
+        if (*e as u32) = (zero as u32)
+            return
+        let host interp.get_perm_host()
+        if host = null
+            return
+        set es_host: host
+        set es_code_region: Escape.region_of(host as pointer[void])
+        set g_es_verdicts: Escape.map_make(host, 8192)
+        set g_es_depths: Escape.map_make(host, 8192)
+        set g_es_bodies: Escape.map_make(host, 2048)
+        set g_es_seen: Escape.map_make(host, 8192)
+        set g_es_b_root: Array[int]^host()
+        set g_es_b_arity: Array[int]^host()
+        set g_es_b_pub: Array[int]^host()
+        set g_es_b_ret: Array[int]^host()
+        set g_es_b_ok: Array[int]^host()
+        set g_es_b_ins: Array[int]^host()
+        set g_es_b_off: Array[int]^host()
+        set g_es_b_len: Array[int]^host()
+        set g_es_i_addr: Array[int]^host()
+        set g_es_i_depth: Array[int]^host()
+        set g_es_i_soff: Array[int]^host()
+        set g_es_stack: Array[int]^host()
+        set g_es_work: Array[int]^host()
+        set g_es_cur: Array[int]^host()
+        set g_es_nd_flags: Array[int]^host()
+        set g_es_nd_insn: Array[int]^host()
+        set g_es_nd_owner: Array[int]^host()
+        set g_es_nd_ehead: Array[int]^host()
+        set g_es_ed_to: Array[int]^host()
+        set g_es_ed_next: Array[int]^host()
+        set g_es_prop: Array[int]^host()
+        set g_es_bail: Array[int]^host()
+        ; bound AFTER the allocation on purpose: a container global is read into
+        ; a local because a method call on a `shared` pointer does not resolve,
+        ; and a local bound before the assignment would still be the null.
+        let es_bail g_es_bail
+        var i 0
+        while i < ES_N_BAIL
+        {
+            es_bail.add(0)
+            set i: i + 1
+        }
+        Escape.setup_prims(host)
+        let t getenv("DAZZLE_ESCAPE_TRUST_PRIMS")
+        if t <> null
+            set es_trust: true
+        ; ★A self-check against a documented silent trap: a module-level `define`
+        ; read from a module declared LATER is dropped without a word, and as a
+        ; CALL ARGUMENT it takes the whole call with it — the audit table would
+        ; then be uniformly UNKNOWN and this would look like "the analysis buys
+        ; nothing" instead of like a build order mistake.
+        if Escape.prim_class(PRIM_CONS) = ES_PRIM_UNKNOWN
+        {
+            scaly_eputs "escape: the primitive audit table is EMPTY — declare module Escape AFTER module Primitive"
+            scaly_eputnl()
+            return
+        }
+        let s getenv("DAZZLE_ESCAPE_STATS")
+        if s <> null
+        {
+            set es_stats: true
+            atexit(&es_report_atexit)
+        }
+        let v getenv("DAZZLE_ESCAPE_VERIFY")
+        if v <> null
+            set es_verify: true
+        set es_state: 1
+    }
+
+    ; --- the page/region primitives, read by documented OFFSET --------------
+    ;
+    ; The same slots FrameMark.scaly reads, for the same reason: a `Page.mark`
+    ; style stdlib entry point that the COMPILER itself never calls is never
+    ; emitted into the compiler image, and the `--jit` leg materialises this
+    ; package inside that process (see FrameMark's comment). `Page.get` is
+    ; reached by the compiler and stays an ordinary call.
+    ;
+    ;   0 next_object   1 current_page   2 next_page   3 exclusive_pages.head
+    ;   4 region
+    function slot(p: pointer[void], i: int) returns i64
+    {
+        let w p as pointer[size_t]
+        *(w + i) as i64
+    }
+
+    function region_of(v: pointer[void]) returns i64
+    {
+        if v = null
+            return 0
+        let pg Page.get(v) as pointer[void]
+        let r Escape.slot(pg, 4)
+        if r = 0
+            return pg as i64
+        r
+    }
+
+    ; Only insns in the region the compiled program lives in may be reasoned
+    ; about. An insn built DURING evaluation (`make_call_insn` from a sort
+    ; comparator, from `apply`) lives in the eval bracket's region and its
+    ; address is recycled when that bracket dies — a verdict cached under it
+    ; would later answer for a different insn.
+    function analysable(i: pointer[Insn]) returns bool
+    {
+        if i = null
+            return false
+        Escape.region_of(i as pointer[void]) = es_code_region
+    }
+
+    ; --- the primitive audit ------------------------------------------------
+    ;
+    ; ★★★What the classification is really about, and what a primitive whitelist
+    ; got wrong before: it is NOT "is this primitive pure". It is two questions
+    ; with different consequences.
+    ;
+    ;   (a) may its result share structure with, or retain, an argument? Then an
+    ;       escaping result drags the arguments out with it (CONNECTED). `cons`
+    ;       is the canonical case, and so is `car` — its result IS part of its
+    ;       argument, so the edge runs the same way.
+    ;   (b) may it store into an object it did not allocate in this call? Then
+    ;       nothing it touches can live in an arena (UNKNOWN, the default).
+    ;
+    ; ★(b) is where the lazily memoising node-list and string primitives fall,
+    ; and that is deliberate rather than lazy. `force_select`/`concat_fill`, the
+    ; string rope's flatten and the grove's view arrays all grow storage off an
+    ; object they were HANDED, through `Page.get(that object)` — which resolves
+    ; to the end of that object's REGION, i.e. above the arena mark of whatever
+    ; frame is running now. The memo cell of an outer frame's node list would
+    ; therefore be reclaimed while the node list itself lives on. They stay
+    ; UNKNOWN until that memo storage is hosted explicitly, which is a rung of
+    ; its own with its own number.
+    procedure setup_prims(host: pointer[Page])
+    {
+        set g_es_prim: Array[int]^host()
+        let es_prim g_es_prim
+        var i 0
+        while i < 256
+        {
+            es_prim.add(ES_PRIM_UNKNOWN)
+            set i: i + 1
+        }
+
+        ; --- pairs and lists: plain structure, nothing memoises --------------
+        ; the result holds the arguments (cons/list/append/reverse) or IS part of
+        ; one (car/cdr/list-ref/list-tail/memv/member/assoc).
+        es_prim.put(PRIM_CONS as size_t, ES_PRIM_CONNECTED)
+        es_prim.put(PRIM_LIST as size_t, ES_PRIM_CONNECTED)
+        es_prim.put(PRIM_CAR as size_t, ES_PRIM_CONNECTED)
+        es_prim.put(PRIM_CDR as size_t, ES_PRIM_CONNECTED)
+        es_prim.put(PRIM_APPEND as size_t, ES_PRIM_CONNECTED)
+        es_prim.put(PRIM_REVERSE as size_t, ES_PRIM_CONNECTED)
+        es_prim.put(PRIM_LIST_REF as size_t, ES_PRIM_CONNECTED)
+        es_prim.put(PRIM_LIST_TAIL as size_t, ES_PRIM_CONNECTED)
+        es_prim.put(PRIM_MEMV as size_t, ES_PRIM_CONNECTED)
+        es_prim.put(PRIM_MEMBER as size_t, ES_PRIM_CONNECTED)
+        es_prim.put(PRIM_ASSOC as size_t, ES_PRIM_CONNECTED)
+
+        ; --- predicates and equality: an interned boolean, no store ----------
+        es_prim.put(PRIM_IS_NULL as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_PAIR as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_LIST as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_LENGTH as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_NOT as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_BOOLEAN as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_CHAR as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_SYMBOL as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_KEYWORD as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_NUMBER as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_INTEGER as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_REAL as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_EXACT as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_INEXACT as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_ZERO as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_POSITIVE as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_NEGATIVE as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_ODD as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_EVEN as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_PROCEDURE as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_VECTOR as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_IS_QUANTITY as size_t, ES_PRIM_FRESH)
+
+        ; --- arithmetic: a fresh number or an immediate, never a store -------
+        es_prim.put(PRIM_PLUS as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_MINUS as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_TIMES as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_DIVIDE as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_QUOTIENT as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_REMAINDER as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_MODULO as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_ABS as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_MIN as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_MAX as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_FLOOR as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_CEILING as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_ROUND as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_TRUNCATE as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_NUM_EQ as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_LESS as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_GREATER as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_LESS_EQ as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_GREATER_EQ as size_t, ES_PRIM_FRESH)
+
+        ; --- the grove side: grove-hosted values or a freshly built string ---
+        ; A grove node is permanent for the run, and what these memoise (the
+        ; grove's own view arrays) grows on the GROVE region, which is never
+        ; rewound — so neither the result nor a store can reach a frame arena.
+        es_prim.put(PRIM_GI as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_ID as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_ATTRIBUTE_STRING as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_INHERITED_ATTRIBUTE_STRING as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_ENTITY_NAME_NORMALIZE as size_t, ES_PRIM_FRESH)
+        es_prim.put(PRIM_GENERAL_NAME_NORMALIZE as size_t, ES_PRIM_FRESH)
+    }
+
+    function prim_class(id: int) returns int
+    {
+        let es_prim g_es_prim
+        if id < 0
+            return ES_PRIM_UNKNOWN
+        if id >= 256
+            return ES_PRIM_UNKNOWN
+        if es_prim = null
+            return ES_PRIM_UNKNOWN
+        let p es_prim.get(id as size_t)
+        if p = null
+            return ES_PRIM_UNKNOWN
+        if es_trust
+        {
+            if *p = ES_PRIM_UNKNOWN
+                return ES_PRIM_CONNECTED
+        }
+        *p
+    }
+
+    ; the prim id behind a callable, or -1
+    function prim_id_of(f: pointer[ELObj]) returns int
+    {
+        if f = null
+            return 0 - 1
+        choose *f
+            when p: Primitive
+                return p.prim_id
+            else
+                return 0 - 1
+        0 - 1
+    }
+
+    ; Which callables this pass knows the stack discipline of. 1 = a closure
+    ; (its Return pops the arguments and pushes one result), 2 = a primitive
+    ; (dispatch in place), 3 = call/cc (the receiver is called with the fresh
+    ; continuation in the argument's slot, so the net effect is the same as a
+    ; one-argument call). 0 = anything else, and that has to ABANDON rather than
+    ; guess: `apply` SPLICES a list onto the stack (`apply_shuffle`), so its
+    ; depth after the call is a property of the runtime argument list.
+    function callee_kind(f: pointer[ELObj]) returns int
+    {
+        if f = null
+            return 0
+        choose *f
+            when c: Closure
+                return 1
+            when p: Primitive
+                return 2
+            when cc: CallCCFn
+                return 3
+            else
+                return 0
+        0
+    }
+
+    function closure_code_of(f: pointer[ELObj]) returns pointer[Insn]
+    {
+        if f = null
+            return null
+        choose *f
+            when c: Closure
+                return c.code
+            else
+                return null
+        null
+    }
+
+    ; --- the body table -----------------------------------------------------
+
+    function body_arity_of_sig(sig: Signature) returns int
+    {
+        if sig.n_optional <> 0
+            return 0 - 1
+        if sig.rest_arg
+            return 0 - 1
+        if sig.n_key <> 0
+            return 0 - 1
+        sig.n_required
+    }
+
+    ; Register a body root with the arity it is entered at. A second
+    ; registration with a DIFFERENT arity marks it unanalysable rather than
+    ; picking one: the abstract stack is frame-relative, so a wrong arity would
+    ; misalign every slot in the body.
+    function register(root: pointer[Insn], arity: int) returns i64
+    {
+        let es_bodies g_es_bodies
+        let es_b_root g_es_b_root
+        let es_b_arity g_es_b_arity
+        let es_b_pub g_es_b_pub
+        let es_b_ret g_es_b_ret
+        let es_b_ok g_es_b_ok
+        let es_b_off g_es_b_off
+        let es_b_len g_es_b_len
+        if Escape.analysable(root) = false
+        {
+            Escape.bail(ES_BAIL_REGION)
+            return 0 - 1
+        }
+        if arity < 0
+            return 0 - 1
+        if arity > ES_MAX_PARAMS
+            return 0 - 1
+        let key root as u64
+        let got Escape.map_get(es_bodies, key, 0)
+        if got <> 0
+        {
+            let bi (got as i64) - 1
+            let ap es_b_arity.get(bi as size_t)
+            if ap <> null
+            {
+                if *ap <> arity
+                {
+                    es_b_ok.put(bi as size_t, 0)
+                    Escape.bail(ES_BAIL_ARITY)
+                    Escape.force_escape(bi)
+                }
+            }
+            return bi
+        }
+        let bi es_b_root.get_length() as i64
+        es_b_root.add(root as int)
+        es_b_arity.add(arity)
+        es_b_pub.add(0)
+        es_b_ret.add(0)
+        es_b_ok.add(1)
+        es_b_off.add(0)
+        es_b_len.add(0)
+        Escape.map_put(es_bodies, key, (bi + 1) as u64)
+        set es_n_bodies: es_n_bodies + 1
+        bi
+    }
+
+    procedure bail(reason: int)
+    {
+        let es_bail g_es_bail
+        if es_bail = null
+            return
+        let p es_bail.get(reason as size_t)
+        if p = null
+            return
+        es_bail.put(reason as size_t, *p + 1)
+    }
+
+    ; --- the public entry ---------------------------------------------------
+    ;
+    ; Called at the top of VM.eval: the root of every evaluation. Bodies reached
+    ; from there by a statically known call, a closure construction or a varargs
+    ; entry point are discovered from here, so this one seam covers the whole
+    ; compiled program without a list of roots to keep in step.
+    procedure analyze(interp: pointer[Interpreter], root: pointer[Insn], n_args: int)
+    {
+        if es_state = 0
+            Escape.setup(interp)
+        if es_state <> 1
+            return
+        Escape.analyze_from(root, n_args)
+    }
+
+    ; ★Split from `analyze` for one reason worth writing down: a container global
+    ; has to be read into a LOCAL (a method call on a `shared` pointer does not
+    ; resolve), and a local bound before `setup` ran would still hold the null
+    ; the global started at. Every function in here that both allocates and uses
+    ; a container binds AFTER the assignment for the same reason.
+    procedure analyze_from(root: pointer[Insn], n_args: int)
+    {
+        let es_bodies g_es_bodies
+        let es_b_root g_es_b_root
+        let es_b_pub g_es_b_pub
+        let es_b_ret g_es_b_ret
+        if root = null
+            return
+        if Escape.analysable(root) = false
+            return
+        if Escape.map_get(es_bodies, root as u64, 0) <> 0
+            return
+        set es_n_roots: es_n_roots + 1
+        let first es_b_root.get_length() as i64
+        if Escape.register(root, n_args) < 0
+            return
+        ; 1. discovery: every body reachable from here
+        var bi first
+        while bi < (es_b_root.get_length() as i64)
+        {
+            Escape.discover(bi)
+            set bi: bi + 1
+        }
+        let last es_b_root.get_length() as i64
+        ; 2. the summaries, by least fixpoint from the empty masks
+        var iter 0
+        var changed true
+        while changed
+        {
+            set changed: false
+            var b first
+            while b < last
+            {
+                if Escape.analyze_body(b, false)
+                    set changed: true
+                set b: b + 1
+            }
+            set iter: iter + 1
+            set es_iters: es_iters + 1
+            if changed
+            {
+                if iter >= ES_MAX_ITER
+                {
+                    ; not converged inside the budget: give this batch the
+                    ; conservative summary rather than a partial one.
+                    var k first
+                    while k < last
+                    {
+                        es_b_pub.put(k as size_t, 0 - 1)
+                        es_b_ret.put(k as size_t, 0 - 1)
+                        set k: k + 1
+                    }
+                    set changed: false
+                }
+            }
+        }
+        ; 3. the verdicts, with the summaries settled
+        var b2 first
+        while b2 < last
+        {
+            if Escape.analyze_body(b2, true)
+                set es_n_ok: es_n_ok
+            set b2: b2 + 1
+        }
+    }
+
+    ; --- discovery ----------------------------------------------------------
+    ;
+    ; Walk one body's insns and register every body it can transfer INTO. The
+    ; walk follows only `next`-style edges, never a callee's code, so bodies stay
+    ; separate.
+    procedure discover(bi: i64)
+    {
+        let es_seen g_es_seen
+        let es_b_root g_es_b_root
+        let es_b_arity g_es_b_arity
+        let es_b_ins g_es_b_ins
+        let es_b_off g_es_b_off
+        let es_b_len g_es_b_len
+        let es_i_addr g_es_i_addr
+        let es_work g_es_work
+        let rp es_b_root.get(bi as size_t)
+        if rp = null
+            return
+        let root *rp as pointer[Insn]
+        let ap es_b_arity.get(bi as size_t)
+        if ap = null
+            return
+        es_work.clear()
+        es_i_addr.clear()
+        es_work.add(root as int)
+        var wi: size_t 0
+        while wi < es_work.get_length()
+        {
+            let ip es_work.get(wi)
+            set wi: wi + 1
+            if ip <> null
+            {
+                let cur *ip as pointer[Insn]
+                if Escape.map_get(es_seen, cur as u64, 0) = 0
+                {
+                    Escape.map_put(es_seen, cur as u64, 1)
+                    es_i_addr.add(cur as int)
+                    Escape.discover_one(cur)
+                    var s0: pointer[Insn] null
+                    var s1: pointer[Insn] null
+                    ; ★The successor relation is a property of the Insn graph,
+                    ; not of a consumer, and the JIT already enumerates it arm by
+                    ; arm for its block layout. A second copy here would be 200
+                    ; lines that drift apart the first time an arm is added —
+                    ; which is exactly the failure mode a port cannot afford. It
+                    ; answers 0 for every arm that LEAVES the body (Return, both
+                    ; tail calls, TailApply, the error arms), which is the
+                    ; boundary this walk needs.
+                    let ns Jit.insn_successors(cur, &s0, &s1)
+                    if ns > 0
+                    {
+                        if s0 <> null
+                            es_work.add(s0 as int)
+                    }
+                    if ns > 1
+                    {
+                        if s1 <> null
+                            es_work.add(s1 as int)
+                    }
+                }
+            }
+        }
+        ; keep the reach as a slice, then forget the marks so the next body
+        ; starts clean
+        let off es_b_ins.get_length()
+        es_b_off.put(bi as size_t, off as int)
+        var i: size_t 0
+        let ni es_i_addr.get_length()
+        while i < ni
+        {
+            let q es_i_addr.get(i)
+            if q <> null
+            {
+                es_b_ins.add(*q)
+                Escape.map_forget(es_seen, *q as u64)
+            }
+            set i: i + 1
+        }
+        es_b_len.put(bi as size_t, (es_b_ins.get_length() - off) as int)
+    }
+
+    ; the bodies one insn can transfer into
+    procedure discover_one(i: pointer[Insn])
+    {
+        choose *i
+            when a: ClosureMk
+            {
+                let ar Escape.body_arity_of_sig(a.sig)
+                if ar >= 0
+                    Escape.register(a.code, ar)
+                else
+                    Escape.register_varargs(a.code)
+            }
+            when a: FunctionCall
+            {
+                let cc Escape.closure_code_of(a.func)
+                if cc <> null
+                    Escape.register(cc, a.n_args)
+            }
+            when a: FunctionTailCall
+            {
+                let cc Escape.closure_code_of(a.func)
+                if cc <> null
+                    Escape.register(cc, a.n_args)
+            }
+            else
+                return
+    }
+
+    ; A variadic closure's code is a Varargs insn: register each entry point with
+    ; the depth it is entered at (exec_varargs' own arithmetic — entry point j
+    ; takes n_required + j arguments, and the last one takes the rest/keyword
+    ; shape after the shuffle).
+    procedure register_varargs(code: pointer[Insn])
+    {
+        if code = null
+            return
+        choose *code
+            when a: Varargs
+            {
+                var j 0
+                while j < a.n_entry
+                {
+                    let ep *(a.entry_points + j)
+                    if ep <> null
+                    {
+                        var d a.sig.n_required + j
+                        if j = (a.n_entry - 1)
+                        {
+                            var variadic false
+                            if a.sig.rest_arg
+                                set variadic: true
+                            if a.sig.n_key > 0
+                                set variadic: true
+                            if variadic
+                            {
+                                var extra 0
+                                if a.sig.rest_arg
+                                    set extra: 1
+                                set d: a.sig.n_required + (a.n_entry - 2) + extra + a.sig.n_key
+                            }
+                        }
+                        Escape.register(ep, d)
+                    }
+                    set j: j + 1
+                }
+            }
+            else
+                return
+    }
+
+    ; ======================================================================
+    ; the per-body abstract interpretation
+    ; ======================================================================
+
+    procedure ws_reset()
+    {
+        let es_i_addr g_es_i_addr
+        let es_i_depth g_es_i_depth
+        let es_i_soff g_es_i_soff
+        let es_stack g_es_stack
+        let es_work g_es_work
+        let es_cur g_es_cur
+        let es_nd_flags g_es_nd_flags
+        let es_nd_insn g_es_nd_insn
+        let es_nd_owner g_es_nd_owner
+        let es_nd_ehead g_es_nd_ehead
+        let es_ed_to g_es_ed_to
+        let es_ed_next g_es_ed_next
+        let es_prop g_es_prop
+        set es_bailed: false
+        es_i_addr.clear()
+        es_i_depth.clear()
+        es_i_soff.clear()
+        es_stack.clear()
+        es_work.clear()
+        es_cur.clear()
+        es_nd_flags.clear()
+        es_nd_insn.clear()
+        es_nd_owner.clear()
+        es_nd_ehead.clear()
+        es_ed_to.clear()
+        es_ed_next.clear()
+        es_prop.clear()
+    }
+
+    procedure ws_forget()
+    {
+        let es_seen g_es_seen
+        let es_i_addr g_es_i_addr
+        var i: size_t 0
+        let n es_i_addr.get_length()
+        while i < n
+        {
+            let q es_i_addr.get(i)
+            if q <> null
+                Escape.map_forget(es_seen, *q as u64)
+            set i: i + 1
+        }
+    }
+
+    function new_node(flags: int, insn: int) returns int
+    {
+        let es_nd_flags g_es_nd_flags
+        let es_nd_insn g_es_nd_insn
+        let es_nd_owner g_es_nd_owner
+        let es_nd_ehead g_es_nd_ehead
+        let id es_nd_flags.get_length() as int
+        es_nd_flags.add(flags)
+        es_nd_insn.add(insn)
+        es_nd_owner.add(0 - 1)
+        es_nd_ehead.add(0 - 1)
+        id
+    }
+
+    function nd_flags(n: int) returns int
+    {
+        let es_nd_flags g_es_nd_flags
+        let p es_nd_flags.get(n as size_t)
+        if p = null
+            return 0
+        *p
+    }
+
+    procedure nd_or(n: int, f: int)
+    {
+        let es_nd_flags g_es_nd_flags
+        let p es_nd_flags.get(n as size_t)
+        if p = null
+            return
+        es_nd_flags.put(n as size_t, *p | f)
+    }
+
+    procedure add_edge(from: int, to: int)
+    {
+        let es_nd_ehead g_es_nd_ehead
+        let es_ed_to g_es_ed_to
+        let es_ed_next g_es_ed_next
+        if from = to
+            return
+        if to = 0
+            return
+        let hp es_nd_ehead.get(from as size_t)
+        if hp = null
+            return
+        let e es_ed_to.get_length() as int
+        es_ed_to.add(to)
+        es_ed_next.add(*hp)
+        es_nd_ehead.put(from as size_t, e)
+    }
+
+    ; an escape ROOT: this value may outlive the frame
+    procedure mark_ret(n: int)
+    {
+        if n = 0
+            return
+        Escape.nd_or(n, ES_F_RET)
+    }
+
+    procedure mark_pub(n: int)
+    {
+        if n = 0
+            return
+        Escape.nd_or(n, ES_F_PUB)
+    }
+
+    ; --- the current stack --------------------------------------------------
+
+    function cur_get(k: i64) returns int
+    {
+        let es_cur g_es_cur
+        if k < 0
+        {
+            set es_bailed: true
+            Escape.bail(ES_BAIL_SLOT)
+            return 0
+        }
+        if k >= es_d
+        {
+            set es_bailed: true
+            Escape.bail(ES_BAIL_SLOT)
+            return 0
+        }
+        let p es_cur.get(k as size_t)
+        if p = null
+        {
+            set es_bailed: true
+            Escape.bail(ES_BAIL_SLOT)
+            return 0
+        }
+        *p
+    }
+
+    procedure cur_set(k: i64, v: int)
+    {
+        let es_cur g_es_cur
+        if k < 0
+        {
+            set es_bailed: true
+            Escape.bail(ES_BAIL_SLOT)
+            return
+        }
+        if k >= ES_MAX_DEPTH
+        {
+            set es_bailed: true
+            Escape.bail(ES_BAIL_DEPTH)
+            return
+        }
+        while (es_cur.get_length() as i64) <= k
+            es_cur.add(0)
+        es_cur.put(k as size_t, v)
+    }
+
+    procedure cur_push(v: int)
+    {
+        Escape.cur_set(es_d, v)
+        set es_d: es_d + 1
+    }
+
+    ; a write to a slot that must already be part of the frame's stack. An index
+    ; at or above the depth would be silently dropped by the merge (which copies
+    ; `depth` slots), so it is a modelling error rather than a slow path.
+    procedure cur_store(k: i64, v: int)
+    {
+        if k >= es_d
+        {
+            set es_bailed: true
+            Escape.bail(ES_BAIL_SLOT)
+            return
+        }
+        Escape.cur_set(k, v)
+    }
+
+    ; --- interning and merging ---------------------------------------------
+
+    ; The insn's index in this body, creating it (with the current stack as its
+    ; entry state) if new. Answers -1 on a bail.
+    function intern(i: pointer[Insn], depth: i64) returns i64
+    {
+        let es_seen g_es_seen
+        let es_i_addr g_es_i_addr
+        let es_i_depth g_es_i_depth
+        let es_i_soff g_es_i_soff
+        let es_stack g_es_stack
+        let es_work g_es_work
+        let es_cur g_es_cur
+        if i = null
+            return 0 - 1
+        if Escape.analysable(i) = false
+        {
+            set es_bailed: true
+            Escape.bail(ES_BAIL_REGION)
+            return 0 - 1
+        }
+        let got Escape.map_get(es_seen, i as u64, 0)
+        if got <> 0
+            return (got as i64) - 1
+        if (es_i_addr.get_length() as i64) >= ES_MAX_INSNS
+        {
+            set es_bailed: true
+            Escape.bail(ES_BAIL_SIZE)
+            return 0 - 1
+        }
+        let idx es_i_addr.get_length() as i64
+        es_i_addr.add(i as int)
+        es_i_depth.add(depth as int)
+        es_i_soff.add(es_stack.get_length() as int)
+        var k: i64 0
+        while k < depth
+        {
+            let p es_cur.get(k as size_t)
+            if p = null
+                es_stack.add(0)
+            else
+                es_stack.add(*p)
+            set k: k + 1
+        }
+        Escape.map_put(es_seen, i as u64, (idx + 1) as u64)
+        es_work.add(idx as int)
+        idx
+    }
+
+    ; Hand the current stack (depth `depth`) to `succ`. A null successor ends the
+    ; evaluation with the top of stack as its value, which is an escape.
+    procedure merge(succ: pointer[Insn], depth: i64)
+    {
+        let es_i_depth g_es_i_depth
+        let es_i_soff g_es_i_soff
+        let es_stack g_es_stack
+        let es_work g_es_work
+        let es_cur g_es_cur
+        let es_nd_owner g_es_nd_owner
+        if es_bailed
+            return
+        if succ = null
+        {
+            if depth > 0
+                Escape.mark_ret(Escape.cur_get(depth - 1))
+            return
+        }
+        let saved es_d
+        set es_d: depth
+        let idx Escape.intern(succ, depth)
+        set es_d: saved
+        if idx < 0
+            return
+        let dp es_i_depth.get(idx as size_t)
+        if dp = null
+            return
+        if (*dp as i64) <> depth
+        {
+            set es_bailed: true
+            Escape.bail(ES_BAIL_DEPTH)
+            return
+        }
+        let op es_i_soff.get(idx as size_t)
+        if op = null
+            return
+        let off *op as i64
+        var changed false
+        var k: i64 0
+        while k < depth
+        {
+            let rp es_stack.get((off + k) as size_t)
+            let ip es_cur.get(k as size_t)
+            if rp <> null
+            {
+                if ip <> null
+                {
+                    let rec *rp
+                    let inc *ip
+                    if rec <> inc
+                    {
+                        let owner_key (idx * ES_MAX_DEPTH) + k
+                        var is_own false
+                        if (Escape.nd_flags(rec) & ES_F_PHI) <> 0
+                        {
+                            let ow es_nd_owner.get(rec as size_t)
+                            if ow <> null
+                            {
+                                if (*ow as i64) = owner_key
+                                    set is_own: true
+                            }
+                        }
+                        if is_own
+                            Escape.add_edge(rec, inc)
+                        else
+                        {
+                            let p Escape.new_node(ES_F_PHI, 0)
+                            es_nd_owner.put(p as size_t, owner_key as int)
+                            Escape.add_edge(p, rec)
+                            Escape.add_edge(p, inc)
+                            es_stack.put((off + k) as size_t, p)
+                            set changed: true
+                        }
+                    }
+                }
+            }
+            set k: k + 1
+        }
+        if changed
+            es_work.add(idx as int)
+    }
+
+    ; ======================================================================
+    ; ONE INSN. The depth arithmetic here mirrors Insn.execute arm for arm; the
+    ; VERIFY mode checks it against the running interpreter, because a wrong
+    ; depth is the one mistake that mislabels silently.
+    ; ======================================================================
+    procedure step(idx: i64)
+    {
+        let es_i_addr g_es_i_addr
+        let es_i_depth g_es_i_depth
+        let es_i_soff g_es_i_soff
+        let es_stack g_es_stack
+        let es_cur g_es_cur
+        let ap es_i_addr.get(idx as size_t)
+        let dp es_i_depth.get(idx as size_t)
+        let op es_i_soff.get(idx as size_t)
+        if ap = null
+            return
+        if dp = null
+            return
+        if op = null
+            return
+        let insn *ap as pointer[Insn]
+        let depth *dp as i64
+        let off *op as i64
+        ; load the entry stack
+        es_cur.clear()
+        var k: i64 0
+        while k < depth
+        {
+            let sp es_stack.get((off + k) as size_t)
+            if sp = null
+                es_cur.add(0)
+            else
+                es_cur.add(*sp)
+            set k: k + 1
+        }
+        set es_d: depth
+        Escape.step_arm(insn)
+    }
+
+    procedure step_arm(insn: pointer[Insn])
+    {
+        choose *insn
+            when a: Error
+                return
+            when a: CondFail
+                return
+            when a: CaseFail
+                return
+            when a: Constant
+            {
+                Escape.cur_push(0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: ResolveQuantities
+            {
+                ; the top is replaced by a resolved quantity built on the eval
+                ; host, which this pass does not place — so the operand escapes.
+                Escape.mark_pub(Escape.cur_get(es_d - 1))
+                Escape.cur_store(es_d - 1, 0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: Test
+                Escape.merge2(a.consequent, a.alternative, es_d - 1, es_d - 1)
+            when a: Or
+                Escape.merge2(a.next, a.next_test, es_d, es_d - 1)
+            when a: And
+                Escape.merge2(a.next, a.next_test, es_d, es_d - 1)
+            when a: Case
+                Escape.merge2(a.matched, a.fail, es_d - 1, es_d)
+            when a: Pop
+                Escape.merge(a.next, es_d - 1)
+            when a: Cons
+            {
+                ; make_pair(host, a, d) — a tracked site holding both operands
+                let car Escape.cur_get(es_d - 1)
+                let cdr Escape.cur_get(es_d - 2)
+                let n Escape.new_node(ES_F_SITE, insn as int)
+                Escape.add_edge(n, car)
+                Escape.add_edge(n, cdr)
+                Escape.cur_store(es_d - 2, n)
+                set es_d: es_d - 1
+                Escape.merge(a.next, es_d)
+            }
+            when a: Append
+            {
+                ; the copied spine holds both operands' contents, and the fresh
+                ; pairs are not placed by this pass
+                Escape.mark_pub(Escape.cur_get(es_d - 1))
+                Escape.mark_pub(Escape.cur_get(es_d - 2))
+                Escape.cur_store(es_d - 2, 0)
+                set es_d: es_d - 1
+                Escape.merge(a.next, es_d)
+            }
+            when a: Apply
+            {
+                ; the callee is dynamic, and decode_args trims the stack by an
+                ; amount that depends on ITS signature
+                set es_bailed: true
+                Escape.bail(ES_BAIL_APPLY)
+            }
+            when a: TailApply
+            {
+                set es_bailed: true
+                Escape.bail(ES_BAIL_APPLY)
+            }
+            when a: FrameRef
+            {
+                Escape.cur_push(Escape.cur_get(a.index as i64))
+                Escape.merge(a.next, es_d)
+            }
+            when a: StackRef
+            {
+                Escape.cur_push(Escape.cur_get(es_d + (a.index as i64)))
+                Escape.merge(a.next, es_d)
+            }
+            when a: ClosureRef
+            {
+                Escape.cur_push(0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: TopRef
+            {
+                Escape.cur_push(0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: PopBindings
+            {
+                let v Escape.cur_get(es_d - 1)
+                set es_d: es_d - (a.n as i64)
+                Escape.cur_store(es_d - 1, v)
+                Escape.merge(a.next, es_d)
+            }
+            when a: Return
+                Escape.mark_ret(Escape.cur_get(es_d - 1))
+            when a: PrimitiveCall
+                Escape.do_prim(insn, Escape.prim_id_of(a.prim), a.n_args, a.next, false)
+            when a: ClosureMk
+            {
+                ; the closure record is built on the eval host and captures the
+                ; display slots, which this pass does not place
+                var j 0
+                while j < a.display_length
+                {
+                    Escape.mark_pub(Escape.cur_get(es_d - (a.display_length as i64) + (j as i64)))
+                    set j: j + 1
+                }
+                set es_d: es_d - (a.display_length as i64)
+                Escape.cur_push(0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: FunctionCall
+            {
+                let k Escape.callee_kind(a.func)
+                if k = 0
+                {
+                    set es_bailed: true
+                    Escape.bail(ES_BAIL_APPLY)
+                }
+                if k = 2
+                    Escape.do_prim(insn, Escape.prim_id_of(a.func), a.n_args, a.next, false)
+                if k = 1
+                    Escape.do_call(a.func, a.n_args, a.next, false)
+                if k = 3
+                    Escape.do_call(null, a.n_args, a.next, false)
+            }
+            when a: FunctionTailCall
+            {
+                let k Escape.callee_kind(a.func)
+                if k = 0
+                {
+                    set es_bailed: true
+                    Escape.bail(ES_BAIL_APPLY)
+                }
+                if k = 2
+                    Escape.do_prim(insn, Escape.prim_id_of(a.func), a.n_args, null, true)
+                if k = 1
+                    Escape.do_call(a.func, a.n_args, null, true)
+                if k = 3
+                    Escape.do_call(null, a.n_args, null, true)
+            }
+            when a: Varargs
+            {
+                ; a Varargs is a body ENTRY (its entry points are registered as
+                ; bodies of their own); meeting one mid-body is not modelled
+                set es_bailed: true
+                Escape.bail(ES_BAIL_VARARGS)
+            }
+            when a: SetKeyArg
+            {
+                let v Escape.cur_get(es_d - 1)
+                set es_d: es_d - 1
+                Escape.cur_store(es_d + (a.offset as i64), v)
+                Escape.merge(a.next, es_d)
+            }
+            when a: TestNull
+                Escape.merge2(a.if_null, a.if_not_null, es_d, es_d)
+            when a: Box
+            {
+                ; make_box on the eval host: unplaced, so the boxed value escapes
+                Escape.mark_pub(Escape.cur_get(es_d - 1))
+                Escape.cur_store(es_d - 1, 0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: BoxArg
+            {
+                ; ★The slot index is `sp + n - n_actual_args`, and this pass does
+                ; not track n_actual_args across nested calls — so WHICH slot is
+                ; boxed is unknown. The depth is not: BoxArg pushes nothing. An
+                ; unknown SLOT at a known DEPTH does not have to cost the body:
+                ; publish every live slot and forget them all, which is sound
+                ; whichever slot it really was. Measured worth: 64 bodies of the
+                ; heaviest codegen that were abandoned whole before.
+                var j: i64 0
+                while j < es_d
+                {
+                    Escape.mark_pub(Escape.cur_get(j))
+                    Escape.cur_store(j, 0)
+                    set j: j + 1
+                }
+                Escape.merge(a.next, es_d)
+            }
+            when a: BoxStack
+            {
+                Escape.mark_pub(Escape.cur_get(es_d + (a.n as i64)))
+                Escape.cur_store(es_d + (a.n as i64), 0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: Unbox
+            {
+                Escape.cur_store(es_d - 1, 0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: SetBox
+            {
+                let v Escape.cur_get(es_d - 1)
+                set es_d: es_d - 1
+                ; a box can belong to any enclosing frame
+                Escape.mark_pub(v)
+                Escape.merge(a.next, es_d)
+            }
+            when a: SetImmediate
+            {
+                let v Escape.cur_get(es_d - 1)
+                set es_d: es_d - 1
+                Escape.cur_store(es_d - (a.n as i64), v)
+                Escape.merge(a.next, es_d)
+            }
+            when a: CheckInit
+                Escape.merge(a.next, es_d)
+            when a: StackSetBox
+            {
+                Escape.mark_pub(Escape.cur_get(es_d - 1))
+                Escape.cur_store(es_d - 1, 0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: StackSet
+            {
+                let idx es_d + (a.index as i64)
+                let top Escape.cur_get(es_d - 1)
+                let other Escape.cur_get(idx)
+                Escape.cur_store(idx, top)
+                Escape.cur_store(es_d - 1, other)
+                Escape.merge(a.next, es_d)
+            }
+            when a: ClosureSetBox
+            {
+                Escape.mark_pub(Escape.cur_get(es_d - 1))
+                Escape.cur_store(es_d - 1, 0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: Vector
+            {
+                var j 0
+                while j < a.n
+                {
+                    Escape.mark_pub(Escape.cur_get(es_d - (a.n as i64) + (j as i64)))
+                    set j: j + 1
+                }
+                set es_d: es_d - (a.n as i64)
+                Escape.cur_push(0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: ListToVector
+            {
+                Escape.mark_pub(Escape.cur_get(es_d - 1))
+                Escape.cur_store(es_d - 1, 0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: MakeFlowObj
+            {
+                ; ★The one arm whose stack arithmetic is worth reproducing here
+                ; rather than abandoning: the `make` bodies ARE the construction
+                ; rules, and with them abandoned 21 % of the byte mass sat behind
+                ; a coverage hole rather than behind an escape. The two paths and
+                ; the condition that picks them are exec_make_flow_obj /
+                ; exec_make_styled_flow_obj verbatim — and the DEPTH VERIFIER is
+                ; what makes copying arithmetic acceptable at all.
+                var total 0
+                var n_key 0
+                if a.keys <> null
+                    set n_key: a.keys.get_length() as int
+                if Escape.styled_make(a.foc, a.key_class)
+                {
+                    var n_slots 0
+                    var k 0
+                    while k < n_key
+                    {
+                        if a.key_class <> null
+                        {
+                            let cp a.key_class.get(k as size_t)
+                            if cp <> null
+                            {
+                                if Insn.key_has_slot(*cp)
+                                    set n_slots: n_slots + 1
+                            }
+                        }
+                        set k: k + 1
+                    }
+                    var n_cm 0
+                    if a.has_cm
+                        set n_cm: 1
+                    set total: n_slots + a.n_content + n_cm + a.n_bound
+                }
+                else
+                    set total: n_key + a.n_content
+                ; everything consumed is retained by the flow object or its
+                ; sosofo, neither of which this pass places
+                var j 0
+                while j < total
+                {
+                    Escape.mark_pub(Escape.cur_get(es_d - (total as i64) + (j as i64)))
+                    set j: j + 1
+                }
+                set es_d: es_d - (total as i64)
+                Escape.cur_push(0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: LabelSosofo
+            {
+                Escape.mark_pub(Escape.cur_get(es_d - 1))
+                Escape.mark_pub(Escape.cur_get(es_d - 2))
+                Escape.cur_store(es_d - 2, 0)
+                set es_d: es_d - 1
+                Escape.merge(a.next, es_d)
+            }
+            when a: SetNic
+            {
+                Escape.mark_pub(Escape.cur_get(es_d - 1))
+                Escape.mark_pub(Escape.cur_get(es_d - 2))
+                set es_d: es_d - 1
+                Escape.merge(a.next, es_d)
+            }
+            when a: MakeStyle
+            {
+                ; exec_make_style: one slot per use:/ignored key, then the
+                ; captured display vars
+                var n_key 0
+                if a.keys <> null
+                    set n_key: a.keys.get_length() as int
+                var n_slots 0
+                var k 0
+                while k < n_key
+                {
+                    if a.key_class <> null
+                    {
+                        let cp a.key_class.get(k as size_t)
+                        if cp <> null
+                        {
+                            if Insn.key_has_slot(*cp)
+                                set n_slots: n_slots + 1
+                        }
+                    }
+                    set k: k + 1
+                }
+                let total n_slots + a.n_bound
+                var j 0
+                while j < total
+                {
+                    Escape.mark_pub(Escape.cur_get(es_d - (total as i64) + (j as i64)))
+                    set j: j + 1
+                }
+                set es_d: es_d - (total as i64)
+                Escape.cur_push(0)
+                Escape.merge(a.next, es_d)
+            }
+            when a: PushMode
+                Escape.merge(a.next, es_d)
+            when a: PopMode
+                Escape.merge(a.next, es_d)
+            when a: CheckSosofo
+                Escape.merge(a.next, es_d)
+            when a: UnpackMacroFlowObj
+            {
+                ; one stack slot per declared characteristic — a count that is
+                ; read off the macro at run time
+                set es_bailed: true
+                Escape.bail(ES_BAIL_UNPACK)
+            }
+            else
+            {
+                set es_bailed: true
+                Escape.bail(ES_BAIL_ARM)
+            }
+    }
+
+    ; Which of the two `make` implementations the arm dispatches to — the very
+    ; conditions Insn.execute tests, in the same order. Getting this wrong is a
+    ; wrong DEPTH, which is why the verifier exists.
+    function styled_make(foc: int, key_class: pointer[Array[int]]) returns bool
+    {
+        if key_class <> null
+            return true
+        if foc >= FOC_PARAGRAPH
+        {
+            if foc <= FOC_COLUMN_SET_SEQUENCE
+                return true
+        }
+        foc = FOC_MACRO
+    }
+
+    procedure merge2(s0: pointer[Insn], s1: pointer[Insn], d0: i64, d1: i64)
+    {
+        Escape.merge(s0, d0)
+        Escape.merge(s1, d1)
+    }
+
+    ; A primitive call: the audited class decides everything. `tail` means the
+    ; result IS the frame's value (prim_tail_call), which is an escape by
+    ; definition.
+    procedure do_prim(insn: pointer[Insn], id: int, n_args: int, next: pointer[Insn], tail: bool)
+    {
+        let cls Escape.prim_class(id)
+        let n n_args as i64
+        var result 0
+        if cls = ES_PRIM_UNKNOWN
+        {
+            var j: i64 0
+            while j < n
+            {
+                Escape.mark_pub(Escape.cur_get(es_d - n + j))
+                set j: j + 1
+            }
+            ; its own allocations must go outward too
+            if es_writing
+                set es_n_unaudited: es_n_unaudited + 1
+            Escape.put_verdict(insn as u64, ES_V_ESCAPE)
+        }
+        else
+        {
+            let node Escape.new_node(ES_F_SITE, insn as int)
+            if cls = ES_PRIM_CONNECTED
+            {
+                var j: i64 0
+                while j < n
+                {
+                    Escape.add_edge(node, Escape.cur_get(es_d - n + j))
+                    set j: j + 1
+                }
+            }
+            set result: node
+        }
+        if tail
+        {
+            Escape.mark_ret(result)
+            return
+        }
+        set es_d: es_d - n
+        Escape.cur_push(result)
+        Escape.merge(next, es_d)
+    }
+
+    ; A call into another body: the callee's summary decides what happens to the
+    ; arguments. An unknown callee is conservative in both directions.
+    procedure do_call(func: pointer[ELObj], n_args: int, next: pointer[Insn], tail: bool)
+    {
+        let es_bodies g_es_bodies
+        let es_b_pub g_es_b_pub
+        let es_b_ret g_es_b_ret
+        let es_b_ok g_es_b_ok
+        let n n_args as i64
+        var pub_mask 0 - 1
+        var ret_mask 0 - 1
+        let cc Escape.closure_code_of(func)
+        if cc <> null
+        {
+            let got Escape.map_get(es_bodies, cc as u64, 0)
+            if got <> 0
+            {
+                let bi (got as i64) - 1
+                let okp es_b_ok.get(bi as size_t)
+                let pp es_b_pub.get(bi as size_t)
+                let rp es_b_ret.get(bi as size_t)
+                if okp <> null
+                {
+                    if *okp <> 0
+                    {
+                        if pp <> null
+                            set pub_mask: *pp
+                        if rp <> null
+                            set ret_mask: *rp
+                    }
+                }
+            }
+        }
+        ; the callee's result, which may retain the arguments it keeps
+        let node Escape.new_node(0, 0)
+        var j: i64 0
+        while j < n
+        {
+            let arg Escape.cur_get(es_d - n + j)
+            if j < (ES_MAX_PARAMS as i64)
+            {
+                let bit (1 as int) << (j as int)
+                if (pub_mask & bit) <> 0
+                    Escape.mark_pub(arg)
+                if (ret_mask & bit) <> 0
+                    Escape.add_edge(node, arg)
+            }
+            else
+            {
+                Escape.mark_pub(arg)
+            }
+            set j: j + 1
+        }
+        if tail
+        {
+            Escape.mark_ret(node)
+            return
+        }
+        set es_d: es_d - n
+        Escape.cur_push(node)
+        Escape.merge(next, es_d)
+    }
+
+    ; ======================================================================
+    ; propagation, summaries, verdicts
+    ; ======================================================================
+
+    procedure propagate(flag: int)
+    {
+        let es_nd_flags g_es_nd_flags
+        let es_nd_ehead g_es_nd_ehead
+        let es_ed_to g_es_ed_to
+        let es_ed_next g_es_ed_next
+        let es_prop g_es_prop
+        es_prop.clear()
+        var n: size_t 0
+        let nn es_nd_flags.get_length()
+        while n < nn
+        {
+            let p es_nd_flags.get(n)
+            if p <> null
+            {
+                if (*p & flag) <> 0
+                    es_prop.add(n as int)
+            }
+            set n: n + 1
+        }
+        var wi: size_t 0
+        while wi < es_prop.get_length()
+        {
+            let up es_prop.get(wi)
+            set wi: wi + 1
+            if up <> null
+            {
+                let u *up
+                let hp es_nd_ehead.get(u as size_t)
+                if hp <> null
+                {
+                    var e *hp
+                    while e >= 0
+                    {
+                        let tp es_ed_to.get(e as size_t)
+                        let np es_ed_next.get(e as size_t)
+                        if tp <> null
+                        {
+                            let t *tp
+                            if (Escape.nd_flags(t) & flag) = 0
+                            {
+                                Escape.nd_or(t, flag)
+                                es_prop.add(t)
+                            }
+                        }
+                        if np = null
+                            set e: 0 - 1
+                        else
+                            set e: *np
+                    }
+                }
+            }
+        }
+    }
+
+    ; ESCAPE is sticky: an insn can belong to two bodies (shared varargs tails),
+    ; and a body that had to be abandoned forces its insns outward. Whichever
+    ; order the two verdicts are written in, the conservative one must win.
+    procedure put_verdict(addr: u64, v: u64)
+    {
+        let es_verdicts g_es_verdicts
+        if addr = 0
+            return
+        let got Escape.map_get(es_verdicts, addr, 0)
+        if got = ES_V_ESCAPE
+            return
+        Escape.map_put(es_verdicts, addr, v)
+    }
+
+    ; Analyse one body. `write` = the final pass, which records the verdicts;
+    ; otherwise only the summary is recomputed. Answers true when the summary
+    ; CHANGED, which is what drives the fixpoint.
+    function analyze_body(bi: i64, write: bool) returns bool
+    {
+        let es_depths g_es_depths
+        let es_b_root g_es_b_root
+        let es_b_arity g_es_b_arity
+        let es_b_pub g_es_b_pub
+        let es_b_ret g_es_b_ret
+        let es_b_ok g_es_b_ok
+        let es_i_addr g_es_i_addr
+        let es_i_depth g_es_i_depth
+        let es_work g_es_work
+        let es_cur g_es_cur
+        let es_nd_flags g_es_nd_flags
+        let es_nd_insn g_es_nd_insn
+        let okp es_b_ok.get(bi as size_t)
+        let rootp es_b_root.get(bi as size_t)
+        let arityp es_b_arity.get(bi as size_t)
+        if okp = null
+            return false
+        if rootp = null
+            return false
+        if arityp = null
+            return false
+        if *okp = 0
+            return false
+        let root *rootp as pointer[Insn]
+        let arity *arityp
+        set es_writing: write
+        Escape.ws_reset()
+        ; node 0 = EXTERNAL, nodes 1..arity = the parameters
+        Escape.new_node(0, 0)
+        var i 0
+        while i < arity
+        {
+            Escape.new_node(0, 0)
+            set i: i + 1
+        }
+        es_cur.clear()
+        set i: 0
+        while i < arity
+        {
+            es_cur.add(i + 1)
+            set i: i + 1
+        }
+        set es_d: arity as i64
+        if Escape.intern(root, arity as i64) < 0
+        {
+            Escape.abandon(bi)
+            return false
+        }
+        var wi: size_t 0
+        while wi < es_work.get_length()
+        {
+            if es_bailed
+                break
+            let q es_work.get(wi)
+            set wi: wi + 1
+            if q <> null
+                Escape.step(*q as i64)
+        }
+        if es_bailed
+        {
+            Escape.abandon(bi)
+            return false
+        }
+        Escape.propagate(ES_F_RET)
+        Escape.propagate(ES_F_PUB)
+        ; the summary: what the parameters do
+        var pub_mask 0
+        var ret_mask 0
+        var j 0
+        while j < arity
+        {
+            let f Escape.nd_flags(j + 1)
+            let bit (1 as int) << j
+            if (f & ES_F_PUB) <> 0
+                set pub_mask: pub_mask | bit
+            if (f & ES_F_RET) <> 0
+                set ret_mask: ret_mask | bit
+            set j: j + 1
+        }
+        var changed false
+        let pp es_b_pub.get(bi as size_t)
+        let rp es_b_ret.get(bi as size_t)
+        if pp <> null
+        {
+            if *pp <> (pub_mask | *pp)
+                set changed: true
+            es_b_pub.put(bi as size_t, pub_mask | *pp)
+        }
+        if rp <> null
+        {
+            if *rp <> (ret_mask | *rp)
+                set changed: true
+            es_b_ret.put(bi as size_t, ret_mask | *rp)
+        }
+        if write
+        {
+            set es_n_ok: es_n_ok + 1
+            var n: size_t 0
+            let nn es_nd_flags.get_length()
+            while n < nn
+            {
+                let fp es_nd_flags.get(n)
+                let ip es_nd_insn.get(n)
+                if fp <> null
+                {
+                    if ip <> null
+                    {
+                        if (*fp & ES_F_SITE) <> 0
+                        {
+                            set es_n_sites: es_n_sites + 1
+                            if (*fp & (ES_F_RET | ES_F_PUB)) <> 0
+                            {
+                                if (*fp & ES_F_RET) <> 0
+                                {
+                                    if (*fp & ES_F_PUB) <> 0
+                                        set es_n_both: es_n_both + 1
+                                    else
+                                        set es_n_ret: es_n_ret + 1
+                                }
+                                else
+                                    set es_n_pub: es_n_pub + 1
+                                Escape.put_verdict(*ip as u64, ES_V_ESCAPE)
+                            }
+                            else
+                            {
+                                set es_n_local: es_n_local + 1
+                                Escape.put_verdict(*ip as u64, ES_V_LOCAL)
+                            }
+                        }
+                    }
+                }
+                set n: n + 1
+            }
+            if es_verify
+            {
+                var m: size_t 0
+                let nm es_i_addr.get_length()
+                while m < nm
+                {
+                    let apx es_i_addr.get(m)
+                    let dpx es_i_depth.get(m)
+                    if apx <> null
+                    {
+                        if dpx <> null
+                        {
+                            let key *apx as u64
+                            let want (*dpx + 1) as u64
+                            let had Escape.map_get(es_depths, key, 0)
+                            if had = 0
+                                Escape.map_put(es_depths, key, want)
+                            else
+                            {
+                                ; the same insn entered at two depths from two
+                                ; bodies: stop checking it rather than report a
+                                ; disagreement that is not a modelling error
+                                if had <> want
+                                    Escape.map_put(es_depths, key, 1000000)
+                            }
+                        }
+                    }
+                    set m: m + 1
+                }
+            }
+        }
+        Escape.ws_forget()
+        changed
+    }
+
+    ; A body this pass cannot model: force every insn discovery found in it
+    ; outward — not merely the ones interned before the give-up — and never look
+    ; at it again.
+    procedure abandon(bi: i64)
+    {
+        let es_b_ok g_es_b_ok
+        es_b_ok.put(bi as size_t, 0)
+        Escape.force_escape(bi)
+        Escape.ws_forget()
+    }
+
+    ; Every insn discovery found in the body, forced outward. Separate from
+    ; `abandon` because an ARITY CONFLICT needs it too: a body entered at two
+    ; different depths has one analysis with every slot misaligned, and a verdict
+    ; from the arity that WAS analysed would otherwise answer for a frame shape
+    ; nobody checked.
+    procedure force_escape(bi: i64)
+    {
+        let es_b_ins g_es_b_ins
+        let es_b_off g_es_b_off
+        let es_b_len g_es_b_len
+        let offp es_b_off.get(bi as size_t)
+        let lenp es_b_len.get(bi as size_t)
+        if offp <> null
+        {
+            if lenp <> null
+            {
+                var i *offp
+                let end *offp + *lenp
+                while i < end
+                {
+                    let p es_b_ins.get(i as size_t)
+                    if p <> null
+                        Escape.put_verdict(*p as u64, ES_V_ABANDON)
+                    set i: i + 1
+                }
+            }
+        }
+    }
+
+    ; ======================================================================
+    ; the runtime surface
+    ; ======================================================================
+
+    ; the verdict for an allocation site: ES_V_LOCAL, ES_V_ESCAPE, or 0 = none
+    function verdict(i: pointer[Insn]) returns u64
+    {
+        let es_verdicts g_es_verdicts
+        if es_state <> 1
+            return 0
+        if i = null
+            return 0
+        Escape.map_get(es_verdicts, i as u64, 0)
+    }
+
+    ; --- the measurement (DAZZLE_ESCAPE_STATS) ------------------------------
+    ;
+    ; Weighs the static verdicts by the bytes they actually account for: the
+    ; bump pointer of the eval region before and after one dispatch. A call that
+    ; crosses a page boundary is counted separately rather than guessed at —
+    ; ~0.3 % of frames allocate more than a page.
+    function bump_of(host: pointer[Page]) returns i64
+    {
+        if host = null
+            return 0
+        let h host as pointer[void]
+        let cp Escape.slot(h, 1)
+        if cp = 0
+            return Escape.slot(h, 0)
+        Escape.slot(cp as pointer[void], 0)
+    }
+
+    function page_of(host: pointer[Page]) returns i64
+    {
+        if host = null
+            return 0
+        let h host as pointer[void]
+        let cp Escape.slot(h, 1)
+        if cp = 0
+            return h as i64
+        cp
+    }
+
+    procedure tick(i: pointer[Insn], interp: pointer[Interpreter])
+    {
+        if es_state <> 1
+            return
+        if es_stats = false
+            return
+        let v Escape.verdict(i)
+        var cls 0
+        if v = ES_V_LOCAL
+            set cls: 1
+        if v = ES_V_ESCAPE
+            set cls: 2
+        if v = ES_V_ABANDON
+            set cls: 3
+        set es_tick_class: cls
+        let host interp.get_host()
+        set es_tick_page: Escape.page_of(host)
+        set es_tick_bump: Escape.bump_of(host)
+        if cls = 1
+            set es_dyn_calls_local: es_dyn_calls_local + 1
+        if cls = 2
+            set es_dyn_calls_esc: es_dyn_calls_esc + 1
+        if cls = 3
+            set es_dyn_calls_aband: es_dyn_calls_aband + 1
+        if cls = 0
+            set es_dyn_calls_none: es_dyn_calls_none + 1
+    }
+
+    procedure tock(interp: pointer[Interpreter])
+    {
+        if es_state <> 1
+            return
+        if es_stats = false
+            return
+        let host interp.get_host()
+        if Escape.page_of(host) <> es_tick_page
+        {
+            set es_dyn_crossed: es_dyn_crossed + 1
+            return
+        }
+        let d Escape.bump_of(host) - es_tick_bump
+        if d <= 0
+            return
+        if es_tick_class = 1
+            set es_dyn_bytes_local: es_dyn_bytes_local + d
+        if es_tick_class = 2
+            set es_dyn_bytes_esc: es_dyn_bytes_esc + d
+        if es_tick_class = 3
+            set es_dyn_bytes_aband: es_dyn_bytes_aband + d
+        if es_tick_class = 0
+            set es_dyn_bytes_none: es_dyn_bytes_none + d
+    }
+
+    ; --- the depth verifier (DAZZLE_ESCAPE_VERIFY) --------------------------
+    procedure check_depth(i: pointer[Insn], sp: int, frame_start: int)
+    {
+        let es_depths g_es_depths
+        if es_state <> 1
+            return
+        if es_verify = false
+            return
+        if i = null
+            return
+        let want Escape.map_get(es_depths, i as u64, 0)
+        if want = 0
+            return
+        if want = 1000000
+            return
+        set es_depth_checks: es_depth_checks + 1
+        if ((want as i64) - 1) <> ((sp - frame_start) as i64)
+        {
+            set es_depth_bad: es_depth_bad + 1
+            if es_depth_bad < 20
+            {
+                scaly_eputs "escape: DEPTH MODEL WRONG at insn "
+                scaly_eputi(i as i64)
+                scaly_eputs ": modelled "
+                scaly_eputi((want as i64) - 1)
+                scaly_eputs ", actual "
+                scaly_eputi((sp - frame_start) as i64)
+                scaly_eputnl()
+            }
+        }
+    }
+
+    procedure report()
+    {
+        if es_stats = false
+            return
+        scaly_eputs "escape: "
+        scaly_eputi es_n_roots
+        scaly_eputs " roots, "
+        scaly_eputi es_n_bodies
+        scaly_eputs " bodies ("
+        scaly_eputi es_n_ok
+        scaly_eputs " analysed), "
+        scaly_eputi es_n_sites
+        scaly_eputs " sites, "
+        scaly_eputi es_n_local
+        scaly_eputs " frame-local"
+        scaly_eputnl()
+        scaly_eputs "escape: outward because  result "
+        scaly_eputi es_n_ret
+        scaly_eputs "  published "
+        scaly_eputi es_n_pub
+        scaly_eputs "  both "
+        scaly_eputi es_n_both
+        scaly_eputs "  unaudited primitive "
+        scaly_eputi es_n_unaudited
+        scaly_eputnl()
+        scaly_eputs "escape: abandoned  arm "
+        Escape.report_bail(ES_BAIL_ARM)
+        scaly_eputs "  depth "
+        Escape.report_bail(ES_BAIL_DEPTH)
+        scaly_eputs "  slot "
+        Escape.report_bail(ES_BAIL_SLOT)
+        scaly_eputs "  region "
+        Escape.report_bail(ES_BAIL_REGION)
+        scaly_eputs "  arity "
+        Escape.report_bail(ES_BAIL_ARITY)
+        scaly_eputs "  size "
+        Escape.report_bail(ES_BAIL_SIZE)
+        scaly_eputs "  apply "
+        Escape.report_bail(ES_BAIL_APPLY)
+        scaly_eputs "  macro-unpack "
+        Escape.report_bail(ES_BAIL_UNPACK)
+        scaly_eputs "  box-arg "
+        Escape.report_bail(ES_BAIL_BOXARG)
+        scaly_eputs "  varargs "
+        Escape.report_bail(ES_BAIL_VARARGS)
+        scaly_eputs "  (fixpoint passes "
+        scaly_eputi es_iters
+        scaly_eputs ")"
+        scaly_eputnl()
+        scaly_eputs "escape: dynamic  local "
+        scaly_eputi es_dyn_calls_local
+        scaly_eputs " calls / "
+        scaly_eputi es_dyn_bytes_local
+        scaly_eputs " bytes,  escaping "
+        scaly_eputi es_dyn_calls_esc
+        scaly_eputs " / "
+        scaly_eputi es_dyn_bytes_esc
+        scaly_eputs ",  abandoned body "
+        scaly_eputi es_dyn_calls_aband
+        scaly_eputs " / "
+        scaly_eputi es_dyn_bytes_aband
+        scaly_eputs ",  no verdict "
+        scaly_eputi es_dyn_calls_none
+        scaly_eputs " / "
+        scaly_eputi es_dyn_bytes_none
+        scaly_eputnl()
+        scaly_eputs "escape: page-crossed "
+        scaly_eputi es_dyn_crossed
+        scaly_eputs ", depth checks "
+        scaly_eputi es_depth_checks
+        scaly_eputs " ("
+        scaly_eputi es_depth_bad
+        scaly_eputs " wrong)"
+        scaly_eputnl()
+    }
+
+    procedure report_bail(r: int)
+    {
+        let es_bail g_es_bail
+        let p es_bail.get(r as size_t)
+        if p = null
+            scaly_eputi 0
+        else
+            scaly_eputi(*p)
+    }
+}
