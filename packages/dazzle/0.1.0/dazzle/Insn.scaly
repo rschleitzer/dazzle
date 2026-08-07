@@ -142,25 +142,39 @@ define UnpackMacroFlowObjInsn (next: pointer[Insn])
 
 define Insn union
 (
+    ; ★THE ORDER IS LOAD-BEARING, and it is the other half of the thin
+    ; `Insn.execute` (see the comment there). The tag is the union's declaration
+    ; index, and `execute` handles exactly the twelve arms below — so keeping
+    ; them CONTIGUOUS and FIRST is what lets the optimizer emit a range check
+    ; plus a jump table for them. Measured with them scattered over 0..34: the
+    ; same twelve arms came out as a chain of `cmp`/`b.eq` instead, which ate
+    ; the whole prologue saving (4.205 → 4.186 G, i.e. nothing). The rest keep
+    ; their old relative order and get their own table one call deeper.
+    ; `Jit.arm_index` numbers arms for its histogram and is source-level, so it
+    ; is unaffected by this order.
+    StackRef: StackRefInsn
+    Test: TestInsn
+    Unbox: UnboxInsn
+    ClosureRef: ClosureRefInsn
+    Constant: ConstantInsn
+    And: AndInsn
+    Or: OrInsn
+    Case: CaseInsn
+    FrameRef: FrameRefInsn
+    Pop: PopInsn
+    PopBindings: PopBindingsInsn
+    SetImmediate: SetImmediateInsn
+    TestNull: TestNullInsn
+    StackSet: StackSetInsn
     Error: ErrorInsn
     CondFail: CondFailInsn
     CaseFail: CaseFailInsn
-    Constant: ConstantInsn
     ResolveQuantities: ResolveQuantitiesInsn
-    Test: TestInsn
-    Or: OrInsn
-    And: AndInsn
-    Case: CaseInsn
-    Pop: PopInsn
     Cons: ConsInsn
     Append: AppendInsn
     Apply: ApplyInsn
     TailApply: TailApplyInsn
-    FrameRef: FrameRefInsn
-    StackRef: StackRefInsn
-    ClosureRef: ClosureRefInsn
     TopRef: TopRefInsn
-    PopBindings: PopBindingsInsn
     Return: ReturnInsn
     PrimitiveCall: PrimitiveCallInsn
     ClosureMk: ClosureInsn
@@ -168,16 +182,12 @@ define Insn union
     FunctionTailCall: FunctionTailCallInsn
     Varargs: VarargsInsn
     SetKeyArg: SetKeyArgInsn
-    TestNull: TestNullInsn
     Box: BoxInsn
     BoxArg: BoxArgInsn
     BoxStack: BoxStackInsn
-    Unbox: UnboxInsn
     SetBox: SetBoxInsn
-    SetImmediate: SetImmediateInsn
     CheckInit: CheckInitInsn
     StackSetBox: StackSetBoxInsn
-    StackSet: StackSetInsn
     ClosureSetBox: ClosureSetBoxInsn
     Vector: VectorInsn
     ListToVector: ListToVectorInsn
@@ -676,7 +686,124 @@ define Insn union
     }
 
     ; --- the execution loop body -------------------------------------------
+    ; ★TWO functions on purpose, and the split is the union lesson applied to
+    ; CODE. One `choose` over all 47 arms is ONE stack frame, sized by the
+    ; WIDEST arm: the shipped build entered `Insn.execute` with `sub sp, sp,
+    ; #0x1b0` plus six `stp` pairs (twelve callee-saved registers) plus a
+    ; region-frame descriptor, on EVERY interpreted step — 21.97 million of them
+    ; on a single-file real-world codegen. The arms that need any of that are
+    ; the ones that call out (PrimitiveCall, Return, MakeFlowObj, the message
+    ; paths); the arms that carry the step count need nothing but the value
+    ; stack.
+    ;
+    ; So the hot, call-free arms sit in a thin `execute` and everything else
+    ; goes one call deeper into `execute_rest`. That is also the reference's
+    ; shape — openjade gives every Insn subclass its own virtual `execute`, so
+    ; StackRefInsn::execute has StackRef's frame and nobody else's. Nothing is
+    ; duplicated: an arm lives in exactly one of the two functions.
     function execute(this: pointer[Insn], vm: pointer[VM]) returns pointer[Insn]
+    {
+        choose this
+            when sr: StackRef
+            {
+                vm.need_stack(1)
+                vm.stack_set(vm.get_sp(), vm.stack_ref(vm.get_sp() + sr.index))
+                vm.set_sp(vm.get_sp() + 1)
+                return sr.next
+            }
+            when ti: Test
+            {
+                let was_true vm.stack_ref(vm.get_sp() - 1).is_true()
+                vm.set_sp(vm.get_sp() - 1)
+                if was_true
+                    return ti.consequent
+                return ti.alternative
+            }
+            when ub: Unbox
+            {
+                vm.stack_set(vm.get_sp() - 1, vm.stack_ref(vm.get_sp() - 1).box_value())
+                return ub.next
+            }
+            when cr: ClosureRef
+            {
+                vm.need_stack(1)
+                vm.stack_set(vm.get_sp(), vm.closure_ref(cr.index))
+                vm.set_sp(vm.get_sp() + 1)
+                return cr.next
+            }
+            when co: Constant
+            {
+                vm.need_stack(1)
+                vm.stack_set(vm.get_sp(), co.value)
+                vm.set_sp(vm.get_sp() + 1)
+                return co.next
+            }
+            when an: And
+            {
+                if vm.stack_ref(vm.get_sp() - 1).is_true() = false
+                    return an.next
+                vm.set_sp(vm.get_sp() - 1)
+                return an.next_test
+            }
+            when oi: Or
+            {
+                if vm.stack_ref(vm.get_sp() - 1).is_true()
+                    return oi.next
+                vm.set_sp(vm.get_sp() - 1)
+                return oi.next_test
+            }
+            when ca: Case
+            {
+                if ELObj.eqv(vm.stack_ref(vm.get_sp() - 1), ca.obj)
+                {
+                    vm.set_sp(vm.get_sp() - 1)
+                    return ca.matched
+                }
+                return ca.fail
+            }
+            when fr: FrameRef
+            {
+                vm.need_stack(1)
+                vm.stack_set(vm.get_sp(), vm.stack_ref(vm.get_frame_start() + fr.index))
+                vm.set_sp(vm.get_sp() + 1)
+                return fr.next
+            }
+            when po: Pop
+            {
+                vm.set_sp(vm.get_sp() - 1)
+                return po.next
+            }
+            when pb: PopBindings
+            {
+                vm.set_sp(vm.get_sp() - pb.n)
+                vm.stack_set(vm.get_sp() - 1, vm.stack_ref(vm.get_sp() + pb.n - 1))
+                return pb.next
+            }
+            when si: SetImmediate
+            {
+                vm.set_sp(vm.get_sp() - 1)
+                vm.stack_set(vm.get_sp() - si.n, vm.stack_ref(vm.get_sp()))
+                return si.next
+            }
+            when tn: TestNull
+            {
+                if vm.stack_ref(vm.get_sp() + tn.offset) = null
+                    return tn.if_null
+                return tn.if_not_null
+            }
+            when ss: StackSet
+            {
+                let tem vm.stack_ref(vm.get_sp() + ss.index)
+                vm.stack_set(vm.get_sp() + ss.index, vm.stack_ref(vm.get_sp() - 1))
+                vm.stack_set(vm.get_sp() - 1, tem)
+                return ss.next
+            }
+            else
+                return this.execute_rest(vm)
+        null
+    }
+
+    function execute_rest(this: pointer[Insn], vm: pointer[VM]) returns pointer[Insn]
     {
         choose this
             when e: Error
@@ -710,13 +837,6 @@ define Insn union
                 vm.set_sp(0 - 1)
                 return null
             }
-            when co: Constant
-            {
-                vm.need_stack(1)
-                vm.stack_set(vm.get_sp(), co.value)
-                vm.set_sp(vm.get_sp() + 1)
-                return co.next
-            }
             when rq: ResolveQuantities
             {
                 let sp vm.get_sp()
@@ -730,42 +850,6 @@ define Insn union
                 }
                 vm.stack_set(sp - 1, tem)
                 return rq.next
-            }
-            when ti: Test
-            {
-                let was_true vm.stack_ref(vm.get_sp() - 1).is_true()
-                vm.set_sp(vm.get_sp() - 1)
-                if was_true
-                    return ti.consequent
-                return ti.alternative
-            }
-            when oi: Or
-            {
-                if vm.stack_ref(vm.get_sp() - 1).is_true()
-                    return oi.next
-                vm.set_sp(vm.get_sp() - 1)
-                return oi.next_test
-            }
-            when an: And
-            {
-                if vm.stack_ref(vm.get_sp() - 1).is_true() = false
-                    return an.next
-                vm.set_sp(vm.get_sp() - 1)
-                return an.next_test
-            }
-            when ca: Case
-            {
-                if ELObj.eqv(vm.stack_ref(vm.get_sp() - 1), ca.obj)
-                {
-                    vm.set_sp(vm.get_sp() - 1)
-                    return ca.matched
-                }
-                return ca.fail
-            }
-            when po: Pop
-            {
-                vm.set_sp(vm.get_sp() - 1)
-                return po.next
             }
             when cn: Cons
             {
@@ -789,27 +873,6 @@ define Insn union
                 return Insn.exec_apply(vm, ai.n_args, ai.loc, ai.next)
             when ta: TailApply
                 return Insn.exec_tail_apply(vm, ta.n_caller_args, ta.n_args, ta.loc)
-            when fr: FrameRef
-            {
-                vm.need_stack(1)
-                vm.stack_set(vm.get_sp(), vm.stack_ref(vm.get_frame_start() + fr.index))
-                vm.set_sp(vm.get_sp() + 1)
-                return fr.next
-            }
-            when sr: StackRef
-            {
-                vm.need_stack(1)
-                vm.stack_set(vm.get_sp(), vm.stack_ref(vm.get_sp() + sr.index))
-                vm.set_sp(vm.get_sp() + 1)
-                return sr.next
-            }
-            when cr: ClosureRef
-            {
-                vm.need_stack(1)
-                vm.stack_set(vm.get_sp(), vm.closure_ref(cr.index))
-                vm.set_sp(vm.get_sp() + 1)
-                return cr.next
-            }
             when tr: TopRef
             {
                 let tem tr.ident.compute_value(true, vm.get_interp())
@@ -823,12 +886,6 @@ define Insn union
                 vm.stack_set(vm.get_sp(), tem)
                 vm.set_sp(vm.get_sp() + 1)
                 return tr.next
-            }
-            when pb: PopBindings
-            {
-                vm.set_sp(vm.get_sp() - pb.n)
-                vm.stack_set(vm.get_sp() - 1, vm.stack_ref(vm.get_sp() + pb.n - 1))
-                return pb.next
             }
             when ri: Return
             {
@@ -886,12 +943,6 @@ define Insn union
                 vm.stack_set(vm.get_sp() + sk.offset, val)
                 return sk.next
             }
-            when tn: TestNull
-            {
-                if vm.stack_ref(vm.get_sp() + tn.offset) = null
-                    return tn.if_null
-                return tn.if_not_null
-            }
             when bx: Box
             {
                 vm.stack_set(vm.get_sp() - 1, ELObj.make_box(vm.get_host(), vm.stack_ref(vm.get_sp() - 1)))
@@ -909,11 +960,6 @@ define Insn union
                 vm.stack_set(idx, ELObj.make_box(vm.get_host(), vm.stack_ref(idx)))
                 return bs.next
             }
-            when ub: Unbox
-            {
-                vm.stack_set(vm.get_sp() - 1, vm.stack_ref(vm.get_sp() - 1).box_value())
-                return ub.next
-            }
             when sbx: SetBox
             {
                 vm.set_sp(vm.get_sp() - 1)
@@ -922,12 +968,6 @@ define Insn union
                 FrameMark.publish()
                 box.box_set_value(vm.stack_ref(vm.get_sp()))
                 return sbx.next
-            }
-            when si: SetImmediate
-            {
-                vm.set_sp(vm.get_sp() - 1)
-                vm.stack_set(vm.get_sp() - si.n, vm.stack_ref(vm.get_sp()))
-                return si.next
             }
             when ck: CheckInit
             {
@@ -953,13 +993,6 @@ define Insn union
                 box.box_set_value(vm.stack_ref(vm.get_sp() - 1))
                 vm.stack_set(vm.get_sp() - 1, tem)
                 return ssb.next
-            }
-            when ss: StackSet
-            {
-                let tem vm.stack_ref(vm.get_sp() + ss.index)
-                vm.stack_set(vm.get_sp() + ss.index, vm.stack_ref(vm.get_sp() - 1))
-                vm.stack_set(vm.get_sp() - 1, tem)
-                return ss.next
             }
             when cs: ClosureSetBox
             {
