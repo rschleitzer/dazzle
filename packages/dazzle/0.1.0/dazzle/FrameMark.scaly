@@ -94,6 +94,41 @@ use dazzle.Interpreter.Interpreter
 ; 13 754 of 14 028 tail calls stayed behind and the win went negative. Breaking
 ; that cycle needs to know at the PRODUCER whether its value escapes, which is
 ; the dataflow and not a runtime test ("Sprosse 3 GEBAUT und VERWORFEN").
+;
+; ---- the SHAPE of this file, which is a measurement ----------------------
+;
+; ★★★The mechanism costs 173 instructions per frame on the heaviest codegen
+; (14.19 G for 81 775 653 frames) where its design says "one store". The
+; decomposition that explains the gap is in PERFORMANCE.md ("Die Marke
+; ZERLEGT"), and three of its findings are BUILT INTO the code below — read
+; them before "simplifying" any of it back:
+;
+;   1. ONE STATE BLOCK, not eighteen globals. AArch64 materialises an `adrp`
+;      per GLOBAL, not per 4 KB page: every one of these globals lives in the
+;      same page and the hot path still paid ~25 `adrp` per frame. So the whole
+;      hot state — the scalars AND the per-frame columns — sits in one calloc'd
+;      block behind `fm_s`, read once into a register (`let f fm_s`) and
+;      addressed by the FM_*/FC_* word offsets below. A new hot field goes in
+;      the block; a new instrument switch stays a global, because it is only
+;      read on the probe path.
+;   2. The per-frame columns are ONE 64-byte line per frame (FM_COLS = 8), not
+;      seven parallel arrays. Same instruction count for the stores, one cache
+;      line instead of seven.
+;   3. ONE PRE-COMBINED PROBE WORD (`FM_PROBE`), the same trick as
+;      `Escape.es_stats_on`: stats, trap, trap-pop, scan, verify, backfill and
+;      limit are all OFF in real-world, and asking for them one at a time cost
+;      26 of the 182 instructions. `setup` publishes FM_PROBE LAST, so the hot
+;      path can never see the summary before the switches it stands for. The
+;      counters live behind it too — which is why every instrument has to be
+;      re-run and compared LINE BY LINE after touching this file: a probe word
+;      can switch a measurement off silently and the output stays identical.
+;   4. The printers are OUT of the hot functions (`trap_print`, shared by the
+;      push and the pop trap so the inliner cannot pull it back into either).
+;      They were the reason `push_on` opened with six `stp` and closed with six
+;      `ldp` — 13 instructions per frame for code that never runs. Check with
+;      one line of disassembler after any change here:
+;         objdump -d <bin> | sed -n '/<__ZN9FrameMark7push_onEi>:/,/ret/p'
+;      No `stp` in the hot prologue, and the only `bl` on a cold branch.
 
 function getenv(name: pointer[const_char]) returns pointer[const_char] extern
 function calloc(count: size_t, size: size_t) returns pointer[void] extern
@@ -107,30 +142,47 @@ procedure scaly_eputnl() extern
 ; deeper frames are counted, not marked
 define FM_MAX_DEPTH: i64 65536
 
-; 0 = not asked yet, 1 = on, 2 = off
+; --- the state block, by word offset --------------------------------------
+; scalars first, then FM_MAX_DEPTH frames of FM_COLS words each
+define FM_HEAD: i64 0       ; the region being marked (the eval bracket's)
+define FM_GEN: i64 1        ; its generation — condition 1
+define FM_EPOCH: i64 2      ; the publication counter — condition 5
+define FM_TOP: i64 3        ; the innermost live frame's index
+define FM_PROBE: i64 4      ; any instrument on? see finding 3 above
+define FM_FRAMES: i64 5
+define FM_REWOUND: i64 6
+define FM_BYTES: i64 7
+define FM_PAGES: i64 8
+define FM_PUBLISHES: i64 9
+define FM_BINVALID: i64 10
+define FM_BPUBLISH: i64 11
+define FM_BRESULT: i64 12
+define FM_BREFUSED: i64 13
+define FM_BDEEP: i64 14
+define FM_BBELOW: i64 15
+define FM_HDR: i64 32       ; where the per-frame columns start
+
+; one 64-byte line per frame
+define FM_COLS: i64 8
+define FC_PAGE: i64 0       ; the mark's page
+define FC_OFF: i64 1        ; the mark itself
+define FC_EXCL: i64 2       ; the mark page's exclusive list — condition 3
+define FC_HEXCL: i64 3      ; the region HEAD's, a DIFFERENT list
+define FC_HEADAT: i64 4     ; the head's bump at the push — condition 6
+define FC_GEN: i64 5        ; -1 means "this frame carries no mark"
+define FC_EPOCH: i64 6
+
+; 0 = not asked yet, 1 = on, 2 = off. Its own global: the thin wrappers below
+; are inlined into their callers, where the block pointer is not live.
 shared fm_state: int 0
+shared fm_s: pointer[i64] null
+
+; --- the instrument switches, read on the PROBE path only ------------------
 shared fm_stats: bool false
-
-; the region being marked (the eval bracket's), and its generation
-shared fm_head: pointer[Page] null
-shared fm_gen: i64 0
-; the publication counter — condition 5
-shared fm_epoch: i64 0
-; the innermost live frame's index
-shared fm_top: i64 -1
-
-; per-frame columns
-shared fm_page: pointer[i64] null
-shared fm_off: pointer[i64] null
-shared fm_excl: pointer[i64] null
-; the region HEAD's exclusive list, which is a DIFFERENT list from the mark
-; page's whenever the mark is on an extension page
-shared fm_hexcl: pointer[i64] null
-shared fm_gen_at: pointer[i64] null
-shared fm_epoch_at: pointer[i64] null
-; condition 6 — see BACKFILL below
+; probe-only side tables: the trap's sequence numbers and the general form of
+; condition 6. Both are per frame and neither is touched in real-world.
+shared fm_seq: pointer[i64] null
 shared fm_below: pointer[i64] null
-shared fm_head_at: pointer[i64] null
 
 ; --- the HUNT for the store the sweep does not hook (DZ_FRAME_MARK_LIMIT/SCAN) -
 ;
@@ -167,9 +219,9 @@ shared fm_trap_pop: i64 0 - 1
 shared fm_watch: i64 1040
 ; the push trap parks the computed address here so a debugger can read it out of
 ; a SYMBOL instead of scraping stderr — the instrument globals carry no debug
-; info, but they are symbols, and the arena base moves between runs
+; info, but they are symbols, and the arena base moves between runs. ★It stays
+; its OWN global for exactly that reason: a word inside the block has no name.
 shared fm_watch_at: i64 0
-shared fm_seq: pointer[i64] null
 ; ★★★DZ_FRAME_MARK_VERIFY=1 — the check the store sweep never had. Before EVERY
 ; rewind, scan the marked region for a word below the mark that points into the
 ; span about to be reclaimed. A hit is a rewind that frees live data, i.e. a
@@ -180,19 +232,6 @@ shared fm_seq: pointer[i64] null
 shared fm_verify: bool false
 shared fm_violations: i64 0
 shared fm_verified: i64 0
-
-; counters (DAZZLE_FRAME_MARK_STATS)
-shared fm_frames: i64 0
-shared fm_rewound: i64 0
-shared fm_bytes: i64 0
-shared fm_b_invalid: i64 0
-shared fm_b_publish: i64 0
-shared fm_b_result: i64 0
-shared fm_b_refused: i64 0
-shared fm_b_deep: i64 0
-shared fm_publishes: i64 0
-shared fm_pages: i64 0
-shared fm_b_below: i64 0
 ; DZ_FRAME_MARK_BACKFILL=N — run the general form of condition 6 on every Nth
 ; rewind. N=1 is exhaustive and costs 27x on the reproducer; a stride is what
 ; makes the heaviest codegen (81.8 M frames) reachable at all.
@@ -234,30 +273,15 @@ define FrameMark
             if (*e as u32) = (zero as u32)
                 return
         }
-        set fm_page: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
-        set fm_off: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
-        set fm_excl: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
-        set fm_hexcl: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
-        set fm_below: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
-        set fm_head_at: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
-        set fm_gen_at: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
-        set fm_epoch_at: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
+        ; ONE block for the whole hot state — see finding 1 in the header.
+        set fm_s: calloc((FM_HDR + (FM_MAX_DEPTH * FM_COLS)) as size_t, 8) as pointer[i64]
         set fm_seq: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
-        if fm_page = null
+        set fm_below: calloc(FM_MAX_DEPTH as size_t, 8) as pointer[i64]
+        if fm_s = null
             return
-        if fm_off = null
-            return
-        if fm_excl = null
-            return
-        if fm_hexcl = null
+        if fm_seq = null
             return
         if fm_below = null
-            return
-        if fm_head_at = null
-            return
-        if fm_gen_at = null
-            return
-        if fm_epoch_at = null
             return
         let lim getenv("DZ_FRAME_MARK_LIMIT")
         if lim <> null
@@ -286,6 +310,27 @@ define FrameMark
             set fm_stats: true
             atexit(&fm_stats_atexit)
         }
+        ; ★★★The probe word, published LAST so that it can never be true before
+        ; the switch it summarises is set — same discipline as
+        ; `Escape.es_stats_on`. Every instrument, INCLUDING the counters, hangs
+        ; off it; a new switch must be added here or it will silently never fire.
+        var probe: i64 0
+        if fm_stats
+            set probe: 1
+        if fm_verify
+            set probe: 1
+        if fm_backfill > 0
+            set probe: 1
+        if fm_limit >= 0
+            set probe: 1
+        if fm_scan >= 0
+            set probe: 1
+        if fm_trap >= 0
+            set probe: 1
+        if fm_trap_pop >= 0
+            set probe: 1
+        let f fm_s
+        set *(f + FM_PROBE): probe
         set fm_state: 1
     }
 
@@ -313,12 +358,599 @@ define FrameMark
         v
     }
 
-    ; ★The referrer scan: every 8-byte word of the marked region and of the run
-    ; arena that points INTO [lo, hi) — the span this rewind is about to reclaim.
-    ; A hit in the run arena means a long-lived object holds it; a hit in the
-    ; marked region BELOW the mark means an older frame does. Either way the
-    ; address identifies the record, and the record identifies the store.
-    procedure scan_for_refs(lo: i64, hi: i64)
+    ; --- the region, read and written by documented OFFSET ------------------
+    ;
+    ; ★★★Why by offset and not through a `Page.mark`/`Page.rewind` pair in the
+    ; stdlib, which is where this knowledge belongs: it was TRIED and it fails a
+    ; structural constraint of the in-process JIT. The planner is DEMAND-DRIVEN,
+    ; so a stdlib function nothing in the COMPILER calls is never emitted into
+    ; the compiler image (adding the six functions left `tools/cycle.sh`
+    ; IDENTICAL, which is the same fact seen from the other side) — and the
+    ; `--jit` leg of tests/dazzle/run.sh materialises this package INSIDE the
+    ; compiler process and resolves its externals there. Result:
+    ; `Failed to materialize symbols: { _ZN4Page6rewindE… }` and the whole leg
+    ; red. **A new stdlib entry point may only be called from a package that the
+    ; --jit leg exercises if the compiler itself also reaches it.** So the four
+    ; slots are read here, against the comment in `Page.scaly` that declares them
+    ; load-bearing by number:
+    ;
+    ;   0 next_object   1 current_page   2 next_page   3 exclusive_pages.head
+    ;
+    ; `Page.get` and `Page.release_page` ARE used by the compiler and therefore
+    ; resolve — those two stay ordinary calls.
+
+    function slot(p: i64, i: int) returns i64
+        *((p as pointer[i64]) + i)
+
+    ; the END of the marked region's extension chain
+    function tail(head: i64) returns i64
+    {
+        let cp FrameMark.slot(head, 1)
+        if cp = 0
+            return head
+        cp
+    }
+
+    ; --- hooks --------------------------------------------------------------
+    ;
+    ; ★Each hook is a THIN wrapper around its `*_on` core, and that shape is
+    ; load-bearing for the OFF path (the escape hatch). The check used to sit at
+    ; the top of the big core, so every frame push, every frame pop and every
+    ; store site paid a CALL to find out that the mechanism is off — measured
+    ; 2026-08-07 at 2.0 % of a codegen run (`FrameMark::push` 1.10 %,
+    ; `::pop` 0.80 %, `::store` 0.09 % of self time, with the mark OFF). Split
+    ; this way, LTO inlines the wrapper into its callers and the off path is a
+    ; load of `fm_state` plus a branch. Same class as the two switches that
+    ; `VM.eval` reads once before its loop.
+
+    ; VM.push_frame, after csp was incremented: the new frame's index is csp-1
+    procedure push(csp: int)
+    {
+        if FrameMark.on()
+            FrameMark.push_on(csp)
+    }
+
+    procedure pop(csp: int, result: pointer[void])
+    {
+        if FrameMark.on()
+            FrameMark.pop_on(csp, result)
+    }
+
+    procedure pop_unknown()
+    {
+        if FrameMark.on()
+            FrameMark.publish_on()
+    }
+
+    procedure store(target: pointer[void])
+    {
+        if FrameMark.on()
+            FrameMark.store_on(target)
+    }
+
+    procedure publish()
+    {
+        if FrameMark.on()
+            FrameMark.publish_on()
+    }
+
+    procedure push_on(csp: int)
+    {
+        let f fm_s
+        let idx (csp - 1) as i64
+        set *(f + FM_TOP): idx
+        let probe *(f + FM_PROBE)
+        ; the frame COUNTER is an instrument too: it is the trap's sequence
+        ; number and the stats line's first column, and nothing else reads it.
+        if probe <> 0
+            FrameMark.push_probe(f, idx)
+        if idx < 0
+            return
+        if idx >= FM_MAX_DEPTH
+            return
+        let head *(f + FM_HEAD)
+        let c f + (FM_HDR + (idx * FM_COLS))
+        if head = 0
+        {
+            ; outside any eval bracket the run page is the host, and that is
+            ; never rewound
+            set *(c + FC_GEN): 0 - 1
+            return
+        }
+        let t FrameMark.tail(head)
+        let b FrameMark.slot(t, 0)
+        if b = 0
+        {
+            set *(c + FC_GEN): 0 - 1
+            if probe <> 0
+                FrameMark.push_tail(f, idx, t, b)
+            return
+        }
+        set *(c + FC_PAGE): t
+        set *(c + FC_OFF): b
+        set *(c + FC_EXCL): FrameMark.slot(t, 3)
+        set *(c + FC_HEXCL): FrameMark.slot(head, 3)
+        set *(c + FC_HEADAT): FrameMark.slot(head, 0)
+        set *(c + FC_GEN): *(f + FM_GEN)
+        set *(c + FC_EPOCH): *(f + FM_EPOCH)
+        ; ★LAST, and that position is load-bearing: in TAIL position this is a
+        ; sibling call, so `push_on` needs no stack frame at all — with the trap
+        ; sitting in the middle (where the pre-rewrite code had it) the register
+        ; allocator spilled five callee-saved PAIRS on every one of 81.8 M
+        ; pushes for a branch that never runs. The price is that the push trap
+        ; now fires with the frame's columns already written, which is if
+        ; anything the better moment to inspect them.
+        if probe <> 0
+            FrameMark.push_tail(f, idx, t, b)
+    }
+
+    ; --- the probe path: everything that is off in real-world ---------------
+
+    procedure push_probe(f: pointer[i64], idx: i64)
+    {
+        set *(f + FM_FRAMES): *(f + FM_FRAMES) + 1
+        if idx < 0
+            return
+        if idx >= FM_MAX_DEPTH
+        {
+            set *(f + FM_BDEEP): *(f + FM_BDEEP) + 1
+            return
+        }
+        set *(fm_seq + idx): *(f + FM_FRAMES)
+    }
+
+    ; the trap, plus the general verifier's push-side snapshot. ★The verifier
+    ; samples by FRAME so that the walk is strided on the push side too — at the
+    ; push there is no rewind number yet, and walking on every push is what
+    ; makes stride 1 unaffordable on a workload with 81.8 M frames.
+    ; ★The TRAP goes last inside here, and that is the same reason as above one
+    ; level down: this procedure is small enough that LTO inlines it back into
+    ; `push_on`, so `trap_print` is only a sibling call — and `push_on` only
+    ; frameless — when nothing follows it.
+    procedure push_tail(f: pointer[i64], idx: i64, t: i64, b: i64)
+    {
+        if b <> 0
+        {
+            if fm_backfill > 0
+            {
+                set *(fm_below + idx): 0 - 1
+                if (*(f + FM_FRAMES) % fm_backfill) = 0
+                    set *(fm_below + idx): FrameMark.below_sum(*(f + FM_HEAD), t)
+            }
+        }
+        if fm_trap < 0
+            return
+        if *(f + FM_FRAMES) <> fm_trap
+            return
+        FrameMark.trap_print("push", *(f + FM_FRAMES), t, b, true)
+    }
+
+    ; ★Shared by BOTH traps on purpose. A printer called from one place is what
+    ; the inliner pulls back into the hot function — and that is where
+    ; `push_on`'s six `stp` came from.
+    procedure trap_print(what: pointer[const_char], seq: i64, page: i64, mark: i64, watch: bool)
+    {
+        scaly_eputs "frame-mark: TRAP at "
+        scaly_eputs what
+        scaly_eputs " of frame seq "
+        scaly_eputi seq
+        if watch
+        {
+            scaly_eputs ", mark page "
+            scaly_eputi page
+            scaly_eputs ", mark "
+            scaly_eputi mark
+            scaly_eputs ", WATCH "
+            scaly_eputi(mark - fm_watch)
+            set fm_watch_at: mark - fm_watch
+        }
+        scaly_eputnl()
+        raise(5)
+    }
+
+    ; The ReturnInsn arm and PrimitiveObj::tailCall, before VM.pop_frame — `csp`
+    ; is still the leaving frame's, so its index is csp-1, and `result` is the
+    ; value it yields. ★89 % of frames leave through the tail-call path, not
+    ; through the Return insn: a DSSSL body typically ends in a primitive call in
+    ; tail position, and treating that path as "no result reported" makes this
+    ; whole mechanism report zero.
+    procedure pop_on(csp: int, result: pointer[void])
+    {
+        let f fm_s
+        let idx (csp - 1) as i64
+        set *(f + FM_TOP): idx - 1
+        if idx < 0
+            return
+        if idx >= FM_MAX_DEPTH
+            return
+        let probe *(f + FM_PROBE)
+        ; the closing half of the watch window — see DZ_FRAME_MARK_TRAP_POP
+        if probe <> 0
+            FrameMark.pop_trap(idx)
+        let head *(f + FM_HEAD)
+        if head = 0
+        {
+            if probe <> 0
+                set *(f + FM_BINVALID): *(f + FM_BINVALID) + 1
+            return
+        }
+        let c f + (FM_HDR + (idx * FM_COLS))
+        ; 1. VALID
+        if *(c + FC_GEN) <> *(f + FM_GEN)
+        {
+            if probe <> 0
+                set *(f + FM_BINVALID): *(f + FM_BINVALID) + 1
+            return
+        }
+        ; 5. QUIET — cheapest and the most common no
+        if *(c + FC_EPOCH) <> *(f + FM_EPOCH)
+        {
+            if probe <> 0
+                set *(f + FM_BPUBLISH): *(f + FM_BPUBLISH) + 1
+            return
+        }
+        ; 4. RESULT
+        if FrameMark.in_span(c, head, result)
+        {
+            if probe <> 0
+                set *(f + FM_BRESULT): *(f + FM_BRESULT) + 1
+            return
+        }
+        ; 6. BACKFILL — the region head served nothing while the frame ran.
+        ; ★Only when the head is NOT the mark's page: on a single-page region the
+        ; head's bump IS the span's, so testing it there refuses everything
+        ; (measured: 92 refusals instead of 3, and the 89 are all this case).
+        if *(c + FC_PAGE) <> head
+        {
+            if FrameMark.slot(head, 0) <> *(c + FC_HEADAT)
+            {
+                if probe <> 0
+                    set *(f + FM_BBELOW): *(f + FM_BBELOW) + 1
+                return
+            }
+        }
+        ; the hunt's switches, the general form of condition 6 and the verifier
+        if probe <> 0
+        {
+            if FrameMark.pop_probe(f, idx, c) = false
+                return
+        }
+        ; 2. THE CHAIN and 3. EXCLUSIVE both live in `rewind`, which changes
+        ; nothing when it cannot honour the mark.
+        if FrameMark.rewind(f, c, head)
+        {
+            if probe <> 0
+                set *(f + FM_REWOUND): *(f + FM_REWOUND) + 1
+        }
+        else
+        {
+            if probe <> 0
+                set *(f + FM_BREFUSED): *(f + FM_BREFUSED) + 1
+        }
+    }
+
+    procedure pop_trap(idx: i64)
+    {
+        if fm_trap_pop < 0
+            return
+        if *(fm_seq + idx) <> fm_trap_pop
+            return
+        FrameMark.trap_print("pop", fm_trap_pop, 0, 0, false)
+    }
+
+    ; answers false when this rewind must NOT happen
+    function pop_probe(f: pointer[i64], idx: i64, c: pointer[i64]) returns bool
+    {
+        ; the general form of condition 6, opt-in: every page below the mark.
+        ; Counts what the head test alone would let through — see below_sum.
+        if fm_backfill > 0
+        {
+            let snap *(fm_below + idx)
+            if snap <> (0 - 1)
+            {
+                set fm_below_checked: fm_below_checked + 1
+                if FrameMark.below_sum(*(f + FM_HEAD), *(c + FC_PAGE)) <> snap
+                {
+                    set fm_below_missed: fm_below_missed + 1
+                    return false
+                }
+            }
+        }
+        if fm_limit >= 0
+        {
+            if *(f + FM_REWOUND) >= fm_limit
+            {
+                set *(f + FM_BREFUSED): *(f + FM_BREFUSED) + 1
+                return false
+            }
+        }
+        if fm_scan >= 0
+        {
+            if *(f + FM_REWOUND) = fm_scan
+            {
+                let mp *(c + FC_PAGE)
+                scaly_eputs "frame-mark: SCAN frame seq "
+                scaly_eputi(*(fm_seq + idx))
+                scaly_eputs ", mark page "
+                scaly_eputi mp
+                scaly_eputnl()
+                FrameMark.scan_for_refs(*(f + FM_HEAD), *(c + FC_OFF), FrameMark.slot(mp, 0))
+            }
+        }
+        if fm_verify
+        {
+            let mp2 *(c + FC_PAGE)
+            set fm_verified: fm_verified + 1
+            if FrameMark.count_refs(*(f + FM_HEAD), *(c + FC_OFF), FrameMark.slot(mp2, 0)) > 0
+                set fm_violations: fm_violations + 1
+        }
+        true
+    }
+
+    ; --- condition 6: BACKFILL ------------------------------------------------
+    ;
+    ; ★★★The store the sweep never hooked was not a store at all — it is the
+    ; ALLOCATOR. `Page.allocate` serves from the page it was CALLED ON whenever
+    ; that page still has room (`capacity < size` is what sends a request to the
+    ; region's tail), and the engine calls it on the region HEAD (`host.allocate`
+    ; in every `ELObj.make_*`) and on arbitrary pages of the chain (the
+    ; `Page.get(object)` / `^this` / container-growth idiom). So the frontier is
+    ; NOT the tail alone: a page below the mark that kept a few free bytes serves
+    ; small requests forever, BELOW every live mark.
+    ;
+    ; That breaks the span's defining property. Measured on the reproducer:
+    ; `ELObj.make_string` got its 40-byte ELObj from the head's 56-byte remainder
+    ; — below the mark — and the string buffer it then allocates no longer fitted
+    ; there, so it came off the tail, ABOVE the mark. The rewind freed the buffer
+    ; and left the object holding a pointer into it: 150 characters of generated
+    ; output turned into garbage bytes in one file of 278. Found with
+    ; DZ_FRAME_MARK_TRAP + DZ_FRAME_MARK_TRAP_POP and a watchpoint on the word the
+    ; SCAN named, which is the only way to attribute a write to a frame's window
+    ; — the word is recycled after every rewind.
+    ;
+    ; The test that ships is ONE comparison: the region HEAD's bump pointer must
+    ; be the same at the pop as it was at the push. Bump pointers only move
+    ; forward and no page before the mark's is released while the frame runs, so
+    ; equality means the head served nothing during the window. No propagation is
+    ; needed — an ancestor's window contains its descendants', exactly as for
+    ; condition 5.
+    ;
+    ; ★★★Why the HEAD and not every page below the mark: `this` is the head for
+    ; every allocation the engine makes from a page it did not derive from an
+    ; object (`host.allocate`, and `host` IS `interp.get_host()` = the eval
+    ; region head). A MIDDLE page can only become `this` through
+    ; `Page.get(object)` on a PRE-EXISTING object — and that is precisely the set
+    ; of sites the store sweep hooks, so such an allocation already publishes and
+    ; is stopped by condition 5. Head test plus store sweep is the whole rule.
+    ;
+    ; ★★And the general test was MEASURED AWAY rather than assumed away, because
+    ; the first version of this condition was the general one: sum the bumps of
+    ; every page below the mark. It is correct and it costs **27x** — 2.9 billion
+    ; page steps on the 278-file reproducer, because the eval region is not short
+    ; (chains of 13 536 pages below a mark with the memo probe, 20 324 without).
+    ; The run went 2.18 s -> 59.6 s. It survives as the VERIFIER
+    ; `DZ_FRAME_MARK_BACKFILL=1`, which counts the rewinds the general test would
+    ; refuse ON TOP of the head test — that number is what gates the paragraph
+    ; above, and it is 0 across the corpus.
+    function below_sum(head: i64, mp: i64) returns i64
+    {
+        var s: i64 0
+        var n: i64 0
+        var p head
+        while p <> 0
+        {
+            if p = mp
+                break
+            set s: s + FrameMark.slot(p, 0)
+            set n: n + 1
+            set p: FrameMark.slot(p, 2)
+        }
+        set fm_walk: fm_walk + n
+        if n > fm_walk_max
+            set fm_walk_max: n
+        s
+    }
+
+    ; is `v` inside the span the frame at `c` marked — its page from the mark
+    ; onward, plus every page appended after it?
+    function in_span(c: pointer[i64], head: i64, v: pointer[void]) returns bool
+    {
+        if v = null
+            return false
+        let mp *(c + FC_PAGE)
+        let vp Page.get(v) as i64
+        if vp = mp
+        {
+            if (v as i64) >= *(c + FC_OFF)
+                return true
+            return false
+        }
+        ; another region can never be in the span: a container growing off an
+        ; object there allocates at THAT region's end
+        if FrameMark.slot(vp, 4) <> head
+            return false
+        ; same region — only the pages AFTER the mark's page are in the span, and
+        ; a frame appends none in 99.7 % of cases, so this walk is usually empty
+        var p FrameMark.slot(mp, 2)
+        while p <> 0
+        {
+            if p = vp
+                return true
+            set p: FrameMark.slot(p, 2)
+        }
+        false
+    }
+
+    ; Give back everything allocated in the marked region since the frame's mark.
+    ; Answers false and changes NOTHING when the mark cannot be honoured.
+    ;
+    ; Two passes on purpose: VALIDATE the chain first, then release. A page whose
+    ; own exclusive-page list grew since the mark must not be dropped half way,
+    ; and `allocate_oversized` attaches to the page it was CALLED on rather than
+    ; to the head, so the check is per page.
+    function rewind(f: pointer[i64], c: pointer[i64], head: i64) returns bool
+    {
+        let mp *(c + FC_PAGE)
+        let mark *(c + FC_OFF)
+        ; NO "the mark's page must still be the end" test — that was the
+        ; single-page restriction, and dropping it is the point: pages appended
+        ; after `mp` are exactly what this frame added, because `allocate` only
+        ; ever appends at the region's end.
+        ; an oversized page has no bump pointer and cannot carry a mark
+        let now FrameMark.slot(mp, 0)
+        if now = 0
+            return false
+        if mark < mp
+            return false
+        if mark > now
+            return false
+        ; the mark page's own exclusive list must not have moved: an oversized
+        ; allocation since the mark put its PageNode inside the span, so the
+        ; surviving list head would dangle
+        if FrameMark.slot(mp, 3) <> *(c + FC_EXCL)
+            return false
+        ; ★★And the region HEAD's list as well, which is a DIFFERENT list as soon
+        ; as the mark sits on an extension page. `allocate` forwards an oversized
+        ; request to `allocate_oversized` on the page it was CALLED on, and a
+        ; frame allocates on its host — the head. Its PageNode is then
+        ; bump-allocated at the region's end, i.e. inside the span, so the
+        ; surviving head's list would dangle. Leaving this out cost 3 of the 48
+        ; real-world codegens; the gate is what found it.
+        if FrameMark.slot(head, 3) <> *(c + FC_HEXCL)
+            return false
+        ; the pages this frame APPENDED go back too. It is not the frame's size
+        ; that makes that necessary — 99.7 % allocate under 4 KB — but where the
+        ; bump pointer happened to stand at entry; measured, it decides 19 % of
+        ; all frames. VALIDATE the whole chain first: a page whose own exclusive
+        ; list is non-empty must not be dropped (its PageNode sits in the span we
+        ; are about to reclaim), and noticing that half way through the release
+        ; would leave the region in pieces.
+        var p FrameMark.slot(mp, 2)
+        var extra: i64 0
+        var pages: i64 0
+        while p <> 0
+        {
+            if FrameMark.slot(p, 3) <> 0
+                return false
+            set extra: extra + (FrameMark.slot(p, 0) - p)
+            set pages: pages + 1
+            set p: FrameMark.slot(p, 2)
+        }
+        if now = mark
+        {
+            if pages = 0
+                return true
+        }
+        var q FrameMark.slot(mp, 2)
+        while q <> 0
+        {
+            let following FrameMark.slot(q, 2)
+            Page.release_page(q as pointer[Page])
+            set q: following
+        }
+        let w mp as pointer[i64]
+        ; cut the chain and make the mark's page the end again. The head records
+        ; the end, and null means "the head IS the end" — the state `allocate`
+        ; expects, it appends on demand.
+        set *(w + 2): 0
+        let hw head as pointer[i64]
+        if mp = head
+            set *(hw + 1): 0
+        else
+            set *(hw + 1): mp
+        set *w: mark
+        if *(f + FM_PROBE) <> 0
+        {
+            set *(f + FM_BYTES): *(f + FM_BYTES) + (now - mark) + extra
+            set *(f + FM_PAGES): *(f + FM_PAGES) + pages
+        }
+        true
+    }
+
+    procedure publish_on()
+    {
+        let f fm_s
+        set *(f + FM_EPOCH): *(f + FM_EPOCH) + 1
+        if *(f + FM_PROBE) <> 0
+            set *(f + FM_PUBLISHES): *(f + FM_PUBLISHES) + 1
+    }
+
+    ; ★A STORE into a pre-existing object. It publishes in exactly one shape:
+    ; the target lives in the region being marked AND below the innermost frame's
+    ; mark — then whatever the store allocates lands at the region's END, inside
+    ; the span, while the target survives the rewind. A target in another region
+    ; (the grove, the run page) allocates at THAT region's end and can never
+    ; point into the span; a target inside the span dies with it.
+    procedure store_on(target: pointer[void])
+    {
+        if target = null
+            return
+        let f fm_s
+        let head *(f + FM_HEAD)
+        if head = 0
+            return
+        let tp Page.get(target) as i64
+        if FrameMark.slot(tp, 4) <> head
+            return
+        let top *(f + FM_TOP)
+        if top < 0
+        {
+            FrameMark.publish_on()
+            return
+        }
+        if top >= FM_MAX_DEPTH
+        {
+            FrameMark.publish_on()
+            return
+        }
+        let c f + (FM_HDR + (top * FM_COLS))
+        if *(c + FC_GEN) <> *(f + FM_GEN)
+        {
+            FrameMark.publish_on()
+            return
+        }
+        ; ★★★Deliberately STRICTER than `in_span`: the target counts as safe only
+        ; when it sits on the innermost frame's own MARK PAGE at or above the
+        ; mark, and the region has not moved off that page since. Reasoning that
+        ; a target on a LATER page of the span is equally safe is what the
+        ; rewritten version did — and it made 3 of the 48 real-world codegens
+        ; differ while publishing 42 000 times less. The looser rule may well be
+        ; defensible; it is not GATED, and this one is.
+        let t FrameMark.tail(head)
+        if t <> *(c + FC_PAGE)
+        {
+            FrameMark.publish_on()
+            return
+        }
+        let r target as i64
+        if r >= *(c + FC_OFF)
+        {
+            if r < FrameMark.slot(t, 0)
+                return
+        }
+        FrameMark.publish_on()
+    }
+
+    ; Interpreter.set_eval_region — the region under every live mark changes
+    procedure region(p: pointer[Page])
+    {
+        if FrameMark.on() = false
+            return
+        let f fm_s
+        if (p as i64) = *(f + FM_HEAD)
+            return
+        set *(f + FM_HEAD): p as i64
+        set *(f + FM_GEN): *(f + FM_GEN) + 1
+    }
+
+    ; --- the referrer scan (DZ_FRAME_MARK_SCAN / _VERIFY) -------------------
+    ;
+    ; ★Every 8-byte word of the marked region and of the run arena that points
+    ; INTO [lo, hi) — the span this rewind is about to reclaim. A hit in the run
+    ; arena means a long-lived object holds it; a hit in the marked region BELOW
+    ; the mark means an older frame does. Either way the address identifies the
+    ; record, and the record identifies the store.
+    procedure scan_for_refs(head: i64, lo: i64, hi: i64)
     {
         scaly_eputs "frame-mark: SCAN span ["
         scaly_eputi lo
@@ -329,11 +961,11 @@ define FrameMark
         scaly_eputs " bytes"
         scaly_eputnl()
         var hits: i64 0
-        set hits: hits + FrameMark.scan_region(fm_head as i64, lo, hi, "marked-region")
+        set hits: hits + FrameMark.scan_region(head, lo, hi, "marked-region")
         let perm Interpreter.perm_page()
         if perm <> null
         {
-            if (perm as i64) <> (fm_head as i64)
+            if (perm as i64) <> head
                 set hits: hits + FrameMark.scan_region(perm as i64, lo, hi, "run-arena")
         }
         scaly_eputs "frame-mark: SCAN total referrers "
@@ -403,13 +1035,13 @@ define FrameMark
     }
 
     ; the silent form of scan_region, over the marked region only
-    function count_refs(lo: i64, hi: i64) returns i64
+    function count_refs(head: i64, lo: i64, hi: i64) returns i64
     {
         var hits: i64 0
-        var p fm_head as i64
+        var p head
         while p <> 0
         {
-            let end FrameMark.slot(p as pointer[void], 0)
+            let end FrameMark.slot(p, 0)
             var q p + 40
             while (q + 8) <= end
             {
@@ -430,7 +1062,7 @@ define FrameMark
                 }
                 set q: q + 8
             }
-            set p: FrameMark.slot(p as pointer[void], 2)
+            set p: FrameMark.slot(p, 2)
         }
         hits
     }
@@ -445,7 +1077,7 @@ define FrameMark
         while p <> 0
         {
             set pages: pages + 1
-            let end FrameMark.slot(p as pointer[void], 0)
+            let end FrameMark.slot(p, 0)
             var q p + 40
             while (q + 8) <= end
             {
@@ -471,7 +1103,7 @@ define FrameMark
                 }
                 set q: q + 8
             }
-            set p: FrameMark.slot(p as pointer[void], 2)
+            set p: FrameMark.slot(p, 2)
         }
         scaly_eputs "frame-mark: SCAN "
         scaly_eputs what
@@ -484,543 +1116,35 @@ define FrameMark
         hits
     }
 
-    ; --- the region, read and written by documented OFFSET ------------------
-    ;
-    ; ★★★Why by offset and not through a `Page.mark`/`Page.rewind` pair in the
-    ; stdlib, which is where this knowledge belongs: it was TRIED and it fails a
-    ; structural constraint of the in-process JIT. The planner is DEMAND-DRIVEN,
-    ; so a stdlib function nothing in the COMPILER calls is never emitted into
-    ; the compiler image (adding the six functions left `tools/cycle.sh`
-    ; IDENTICAL, which is the same fact seen from the other side) — and the
-    ; `--jit` leg of tests/dazzle/run.sh materialises this package INSIDE the
-    ; compiler process and resolves its externals there. Result:
-    ; `Failed to materialize symbols: { _ZN4Page6rewindE… }` and the whole leg
-    ; red. **A new stdlib entry point may only be called from a package that the
-    ; --jit leg exercises if the compiler itself also reaches it.** So the four
-    ; slots are read here, against the comment in `Page.scaly` that declares them
-    ; load-bearing by number:
-    ;
-    ;   0 next_object   1 current_page   2 next_page   3 exclusive_pages.head
-    ;
-    ; `Page.get` and `Page.release_page` ARE used by the compiler and therefore
-    ; resolve — those two stay ordinary calls.
-
-    function slot(p: pointer[void], i: int) returns i64
-    {
-        let w p as pointer[size_t]
-        *(w + i) as i64
-    }
-
-    ; --- condition 6: BACKFILL ------------------------------------------------
-    ;
-    ; ★★★The store the sweep never hooked was not a store at all — it is the
-    ; ALLOCATOR. `Page.allocate` serves from the page it was CALLED ON whenever
-    ; that page still has room (`capacity < size` is what sends a request to the
-    ; region's tail), and the engine calls it on the region HEAD (`host.allocate`
-    ; in every `ELObj.make_*`) and on arbitrary pages of the chain (the
-    ; `Page.get(object)` / `^this` / container-growth idiom). So the frontier is
-    ; NOT the tail alone: a page below the mark that kept a few free bytes serves
-    ; small requests forever, BELOW every live mark.
-    ;
-    ; That breaks the span's defining property. Measured on the reproducer:
-    ; `ELObj.make_string` got its 40-byte ELObj from the head's 56-byte remainder
-    ; — below the mark — and the string buffer it then allocates no longer fitted
-    ; there, so it came off the tail, ABOVE the mark. The rewind freed the buffer
-    ; and left the object holding a pointer into it: 150 characters of generated
-    ; output turned into garbage bytes in one file of 278. Found with
-    ; DZ_FRAME_MARK_TRAP + DZ_FRAME_MARK_TRAP_POP and a watchpoint on the word the
-    ; SCAN named, which is the only way to attribute a write to a frame's window
-    ; — the word is recycled after every rewind.
-    ;
-    ; The test that ships is ONE comparison: the region HEAD's bump pointer must
-    ; be the same at the pop as it was at the push. Bump pointers only move
-    ; forward and no page before the mark's is released while the frame runs, so
-    ; equality means the head served nothing during the window. No propagation is
-    ; needed — an ancestor's window contains its descendants', exactly as for
-    ; condition 5.
-    ;
-    ; ★★★Why the HEAD and not every page below the mark: `this` is the head for
-    ; every allocation the engine makes from a page it did not derive from an
-    ; object (`host.allocate`, and `host` IS `interp.get_host()` = the eval
-    ; region head). A MIDDLE page can only become `this` through
-    ; `Page.get(object)` on a PRE-EXISTING object — and that is precisely the set
-    ; of sites the store sweep hooks, so such an allocation already publishes and
-    ; is stopped by condition 5. Head test plus store sweep is the whole rule.
-    ;
-    ; ★★And the general test was MEASURED AWAY rather than assumed away, because
-    ; the first version of this condition was the general one: sum the bumps of
-    ; every page below the mark. It is correct and it costs **27x** — 2.9 billion
-    ; page steps on the 278-file reproducer, because the eval region is not short
-    ; (chains of 13 536 pages below a mark with the memo probe, 20 324 without).
-    ; The run went 2.18 s -> 59.6 s. It survives as the VERIFIER
-    ; `DZ_FRAME_MARK_BACKFILL=1`, which counts the rewinds the general test would
-    ; refuse ON TOP of the head test — that number is what gates the paragraph
-    ; above, and it is 0 across the corpus.
-    function below_sum(mp: i64) returns i64
-    {
-        var s: i64 0
-        var n: i64 0
-        var p fm_head as i64
-        while p <> 0
-        {
-            if p = mp
-                break
-            set s: s + FrameMark.slot(p as pointer[void], 0)
-            set n: n + 1
-            set p: FrameMark.slot(p as pointer[void], 2)
-        }
-        set fm_walk: fm_walk + n
-        if n > fm_walk_max
-            set fm_walk_max: n
-        s
-    }
-
-    ; the END of the marked region's extension chain
-    function tail() returns pointer[void]
-    {
-        let h fm_head as pointer[void]
-        let cp FrameMark.slot(h, 1)
-        if cp = 0
-            return h
-        cp as pointer[void]
-    }
-
-    ; is `v` inside the span the frame at `idx` marked — its page from the mark
-    ; onward, plus every page appended after it?
-    function in_span(idx: i64, v: pointer[void]) returns bool
-    {
-        if v = null
-            return false
-        let mp *(fm_page + idx)
-        let vp Page.get(v) as i64
-        if vp = mp
-        {
-            if (v as i64) >= *(fm_off + idx)
-                return true
-            return false
-        }
-        ; another region can never be in the span: a container growing off an
-        ; object there allocates at THAT region's end
-        let reg FrameMark.slot(vp as pointer[void], 4)
-        if reg <> (fm_head as i64)
-            return false
-        ; same region — only the pages AFTER the mark's page are in the span, and
-        ; a frame appends none in 99.7 % of cases, so this walk is usually empty
-        var p FrameMark.slot(mp as pointer[void], 2)
-        while p <> 0
-        {
-            if p = vp
-                return true
-            set p: FrameMark.slot(p as pointer[void], 2)
-        }
-        false
-    }
-
-    ; Give back everything allocated in the marked region since the frame's mark.
-    ; Answers false and changes NOTHING when the mark cannot be honoured.
-    ;
-    ; Two passes on purpose: VALIDATE the chain first, then release. A page whose
-    ; own exclusive-page list grew since the mark must not be dropped half way,
-    ; and `allocate_oversized` attaches to the page it was CALLED on rather than
-    ; to the head, so the check is per page.
-    function rewind(idx: i64) returns bool
-    {
-        let mp *(fm_page + idx) as pointer[void]
-        let mark *(fm_off + idx)
-        ; NO "the mark's page must still be the end" test — that was the
-        ; single-page restriction, and dropping it is the point: pages appended
-        ; after `mp` are exactly what this frame added, because `allocate` only
-        ; ever appends at the region's end.
-        ; an oversized page has no bump pointer and cannot carry a mark
-        let now FrameMark.slot(mp, 0)
-        if now = 0
-            return false
-        if mark < (mp as i64)
-            return false
-        if mark > now
-            return false
-        ; the mark page's own exclusive list must not have moved: an oversized
-        ; allocation since the mark put its PageNode inside the span, so the
-        ; surviving list head would dangle
-        if FrameMark.slot(mp, 3) <> *(fm_excl + idx)
-            return false
-        ; ★★And the region HEAD's list as well, which is a DIFFERENT list as soon
-        ; as the mark sits on an extension page. `allocate` forwards an oversized
-        ; request to `allocate_oversized` on the page it was CALLED on, and a
-        ; frame allocates on its host — the head. Its PageNode is then
-        ; bump-allocated at the region's end, i.e. inside the span, so the
-        ; surviving head's list would dangle. Leaving this out cost 3 of the 48
-        ; real-world codegens; the gate is what found it.
-        if FrameMark.slot(fm_head as pointer[void], 3) <> *(fm_hexcl + idx)
-            return false
-        ; the pages this frame APPENDED go back too. It is not the frame's size
-        ; that makes that necessary — 99.7 % allocate under 4 KB — but where the
-        ; bump pointer happened to stand at entry; measured, it decides 19 % of
-        ; all frames. VALIDATE the whole chain first: a page whose own exclusive
-        ; list is non-empty must not be dropped (its PageNode sits in the span we
-        ; are about to reclaim), and noticing that half way through the release
-        ; would leave the region in pieces.
-        var p FrameMark.slot(mp, 2)
-        var extra: i64 0
-        var pages: i64 0
-        while p <> 0
-        {
-            if FrameMark.slot(p as pointer[void], 3) <> 0
-                return false
-            set extra: extra + (FrameMark.slot(p as pointer[void], 0) - p)
-            set pages: pages + 1
-            set p: FrameMark.slot(p as pointer[void], 2)
-        }
-        if now = mark
-        {
-            if pages = 0
-                return true
-        }
-        var q FrameMark.slot(mp, 2)
-        while q <> 0
-        {
-            let following FrameMark.slot(q as pointer[void], 2)
-            Page.release_page(q as pointer[Page])
-            set q: following
-        }
-        let w mp as pointer[size_t]
-        ; cut the chain and make the mark's page the end again. The head records
-        ; the end, and null means "the head IS the end" — the state `allocate`
-        ; expects, it appends on demand.
-        set *(w + 2): 0 as size_t
-        let hw fm_head as pointer[size_t]
-        if (mp as i64) = (fm_head as i64)
-            set *(hw + 1): 0 as size_t
-        else
-            set *(hw + 1): mp as size_t
-        set *w: mark as size_t
-        set fm_bytes: fm_bytes + (now - mark) + extra
-        set fm_pages: fm_pages + pages
-        true
-    }
-
-    ; --- hooks --------------------------------------------------------------
-    ;
-    ; ★Each hook is a THIN wrapper around its `*_on` core, and that shape is
-    ; load-bearing for the DEFAULT (mark off) path. The check used to sit at the
-    ; top of the big core, so every frame push, every frame pop and every store
-    ; site paid a CALL to find out that the mechanism is off — measured
-    ; 2026-08-07 at 2.0 % of a codegen run (`FrameMark::push` 1.10 %,
-    ; `::pop` 0.80 %, `::store` 0.09 % of self time, with the mark OFF). Split
-    ; this way, LTO inlines the wrapper into its callers and the off path is a
-    ; load of `fm_state` plus a branch. Same class as the two switches that
-    ; `VM.eval` reads once before its loop.
-
-    ; VM.push_frame, after csp was incremented: the new frame's index is csp-1
-    procedure push(csp: int)
-    {
-        if FrameMark.on()
-            FrameMark.push_on(csp)
-    }
-
-    procedure pop(csp: int, result: pointer[void])
-    {
-        if FrameMark.on()
-            FrameMark.pop_on(csp, result)
-    }
-
-    procedure pop_unknown()
-    {
-        if FrameMark.on()
-            FrameMark.pop_unknown_on()
-    }
-
-    procedure store(target: pointer[void])
-    {
-        if FrameMark.on()
-            FrameMark.store_on(target)
-    }
-
-    procedure push_on(csp: int)
-    {
-        let idx (csp - 1) as i64
-        set fm_frames: fm_frames + 1
-        set fm_top: idx
-        if idx < 0
-            return
-        if idx >= FM_MAX_DEPTH
-        {
-            set fm_b_deep: fm_b_deep + 1
-            return
-        }
-        if fm_head = null
-        {
-            ; outside any eval bracket the run page is the host, and that is
-            ; never rewound
-            set *(fm_gen_at + idx): 0 - 1
-            return
-        }
-        let t FrameMark.tail()
-        let b FrameMark.slot(t, 0)
-        if fm_seq <> null
-            set *(fm_seq + idx): fm_frames
-        if fm_trap >= 0
-        {
-            if fm_frames = fm_trap
-            {
-                scaly_eputs "frame-mark: TRAP at push of frame seq "
-                scaly_eputi fm_frames
-                scaly_eputs ", mark page "
-                scaly_eputi(t as i64)
-                scaly_eputs ", mark "
-                scaly_eputi b
-                scaly_eputs ", WATCH "
-                scaly_eputi(b - fm_watch)
-                scaly_eputnl()
-                set fm_watch_at: b - fm_watch
-                raise(5)
-            }
-        }
-        if b = 0
-            set *(fm_gen_at + idx): 0 - 1
-        else
-        {
-            set *(fm_page + idx): t as i64
-            set *(fm_off + idx): b
-            set *(fm_excl + idx): FrameMark.slot(t, 3)
-            set *(fm_hexcl + idx): FrameMark.slot(fm_head as pointer[void], 3)
-            set *(fm_head_at + idx): FrameMark.slot(fm_head as pointer[void], 0)
-            ; the general verifier samples by FRAME, so that the walk is
-            ; strided on the push side too — at the push there is no rewind
-            ; number yet, and walking on every push is what makes stride 1
-            ; unaffordable on a workload with 81.8 M frames
-            if fm_backfill > 0
-            {
-                set *(fm_below + idx): 0 - 1
-                if (fm_frames % fm_backfill) = 0
-                    set *(fm_below + idx): FrameMark.below_sum(t as i64)
-            }
-            set *(fm_gen_at + idx): fm_gen
-            set *(fm_epoch_at + idx): fm_epoch
-        }
-    }
-
-    ; The ReturnInsn arm and PrimitiveObj::tailCall, before VM.pop_frame — `csp`
-    ; is still the leaving frame's, so its index is csp-1, and `result` is the
-    ; value it yields. ★89 % of frames leave through the tail-call path, not
-    ; through the Return insn: a DSSSL body typically ends in a primitive call in
-    ; tail position, and treating that path as "no result reported" makes this
-    ; whole mechanism report zero.
-    procedure pop_on(csp: int, result: pointer[void])
-    {
-        let idx (csp - 1) as i64
-        set fm_top: idx - 1
-        if idx < 0
-            return
-        if idx >= FM_MAX_DEPTH
-            return
-        ; the closing half of the watch window — see DZ_FRAME_MARK_TRAP_POP
-        if fm_trap_pop >= 0
-        {
-            if fm_seq <> null
-            {
-                if *(fm_seq + idx) = fm_trap_pop
-                {
-                    scaly_eputs "frame-mark: TRAP at pop of frame seq "
-                    scaly_eputi fm_trap_pop
-                    scaly_eputnl()
-                    raise(5)
-                }
-            }
-        }
-        if fm_head = null
-        {
-            set fm_b_invalid: fm_b_invalid + 1
-            return
-        }
-        ; 1. VALID
-        if *(fm_gen_at + idx) <> fm_gen
-        {
-            set fm_b_invalid: fm_b_invalid + 1
-            return
-        }
-        ; 5. QUIET — cheapest and the most common no
-        if *(fm_epoch_at + idx) <> fm_epoch
-        {
-            set fm_b_publish: fm_b_publish + 1
-            return
-        }
-        ; 4. RESULT
-        if FrameMark.in_span(idx, result)
-        {
-            set fm_b_result: fm_b_result + 1
-            return
-        }
-        ; 6. BACKFILL — the region head served nothing while the frame ran.
-        ; ★Only when the head is NOT the mark's page: on a single-page region the
-        ; head's bump IS the span's, so testing it there refuses everything
-        ; (measured: 92 refusals instead of 3, and the 89 are all this case).
-        if *(fm_page + idx) <> (fm_head as i64)
-        {
-            if FrameMark.slot(fm_head as pointer[void], 0) <> *(fm_head_at + idx)
-            {
-                set fm_b_below: fm_b_below + 1
-                return
-            }
-        }
-        ; the general form of condition 6, opt-in: every page below the mark.
-        ; Counts what the head test alone would let through — see below_sum.
-        if fm_backfill > 0
-        {
-            let snap *(fm_below + idx)
-            if snap <> (0 - 1)
-            {
-                set fm_below_checked: fm_below_checked + 1
-                if FrameMark.below_sum(*(fm_page + idx)) <> snap
-                {
-                    set fm_below_missed: fm_below_missed + 1
-                    return
-                }
-            }
-        }
-        ; the hunt's two switches (see the block above)
-        if fm_limit >= 0
-        {
-            if fm_rewound >= fm_limit
-            {
-                set fm_b_refused: fm_b_refused + 1
-                return
-            }
-        }
-        if fm_scan >= 0
-        {
-            if fm_rewound = fm_scan
-            {
-                let mp *(fm_page + idx) as pointer[void]
-                scaly_eputs "frame-mark: SCAN frame seq "
-                scaly_eputi(*(fm_seq + idx))
-                scaly_eputs ", mark page "
-                scaly_eputi(mp as i64)
-                scaly_eputnl()
-                FrameMark.scan_for_refs(*(fm_off + idx), FrameMark.slot(mp, 0))
-            }
-        }
-        if fm_verify
-        {
-            let mp2 *(fm_page + idx) as pointer[void]
-            set fm_verified: fm_verified + 1
-            if FrameMark.count_refs(*(fm_off + idx), FrameMark.slot(mp2, 0)) > 0
-                set fm_violations: fm_violations + 1
-        }
-        ; 2. THE CHAIN and 3. EXCLUSIVE both live in `rewind`, which changes
-        ; nothing when it cannot honour the mark.
-        if FrameMark.rewind(idx)
-            set fm_rewound: fm_rewound + 1
-        else
-            set fm_b_refused: fm_b_refused + 1
-    }
-
-    ; a frame left by a path that reports no result (a continuation, a call/cc
-    ; unwind): nothing above ANY live mark can be trusted, so this publishes.
-    procedure pop_unknown_on()
-    {
-        FrameMark.publish()
-    }
-
-    procedure publish()
-    {
-        if FrameMark.on() = false
-            return
-        set fm_epoch: fm_epoch + 1
-        set fm_publishes: fm_publishes + 1
-    }
-
-    ; ★A STORE into a pre-existing object. It publishes in exactly one shape:
-    ; the target lives in the region being marked AND below the innermost frame's
-    ; mark — then whatever the store allocates lands at the region's END, inside
-    ; the span, while the target survives the rewind. A target in another region
-    ; (the grove, the run page) allocates at THAT region's end and can never
-    ; point into the span; a target inside the span dies with it.
-    procedure store_on(target: pointer[void])
-    {
-        if target = null
-            return
-        if fm_head = null
-            return
-        let tp Page.get(target) as pointer[void]
-        if FrameMark.slot(tp, 4) <> (fm_head as i64)
-            return
-        if fm_top < 0
-        {
-            FrameMark.publish()
-            return
-        }
-        if fm_top >= FM_MAX_DEPTH
-        {
-            FrameMark.publish()
-            return
-        }
-        if *(fm_gen_at + fm_top) <> fm_gen
-        {
-            FrameMark.publish()
-            return
-        }
-        ; ★★★Deliberately STRICTER than `in_span`: the target counts as safe only
-        ; when it sits on the innermost frame's own MARK PAGE at or above the
-        ; mark, and the region has not moved off that page since. Reasoning that
-        ; a target on a LATER page of the span is equally safe is what the
-        ; rewritten version did — and it made 3 of the 48 real-world codegens
-        ; differ while publishing 42 000 times less. The looser rule may well be
-        ; defensible; it is not GATED, and this one is.
-        let t FrameMark.tail()
-        if (t as i64) <> *(fm_page + fm_top)
-        {
-            FrameMark.publish()
-            return
-        }
-        let r target as i64
-        if r >= *(fm_off + fm_top)
-        {
-            if r < FrameMark.slot(t, 0)
-                return
-        }
-        FrameMark.publish()
-    }
-
-    ; Interpreter.set_eval_region — the region under every live mark changes
-    procedure region(p: pointer[Page])
-    {
-        if FrameMark.on() = false
-            return
-        if p = fm_head
-            return
-        set fm_head: p
-        set fm_gen: fm_gen + 1
-    }
-
     procedure report()
     {
         if fm_stats = false
             return
+        let f fm_s
         scaly_eputs "frame-mark: "
-        scaly_eputi fm_frames
+        scaly_eputi(*(f + FM_FRAMES))
         scaly_eputs " frames, "
-        scaly_eputi fm_rewound
+        scaly_eputi(*(f + FM_REWOUND))
         scaly_eputs " rewound, "
-        scaly_eputi fm_bytes
+        scaly_eputi(*(f + FM_BYTES))
         scaly_eputs " bytes reclaimed, "
-        scaly_eputi fm_pages
+        scaly_eputi(*(f + FM_PAGES))
         scaly_eputs " extension pages handed back"
         scaly_eputnl()
         scaly_eputs "frame-mark: blocked by  publish "
-        scaly_eputi fm_b_publish
+        scaly_eputi(*(f + FM_BPUBLISH))
         scaly_eputs "  result "
-        scaly_eputi fm_b_result
+        scaly_eputi(*(f + FM_BRESULT))
         scaly_eputs "  refused "
-        scaly_eputi fm_b_refused
+        scaly_eputi(*(f + FM_BREFUSED))
         scaly_eputs "  bracket "
-        scaly_eputi fm_b_invalid
+        scaly_eputi(*(f + FM_BINVALID))
         scaly_eputs "  too-deep "
-        scaly_eputi fm_b_deep
+        scaly_eputi(*(f + FM_BDEEP))
         scaly_eputs "  backfill "
-        scaly_eputi fm_b_below
+        scaly_eputi(*(f + FM_BBELOW))
         scaly_eputs "  ("
-        scaly_eputi fm_publishes
+        scaly_eputi(*(f + FM_PUBLISHES))
         scaly_eputs " publications)"
         scaly_eputnl()
         if fm_backfill > 0
