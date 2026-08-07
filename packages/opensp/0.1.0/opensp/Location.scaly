@@ -177,7 +177,14 @@ define TextChunk (start: size_t, loc: Location)
     }
 }
 
-define Origin (ref_location: Location, entity_decl: pointer[void](null), file_name: StringC, contents: pointer[u32](null), length: size_t(0), ref_length: size_t(0), rs_list: pointer[Array[u32]](null), segments: pointer[Array[DocSegment]](null), unopened: bool(false), text_chunks: pointer[Array[TextChunk]](null), fill_bounds: pointer[Array[size_t]](null), has_text: bool(false))
+; `pinned` is the forwarding pointer of Origin.pin — see the comment there. It
+; is NOT parse state: it stays null for the whole of a parse and is written
+; once, by the pin, when a consumer copies this origin onto a longer-lived
+; host. Kept in the record rather than in a side table because the natural key
+; IS the origin's address, and an address is only unique while the arena that
+; holds it lives — a side table would survive that arena and answer for a
+; recycled address.
+define Origin (ref_location: Location, entity_decl: pointer[void](null), file_name: StringC, contents: pointer[u32](null), length: size_t(0), ref_length: size_t(0), rs_list: pointer[Array[u32]](null), segments: pointer[Array[DocSegment]](null), unopened: bool(false), text_chunks: pointer[Array[TextChunk]](null), fill_bounds: pointer[Array[size_t]](null), has_text: bool(false), pinned: pointer[Origin](null), entity_marked: bool(false))
 {
     init()
     {
@@ -193,6 +200,8 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set text_chunks: null
         set fill_bounds: null
         set has_text: false
+        set pinned: null
+        set entity_marked: false
     }
 
     init(ref_location: Location)
@@ -209,6 +218,8 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set text_chunks: null
         set fill_bounds: null
         set has_text: false
+        set pinned: null
+        set entity_marked: false
     }
 
     init(ref_location: Location, entity_decl: pointer[void])
@@ -225,6 +236,8 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set text_chunks: null
         set fill_bounds: null
         set has_text: false
+        set pinned: null
+        set entity_marked: false
     }
 
     ; EntityOrigin::make(entity, refLocation, refLength, markup): an entity origin
@@ -243,6 +256,8 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set text_chunks: null
         set fill_bounds: null
         set has_text: false
+        set pinned: null
+        set entity_marked: false
     }
 
     ; EntityOrigin::make(entity, Location()) for a cross-package caller (the
@@ -274,7 +289,149 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
         set org.text_chunks: chunks
         set org.fill_bounds: null
         set org.has_text: false
+        set org.pinned: null
+        set org.entity_marked: false
         org
+    }
+
+    ; --- pinning a location onto a longer-lived host -----------------------
+    ;
+    ; ★A Location is an (origin, index) pair, and an origin lives on the arena
+    ; of the PARSE that produced it. Every consumer that keeps a location past
+    ; its parse — the DSSSL spec handler keeps one per gathered text chunk, so
+    ; a runtime diagnostic in the assembled Scheme resolves back into the
+    ; original `.dsl`/`.scm` line — must therefore COPY the chain onto its own
+    ; host first. pin() is that copy, and it is a copy of the chain, because
+    ; resolve_chain walks parent() up to the first origin with a real backing
+    ; source and reads line/col off THAT one.
+    ;
+    ; What is copied is exactly what a POST-parse reader touches: file_name,
+    ; length, ref_length, unopened, has_text, rs_list, segments, fill_bounds
+    ; (line_col + file_name_at + on_segment_leading_rs) and the parent chain.
+    ; Two fields are deliberately NOT carried over, and both would be a stale
+    ; pointer into the released arena rather than data:
+    ;   * `contents` — the whole decoded buffer. line_col computes off rs_list
+    ;     alone; the only readers of get_contents() are the parse itself (the
+    ;     catalog sub-parse and the InputSource clone). Dropped to null, which
+    ;     is exactly the shape a STREAMING source already has.
+    ;   * `entity_decl` — an Entity on the parse arena. The one post-parse
+    ;     reader needs the PROPERTY, not the entity (resolve_chain's index
+    ;     arithmetic: an entity origin re-anchors past the reference, a plain
+    ;     one adds through), so the copy carries `entity_marked` and leaves the
+    ;     pointer null — see is_entity_origin. The parse-side walk that really
+    ;     does dereference it (resolve_location_open's "In entity" header)
+    ;     never sees a pinned origin, and would get a null it already handles
+    ;     if it ever did.
+    ;
+    ; The memo is the `pinned` field of the SOURCE origin (a forwarding
+    ; pointer): the chunk table of one body element holds hundreds of thousands
+    ; of locations over a few thousand distinct origins, so the lookup has to be
+    ; O(1), and the field dies with the arena it lives on — which is the only
+    ; correct lifetime for a memo keyed on an address. A pinned copy forwards to
+    ; ITSELF, so pinning an already-pinned location is the identity.
+    function pin(host: pointer[Page], o: pointer[Origin]) returns pointer[Origin]
+    {
+        if o = null
+            return null
+        if o.pinned <> null
+            return o.pinned
+        let c host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+        ; publish the forwarding pointer BEFORE recursing, so the walk
+        ; terminates even if a chain were ever to close on itself
+        set o.pinned: c
+        set c.pinned: c
+        set c.contents: null
+        set c.entity_decl: null
+        set c.entity_marked: o.is_entity_origin()
+        set c.length: o.length
+        set c.ref_length: o.ref_length
+        set c.unopened: o.unopened
+        set c.has_text: o.has_text
+        set c.file_name: StringC()
+        if o.file_name.get_size() > 0
+            set c.file_name: StringC^host(o.file_name.data_ptr(), o.file_name.get_size())
+        set c.rs_list: null
+        if o.rs_list <> null
+        {
+            let rl Array[u32]^host()
+            let rn o.rs_list.get_length()
+            var ri: size_t 0
+            while ri < rn
+            {
+                rl.add(*(o.rs_list.get_buffer() + ri))
+                set ri: ri + 1
+            }
+            set c.rs_list: rl
+        }
+        set c.fill_bounds: null
+        if o.fill_bounds <> null
+        {
+            let fl Array[size_t]^host()
+            let fn o.fill_bounds.get_length()
+            var fi: size_t 0
+            while fi < fn
+            {
+                fl.add(*(o.fill_bounds.get_buffer() + fi))
+                set fi: fi + 1
+            }
+            set c.fill_bounds: fl
+        }
+        set c.segments: null
+        if o.segments <> null
+        {
+            let sl Array[DocSegment]^host()
+            let sn o.segments.get_length()
+            var si: size_t 0
+            while si < sn
+            {
+                let sg *(o.segments.get_buffer() + si)
+                var sc DocSegment()
+                set sc.start: sg.start
+                set sc.starts_with_rs: sg.starts_with_rs
+                set sc.name: StringC()
+                if sg.name.get_size() > 0
+                    set sc.name: StringC^host(sg.name.data_ptr(), sg.name.get_size())
+                set sc.base_dir: String^host(sg.base_dir)
+                sl.add(sc)
+                set si: si + 1
+            }
+            set c.segments: sl
+        }
+        set c.text_chunks: null
+        if o.text_chunks <> null
+        {
+            let tl Array[TextChunk]^host()
+            let tn o.text_chunks.get_length()
+            var ti: size_t 0
+            while ti < tn
+            {
+                ; copy + overwrite, never a fresh TextChunk(...) in argument
+                ; position — that construction is region-allocated per element
+                var ch *(o.text_chunks.get_buffer() + ti)
+                set ch.loc: Origin.pin_location(host, ch.loc)
+                tl.add(ch)
+                set ti: ti + 1
+            }
+            set c.text_chunks: tl
+        }
+        set c.ref_location: Origin.pin_location(host, o.ref_location)
+        c
+    }
+
+    ; ★The forwarding-pointer HIT is the hot half — one gathered body element
+    ; pins hundreds of thousands of chunk locations over a few thousand
+    ; distinct origins — so it lives here, in a body small enough to inline,
+    ; and only the miss calls the copy. (One construction of the returned
+    ; Location, per the small-struct return rule.)
+    function pin_location(host: pointer[Page], loc: Location) returns Location
+    {
+        let o loc.get_origin()
+        var po: pointer[Origin] null
+        if o <> null
+            set po: o.pinned
+        if po = null
+            set po: Origin.pin(host, o)
+        Location(po, loc.get_index())
     }
 
     function get_text_chunks(this: Origin) returns pointer[Array[TextChunk]]
@@ -346,7 +503,7 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
                     set walking: false
                 else
                 {
-                    if org.get_entity_decl() <> null
+                    if org.is_entity_origin()
                         set index: par.get_index() + (org.get_ref_length() as u32)
                     else
                         set index: index + par.get_index()
@@ -377,6 +534,22 @@ define Origin (ref_location: Location, entity_decl: pointer[void](null), file_na
 
     function get_entity_decl(this: Origin) returns pointer[void]
         entity_decl
+
+    ; "this origin was opened by an entity reference" — the property, as
+    ; opposed to the entity itself. A PINNED origin (Origin.pin) has the
+    ; property without the pointer: its Entity lives on the released parse
+    ; arena, and the only post-parse reader of the field is the index
+    ; arithmetic in resolve_chain, which needs the bit and not the entity.
+    ; So the copy carries the bit and leaves entity_decl NULL — a later
+    ; reader that does dereference it (resolve_location_open's "In entity"
+    ; walk, which is parse-side and never sees a pinned origin) then gets a
+    ; null it must already handle, not freed memory.
+    function is_entity_origin(this: Origin) returns bool
+    {
+        if entity_decl <> null
+            return true
+        entity_marked
+    }
 
     function get_ref_location(this: Origin) returns Location
         ref_location

@@ -219,10 +219,13 @@ define PartHeader
         id
 
     ; setRefLoc — first reference wins (the reference guards on a null origin).
-    function set_ref_loc(this: pointer[PartHeader], loc: Location)
+    ; The location is PINNED (Origin.pin): a header outlives the parse of the
+    ; document that referenced it, and missingPart renders this anchor later,
+    ; from resolve_parts.
+    function set_ref_loc(this: pointer[PartHeader], host: pointer[Page], loc: Location)
     {
         if this.ref_loc.get_origin() = null
-            set this.ref_loc: loc
+            set this.ref_loc: Origin.pin_location(host, loc)
     }
 
     function set_concrete(this: pointer[PartHeader], host: pointer[Page], part: pointer[Part])
@@ -305,9 +308,11 @@ define Doc
     function append_decl(this: pointer[Doc], d: pointer[DeclarationElement])
         this.declarations.add(d)
 
-    ; the doc's own location (its end-prolog event; anchors noParts).
-    function set_location(this: pointer[Doc], loc: Location)
-        set this.loc: loc
+    ; the doc's own location (its end-prolog event; anchors noParts) — PINNED
+    ; for the same reason as PartHeader.ref_loc: resolve_first_part renders it
+    ; after the walk that produced it.
+    function set_location(this: pointer[Doc], host: pointer[Page], loc: Location)
+        set this.loc: Origin.pin_location(host, loc)
 
     ; resolveFirstPart: the FIRST-created header's part — the reference walks
     ; its headers_ IList to the last iteration position, and IList::insert
@@ -521,7 +526,8 @@ define DssslSpecEventHandler
         {
             ; refPart(specid, event.location()) — the missingPart anchor
             let sub_header doc.ref_part(this.host, specid)
-            sub_header.set_ref_loc(ev.get_loc())
+            let sub_loc ev.get_loc()
+            sub_header.set_ref_loc(host, sub_loc)
             header.set_external(this.host, sub_header)
         }
     }
@@ -556,7 +562,7 @@ define DssslSpecEventHandler
                 let sub use_str.substr(i, j - i)
                 let uh this.current_doc.ref_part(this.host, sub)
                 let uloc DssslSpecEventHandler.text_char_loc(use_text, i)
-                uh.set_ref_loc(uloc)
+                uh.set_ref_loc(this.host, uloc)
                 part.add_use(uh)
             }
             if j >= un
@@ -594,13 +600,29 @@ define DssslSpecEventHandler
             {
                 let text StringC^host(this.current_body.get_buffer(), this.current_body.get_length())
                 ; snapshot the chunk table — current_chunks is reused by the
-                ; next gathered element.
+                ; next gathered element. ★This is THE copy-out of the parse:
+                ; a chunk's Location holds an origin on the parse arena, and
+                ; the table is read long after that parse (a runtime diagnostic
+                ; in the assembled Scheme resolves through it into the original
+                ; source — tests/dazzle/cli/trace). Pin the chain here, while
+                ; the parse is still alive; Origin.pin memoizes, so the
+                ; hundreds of thousands of chunks cost one copy per distinct
+                ; origin.
                 let chunks Array[TextChunk]^host()
                 let cn this.current_chunks.get_length()
                 var ci: size_t 0
                 while ci < cn
                 {
-                    chunks.add(*(this.current_chunks.get_buffer() + ci))
+                    ; ★copy the chunk and overwrite its location — do NOT build
+                    ; a fresh `TextChunk(...)` as the argument: a by-value
+                    ; construction in argument position is REGION-ALLOCATED, so
+                    ; that spelling put a `scaly_force_frame` + a 24-byte
+                    ; `Page.allocate` inside this loop, once per gathered
+                    ; character (+2.7 % of the whole start run; one line of
+                    ; objdump over this function shows it).
+                    var ch *(this.current_chunks.get_buffer() + ci)
+                    set ch.loc: Origin.pin_location(host, ch.loc)
+                    chunks.add(ch)
                     set ci: ci + 1
                 }
                 this.current_part.append_body(BodyElement.make_immediate(this.host, text, chunks))
@@ -621,18 +643,22 @@ define DssslSpecEventHandler
         set this.current_chunks: Array[TextChunk]^bhost()
         set this.gathering_body: true
         let decl DeclarationElement.make(this.host, decl_type)
+        ; ★an attribute_string is BORROWED from the parse arena (it is the
+        ; attribute value's Text, not a copy) and the declaration element
+        ; outlives the parse — so every one of the four is copied onto the
+        ; handler's own host here, at the point it is kept.
         let nm DssslSpecEventHandler.attribute_string(ev, "NAME")
         if nm.get_size() > 0
-            set decl.name: nm
+            set decl.name: StringC^bhost(nm.data_ptr(), nm.get_size())
         let tx DssslSpecEventHandler.attribute_string(ev, "TEXT")
         if tx.get_size() > 0
-            set decl.text: tx
+            set decl.text: StringC^bhost(tx.data_ptr(), tx.get_size())
         let md DssslSpecEventHandler.attribute_string(ev, "MODADD")
         if md.get_size() > 0
-            set decl.modadd: md
+            set decl.modadd: StringC^bhost(md.data_ptr(), md.get_size())
         let ds DssslSpecEventHandler.attribute_string(ev, "DESC")
         if ds.get_size() > 0
-            set decl.desc: ds
+            set decl.desc: StringC^bhost(ds.data_ptr(), ds.get_size())
         set this.current_decl: decl
     }
 
@@ -687,6 +713,15 @@ define DssslSpecEventHandler
     function walk(this: pointer[DssslSpecEventHandler], ps: pointer[ParserState])
     {
         let n ps.n_events()
+        ; ★ONE reused chunk record for the data arm below. Spelling that arm
+        ; `current_chunks.add(TextChunk(len, ev.get_loc()))` puts the argument's
+        ; storage on the REGION — a `scaly_force_frame` plus a 24-byte
+        ; `Page.allocate` per data event, and this parser makes one data event
+        ; per CHARACTER (445 317 of them for the DocBook style sheet). Whether
+        ; the planner puts such a temporary on the stack or on the region
+        ; depends on the rest of the function, so it is not stable enough to
+        ; rely on: hold the record in a local and set its fields.
+        var chunk TextChunk(0, Location())
         var k: size_t 0
         while k < n
         {
@@ -726,7 +761,10 @@ define DssslSpecEventHandler
             {
                 ; endProlog — the current doc's own location (anchors noParts)
                 if this.current_doc <> null
-                    this.current_doc.set_location(ev.get_loc())
+                {
+                    let ep_loc ev.get_loc()
+                    this.current_doc.set_location(this.host, ep_loc)
+                }
             }
             else if ty = EVK_DATA
             {
@@ -735,7 +773,9 @@ define DssslSpecEventHandler
                     let d ev.get_data()
                     ; Text::addChars — record where this run came from before
                     ; appending it (one chunk per data event).
-                    this.current_chunks.add(TextChunk(this.current_body.get_length(), ev.get_loc()))
+                    set chunk.start: this.current_body.get_length()
+                    set chunk.loc: ev.get_loc()
+                    this.current_chunks.add(chunk)
                     var di: size_t 0
                     let dn d.get_size()
                     while di < dn
