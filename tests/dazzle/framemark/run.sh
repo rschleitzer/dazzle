@@ -1,16 +1,26 @@
 #!/usr/bin/env bash
-# tests/dazzle/framemark/run.sh — the frame-mark gate.
+# tests/dazzle/framemark/run.sh — the frame-mark gate, INVERTED since 2026-08-07.
 #
 #   tests/dazzle/framemark/run.sh [scalyc-binary]
 #
-# The mark (packages/dazzle/0.1.0/dazzle/FrameMark.scaly, DAZZLE_FRAME_MARK=1)
-# reclaims per VM FRAME inside an eval bracket. It is OFF by default, so without
-# a gate it would rot: this runs the two harnesses that cover the engine end to
-# end WITH it on, against the very same goldens, and then proves the mark
-# actually engaged — a silently disabled mark must not pass a differential.
+# The mark (packages/dazzle/0.1.0/dazzle/FrameMark.scaly) reclaims per VM FRAME
+# inside an eval bracket, and it is ON BY DEFAULT since 2026-08-07 — so every
+# other suite in the tree now runs it, and this gate no longer has to. What it
+# guards instead is the other three things a default needs:
 #
-# Numbers and the reasoning behind the five conditions are in
-# tests/dazzle/PERFORMANCE.md ("Die Marke GEBAUT", "Die Marke IN PRODUKTION").
+#   1. the mark actually ENGAGES by default (a silently disabled mark passes
+#      every differential there is — the same trap the instrument fell into when
+#      89 % of frames left through a path it was not watching);
+#   2. BOTH escape hatches really turn it off — `DAZZLE_FRAME_MARK=0` and the
+#      CLI's `--no-frame-mark`. They are load-bearing: condition 5's
+#      completeness is empirically gated rather than proven (see the header of
+#      FrameMark.scaly), so the way out has to work on the day it is needed;
+#   3. the OFF path still produces the goldens. That path is now the unusual
+#      one, and an unusual path with no gate rots.
+#
+# Numbers and the reasoning behind the six conditions are in
+# tests/dazzle/PERFORMANCE.md ("Die Marke GEBAUT", "Die Marke IN PRODUKTION",
+# "Die Marke als VORGABE").
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -18,39 +28,56 @@ BIN="${1:-$ROOT/scalyc/build/scalyc}"
 cd "$ROOT"
 rc=0
 
-echo "framemark: engine suites with the mark ON"
-if ! DAZZLE_FRAME_MARK=1 tests/dazzle/run.sh "$BIN" > /tmp/framemark-suites.log 2>&1; then
-  echo "framemark: FAIL (tests/dazzle/run.sh with the mark on)"; tail -20 /tmp/framemark-suites.log; rc=1
-fi
-
-echo "framemark: codegen reproduction with the mark ON"
-if ! DAZZLE_FRAME_MARK=1 tests/dazzle/codegen/run.sh "$BIN" > /tmp/framemark-codegen.log 2>&1; then
-  echo "framemark: FAIL (tests/dazzle/codegen/run.sh with the mark on)"; tail -20 /tmp/framemark-codegen.log; rc=1
-fi
-
-# The mark must have DONE something. Without this a build that silently never
-# rewinds passes every differential above — the same trap the instrument fell
-# into when 89 % of frames left through a path it was not watching.
 TMP="$(mktemp -d)"
 DZ="$TMP/dazzle"
 if ! tests/dazzle/build-cli.sh "$DZ" "$BIN" > "$TMP/build.log" 2>&1; then
   echo "framemark: FAIL (build)"; tail -8 "$TMP/build.log"; rm -rf "$TMP"; exit 1
 fi
+
+# --- 1. the mark engages BY DEFAULT --------------------------------------
 # ★ NEVER restore with `git checkout -- .` here. An earlier draft did, and it
 # reverted every uncommitted source change in the tree. The codegen regenerates
 # its outputs byte-identically, so there is nothing to restore in the first place.
-DAZZLE_FRAME_MARK=1 DAZZLE_FRAME_MARK_STATS=1 "$DZ" \
-  -t sgml -d codegen/scaly.dsl scaly.sgm > /dev/null 2> "$TMP/stats"
-REWOUND="$(sed -n 's/^frame-mark: [0-9]* frames, \([0-9]*\) rewound.*/\1/p' "$TMP/stats")"
+DAZZLE_FRAME_MARK_STATS=1 "$DZ" \
+  -t sgml -d codegen/scaly.dsl scaly.sgm > /dev/null 2> "$TMP/on"
+REWOUND="$(sed -n 's/^frame-mark: [0-9]* frames, \([0-9]*\) rewound.*/\1/p' "$TMP/on")"
 if [ -z "$REWOUND" ]; then
-  echo "framemark: FAIL (no stats line — DAZZLE_FRAME_MARK_STATS did not report)"
-  cat "$TMP/stats"; rc=1
+  echo "framemark: FAIL (no stats line by default — the mark is not on)"
+  cat "$TMP/on"; rc=1
 elif [ "$REWOUND" -lt 100 ]; then
-  echo "framemark: FAIL (the mark engaged $REWOUND times — it is not doing anything)"; rc=1
+  echo "framemark: FAIL (the mark engaged $REWOUND times by default)"; rc=1
 else
-  echo "framemark: engaged ($REWOUND frames rewound on the mkp codegen)"
+  echo "framemark: on by default ($REWOUND frames rewound on the mkp codegen)"
 fi
-rm -rf "$TMP"
 
+# --- 2. both escape hatches turn it OFF ----------------------------------
+for way in env cli; do
+  if [ "$way" = env ]; then
+    DAZZLE_FRAME_MARK=0 DAZZLE_FRAME_MARK_STATS=1 "$DZ" \
+      -t sgml -d codegen/scaly.dsl scaly.sgm > /dev/null 2> "$TMP/off.$way"
+  else
+    DAZZLE_FRAME_MARK_STATS=1 "$DZ" --no-frame-mark \
+      -t sgml -d codegen/scaly.dsl scaly.sgm > /dev/null 2> "$TMP/off.$way"
+  fi
+  if [ -s "$TMP/off.$way" ]; then
+    echo "framemark: FAIL (the $way escape hatch did not turn the mark off)"
+    head -3 "$TMP/off.$way"; rc=1
+  else
+    echo "framemark: $way escape hatch turns it off"
+  fi
+done
+
+# --- 3. the OFF path still makes the goldens ------------------------------
+echo "framemark: engine suites with the mark OFF"
+if ! DAZZLE_FRAME_MARK=0 tests/dazzle/run.sh "$BIN" > /tmp/framemark-suites.log 2>&1; then
+  echo "framemark: FAIL (tests/dazzle/run.sh with the mark off)"; tail -20 /tmp/framemark-suites.log; rc=1
+fi
+
+echo "framemark: codegen reproduction with the mark OFF"
+if ! DAZZLE_FRAME_MARK=0 tests/dazzle/codegen/run.sh "$BIN" > /tmp/framemark-codegen.log 2>&1; then
+  echo "framemark: FAIL (tests/dazzle/codegen/run.sh with the mark off)"; tail -20 /tmp/framemark-codegen.log; rc=1
+fi
+
+rm -rf "$TMP"
 [ $rc = 0 ] && echo "framemark: PASS" || echo "framemark: FAIL"
 exit $rc
