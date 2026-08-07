@@ -718,108 +718,145 @@ define Insn union
     ; and the `grow_stack` half of `need_stack`, which the optimizer inlined into
     ; all four pushing arms (⇒ `execute_grow`, below). The check is one line of
     ; disassembly: `Insn::execute` must contain no `bl` and no `stp`/`ldp` pair.
-    function execute(this: pointer[Insn], vm: pointer[VM]) returns pointer[Insn]
+    ;
+    ; ★★★It also RUNS the tier rather than stepping it: as long as the successor
+    ; is another arm of this tier, the loop keeps going, and only a cold-tier
+    ; insn (a tail call to `execute_rest`) or a stack growth hands control back.
+    ; What that buys is the ENTRY, not the arm: the jump table's base address is
+    ; loop-invariant (three instructions of `adrp`/`add`/`adr` that used to be
+    ; recomputed on every step), and with it go the `bl`/`ret` of the call from
+    ; `VM.eval` and that loop's own per-iteration tests. The mean run length is a
+    ; MEASURED number, not an estimate — a call consumes exactly one cold-tier
+    ; step, so it is `steps / cold steps`: 2.61 on a single-file codegen, 2.32 on
+    ; the 1804-file one, 2.16 on a styling run (2026-08-07, `--jit --jit-stats`
+    ; with `DAZZLE_JIT_THRESHOLD=2000000000`).
+    ;
+    ; ★`single` keeps the old one-step-per-call behaviour, and it is not an
+    ; option — two callers NEED it. `Jit.step` asks per insn whether that insn is
+    ; the entry of a compiled region, so a run would hide every entry point
+    ; inside it; and `DAZZLE_ESCAPE_VERIFY` checks the modelled stack depth
+    ; against the real one per insn (745 M checks), which a run would thin out to
+    ; the run boundaries. Both are off on the default path, both read the flag
+    ; from a register the whole loop through, and neither may be traded for the
+    ; ~1 instruction per step it costs there.
+    function execute(this: pointer[Insn], vm: pointer[VM], single: bool) returns pointer[Insn]
     {
-        choose this
-            when sr: StackRef
-            {
-                let sp vm.get_sp()
-                if vm.needs_grow(1)
-                    return this.execute_grow(vm)
-                vm.stack_set(sp, vm.stack_ref(sp + sr.index))
-                vm.set_sp(sp + 1)
-                return sr.next
-            }
-            when ti: Test
-            {
-                let was_true vm.stack_ref(vm.get_sp() - 1).is_true()
-                vm.set_sp(vm.get_sp() - 1)
-                if was_true
-                    return ti.consequent
-                return ti.alternative
-            }
-            when ub: Unbox
-            {
-                vm.stack_set(vm.get_sp() - 1, vm.stack_ref(vm.get_sp() - 1).box_value())
-                return ub.next
-            }
-            when cr: ClosureRef
-            {
-                let sp vm.get_sp()
-                if vm.needs_grow(1)
-                    return this.execute_grow(vm)
-                vm.stack_set(sp, vm.closure_ref(cr.index))
-                vm.set_sp(sp + 1)
-                return cr.next
-            }
-            when co: Constant
-            {
-                let sp vm.get_sp()
-                if vm.needs_grow(1)
-                    return this.execute_grow(vm)
-                vm.stack_set(sp, co.value)
-                vm.set_sp(sp + 1)
-                return co.next
-            }
-            when an: And
-            {
-                if vm.stack_ref(vm.get_sp() - 1).is_true() = false
-                    return an.next
-                vm.set_sp(vm.get_sp() - 1)
-                return an.next_test
-            }
-            when oi: Or
-            {
-                if vm.stack_ref(vm.get_sp() - 1).is_true()
-                    return oi.next
-                vm.set_sp(vm.get_sp() - 1)
-                return oi.next_test
-            }
-            when er: Error
-            {
-                return vm.fail()
-            }
-            when fr: FrameRef
-            {
-                let sp vm.get_sp()
-                if vm.needs_grow(1)
-                    return this.execute_grow(vm)
-                vm.stack_set(sp, vm.stack_ref(vm.get_frame_start() + fr.index))
-                vm.set_sp(sp + 1)
-                return fr.next
-            }
-            when po: Pop
-            {
-                vm.set_sp(vm.get_sp() - 1)
-                return po.next
-            }
-            when pb: PopBindings
-            {
-                vm.set_sp(vm.get_sp() - pb.n)
-                vm.stack_set(vm.get_sp() - 1, vm.stack_ref(vm.get_sp() + pb.n - 1))
-                return pb.next
-            }
-            when si: SetImmediate
-            {
-                vm.set_sp(vm.get_sp() - 1)
-                vm.stack_set(vm.get_sp() - si.n, vm.stack_ref(vm.get_sp()))
-                return si.next
-            }
-            when tn: TestNull
-            {
-                if vm.stack_ref(vm.get_sp() + tn.offset) = null
-                    return tn.if_null
-                return tn.if_not_null
-            }
-            when ss: StackSet
-            {
-                let tem vm.stack_ref(vm.get_sp() + ss.index)
-                vm.stack_set(vm.get_sp() + ss.index, vm.stack_ref(vm.get_sp() - 1))
-                vm.stack_set(vm.get_sp() - 1, tem)
-                return ss.next
-            }
-            else
-                return this.execute_rest(vm)
+        var cur this
+        repeat
+        {
+            choose cur
+                when sr: StackRef
+                {
+                    let sp vm.get_sp()
+                    if vm.needs_grow(1)
+                        return cur.execute_grow(vm)
+                    vm.stack_set(sp, vm.stack_ref(sp + sr.index))
+                    vm.set_sp(sp + 1)
+                    set cur: sr.next
+                }
+                when ti: Test
+                {
+                    let was_true vm.stack_ref(vm.get_sp() - 1).is_true()
+                    vm.set_sp(vm.get_sp() - 1)
+                    var nx ti.alternative
+                    if was_true
+                        set nx: ti.consequent
+                    set cur: nx
+                }
+                when ub: Unbox
+                {
+                    vm.stack_set(vm.get_sp() - 1, vm.stack_ref(vm.get_sp() - 1).box_value())
+                    set cur: ub.next
+                }
+                when cr: ClosureRef
+                {
+                    let sp vm.get_sp()
+                    if vm.needs_grow(1)
+                        return cur.execute_grow(vm)
+                    vm.stack_set(sp, vm.closure_ref(cr.index))
+                    vm.set_sp(sp + 1)
+                    set cur: cr.next
+                }
+                when co: Constant
+                {
+                    let sp vm.get_sp()
+                    if vm.needs_grow(1)
+                        return cur.execute_grow(vm)
+                    vm.stack_set(sp, co.value)
+                    vm.set_sp(sp + 1)
+                    set cur: co.next
+                }
+                when an: And
+                {
+                    var nx an.next
+                    if vm.stack_ref(vm.get_sp() - 1).is_true()
+                    {
+                        vm.set_sp(vm.get_sp() - 1)
+                        set nx: an.next_test
+                    }
+                    set cur: nx
+                }
+                when oi: Or
+                {
+                    var nx oi.next
+                    if vm.stack_ref(vm.get_sp() - 1).is_true() = false
+                    {
+                        vm.set_sp(vm.get_sp() - 1)
+                        set nx: oi.next_test
+                    }
+                    set cur: nx
+                }
+                when er: Error
+                {
+                    return vm.fail()
+                }
+                when fr: FrameRef
+                {
+                    let sp vm.get_sp()
+                    if vm.needs_grow(1)
+                        return cur.execute_grow(vm)
+                    vm.stack_set(sp, vm.stack_ref(vm.get_frame_start() + fr.index))
+                    vm.set_sp(sp + 1)
+                    set cur: fr.next
+                }
+                when po: Pop
+                {
+                    vm.set_sp(vm.get_sp() - 1)
+                    set cur: po.next
+                }
+                when pb: PopBindings
+                {
+                    vm.set_sp(vm.get_sp() - pb.n)
+                    vm.stack_set(vm.get_sp() - 1, vm.stack_ref(vm.get_sp() + pb.n - 1))
+                    set cur: pb.next
+                }
+                when si: SetImmediate
+                {
+                    vm.set_sp(vm.get_sp() - 1)
+                    vm.stack_set(vm.get_sp() - si.n, vm.stack_ref(vm.get_sp()))
+                    set cur: si.next
+                }
+                when tn: TestNull
+                {
+                    var nx tn.if_not_null
+                    if vm.stack_ref(vm.get_sp() + tn.offset) = null
+                        set nx: tn.if_null
+                    set cur: nx
+                }
+                when ss: StackSet
+                {
+                    let tem vm.stack_ref(vm.get_sp() + ss.index)
+                    vm.stack_set(vm.get_sp() + ss.index, vm.stack_ref(vm.get_sp() - 1))
+                    vm.stack_set(vm.get_sp() - 1, tem)
+                    set cur: ss.next
+                }
+                else
+                    return cur.execute_rest(vm)
+            if single
+                return cur
+            if cur = null
+                return null
+        }
         null
     }
 
