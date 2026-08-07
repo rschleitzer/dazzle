@@ -159,7 +159,13 @@ define Insn union
     Constant: ConstantInsn
     And: AndInsn
     Or: OrInsn
-    Case: CaseInsn
+    ; ★`Error` sits in the hot tier because it is CALL-FREE, not because it is
+    ; hot — it is the cheapest filler that keeps the twelve real arms plus
+    ; StackRef/Test at FOURTEEN contiguous tags (AArch64 emits a jump table only
+    ; from thirteen cases up). `Case` used to hold this slot and had to leave:
+    ; its `ELObj.eqv` is recursive, so it cannot be inlined, and one call
+    ; anywhere in `execute` gives EVERY interpreted step a stack frame.
+    Error: ErrorInsn
     FrameRef: FrameRefInsn
     Pop: PopInsn
     PopBindings: PopBindingsInsn
@@ -180,7 +186,9 @@ define Insn union
     SetBox: SetBoxInsn
     StackSetBox: StackSetBoxInsn
     ClosureSetBox: ClosureSetBoxInsn
-    Error: ErrorInsn
+    ; the last tag of the SECOND tier — `Case` calls out (ELObj.eqv), so it
+    ; belongs here and not in the leaf tier; see the note at `Error` above.
+    Case: CaseInsn
     CondFail: CondFailInsn
     CaseFail: CaseFailInsn
     Append: AppendInsn
@@ -701,14 +709,25 @@ define Insn union
     ; subclass its own virtual `execute`, so StackRefInsn::execute has
     ; StackRef's frame and nobody else's. Nothing is duplicated: an arm lives in
     ; exactly one of the three functions.
+    ;
+    ; ★★★And this tier is a LEAF, which is a stronger condition than "cheap
+    ; arms" and has to be maintained deliberately: a function that calls ANYTHING
+    ; on ANY path gets a stack frame, and every step through the jump table then
+    ; pays its entry and exit. Two calls hid here until 2026-08-07 — `ELObj.eqv`
+    ; in the `Case` arm (recursive, so never inlinable ⇒ Case moved down a tier)
+    ; and the `grow_stack` half of `need_stack`, which the optimizer inlined into
+    ; all four pushing arms (⇒ `execute_grow`, below). The check is one line of
+    ; disassembly: `Insn::execute` must contain no `bl` and no `stp`/`ldp` pair.
     function execute(this: pointer[Insn], vm: pointer[VM]) returns pointer[Insn]
     {
         choose this
             when sr: StackRef
             {
-                vm.need_stack(1)
-                vm.stack_set(vm.get_sp(), vm.stack_ref(vm.get_sp() + sr.index))
-                vm.set_sp(vm.get_sp() + 1)
+                let sp vm.get_sp()
+                if vm.needs_grow(1)
+                    return this.execute_grow(vm)
+                vm.stack_set(sp, vm.stack_ref(sp + sr.index))
+                vm.set_sp(sp + 1)
                 return sr.next
             }
             when ti: Test
@@ -726,16 +745,20 @@ define Insn union
             }
             when cr: ClosureRef
             {
-                vm.need_stack(1)
-                vm.stack_set(vm.get_sp(), vm.closure_ref(cr.index))
-                vm.set_sp(vm.get_sp() + 1)
+                let sp vm.get_sp()
+                if vm.needs_grow(1)
+                    return this.execute_grow(vm)
+                vm.stack_set(sp, vm.closure_ref(cr.index))
+                vm.set_sp(sp + 1)
                 return cr.next
             }
             when co: Constant
             {
-                vm.need_stack(1)
-                vm.stack_set(vm.get_sp(), co.value)
-                vm.set_sp(vm.get_sp() + 1)
+                let sp vm.get_sp()
+                if vm.needs_grow(1)
+                    return this.execute_grow(vm)
+                vm.stack_set(sp, co.value)
+                vm.set_sp(sp + 1)
                 return co.next
             }
             when an: And
@@ -752,20 +775,17 @@ define Insn union
                 vm.set_sp(vm.get_sp() - 1)
                 return oi.next_test
             }
-            when ca: Case
+            when er: Error
             {
-                if ELObj.eqv(vm.stack_ref(vm.get_sp() - 1), ca.obj)
-                {
-                    vm.set_sp(vm.get_sp() - 1)
-                    return ca.matched
-                }
-                return ca.fail
+                return vm.fail()
             }
             when fr: FrameRef
             {
-                vm.need_stack(1)
-                vm.stack_set(vm.get_sp(), vm.stack_ref(vm.get_frame_start() + fr.index))
-                vm.set_sp(vm.get_sp() + 1)
+                let sp vm.get_sp()
+                if vm.needs_grow(1)
+                    return this.execute_grow(vm)
+                vm.stack_set(sp, vm.stack_ref(vm.get_frame_start() + fr.index))
+                vm.set_sp(sp + 1)
                 return fr.next
             }
             when po: Pop
@@ -952,8 +972,67 @@ define Insn union
                 vm.stack_set(vm.get_sp() - 1, tem)
                 return cs.next
             }
+            when ca: Case
+            {
+                if ELObj.eqv(vm.stack_ref(vm.get_sp() - 1), ca.obj)
+                {
+                    vm.set_sp(vm.get_sp() - 1)
+                    return ca.matched
+                }
+                return ca.fail
+            }
             else
                 return this.execute_cold(vm)
+        null
+    }
+
+    ; ★The GROWTH half of the four PUSHING arms, out of line — and it is what
+    ; keeps `execute` a LEAF. `need_stack` is two loads and a branch, but its
+    ; slow half calls `Page.allocate`, and the optimizer inlined that into all
+    ; four arms: ONE call anywhere in a function gives the WHOLE function a
+    ; frame, so every interpreted step paid three `stp` on entry and three `ldp`
+    ; on exit — read out of the shipped build's disassembly 2026-08-07, 60 % of
+    ; 21.97 M steps on a single-file real-world codegen. Same mechanic as the
+    ; region frame one tier down (PERFORMANCE.md, "Der Rahmen je Primitivaufruf"),
+    ; only with a plain call instead of a region frame.
+    ;
+    ; The four arms are REPEATED here rather than re-entered through `execute`:
+    ; a mutual recursion would let the inliner fold this function back into the
+    ; caller and undo the whole point. Whoever edits an arm above edits it here.
+    function execute_grow(this: pointer[Insn], vm: pointer[VM]) returns pointer[Insn]
+    {
+        vm.grow_stack(1)
+        choose this
+            when sr: StackRef
+            {
+                let sp vm.get_sp()
+                vm.stack_set(sp, vm.stack_ref(sp + sr.index))
+                vm.set_sp(sp + 1)
+                return sr.next
+            }
+            when cr: ClosureRef
+            {
+                let sp vm.get_sp()
+                vm.stack_set(sp, vm.closure_ref(cr.index))
+                vm.set_sp(sp + 1)
+                return cr.next
+            }
+            when co: Constant
+            {
+                let sp vm.get_sp()
+                vm.stack_set(sp, co.value)
+                vm.set_sp(sp + 1)
+                return co.next
+            }
+            when fr: FrameRef
+            {
+                let sp vm.get_sp()
+                vm.stack_set(sp, vm.stack_ref(vm.get_frame_start() + fr.index))
+                vm.set_sp(sp + 1)
+                return fr.next
+            }
+            else
+                return null
         null
     }
 
@@ -970,10 +1049,6 @@ define Insn union
     function execute_cold(this: pointer[Insn], vm: pointer[VM]) returns pointer[Insn]
     {
         choose this
-            when e: Error
-            {
-                return vm.fail()
-            }
             when cf: CondFail
             {
                 ; CondFailInsn::execute: report at the cond expression, then die.
