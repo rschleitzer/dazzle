@@ -56,6 +56,43 @@ use scaly.io.File
 ; resolved by a NESTED parse) is ported structurally; its resolve re-parses
 ; through parse_simple when a system id is present.
 
+function getenv(name: pointer[const_char]) returns pointer[const_char] extern
+procedure scaly_eputs(s: pointer[const_char]) extern
+procedure scaly_eputi(value: i64) extern
+procedure scaly_eputnl() extern
+
+; --- the per-document parse ARENA ------------------------------------------
+;
+; A style sheet is not one SGML document but 38 (`docbook.dsl` declares 37
+; <external-specification>, each loaded by its own parse), and every one of
+; those parses used to live to program end on the run region — 234 of 270 MB
+; requested, measured by tests/dazzle/startbytes. What survives a spec parse is
+; the assembled Part/Doc structure and, per body element, the gathered text plus
+; its chunk table; all of that is on the handler's own host, and since the
+; pinning step (Origin.pin, StringC copies in declaration_start) NOTHING in it
+; points into the parse any more. So each document's parse gets an exclusive
+; page chain that falls when its walk is done.
+;
+; ★The escape hatch is not comfort. Condition (b) below is an audit of the
+; structures the walk keeps, and an audit is exactly the kind of claim that is
+; invisible when it is wrong (the frame mark's store sweep, 2026-08-06) —
+; `DZ_SPEC_ARENA=0` restores the old lifetime, and tests/dazzle/specarena
+; checks BOTH paths.
+;
+; NOT freed, two conditions:
+;   (a) DZ_SPEC_ARENA=0.
+;   (b) the document produced a BodyElement.Entity (a CONTENT= entity body).
+;       That arm keeps a pointer[Entity] INTO the parse, and make_input_source
+;       dereferences it after every parse is over. Pinning it would mean a deep
+;       copy of an Entity, and no corpus style sheet uses the form — an
+;       untested pin is worse than a held arena, and the hold costs nothing
+;       measurable because it never fires.
+; 0 = not asked yet, 1 = on, 2 = off.
+mutable SPEC_ARENA_STATE: int 0
+mutable SPEC_ARENA_STATS: bool false
+mutable SPEC_ARENA_FREED: i64 0
+mutable SPEC_ARENA_HELD: i64 0
+
 ; DssslSpecEventHandler::DeclarationType
 define DECL_FEATURES: int 0
 define DECL_BASESET_ENCODING: int 1
@@ -365,6 +402,9 @@ define DssslSpecEventHandler
     current_chunks: pointer[Array[TextChunk]]
     current_doc: pointer[Doc]
     current_decl: pointer[DeclarationElement]
+    ; condition (b) of the per-document arena: this document's walk kept a
+    ; pointer INTO its parse. Saved/restored around every walk like current_doc.
+    keeps_parse: bool
     docs: pointer[Array[pointer[Doc]]]
     ; parse parameters for loading EXTERNAL-SPECIFICATION documents (the
     ; reference derives a child SgmlParser from the main parser's params;
@@ -385,10 +425,66 @@ define DssslSpecEventHandler
         set eh.current_chunks: Array[TextChunk]^host()
         set eh.current_doc: null
         set eh.current_decl: null
+        set eh.keeps_parse: false
         set eh.docs: Array[pointer[Doc]]^host()
         set eh.prog_name: String^host(prog_name)
         set eh.catalog_path: String^host(catalog_path)
         eh
+    }
+
+    ; DZ_SPEC_ARENA — see the arena comment at the top of this file.
+    function spec_arena_on() returns bool
+    {
+        if SPEC_ARENA_STATE = 0
+        {
+            set SPEC_ARENA_STATE: 1
+            let e getenv("DZ_SPEC_ARENA")
+            if e <> null
+            {
+                let zero "0" as char
+                if (*e as u32) = (zero as u32)
+                    set SPEC_ARENA_STATE: 2
+            }
+            let s getenv("DZ_SPEC_ARENA_STATS")
+            if s <> null
+                set SPEC_ARENA_STATS: true
+        }
+        SPEC_ARENA_STATE = 1
+    }
+
+    ; the parse host for ONE spec document: an exclusive page chain off `host`
+    ; when the arena is on, otherwise `host` itself (the historical lifetime).
+    function spec_arena(host: pointer[Page]) returns pointer[Page]
+    {
+        if DssslSpecEventHandler.spec_arena_on() = false
+            return host
+        host.allocate_exclusive_page()
+    }
+
+    ; …and its release. `keep` is condition (b), decided by the walk.
+    procedure release_spec_arena(host: pointer[Page], arena: pointer[Page], keep: bool)
+    {
+        if arena = host
+            return
+        if keep
+        {
+            set SPEC_ARENA_HELD: SPEC_ARENA_HELD + 1
+            return
+        }
+        set SPEC_ARENA_FREED: SPEC_ARENA_FREED + 1
+        host.deallocate_exclusive_page(arena)
+    }
+
+    ; the gate's proof that the mechanism engaged at all (DZ_SPEC_ARENA_STATS=1)
+    procedure report_spec_arena()
+    {
+        if SPEC_ARENA_STATS = false
+            return
+        scaly_eputs "specarena: documents released "
+        scaly_eputi SPEC_ARENA_FREED
+        scaly_eputs ", held "
+        scaly_eputi SPEC_ARENA_HELD
+        scaly_eputnl()
     }
 
     ; findDoc(sysid): the doc registry (one Doc per system id; empty = main).
@@ -588,7 +684,12 @@ define DssslSpecEventHandler
         if ent = null
             set this.gathering_body: true
         else
+        {
+            ; the CONTENT= entity arm keeps a pointer into the parse — see the
+            ; arena comment at the top of this file, condition (b)
+            set this.keeps_parse: true
             this.current_part.append_body(BodyElement.make_entity(this.host, ent))
+        }
     }
 
     function style_specification_body_end(this: pointer[DssslSpecEventHandler])
@@ -823,14 +924,23 @@ define DssslSpecEventHandler
         }
         set *(pb + n): 0
         let path String^host(pb as pointer[char])
-        let ps Parser.parse_simple_cat(host, path, this.prog_name, this.catalog_path, null, null, false)
+        ; this document's parse gets its own arena, released at the END of this
+        ; call — resolve_parts recurses over the USE closure, so the child
+        ; parses NEST and each bracket must belong to its own call.
+        let arena DssslSpecEventHandler.spec_arena(host)
+        let ps Parser.parse_simple_cat(arena, path, this.prog_name, this.catalog_path, null, null, false)
         if ps = null
+        {
+            DssslSpecEventHandler.release_spec_arena(host, arena, false)
             return
+        }
         let saved_doc this.current_doc
         let saved_part this.current_part
         let saved_gathering this.gathering_body
+        let saved_keeps this.keeps_parse
         set this.current_part: null
         set this.gathering_body: false
+        set this.keeps_parse: false
         if this.check_dsssl_arch(ps) = false
             this.interp.message0(InterpreterMessages.specNotArc())
         else
@@ -838,9 +948,12 @@ define DssslSpecEventHandler
             set this.current_doc: doc
             this.walk(ps)
         }
+        let keep this.keeps_parse
         set this.current_doc: saved_doc
         set this.current_part: saved_part
         set this.gathering_body: saved_gathering
+        set this.keeps_parse: saved_keeps
+        DssslSpecEventHandler.release_spec_arena(host, arena, keep)
     }
 
     ; --- top-level entry ---------------------------------------------------
@@ -865,6 +978,7 @@ define DssslSpecEventHandler
         let doc this.find_doc(StringC())
         set doc.loaded: true
         set this.current_doc: doc
+        set this.keeps_parse: false
         if this.got_arc
             this.walk(ps)
 
@@ -878,6 +992,11 @@ define DssslSpecEventHandler
         this.resolve_parts(tem, parts)
         parts
     }
+
+    ; condition (b) for the MAIN document, whose parse the driver owns: did its
+    ; walk keep a pointer into it? Read by load_stylesheet after load() returns.
+    function keeps_parse(this: DssslSpecEventHandler) returns bool
+        keeps_parse
 
     ; resolveParts: collect the part and, transitively, its USE closure
     ; (mark guards the use-loop).

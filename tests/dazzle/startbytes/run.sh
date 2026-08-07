@@ -515,15 +515,17 @@ patch('/packages/dazzle/0.1.0/dazzle_cli.scaly', [
     ("        let pcf ProcessContext.make_fot(host, interp, sgml)\n        pcf.process(root)",
      "        let pcf ProcessContext.make_fot(host, interp, sgml)\n"
      "        let sb_s Page.sb_phase(5)\n        pcf.process(root)\n        Page.sb_phase(sb_s)"),
-    # 2 = the SGML parse of the TOP .dsl only
-    ("    let ps Parser.parse_simple_cat(host, dsl_path, prog_name, catalog_path, extra_cats, search_dirs, restrict_reading)",
+    # 2 = the SGML parse of the TOP .dsl only.  ★It parses onto the spec ARENA
+    # since 2026-08-08 (DssslSpecEventHandler, DZ_SPEC_ARENA) — the phase still
+    # measures the same work, and the arena's release shows up as pages
+    # returned, which is exactly what this probe is for.
+    ("    let ps Parser.parse_simple_cat(arena, dsl_path, prog_name, catalog_path, extra_cats, search_dirs, restrict_reading)",
      "    let sb_p Page.sb_phase(2)\n"
-     "    let ps Parser.parse_simple_cat(host, dsl_path, prog_name, catalog_path, extra_cats, search_dirs, restrict_reading)\n"
+     "    let ps Parser.parse_simple_cat(arena, dsl_path, prog_name, catalog_path, extra_cats, search_dirs, restrict_reading)\n"
      "    Page.sb_phase(sb_p)"),
     # 6 = eh.load: part assembly + every external specification's child parse
-    ("    let parts eh.load(ps, dsl_id)\n    if parts = null\n        return false",
-     "    let sb_l Page.sb_phase(6)\n    let parts eh.load(ps, dsl_id)\n    Page.sb_phase(sb_l)\n"
-     "    if parts = null\n        return false"),
+    ("    let parts eh.load(ps, dsl_id)\n",
+     "    let sb_l Page.sb_phase(6)\n    let parts eh.load(ps, dsl_id)\n    Page.sb_phase(sb_l)\n"),
     ("                let bsp SchemeParser.make(host, interp, bsrc)\n                bsp.parse()",
      "                let sb_s Page.sb_phase(3)\n"
      "                let bsp SchemeParser.make(host, interp, bsrc)\n                bsp.parse()\n"
