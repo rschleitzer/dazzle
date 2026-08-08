@@ -297,4 +297,21 @@ run_case decl3  diagdoc.sgml decl3.experr
 run_case decl3b diagdoc.sgml decl3b.experr
 run_case decl4  diagdoc.sgml decl4.experr
 
+# style1..style5 (diagdoc.sgml, -t fot): DSSSL2 STYLE RULES - the last open
+# item of the 2026-08-08 message audit. A rule body that starts with a KEYWORD
+# sets characteristics instead of building a flow object.
+# ★style2 pins the ORDER of equally specific style rules, which IS a contract
+# here and is not one for construction rules: every matching style rule
+# applies. The reference keeps element rules in an IList that PREPENDS, so the
+# run is LAST-DECLARED-FIRST - measured, not assumed.
+# ★style3 is `ambiguousStyle`, which was unreachable until these landed.
+# ★style5 has no style rule at all: it pins the CheckSosofoInsn that
+# Action::compile puts on a CONSTRUCTION rule (and must not put on a style
+# rule) - the same line, so it belongs to this batch.
+run_fot_case style1 diagdoc.sgml style1.experr -2
+run_fot_case style2 diagdoc.sgml style2.experr -2
+run_fot_case style3 diagdoc.sgml style3.experr -2
+run_fot_case style4 diagdoc.sgml style4.experr -2
+run_fot_case style5 diagdoc.sgml style5.experr
+
 echo "dazzle-engine: PASS"
