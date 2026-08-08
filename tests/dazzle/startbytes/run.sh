@@ -47,8 +47,9 @@ PROBE = r'''
 function getenv(name: pointer[const_char]) returns pointer[const_char] extern
 function calloc(count: size_t, size: size_t) returns pointer[void] extern
 procedure atexit(cb: pointer[void]) returns i32 extern
+procedure exit(code: i32) extern
 
-define SB_NPHASE: i64 12
+define SB_NPHASE: i64 18
 define SB_NSIZE: i64 1024
 
 shared sb_state: int 0
@@ -79,6 +80,15 @@ shared sb_livebytes: i64 0
 shared sb_peak: i64 0
 shared sb_peakph: i64 0
 shared sb_peakat: pointer[i64] null
+; The LIVE CURVE per phase, which is the column that decides whether a phase's
+; bytes can matter at all: `sb_net` is the phase's NET contribution to the live
+; total (summed over every bracket it is entered in), `sb_phpeak` the highest
+; the global live total ever stood WHILE that phase was current. A phase whose
+; bracket never runs at the peak cannot lower max RSS however many bytes it
+; requests — measured, not argued.
+shared sb_net: pointer[i64] null
+shared sb_phpeak: pointer[i64] null
+shared sb_lastlive: i64 0
 
 function sb_atexit()
     Page.sb_report()
@@ -141,6 +151,9 @@ procedure sb_grow(n: i64)
         set sb_peak: sb_livebytes
         set sb_peakph: sb_cur
     }
+    let pk sb_phpeak
+    if sb_livebytes > *(pk + sb_cur)
+        set *(pk + sb_cur): sb_livebytes
 }
 
 ; the other end of the same question: does an oversized block ever come back?
@@ -171,7 +184,13 @@ REPORT = r'''
         set sb_ovhist: calloc((SB_NPHASE * 24) as size_t, 8) as pointer[i64]
         set sb_ovhistb: calloc((SB_NPHASE * 24) as size_t, 8) as pointer[i64]
         set sb_peakat: calloc(SB_NPHASE as size_t, 8) as pointer[i64]
+        set sb_net: calloc(SB_NPHASE as size_t, 8) as pointer[i64]
+        set sb_phpeak: calloc(SB_NPHASE as size_t, 8) as pointer[i64]
         set sb_hist: calloc((SB_NPHASE * SB_NSIZE) as size_t, 8) as pointer[i64]
+        if sb_net = null
+            return
+        if sb_phpeak = null
+            return
         if sb_hist = null
             return
         if sb_ovhistb = null
@@ -185,13 +204,38 @@ REPORT = r'''
     {
         if sb_state = 0
             Page.sb_setup()
+        ; ★Switched OFF every pointer below is null. The first version wrote
+        ; through `sb_peakat` unconditionally, so a probe build without
+        ; DZ_START_BYTES SIGSEGVed at the first bracket — invisible, because
+        ; nobody ever ran the probe binary with the switch off.
+        if sb_on = false
+            return 0
         let old sb_cur
+        ; the segment that just ENDED belongs to the phase that was current:
+        ; its net contribution to the live total, accumulated over every
+        ; bracket. Nesting works because an inner bracket closes its own
+        ; segment on the way in and on the way out.
+        let nt sb_net
+        set *(nt + old): *(nt + old) + (sb_livebytes - sb_lastlive)
+        set sb_lastlive: sb_livebytes
         ; live bytes AT the transition — the shape of the curve, which is what
         ; says whether a phase's bytes are still there when the next one runs
         let pa sb_peakat
         set *(pa + k): sb_livebytes
         set sb_cur: k
         old
+    }
+
+    ; DZ_SB_STOP=1 — leave the WORK out instead of estimating what it costs:
+    ; the run ends right after eh.load, i.e. before a single Expression node or
+    ; Insn exists. Same binary either way, so the two max-RSS numbers are
+    ; comparable, and the report still prints (it hangs off atexit). That is
+    ; the ceiling of any rung in `scheme`+`compile`, measured not argued.
+    procedure sb_stop_here()
+    {
+        if getenv("DZ_SB_STOP") = null
+            return
+        exit(0)
     }
 
     function sb_is_on() returns bool
@@ -224,9 +268,21 @@ REPORT = r'''
         if k = 9
             scaly_eputs "walk+gather "
         if k = 10
-            scaly_eputs "phase10     "
+            scaly_eputs "sch/token   "
         if k = 11
-            scaly_eputs "phase11     "
+            scaly_eputs "sch/lookup  "
+        if k = 12
+            scaly_eputs "sch/datum   "
+        if k = 13
+            scaly_eputs "cmp/initial "
+        if k = 14
+            scaly_eputs "cmp/lang    "
+        if k = 15
+            scaly_eputs "cmp/rules   "
+        if k = 16
+            scaly_eputs "cmp/sorted  "
+        if k = 17
+            scaly_eputs "phase17     "
     }
 
     procedure sb_line(name: pointer[const_char], v: i64)
@@ -291,14 +347,26 @@ REPORT = r'''
         scaly_eputs " MB"
         scaly_eputnl()
         let pa sb_peakat
+        let nt sb_net
+        let pk sb_phpeak
+        ; close the last open segment so the net column adds up
+        set *(nt + sb_cur): *(nt + sb_cur) + (sb_livebytes - sb_lastlive)
+        scaly_eputs "startbytes: the LIVE CURVE (net = what the phase leaves behind; peak = highest the run stood while it was current)"
+        scaly_eputnl()
         set i: 0
         while i < SB_NPHASE
         {
-            if *(pa + i) > 0
+            if *(c + i) > 0
             {
-                scaly_eputs "  live bytes when phase "
+                scaly_eputs "  phase "
                 Page.sb_name i
-                scaly_eputs " last began: "
+                scaly_eputs "  net live "
+                scaly_eputi(*(nt + i) / 1048576)
+                scaly_eputs " MB  (requested "
+                scaly_eputi(*(b + i) / 1048576)
+                scaly_eputs " MB)   peak while current "
+                scaly_eputi(*(pk + i) / 1048576)
+                scaly_eputs " MB   live at last entry "
                 scaly_eputi(*(pa + i) / 1048576)
                 scaly_eputs " MB"
                 scaly_eputnl()
@@ -488,6 +556,39 @@ patch('/packages/dazzle/0.1.0/dazzle/DssslSpecEventHandler.scaly', [
      "    function load_external_doc_inner(this: pointer[DssslSpecEventHandler], doc: pointer[Doc])\n    {\n        let host this.host"),
 ])
 
+# ---- SUB-brackets of `scheme` (10/11/12) ---------------------------------
+# A function with many returns is bracketed by a WRAPPER, the same technique
+# load_external_doc uses above.  These nest inside phase 3, so phase 3's own
+# line becomes "the rest of the scheme parse".
+patch('/packages/dazzle/0.1.0/dazzle/SchemeParser.scaly', [
+    ("    function get_token(this: pointer[SchemeParser], allowed: int, tok: pointer[int]) returns bool\n    {\n        repeat",
+     "    function get_token(this: pointer[SchemeParser], allowed: int, tok: pointer[int]) returns bool\n    {\n"
+     "        let sb_t Page.sb_phase(10)\n        let r this.get_token_inner(allowed, tok)\n"
+     "        Page.sb_phase(sb_t)\n        r\n    }\n\n"
+     "    function get_token_inner(this: pointer[SchemeParser], allowed: int, tok: pointer[int]) returns bool\n    {\n        repeat"),
+    ("    function parse_datum(this: pointer[SchemeParser], other_allowed: int, result: pointer[pointer[ELObj]], loc: pointer[Location], tok: pointer[int]) returns bool\n    {\n        if this.parse_self_evaluating(",
+     "    function parse_datum(this: pointer[SchemeParser], other_allowed: int, result: pointer[pointer[ELObj]], loc: pointer[Location], tok: pointer[int]) returns bool\n    {\n"
+     "        let sb_d Page.sb_phase(12)\n        let r this.parse_datum_inner(other_allowed, result, loc, tok)\n"
+     "        Page.sb_phase(sb_d)\n        r\n    }\n\n"
+     "    function parse_datum_inner(this: pointer[SchemeParser], other_allowed: int, result: pointer[pointer[ELObj]], loc: pointer[Location], tok: pointer[int]) returns bool\n    {\n        if this.parse_self_evaluating("),
+])
+
+patch('/packages/dazzle/0.1.0/dazzle/Interpreter.scaly', [
+    ("    function lookup(this: pointer[Interpreter], str: StringC) returns pointer[Identifier]\n    {\n        let hit this.ident_index.lookup(str)",
+     "    function lookup(this: pointer[Interpreter], str: StringC) returns pointer[Identifier]\n    {\n"
+     "        let sb_i Page.sb_phase(11)\n        let r this.lookup_inner(str)\n"
+     "        Page.sb_phase(sb_i)\n        r\n    }\n\n"
+     "    function lookup_inner(this: pointer[Interpreter], str: StringC) returns pointer[Identifier]\n    {\n        let hit this.ident_index.lookup(str)"),
+    # ---- SUB-brackets of `compile` (13/14/15/16) — the body is straight-line
+    ("        this.compile_initial_values()\n        this.compile_default_language()\n        this.initial_mode.compile(this)\n        this.initial_mode.build_sorted(this.host)",
+     "        let sb_ci Page.sb_phase(13)\n        this.compile_initial_values()\n        Page.sb_phase(14)\n        this.compile_default_language()\n"
+     "        Page.sb_phase(15)\n        this.initial_mode.compile(this)\n"
+     "        Page.sb_phase(16)\n        this.initial_mode.build_sorted(this.host)\n        Page.sb_phase(sb_ci)"),
+    ("            let m *(tbl.get_buffer() + i)\n            m.compile(this)\n            m.build_sorted(this.host)",
+     "            let m *(tbl.get_buffer() + i)\n            let sb_m Page.sb_phase(15)\n            m.compile(this)\n"
+     "            Page.sb_phase(16)\n            m.build_sorted(this.host)\n            Page.sb_phase(sb_m)"),
+])
+
 # ---------------------------------------------------------------- brackets
 patch('/packages/dazzle/0.1.0/dazzle_cli.scaly', [
     ("    let gs GroveBuilder.begin(host, 0)",
@@ -525,7 +626,7 @@ patch('/packages/dazzle/0.1.0/dazzle_cli.scaly', [
      "    Page.sb_phase(sb_p)"),
     # 6 = eh.load: part assembly + every external specification's child parse
     ("    let parts eh.load(ps, dsl_id)\n",
-     "    let sb_l Page.sb_phase(6)\n    let parts eh.load(ps, dsl_id)\n    Page.sb_phase(sb_l)\n"),
+     "    let sb_l Page.sb_phase(6)\n    let parts eh.load(ps, dsl_id)\n    Page.sb_phase(sb_l)\n    Page.sb_stop_here()\n"),
     ("                let bsp SchemeParser.make(host, interp, bsrc)\n                bsp.parse()",
      "                let sb_s Page.sb_phase(3)\n"
      "                let bsp SchemeParser.make(host, interp, bsrc)\n                bsp.parse()\n"
