@@ -125,13 +125,20 @@ define EVK_END_PROLOG: int 8
 
 ; A DSSSL declaration element's gathered content (features, char-repertoire,
 ; standard-chars, …). name/text/modadd/desc are the attribute-sourced fields.
-define DeclarationElement (decl_type: int, content: StringC, name: StringC, text: StringC, modadd: StringC, desc: StringC)
+; ★`chunks` is the declaration's own location table, kept for the same
+; reason `ImmediateBody` keeps one: the four declaration parsers DO
+; report (badDeclaration, badCharName, duplicateCharName), and without
+; the table a diagnostic in an entity-expanded declaration anchors
+; nowhere. StyleEngine.cxx builds the same thing —
+; `TextInputSourceOrigin(content_)`.
+define DeclarationElement (decl_type: int, content: StringC, chunks: pointer[Array[TextChunk]], name: StringC, text: StringC, modadd: StringC, desc: StringC)
 {
     function make(host: pointer[Page], decl_type: int) returns pointer[DeclarationElement]
     {
         let d host.allocate(sizeof DeclarationElement, alignof DeclarationElement) as pointer[DeclarationElement]
         set d.decl_type: decl_type
         set d.content: StringC()
+        set d.chunks: null
         set d.name: StringC()
         set d.text: StringC()
         set d.modadd: StringC()
@@ -215,6 +222,16 @@ define Part
 
     function get_body_elements(this: Part) returns pointer[Array[pointer[BodyElement]]]
         body_elements
+
+    ; the document this part came from — StyleEngine::parseSpec reads its
+    ; declarations before the part's own.
+    function get_doc(this: Part) returns pointer[Doc]
+        doc
+
+    ; StyleEngine::parseSpec walks the DOC's declarations and then the PART's
+    ; (the `local` do-while), so both lists need an accessor.
+    function get_declarations(this: Part) returns pointer[Array[pointer[DeclarationElement]]]
+        declarations
 
     function get_use_headers(this: Part) returns pointer[Array[pointer[PartHeader]]]
         use_headers
@@ -327,6 +344,9 @@ define Doc
         set d.loc: Location()
         d
     }
+
+    function get_declarations(this: Doc) returns pointer[Array[pointer[DeclarationElement]]]
+        declarations
 
     function get_sysid(this: Doc) returns StringC
         sysid
@@ -791,6 +811,19 @@ define DssslSpecEventHandler
             set SPEC_CHUNK_CHARS: SPEC_CHUNK_CHARS + (this.current_body.get_length() as i64)
             let text StringC^host(this.current_body.get_buffer(), this.current_body.get_length())
             set this.current_decl.content: text
+            ; pin the chunk chain exactly as the body path does (same reason,
+            ; same by-value-construction trap avoided by copying the chunk).
+            let chunks Array[TextChunk]^host()
+            let cn this.current_chunks.get_length()
+            var ci: size_t 0
+            while ci < cn
+            {
+                var ch *(this.current_chunks.get_buffer() + ci)
+                set ch.loc: Origin.pin_location(host, ch.loc)
+                chunks.add(ch)
+                set ci: ci + 1
+            }
+            set this.current_decl.chunks: chunks
             if this.current_part <> null
                 this.current_part.append_decl(this.current_decl)
             else if this.current_doc <> null
@@ -1089,6 +1122,138 @@ define DssslSpecEventHandler
     ; Location()) — renders "(invalid location)", like the reference). The
     ; CONTENT= EXTERNAL entity fresh-open (entityManager().open) is not
     ; wired yet — no corpus stylesheet uses it; returns null (skipped).
+    ; DeclarationElement::makeInputSource (DssslSpecEventHandler.cxx:523) —
+    ; a TextInputSourceOrigin over the gathered content, i.e. exactly the
+    ; Immediate body arm below with the declaration's own chunk table.
+    ; StyleEngine::parseSpec's DECLARATION phase (StyleEngine.cxx:40-80) — the
+    ; part of the spec that runs BEFORE any Scheme body, and which this port
+    ; gathered but never executed until 2026-08-08 (found by the dazzle-side
+    ; message audit: `Interpreter.set_char_repertoire` and the four
+    ; `SchemeParser.parse_*` declaration readers were fully ported and had ZERO
+    ; callers).
+    ;
+    ; Three shapes of the reference are load-bearing here:
+    ;
+    ;  * TWO PHASES over the whole part list. `char-repertoire` and
+    ;    `standard-chars` run in phase 0, everything else in phase 1 — a
+    ;    `map-sdata-entity` in the FIRST part may name a character that the LAST
+    ;    part's `standard-chars` defines, so the character tables must be complete
+    ;    before anything reads them.
+    ;  * per part, the DOC's declarations first, then the PART's own (the
+    ;    reference's `local` do-while).
+    ;  * `dEndPart` after each part, in BOTH phases — the declaration phase has
+    ;    its own part counter, and it is what decides whether a redefinition
+    ;    overwrites, is ignored, or is a duplicate diagnostic.
+    procedure parse_declarations(host: pointer[Page], interp: pointer[Interpreter], parts: pointer[Array[pointer[Part]]])
+    {
+        let n parts.get_length()
+        var phase 0
+        while phase < 2
+        {
+            var i: size_t 0
+            while i < n
+            {
+                let part *(parts.get_buffer() + i)
+                var local 0
+                while local < 2
+                {
+                    var decls: pointer[Array[pointer[DeclarationElement]]] null
+                    if local = 0
+                    {
+                        let doc part.get_doc()
+                        if doc <> null
+                            set decls: doc.get_declarations()
+                    }
+                    else
+                        set decls: part.get_declarations()
+                    if decls <> null
+                    {
+                        let dn decls.get_length()
+                        var j: size_t 0
+                        while j < dn
+                        {
+                            let d *(decls.get_buffer() + j)
+                            let ty d.get_type()
+                            var want 1
+                            if (ty = DECL_CHAR_REPERTOIRE) or (ty = DECL_STANDARD_CHARS)
+                                set want: 0
+                            if want = phase
+                                DssslSpecEventHandler.run_declaration(host, interp, d, ty)
+                            set j: j + 1
+                        }
+                    }
+                    set local: local + 1
+                }
+                interp.d_end_part()
+                set i: i + 1
+            }
+            set phase: phase + 1
+        }
+    }
+
+    ; the switch of StyleEngine::parseSpec. ★Every arm gets its OWN SchemeParser
+    ; over the declaration's own input source, exactly as the reference does —
+    ; the reader state (token, current entity) must not leak between declarations.
+    procedure run_declaration(host: pointer[Page], interp: pointer[Interpreter], d: pointer[DeclarationElement], ty: int)
+    {
+        if ty = DECL_CHAR_REPERTOIRE
+        {
+            interp.set_char_repertoire(d.get_name())
+            return
+        }
+        if ty = DECL_STANDARD_CHARS
+        {
+            let src DssslSpecEventHandler.make_decl_input_source(host, d)
+            if src = null
+                return
+            let sp SchemeParser.make(host, interp, src)
+            sp.parse_standard_chars()
+            return
+        }
+        if ty = DECL_MAP_SDATA_ENTITY
+        {
+            let src DssslSpecEventHandler.make_decl_input_source(host, d)
+            if src = null
+                return
+            let sp SchemeParser.make(host, interp, src)
+            sp.parse_map_sdata_entity(d.get_name(), d.get_text())
+            return
+        }
+        if ty = DECL_ADD_NAME_CHARS
+        {
+            let src DssslSpecEventHandler.make_decl_input_source(host, d)
+            if src = null
+                return
+            let sp SchemeParser.make(host, interp, src)
+            sp.parse_name_chars()
+            return
+        }
+        if ty = DECL_ADD_SEPARATOR_CHARS
+        {
+            let src DssslSpecEventHandler.make_decl_input_source(host, d)
+            if src = null
+                return
+            let sp SchemeParser.make(host, interp, src)
+            sp.parse_separator_chars()
+            return
+        }
+        ; the reference's `default:` — every OTHER declaration kind (features,
+        ; baseset-encoding, literal-described-char, other-chars, combine-char,
+        ; sgml-grove-plan) is a warning and is ignored. ★It carries NO location:
+        ; the reference calls `interpreter_->message(...)` without a preceding
+        ; setNextLocation, so the line is the bare `<prog>:W: …`.
+        interp.message0(InterpreterMessages.unsupportedDeclaration())
+    }
+
+    function make_decl_input_source(host: pointer[Page], d: pointer[DeclarationElement]) returns pointer[InputSource]
+    {
+        let t d.get_content()
+        if t.get_size() = 0
+            return null
+        let org Origin.make_text(host, d.chunks)
+        InputSource.make(host, org, t.data_ptr(), t.get_size())
+    }
+
     function make_input_source(host: pointer[Page], be: pointer[BodyElement]) returns pointer[InputSource]
     {
         choose *be
