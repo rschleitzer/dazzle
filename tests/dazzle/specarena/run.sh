@@ -66,24 +66,37 @@ done
 [ "$fail" = 0 ] || exit 1
 
 # --- the mechanism must ENGAGE, and the escape hatch must really switch it off
-got="$(cd "$HERE" && SCALY_HOME="$ROOT" DZ_SPEC_ARENA_STATS=1 "$OUT" -t sgml -d extok.dsl doc.sgml 2>&1 | grep '^specarena:')"
+got="$(cd "$HERE" && SCALY_HOME="$ROOT" DZ_SPEC_ARENA_STATS=1 "$OUT" -t sgml -d extok.dsl doc.sgml 2>&1 | grep '^specarena: documents')"
 want="specarena: documents released 2, held 0"
 if [ "$got" != "$want" ]; then
   echo "specarena: FAIL engaged (want '$want', got '$got')"; exit 1
 fi
 
 # condition (b): a CONTENT= entity body holds its document's parse
-got="$(cd "$HERE" && SCALY_HOME="$ROOT" DZ_SPEC_ARENA_STATS=1 "$OUT" -t sgml -d content.dsl doc.sgml 2>&1 | grep '^specarena:')"
+got="$(cd "$HERE" && SCALY_HOME="$ROOT" DZ_SPEC_ARENA_STATS=1 "$OUT" -t sgml -d content.dsl doc.sgml 2>&1 | grep '^specarena: documents')"
 want="specarena: documents released 0, held 1"
 if [ "$got" != "$want" ]; then
   echo "specarena: FAIL condition-b (want '$want', got '$got')"; exit 1
 fi
 
 # the escape hatch
-got="$(cd "$HERE" && SCALY_HOME="$ROOT" DZ_SPEC_ARENA=0 DZ_SPEC_ARENA_STATS=1 "$OUT" -t sgml -d extok.dsl doc.sgml 2>&1 | grep '^specarena:')"
+got="$(cd "$HERE" && SCALY_HOME="$ROOT" DZ_SPEC_ARENA=0 DZ_SPEC_ARENA_STATS=1 "$OUT" -t sgml -d extok.dsl doc.sgml 2>&1 | grep '^specarena: documents')"
 want="specarena: documents released 0, held 0"
 if [ "$got" != "$want" ]; then
   echo "specarena: FAIL escape-hatch (want '$want', got '$got')"; exit 1
 fi
 
-echo "specarena: PASS (5 fixtures x 2 modes; arena engaged, condition (b) holds, DZ_SPEC_ARENA=0 disables)"
+# The chunk table must stay COALESCED (Text::addChars — the walk's data arm).
+# ★This assertion exists because that mechanism is invisible in every other
+# check here: a table with one entry per data event resolves every offset to
+# exactly the same location as the coalesced one, so the five fixtures above
+# pass either way. Only the COUNT tells them apart — 4 entries for these two
+# gathered bodies against 33 without the test (measured, so this line really
+# can fail), over the same 90 gathered characters.
+got="$(cd "$HERE" && SCALY_HOME="$ROOT" DZ_SPEC_ARENA_STATS=1 "$OUT" -t sgml -d extok.dsl doc.sgml 2>&1 | grep '^specarena: chunks')"
+want="specarena: chunks kept 4 of 90 gathered chars"
+if [ "$got" != "$want" ]; then
+  echo "specarena: FAIL coalescing (want '$want', got '$got')"; exit 1
+fi
+
+echo "specarena: PASS (5 fixtures x 2 modes; arena engaged, condition (b) holds, chunks coalesced, DZ_SPEC_ARENA=0 disables)"
