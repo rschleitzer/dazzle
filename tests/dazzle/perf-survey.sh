@@ -7,7 +7,7 @@
 # Environment:
 #   ONSGMLS_BIN  port event dumper   (default: build it into a temp dir)
 #   DAZZLE_BIN   port DSSSL CLI      (default: build it into a temp dir)
-#   REF_ONSGMLS  reference parser    (default: onsgmls)
+#   REF_ONSGMLS  reference parser    (default: /usr/local/bin/onsgmls, else PATH)
 #   REF_JADE     reference engine    (default: dazzle, else openjade)
 #   DAZZLEDOC    DocBook workload    (default: $HOME/repos/dazzledoc)
 #   CLAML        ClaML workload      (no default — the corpus lives in a
@@ -31,7 +31,21 @@
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 RUNS="${1:-7}"
-REF_ONSGMLS="${REF_ONSGMLS:-onsgmls}"
+REF_ONSGMLS="${REF_ONSGMLS:-}"
+if [ -z "$REF_ONSGMLS" ]; then
+  # ★The same doctrine as REF_JADE below, and it took until 2026-08-08 to apply
+  # it here: the right reference is the OpenSP built from the PORTING SOURCE
+  # (~/repos/dazzle/opensp -> /usr/local/bin), not whatever `onsgmls` is on
+  # PATH.  A distribution build (MacPorts, Homebrew) of the same 1.5.2 carries
+  # a CONSTANT ~4 MB more RSS on every workload — it links libintl, which the
+  # porting build does not — and that offset silently flattered every parse row
+  # of this survey: measured the same day, ClaML's RSS factor is 3.48x against
+  # the MacPorts binary and 6.57x against this one, and the "our process socket
+  # is SMALLER than the reference's" row (0.57x) is really 1.14x.  ESIS output
+  # and multi-byte handling are identical between the two builds.
+  if [ -x /usr/local/bin/onsgmls ]; then REF_ONSGMLS=/usr/local/bin/onsgmls
+  else REF_ONSGMLS=onsgmls; fi
+fi
 REF_JADE="${REF_JADE:-}"
 if [ -z "$REF_JADE" ]; then
   # dazzle (openjade 1.3.3-pre1) is the porting source and the right baseline:
