@@ -255,4 +255,29 @@ run_fot_case conv1b keydoc.sgml conv1b.experr "" conv1
 run_fot_case conv2 keydoc.sgml conv2.experr -2
 run_fot_case conv2b keydoc.sgml conv2b.experr "" conv2
 
+# diag1..diag6b (diagdoc.sgml): the DAZZLE-SIDE MESSAGE AUDIT of 2026-08-08.
+# ★These are the only fixtures in this tree whose point is that stderr is NOT
+# empty. Every one of them ran byte-identically on stdout before the audit and
+# said NOTHING on stderr where the reference reports — the class the audit was
+# named after ("a check whose failure branch is silent"), found by walking the
+# generated message catalog for accessors with no caller. Two of them are not
+# diagnostics at all: diag4's stylesheet used to recurse until the stack gave
+# out (rc 139, no output), and diag6/diag6b pin OUTPUT, because `(id …)` was
+# not ported in any position.
+run_case diag1  diagdoc.sgml diag1.experr
+run_case diag1b diagdoc.sgml diag1b.experr
+run_case diag1c diagdoc.sgml diag1c.experr
+run_case diag2  diagdoc.sgml diag2.experr -2
+run_case diag2b diagdoc.sgml diag2b.experr -2
+run_case diag2c diagdoc.sgml diag2c.experr -2
+run_case diag2d diagdoc.sgml diag2d.experr -2
+run_case diag3  diagdoc.sgml diag3.experr
+run_case diag3b diagdoc.sgml diag3b.experr
+run_case diag3c diagdoc.sgml diag3c.experr
+run_case diag4  diagdoc.sgml diag4.experr
+run_case diag5  diagdoc.sgml diag5.experr
+run_case diag5b diagdoc.sgml diag5b.experr
+run_case diag6  diagdoc.sgml diag6.experr
+run_case diag6b diagdoc.sgml diag6b.experr
+
 echo "dazzle-engine: PASS"
