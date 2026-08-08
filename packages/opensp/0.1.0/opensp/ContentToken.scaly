@@ -1,4 +1,5 @@
 use scaly.memory.Page
+use scaly.memory.root_pages.getenv
 use scaly.containers.Array
 use scaly.containers.Vector
 use opensp.ElementType.ElementType
@@ -47,6 +48,33 @@ define NK_GROUP: int 1
 ; Transition::invalidIndex sentinel, and the "no value" marker for the u32
 ; scratch tables (C++ size_t(-1) / uint(-1)).
 define INVALID_U32: u32 0xFFFFFFFF
+
+; --- the compile-time SCRATCH arena ---------------------------------------
+; Everything the position-automaton construction BUILDS is dead the moment
+; `compile` returns: the FIRST/LAST sets and their arrays, the per-member
+; temporaries of or_/seq_/and_analyze1, GroupInfo and its next_type_index
+; table, and the min_buf/elem_buf tables `finish` scribbles on. What SURVIVES
+; is the CmNode graph, each leaf's `follow`/`ai_follow` arrays, and the
+; CompiledModelGroup — and none of those is affected by which page the
+; analysis runs on, because a follow array grows through
+; `Page.get(the Array)`, i.e. the CmNode's OWN page, not the caller's.
+;
+; The reference gets this for free: its FirstSet/LastSet are stack locals and
+; its `Vector<unsigned> minAndDepth(...)` is freed at the end of compile. On a
+; bump region the same objects live as long as the DTD does — measured on the
+; 198-KB DocBook DTD (tests/dazzle/sizeprof): 3.3 MB of a 30.8 MB parse, and
+; content-model compilation is HALF that parse.
+;
+; Escape hatch: SP_CM_SCRATCH=0 puts the scratch back on `host`, i.e. restores
+; the historical lifetime exactly. SP_CM_SCRATCH_STATS=1 prints the counters —
+; ★a seam whose absence is INVISIBLE in the output needs a counter as its
+; checksum, or a build that silently stopped scratching still passes every
+; byte-identity gate.
+mutable CM_SCRATCH_STATE: int 0
+mutable CM_SCRATCH_STATS: bool false
+mutable CM_SCRATCH_ARENAS: i64 0
+mutable CM_SCRATCH_INLINE: i64 0
+mutable CM_SCRATCH_PAGES: i64 0
 
 ; A follow transition annotated for AND-group tracking (struct Transition).
 define Transition
@@ -802,16 +830,90 @@ define ContentToken
     }
 
     ; ---- compile (CompiledModelGroup::compile) ----
+    ; SP_CM_SCRATCH=0 restores the historical lifetime (scratch on `host`).
+    function cm_scratch_on() returns bool
+    {
+        if CM_SCRATCH_STATE = 0
+        {
+            set CM_SCRATCH_STATE: 1
+            let e getenv("SP_CM_SCRATCH")
+            if e <> null
+            {
+                let zero "0" as char
+                if (*e as u32) = (zero as u32)
+                    set CM_SCRATCH_STATE: 2
+            }
+            let s getenv("SP_CM_SCRATCH_STATS")
+            if s <> null
+                set CM_SCRATCH_STATS: true
+        }
+        CM_SCRATCH_STATE = 1
+    }
+
+    ; the analysis host for ONE content model: an exclusive page chain off
+    ; `host` when the seam is on, otherwise `host` itself.
+    function cm_scratch(host: pointer[Page]) returns pointer[Page]
+    {
+        if ContentToken.cm_scratch_on() = false
+        {
+            set CM_SCRATCH_INLINE: CM_SCRATCH_INLINE + 1
+            return host
+        }
+        set CM_SCRATCH_ARENAS: CM_SCRATCH_ARENAS + 1
+        host.allocate_exclusive_page()
+    }
+
+    procedure release_cm_scratch(host: pointer[Page], scratch: pointer[Page])
+    {
+        if scratch = host
+            return
+        ; ★Count the pages BEFORE handing them back. "The seam ran" and "memory
+        ; came back" are different claims, and only the second one is worth
+        ; anything: an arena counter stays right while a release turns into a
+        ; no-op. The gate asserts pages >= arenas, so a scratch that never grew
+        ; past its first page still has to report one.
+        if CM_SCRATCH_STATS
+        {
+            var n: i64 1
+            var p scratch.next_page
+            while p <> null
+            {
+                set n: n + 1
+                set p: p.next_page
+            }
+            set CM_SCRATCH_PAGES: CM_SCRATCH_PAGES + n
+        }
+        host.deallocate_exclusive_page(scratch)
+    }
+
+    procedure report_cm_scratch()
+    {
+        if CM_SCRATCH_STATS = false
+            return
+        scaly_eputs "cm-scratch: arenas "
+        scaly_eputi CM_SCRATCH_ARENAS
+        scaly_eputs ", compiles on host "
+        scaly_eputi CM_SCRATCH_INLINE
+        scaly_eputs ", pages returned "
+        scaly_eputi CM_SCRATCH_PAGES
+        scaly_eputnl()
+    }
+
     function compile(host: pointer[Page], model_group: pointer[CmNode], n_element_type_index: size_t, ambiguities: pointer[Array[Ambiguity]], pcdata_unreachable: pointer[bool]) returns pointer[CompiledModelGroup]
     {
-        let first make_first(host)
-        let last make_last(host)
-        let info host.allocate(sizeof GroupInfo, alignof GroupInfo) as pointer[GroupInfo]
+        ; ★Every allocation below that is NOT explicitly on `host` goes on the
+        ; scratch and dies at the release at the end of this function. The two
+        ; that must stay are `cmg` and `initial` — see the note at
+        ; CM_SCRATCH_STATE for why the follow arrays need no thought.
+        let scratch ContentToken.cm_scratch(host)
+        let first make_first(scratch)
+        let last make_last(scratch)
+        let info scratch.allocate(sizeof GroupInfo, alignof GroupInfo) as pointer[GroupInfo]
         set info.next_leaf_index: 0
         set info.contains_pcdata: false
         set info.and_state_size: 0
         set info.n_type: n_element_type_index
-        set info.next_type_index: host.allocate(n_element_type_index * 4, 4) as pointer[u32]
+        set info.next_type_index: scratch.allocate(n_element_type_index * 4, 4) as pointer[u32]
         var ti: size_t 0
         while ti < n_element_type_index
         {
@@ -819,7 +921,11 @@ define ContentToken
             set ti: ti + 1
         }
 
-        analyze(host, model_group, info, null as pointer[CmNode], 0, first, last)
+        ; the whole analysis subtree allocates ONLY scratch: make_first /
+        ; make_last and, in the AND arm, the two n*8 member vectors. The
+        ; per-leaf writes it makes (leaf_index, type_index, and-info) are
+        ; scalars and pointers to CmNodes, never into the scratch.
+        analyze(scratch, model_group, info, null as pointer[CmNode], 0, first, last)
 
         var li: size_t 0
         let ln last.v.get_length()
@@ -836,9 +942,12 @@ define ContentToken
         set cmg.and_state_size: info.and_state_size
         set cmg.contains_pcdata: info.contains_pcdata
 
+        ; ★`initial` is reachable from `cmg` and its `follow` array is filled
+        ; below — it stays on `host`. The SET that carries it into
+        ; add_transitions is scratch.
         let initial make_leaf(host, null as pointer[ElementType], OI_NONE, false, true)
         set cmg.initial: initial
-        let initial_set make_last(host)
+        let initial_set make_last(scratch)
         initial_set.v.add(initial)
         add_transitions(initial_set, first, true, 0, 0, false, INVALID_U32, INVALID_U32)
         if model_group.inherently_optional
@@ -849,16 +958,17 @@ define ContentToken
         var min_alloc n_leaves as size_t
         if min_alloc < 1
             set min_alloc: 1
-        let min_buf host.allocate(min_alloc * 4, 4) as pointer[u32]
+        let min_buf scratch.allocate(min_alloc * 4, 4) as pointer[u32]
         var elem_alloc n_element_type_index
         if elem_alloc < 1
             set elem_alloc: 1
-        let elem_buf host.allocate(elem_alloc * 4, 4) as pointer[u32]
+        let elem_buf scratch.allocate(elem_alloc * 4, 4) as pointer[u32]
 
         finish(initial, min_buf, n_leaves, elem_buf, n_element_type_index as u32, ambiguities, pcdata_unreachable)
         finish(model_group, min_buf, n_leaves, elem_buf, n_element_type_index as u32, ambiguities, pcdata_unreachable)
         if cmg.contains_pcdata = false
             set *pcdata_unreachable: false
+        ContentToken.release_cm_scratch(host, scratch)
         cmg
     }
 

@@ -49,7 +49,7 @@ function getenv(name: pointer[const_char]) returns pointer[const_char] extern
 function calloc(count: size_t, size: size_t) returns pointer[void] extern
 procedure atexit(cb: pointer[void]) returns i32 extern
 
-define SP_NBUCKET: i64 19
+define SP_NBUCKET: i64 24
 define SP_NSIZE: i64 1024
 
 shared sp_state: int 0
@@ -71,6 +71,13 @@ shared sp_livepages: i64 0
 shared sp_lastlive: i64 0
 shared sp_pages: i64 0
 shared sp_relpages: i64 0
+; the payload question: follow ENTRIES against the bytes the arrays cost.
+shared sp_follow_entries: i64 0
+shared sp_follow_adds: i64 0
+shared sp_leaves: i64 0
+shared sp_excl_pages: i64 0
+shared sp_excl_bytes: i64 0
+shared sp_excl_used: i64 0
 
 function sp_atexit()
     Page.sp_report()
@@ -136,6 +143,32 @@ REPORT = r'''
 
     ; the doubling trail, called from Array.reallocate: a bump-hosted buffer
     ; that growth abandons is region garbage — "there is nothing to release".
+    procedure sp_follow(n: i64)
+    {
+        if sp_on = false
+            return
+        set sp_follow_entries: sp_follow_entries + n
+        set sp_follow_adds: sp_follow_adds + 1
+    }
+
+    procedure sp_leaf()
+    {
+        if sp_on = false
+            return
+        set sp_leaves: sp_leaves + 1
+    }
+
+    ; an Array buffer past 1 KB takes an EXCLUSIVE PAGE — `used` is what the
+    ; elements actually need, `bytes` what the page costs.
+    procedure sp_excl(used: i64, bytes: i64)
+    {
+        if sp_on = false
+            return
+        set sp_excl_pages: sp_excl_pages + 1
+        set sp_excl_used: sp_excl_used + used
+        set sp_excl_bytes: sp_excl_bytes + bytes
+    }
+
     procedure sp_trail(bytes: i64)
     {
         if sp_on = false
@@ -187,6 +220,16 @@ REPORT = r'''
             scaly_eputs "attval/text  "
         if k = 18
             scaly_eputs "parse-literal"
+        if k = 19
+            scaly_eputs "cm/prologue  "
+        if k = 20
+            scaly_eputs "cm/analyze   "
+        if k = 21
+            scaly_eputs "cm/addtrans  "
+        if k = 22
+            scaly_eputs "cm/finish    "
+        if k = 23
+            scaly_eputs "cm/makeset   "
     }
 
     procedure sp_report()
@@ -209,6 +252,26 @@ REPORT = r'''
         let pp sp_pagesph
         set *(nt + sp_cur): *(nt + sp_cur) + (sp_livepages - sp_lastlive)
         scaly_eputs "sizeprof: requested "
+        scaly_eputi(tot / 1024)
+        scaly_eputs " KB total;  follow entries "
+        scaly_eputi sp_follow_entries
+        scaly_eputs " in "
+        scaly_eputi sp_follow_adds
+        scaly_eputs " appends = "
+        scaly_eputi(sp_follow_entries * 8 / 1024)
+        scaly_eputs " KB payload over "
+        scaly_eputi sp_leaves
+        scaly_eputs " leaves"
+        scaly_eputnl()
+        scaly_eputs "sizeprof: exclusive-page buffers "
+        scaly_eputi sp_excl_pages
+        scaly_eputs " holding "
+        scaly_eputi(sp_excl_used / 1024)
+        scaly_eputs " KB of elements in "
+        scaly_eputi(sp_excl_bytes / 1024)
+        scaly_eputs " KB of pages"
+        scaly_eputnl()
+        scaly_eputs "sizeprof: requested-again "
         scaly_eputi(tot / 1024)
         scaly_eputs " KB total;  pages released "
         scaly_eputi sp_relpages
@@ -314,6 +377,9 @@ patch('/packages/scaly/0.1.0/scaly/containers/Array.scaly', [
     ("            let new_vector Vector[T]^own_page(new_capacity)\n            memcpy(new_vector.data, vector.data, vector.length * size)",
      "            Page.sp_trail((vector.length * size) as i64)\n"
      "            let new_vector Vector[T]^own_page(new_capacity)\n            memcpy(new_vector.data, vector.data, vector.length * size)"),
+    ("        let new_vector Vector[T]^new_exclusive_page(new_capacity)",
+     "        Page.sp_excl((vector.length * size) as i64, (new_capacity * size) as i64)\n"
+     "        let new_vector Vector[T]^new_exclusive_page(new_capacity)"),
 ])
 
 # ---------------------------------------------------------- the brackets ---
@@ -422,6 +488,50 @@ patch('/packages/opensp/0.1.0/opensp/Parser.scaly', [
      "        let rdfv this.parse_default_value_inner(decl_input_level, is_notation, parm, attribute_name, declared_value, out_def, any_current)\n"
      "        Page.sp_bracket(sp_dfv)\n        return rdfv\n    }\n\n"
      "    function parse_default_value_inner(this: Parser, decl_input_level: u32, is_notation: bool, parm: pointer[Param], attribute_name: StringC, declared_value: pointer[DeclaredValue], out_def: pointer[pointer[AttributeDefinition]], any_current: pointer[bool]) returns bool\n    {"),
+])
+
+# ---- inside cm-compile: where its 14.9 MB LIVE actually sit ---------------
+patch('/packages/opensp/0.1.0/opensp/ContentToken.scaly', [
+    # the three n-sized scratch buffers of compile() itself
+    ("        set info.next_type_index: scratch.allocate(n_element_type_index * 4, 4) as pointer[u32]",
+     "        let sp_pr Page.sp_bracket(19)\n"
+     "        set info.next_type_index: scratch.allocate(n_element_type_index * 4, 4) as pointer[u32]\n"
+     "        Page.sp_bracket(sp_pr)"),
+    ("        let min_buf scratch.allocate(min_alloc * 4, 4) as pointer[u32]",
+     "        let sp_pr2 Page.sp_bracket(19)\n        let min_buf scratch.allocate(min_alloc * 4, 4) as pointer[u32]\n        Page.sp_bracket(sp_pr2)"),
+    ("        let elem_buf scratch.allocate(elem_alloc * 4, 4) as pointer[u32]",
+     "        let sp_pr3 Page.sp_bracket(19)\n        let elem_buf scratch.allocate(elem_alloc * 4, 4) as pointer[u32]\n        Page.sp_bracket(sp_pr3)"),
+    # the analysis walk (exclusive of addtrans/makeset, which nest inside it)
+    ("        analyze(scratch, model_group, info, null as pointer[CmNode], 0, first, last)",
+     "        let sp_an Page.sp_bracket(20)\n"
+     "        analyze(scratch, model_group, info, null as pointer[CmNode], 0, first, last)\n"
+     "        Page.sp_bracket(sp_an)"),
+    # the follow-set batch append — the loop that already cost one rung today
+    ("    function leaf_add_transitions(p: pointer[CmNode], to: pointer[FirstSet], maybe_required: bool, and_clear_index: u32, and_depth: u32, isolated: bool, require_clear: u32, to_set: u32)\n    {",
+     "    function leaf_add_transitions(p: pointer[CmNode], to: pointer[FirstSet], maybe_required: bool, and_clear_index: u32, and_depth: u32, isolated: bool, require_clear: u32, to_set: u32)\n    {\n"
+     "        let sp_at Page.sp_bracket(21)\n"
+     "        ContentToken.leaf_add_transitions_inner(p, to, maybe_required, and_clear_index, and_depth, isolated, require_clear, to_set)\n"
+     "        Page.sp_bracket(sp_at)\n    }\n\n"
+     "    function leaf_add_transitions_inner(p: pointer[CmNode], to: pointer[FirstSet], maybe_required: bool, and_clear_index: u32, and_depth: u32, isolated: bool, require_clear: u32, to_set: u32)\n    {"),
+    # the per-member FirstSet/LastSet temporaries
+    ("        let src Vector[pointer[CmNode]](buf, n)",
+     "        Page.sp_follow(n as i64)\n        let src Vector[pointer[CmNode]](buf, n)"),
+    ("        set p.leaf_index: info.next_leaf_index",
+     "        Page.sp_leaf()\n        set p.leaf_index: info.next_leaf_index"),
+    ("        let f host.allocate(sizeof FirstSet, alignof FirstSet) as pointer[FirstSet]",
+     "        let sp_mf Page.sp_bracket(23)\n        let f host.allocate(sizeof FirstSet, alignof FirstSet) as pointer[FirstSet]"),
+    ("        set f.v: Array[pointer[CmNode]]^host()",
+     "        set f.v: Array[pointer[CmNode]]^host()\n        Page.sp_bracket(sp_mf)"),
+    ("        let l host.allocate(sizeof LastSet, alignof LastSet) as pointer[LastSet]",
+     "        let sp_ml Page.sp_bracket(23)\n        let l host.allocate(sizeof LastSet, alignof LastSet) as pointer[LastSet]"),
+    ("        set l.v: Array[pointer[CmNode]]^host()",
+     "        set l.v: Array[pointer[CmNode]]^host()\n        Page.sp_bracket(sp_ml)"),
+    # the two finish walks
+    ("        finish(initial, min_buf, n_leaves, elem_buf, n_element_type_index as u32, ambiguities, pcdata_unreachable)\n        finish(model_group,",
+     "        let sp_fi Page.sp_bracket(22)\n"
+     "        finish(initial, min_buf, n_leaves, elem_buf, n_element_type_index as u32, ambiguities, pcdata_unreachable)\n        finish(model_group,"),
+    ("        if cmg.contains_pcdata = false\n            set *pcdata_unreachable: false",
+     "        Page.sp_bracket(sp_fi)\n        if cmg.contains_pcdata = false\n            set *pcdata_unreachable: false"),
 ])
 PY
 
