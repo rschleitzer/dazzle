@@ -45,18 +45,33 @@ use dazzle.InterpreterMessages.InterpreterMessages
 ; a loud out-of-range read of the row rather than a silent wrong order.
 define KEY_STRIDE: int 11
 
+; ProcessingMode::RuleType. ★The ORDER is the semantics, not a label: a node
+; is matched against the STYLE rules first and against the construction rules
+; afterwards, so every style rule that applies has been pushed onto the style
+; stack before the one construction rule that builds the flow objects runs.
+define RT_STYLE: int 0
+define RT_CONSTRUCTION: int 1
+
 ; The match cursor (ProcessingMode::Specificity). next_rule_index resumes a
 ; scan for next-match; found records whether the last findMatch succeeded.
-define Specificity (next_rule_index: int, to_initial: bool)
+; rule_type is the half of the cursor that walks the two rule sets in turn.
+define Specificity (next_rule_index: int, to_initial: bool, rule_type: int)
 {
     init()
     {
+        set this.rule_type: RT_STYLE
         set this.next_rule_index: 0
         ; 1 once the match fell through from a named processing mode to the
         ; initial mode (reference Specificity::toInitial_) — next-match
         ; resumes on the right side of the fallback boundary.
         set this.to_initial: false
     }
+
+    ; Specificity::isStyle — which set the LAST match came from. The caller
+    ; needs it because a style match is pushed and the loop continues, while a
+    ; construction match ends the loop.
+    function is_style(this: Specificity) returns bool
+        rule_type = RT_STYLE
 }
 
 ; ProcessingMode::Action — a rule body: the compiled Insn (evaluated to a
@@ -73,13 +88,21 @@ define Action (expr: pointer[Expression], insn: pointer[Insn], part_index: u32, 
         a
     }
 
-    function compile(this: pointer[Action], interp: pointer[Interpreter])
+    ; ProcessingMode::Action::compile (ProcessingMode.cxx:114). ★The rule type
+    ; decides what the body must EVALUATE TO: a construction rule's value is a
+    ; sosofo and is guarded by a CheckSosofoInsn (so `(element p 42)` reports
+    ; `this context requires a sosofo` instead of silently building nothing),
+    ; a style rule's value is a StyleObj and must NOT be.
+    function compile(this: pointer[Action], interp: pointer[Interpreter], rule_type: int)
     {
         if this.insn <> null
             return
         let host interp.get_host()
         let env Environment.make(host)
-        set this.insn: Expression.optimize_compile(this.expr, interp, env, 0, null)
+        var check: pointer[Insn] null
+        if rule_type = RT_CONSTRUCTION
+            set check: Insn.make_check_sosofo(host, this.def_loc, null)
+        set this.insn: Expression.optimize_compile(this.expr, interp, env, 0, check)
     }
 
     function get_insn(this: Action) returns pointer[Insn]
@@ -221,7 +244,14 @@ define GroveRules (element_table: pointer[NameTable], buckets: pointer[Array[poi
     }
 }
 
-define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_flag: bool, root_rules: pointer[Array[pointer[Rule]]], element_rules: pointer[Array[pointer[Rule]]], sorted_elements: pointer[Array[pointer[Rule]]], sorted_built: bool, grove_rules: pointer[Array[pointer[GroveRules]]])
+; ★The style side is a SECOND, parallel set of the same four structures rather
+; than a second dimension inside each: a stylesheet without style rules leaves
+; every `style_*` field null, so the construction path is bit-for-bit the one
+; that ran before this landed and pays one null test per node for the style
+; pass. The reference indexes by RuleType instead (`rules[nRuleType]`); the
+; observable order is identical because the cursor walks style-then-construction
+; either way.
+define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_flag: bool, root_rules: pointer[Array[pointer[Rule]]], element_rules: pointer[Array[pointer[Rule]]], sorted_elements: pointer[Array[pointer[Rule]]], sorted_built: bool, grove_rules: pointer[Array[pointer[GroveRules]]], style_root_rules: pointer[Array[pointer[Rule]]], style_element_rules: pointer[Array[pointer[Rule]]], style_sorted: pointer[Array[pointer[Rule]]], style_sorted_built: bool, style_grove_rules: pointer[Array[pointer[GroveRules]]])
 {
     function make(host: pointer[Page], name: StringC, initial: pointer[ProcessingMode]) returns pointer[ProcessingMode]
     {
@@ -236,6 +266,11 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
         set m.sorted_elements: null
         set m.sorted_built: false
         set m.grove_rules: null
+        set m.style_root_rules: null
+        set m.style_element_rules: null
+        set m.style_sorted: null
+        set m.style_sorted_built: false
+        set m.style_grove_rules: null
         m
     }
 
@@ -250,9 +285,16 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
 
     ; addRule: one Action shared by all patterns; each pattern -> an ElementRule;
     ; a root rule -> a pattern-less Rule inserted into root_rules by specificity.
-    function add_rule(this: pointer[ProcessingMode], root: bool, patterns: pointer[Array[pointer[Pattern]]], expr: pointer[Expression], loc: Location, interp: pointer[Interpreter])
+    function add_rule(this: pointer[ProcessingMode], root: bool, patterns: pointer[Array[pointer[Pattern]]], expr: pointer[Expression], loc: Location, interp: pointer[Interpreter], rule_type: int)
     {
         let host interp.get_host()
+        if rule_type = RT_STYLE
+        {
+            if this.style_element_rules = null
+                set this.style_element_rules: Array[pointer[Rule]]^host()
+            if this.style_root_rules = null
+                set this.style_root_rules: Array[pointer[Rule]]^host()
+        }
         if this.element_rules = null
             set this.element_rules: Array[pointer[Rule]]^host()
         if this.root_rules = null
@@ -266,11 +308,17 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
             while i < n
             {
                 let pat *(b + i)
-                this.element_rules.add(Rule.make(host, action, pat))
+                let r Rule.make(host, action, pat)
+                if rule_type = RT_STYLE
+                    this.style_element_rules.add(r)
+                else
+                    this.element_rules.add(r)
                 set i: i + 1
             }
         }
         set this.sorted_built: false
+        set this.style_sorted_built: false
+        set this.style_grove_rules: null
         ; a rule added after a grove was indexed invalidates the index too
         ; (rules only ever arrive at stylesheet-read time, before the first
         ; match — this is belt and braces).
@@ -278,9 +326,11 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
         if root = false
             return
         let r Rule.make(host, action, null)
-        this.root_rules.add(r)
-        ; keep root_rules sorted (bubble the new rule up while more specific).
-        let rr this.root_rules
+        var rr this.root_rules
+        if rule_type = RT_STYLE
+            set rr: this.style_root_rules
+        rr.add(r)
+        ; keep the root rules sorted (bubble the new rule up while more specific).
         var k (rr.get_length() as int) - 1
         while k > 0
         {
@@ -291,11 +341,11 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
             {
                 ; duplicateRootRule (ProcessingMode.cxx:165) — a second root
                 ; rule of the SAME importance in the same part, reported with
-                ; the first one as the auxiliary line. ★The reference gates
-                ; this on `ruleType == constructionRule`; this port carries
-                ; construction rules only (see the file header), so the gate
-                ; is the identity.
-                if cmp = 0
+                ; the first one as the auxiliary line. ★The reference gates it
+                ; on `ruleType == constructionRule`, and since the style rules
+                ; landed that gate is real: two root STYLE rules of equal
+                ; specificity are legal and both apply.
+                if (cmp = 0) and (rule_type = RT_CONSTRUCTION)
                 {
                     interp.set_next_location(loc)
                     interp.message0(InterpreterMessages.duplicateRootRule())
@@ -311,25 +361,15 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
 
     ; build the element-rule scan order once (selection sort by specificity;
     ; rule counts per stylesheet are small).
-    function build_sorted(this: pointer[ProcessingMode], host: pointer[Page])
+    ; the style side of build_sorted. ★It shares `sort_rules` with the
+    ; construction side, so a style rule set is ordered by exactly the same
+    ; stable merge on exactly the same keys — the two sets differ in WHEN they
+    ; are scanned, never in HOW they are ordered.
+    ; the sort of build_sorted, factored out so the STYLE rule set is ordered
+    ; by exactly the same stable merge on exactly the same keys.
+    function sort_rules(host: pointer[Page], sorted: pointer[Array[pointer[Rule]]], src: pointer[Array[pointer[Rule]]])
     {
-        if this.sorted_built
-            return
-        if this.element_rules = null
-        {
-            set this.sorted_elements: Array[pointer[Rule]]^host()
-            set this.sorted_built: true
-            return
-        }
-        let src this.element_rules
         let n src.get_length()
-        let sorted Array[pointer[Rule]]^host()
-        var i: size_t 0
-        while i < n
-        {
-            sorted.add(*(src.get_buffer() + i))
-            set i: i + 1
-        }
         let sb sorted.get_buffer()
         let ni n as int
         if ni > 0
@@ -464,6 +504,73 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
                 set w: w + 1
             }
         }
+    }
+
+    function build_sorted_style(this: pointer[ProcessingMode], host: pointer[Page])
+    {
+        if this.style_sorted_built
+            return
+        if this.style_element_rules = null
+        {
+            set this.style_sorted: Array[pointer[Rule]]^host()
+            set this.style_sorted_built: true
+            return
+        }
+        let src this.style_element_rules
+        let n src.get_length()
+        ; ★★★REVERSE declaration order, and this is a CONTRACT here where it is
+        ; not one for construction rules. The reference keeps element rules in
+        ; an IList whose `insert` PREPENDS, so an equal-specificity run is in
+        ; reverse declaration order; its per-bucket qsort then leaves that run
+        ; as it found it. For CONSTRUCTION rules that is invisible — exactly
+        ; one rule of the run fires, which is what `ambiguousMatch` reports —
+        ; but every matching STYLE rule is applied, so the order decides which
+        ; specification of a characteristic wins and in which order the
+        ; characteristics reach the backend. Measured against the reference:
+        ; four equally specific style rules come out last-declared-first.
+        ; Our sort is STABLE, so filling in reverse is the whole fix.
+        ; ★TWO arrays: `sort_rules` writes the ordered result into its first
+        ; argument while READING the second, so source and target must not be
+        ; the same array.
+        let rev Array[pointer[Rule]]^host()
+        var i n
+        while i > 0
+        {
+            set i: i - 1
+            rev.add(*(src.get_buffer() + i))
+        }
+        let sorted Array[pointer[Rule]]^host()
+        var j: size_t 0
+        while j < n
+        {
+            sorted.add(*(rev.get_buffer() + j))
+            set j: j + 1
+        }
+        ProcessingMode.sort_rules(host, sorted, rev)
+        set this.style_sorted: sorted
+        set this.style_sorted_built: true
+    }
+
+    function build_sorted(this: pointer[ProcessingMode], host: pointer[Page])
+    {
+        if this.sorted_built
+            return
+        if this.element_rules = null
+        {
+            set this.sorted_elements: Array[pointer[Rule]]^host()
+            set this.sorted_built: true
+            return
+        }
+        let src this.element_rules
+        let n src.get_length()
+        let sorted Array[pointer[Rule]]^host()
+        var i: size_t 0
+        while i < n
+        {
+            sorted.add(*(src.get_buffer() + i))
+            set i: i + 1
+        }
+        ProcessingMode.sort_rules(host, sorted, src)
         set this.sorted_elements: sorted
         set this.sorted_built: true
     }
@@ -520,19 +627,33 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
     ; interp.get_host(): during processing that is the per-node eval scratch
     ; region, and an index built there would dangle after the bracket (the
     ; same reason build_sorted runs from Interpreter.compile).
-    function grove_rules_for(this: pointer[ProcessingMode], node: pointer[GroveNode], interp: pointer[Interpreter]) returns pointer[GroveRules]
+    function grove_rules_for(this: pointer[ProcessingMode], node: pointer[GroveNode], interp: pointer[Interpreter], rule_type: int) returns pointer[GroveRules]
     {
         let host interp.get_perm_host()
-        this.build_sorted(host)
+        if rule_type = RT_STYLE
+        {
+            this.build_sorted_style(host)
+            if this.style_grove_rules = null
+                set this.style_grove_rules: Array[pointer[GroveRules]]^host()
+        }
+        else
+            this.build_sorted(host)
         if this.grove_rules = null
             set this.grove_rules: Array[pointer[GroveRules]]^host()
-        let table this.grove_rules
+        var table this.grove_rules
+        if rule_type = RT_STYLE
+            set table: this.style_grove_rules
         let idx GroveInfo.index_of(node) as size_t
         while table.get_length() <= idx
             table.add(null)
         let slot table.get_buffer() + idx
         if *slot = null
-            set *slot: GroveRules.build(host, node, this.sorted_elements)
+        {
+            var src this.sorted_elements
+            if rule_type = RT_STYLE
+                set src: this.style_sorted
+            set *slot: GroveRules.build(host, node, src)
+        }
         *slot
     }
 
@@ -540,7 +661,14 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
     ; spec cursor.
     function scan_element_rules(this: pointer[ProcessingMode], node: pointer[GroveNode], host: pointer[Page], interp: pointer[Interpreter], spec: pointer[Specificity]) returns pointer[Rule]
     {
-        let gr this.grove_rules_for(node, interp)
+        ; ★the early out that keeps a stylesheet WITHOUT style rules on exactly
+        ; the path it had before: no index is built, nothing is scanned.
+        if spec.rule_type = RT_STYLE
+        {
+            if this.style_element_rules = null
+                return null
+        }
+        let gr this.grove_rules_for(node, interp, spec.rule_type)
         let sorted gr.rules_for(node)
         let n sorted.get_length() as int
         let b sorted.get_buffer()
@@ -550,7 +678,7 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
             let rule *(b + i)
             if rule.pattern.matches(host, interp, node)
             {
-                set spec.next_rule_index: ProcessingMode.element_rule_advance(host, interp, node, sorted, i)
+                set spec.next_rule_index: ProcessingMode.element_rule_advance(host, interp, node, sorted, i, spec.rule_type)
                 return rule
             }
             set i: i + 1
@@ -570,8 +698,15 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
     ; ★Which rule of an equal-specificity run FIRES is not defined by the
     ; reference: it sorts with qsort, which is not stable, so two tied rules
     ; may land in either order. Only the diagnostic is a contract.
-    function element_rule_advance(host: pointer[Page], interp: pointer[Interpreter], node: pointer[GroveNode], sorted: pointer[Array[pointer[Rule]]], hit: int) returns int
+    ; ★For a STYLE rule the reference simply steps to the next index
+    ; (ProcessingMode.cxx:290: `if (ruleType_ != constructionRule) { ++i; return; }`)
+    ; — SEVERAL style rules are MEANT to apply to one node, one per
+    ; characteristic, so the ambiguity diagnostic would be nonsense there. It
+    ; is a construction-rule concept: exactly one rule may build the node.
+    function element_rule_advance(host: pointer[Page], interp: pointer[Interpreter], node: pointer[GroveNode], sorted: pointer[Array[pointer[Rule]]], hit: int, rule_type: int) returns int
     {
+        if rule_type = RT_STYLE
+            return hit + 1
         let n sorted.get_length() as int
         let b sorted.get_buffer()
         let r *(b + hit)
@@ -613,7 +748,26 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
     ; A named mode's scan FALLS THROUGH to the initial mode's rules when it
     ; is exhausted (reference findElementMatch: specificity.toInitial_ — the
     ; cursor persists across the boundary so next-match resumes correctly).
+    ; findElementMatch's OUTER loop (ProcessingMode.cxx:212): exhaust the
+    ; current rule type — this mode, then the initial mode — and only then
+    ; advance style → construction, resetting the cursor for the new set.
     function find_element_match(this: pointer[ProcessingMode], node: pointer[GroveNode], host: pointer[Page], interp: pointer[Interpreter], spec: pointer[Specificity]) returns pointer[Rule]
+    {
+        repeat
+        {
+            let r this.find_element_match_one(node, host, interp, spec)
+            if r <> null
+                return r
+            if spec.rule_type = RT_CONSTRUCTION
+                break
+            set spec.rule_type: RT_CONSTRUCTION
+            set spec.next_rule_index: 0
+            set spec.to_initial: false
+        }
+        null
+    }
+
+    function find_element_match_one(this: pointer[ProcessingMode], node: pointer[GroveNode], host: pointer[Page], interp: pointer[Interpreter], spec: pointer[Specificity]) returns pointer[Rule]
     {
         if spec.to_initial = false
         {
@@ -633,9 +787,11 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
 
     function scan_root_rules(this: pointer[ProcessingMode], spec: pointer[Specificity]) returns pointer[Rule]
     {
-        if this.root_rules = null
+        var rr this.root_rules
+        if spec.rule_type = RT_STYLE
+            set rr: this.style_root_rules
+        if rr = null
             return null
-        let rr this.root_rules
         let n rr.get_length() as int
         let i spec.next_rule_index
         if i < n
@@ -648,6 +804,22 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
     }
 
     function find_root_match(this: pointer[ProcessingMode], host: pointer[Page], spec: pointer[Specificity]) returns pointer[Rule]
+    {
+        repeat
+        {
+            let r this.find_root_match_one(host, spec)
+            if r <> null
+                return r
+            if spec.rule_type = RT_CONSTRUCTION
+                break
+            set spec.rule_type: RT_CONSTRUCTION
+            set spec.next_rule_index: 0
+            set spec.to_initial: false
+        }
+        null
+    }
+
+    function find_root_match_one(this: pointer[ProcessingMode], host: pointer[Page], spec: pointer[Specificity]) returns pointer[Rule]
     {
         if spec.to_initial = false
         {
@@ -668,30 +840,36 @@ define ProcessingMode (name: StringC, initial: pointer[ProcessingMode], defined_
     ; compile every rule's action.
     function compile(this: pointer[ProcessingMode], interp: pointer[Interpreter])
     {
-        if this.root_rules <> null
+        ProcessingMode.compile_set(interp, this.style_root_rules, this.style_element_rules, RT_STYLE)
+        ProcessingMode.compile_set(interp, this.root_rules, this.element_rules, RT_CONSTRUCTION)
+    }
+
+    function compile_set(interp: pointer[Interpreter], root_set: pointer[Array[pointer[Rule]]], elem_set: pointer[Array[pointer[Rule]]], rule_type: int)
+    {
+        if root_set <> null
         {
-            let rr this.root_rules
+            let rr root_set
             var i: size_t 0
             while i < rr.get_length()
             {
                 let r *(rr.get_buffer() + i)
-                r.action.compile(interp)
+                r.action.compile(interp, rule_type)
                 set i: i + 1
             }
         }
-        if this.element_rules <> null
+        if elem_set <> null
         {
             ; the reference elementRules_ is an IList whose insert PREPENDS —
             ; forward iteration there compiles rules in REVERSE file order
             ; (observable through compile-time diagnostics: constant NIC
             ; conversions, unknown make keywords).
-            let er this.element_rules
+            let er elem_set
             var j er.get_length() as int
             while j > 0
             {
                 set j: j - 1
                 let r *(er.get_buffer() + j)
-                r.action.compile(interp)
+                r.action.compile(interp, rule_type)
             }
         }
     }
