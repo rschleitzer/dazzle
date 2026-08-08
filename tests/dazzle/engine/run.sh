@@ -280,4 +280,21 @@ run_case diag5b diagdoc.sgml diag5b.experr
 run_case diag6  diagdoc.sgml diag6.experr
 run_case diag6b diagdoc.sgml diag6b.experr
 
+# decl1..decl4 (diagdoc.sgml): the DECLARATION PHASE of the specification
+# (StyleEngine.cxx:40-80), gathered by DssslSpecEventHandler since forever and
+# never executed until 2026-08-08. decl1 is the DOC-level list, decl2 the
+# PART-level one plus the map-sdata-entity that motivates the two phases,
+# decl3 add-name-chars WITH its control decl3b (same stylesheet, declaration
+# removed - without it `a@b` is not an identifier, which is what the fixture
+# proves), decl4 the reference's `default:` warning.
+# ★Keep these files pure ASCII. A `.dsl` is read as SGML in an 8-bit charset,
+# so one multi-byte character in a COMMENT makes the reference report
+# `non SGML character number ...` and the whole comparison is about that
+# instead - it cost a mint cycle here.
+run_case decl1  diagdoc.sgml decl1.experr
+run_case decl2  diagdoc.sgml decl2.experr
+run_case decl3  diagdoc.sgml decl3.experr
+run_case decl3b diagdoc.sgml decl3b.experr
+run_case decl4  diagdoc.sgml decl4.experr
+
 echo "dazzle-engine: PASS"
