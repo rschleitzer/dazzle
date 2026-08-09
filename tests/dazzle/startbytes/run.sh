@@ -282,7 +282,7 @@ REPORT = r'''
         if k = 16
             scaly_eputs "cmp/sorted  "
         if k = 17
-            scaly_eputs "phase17     "
+            scaly_eputs "archxform   "
     }
 
     procedure sb_line(name: pointer[const_char], v: i64)
@@ -544,11 +544,21 @@ patch('/packages/scaly/0.1.0/scaly/memory/Page.scaly', [
 
 # 8 = the child SGML parse of an EXTERNAL SPECIFICATION document (37 of them
 #     in the DocBook print stylesheet), 9 = the event sweep that gathers body
-#     text. Both nest inside phase 6.
+#     text, 17 = ArcEngine.transform, the post-parse pass that generates the
+#     ARCHITECTURAL event stream (loadDoc = ArcEngine::parseAll since
+#     2026-08-09). All three nest inside phase 6; 17 nests inside 8 and 9 as
+#     well, and nested brackets attribute exclusively, so its line is the
+#     redirect's own bill.
 patch('/packages/dazzle/0.1.0/dazzle/DssslSpecEventHandler.scaly', [
-    ("        if this.got_arc\n            this.walk(ps)",
+    ("        if this.got_arc\n        {\n            DssslSpecEventHandler.route_through_arch(ps)\n            this.walk(ps)\n        }",
      "        if this.got_arc\n        {\n            let sb_w Page.sb_phase(9)\n"
+     "            DssslSpecEventHandler.route_through_arch(ps)\n"
      "            this.walk(ps)\n            Page.sb_phase(sb_w)\n        }"),
+    ("    function route_through_arch(ps: pointer[ParserState])\n    {\n        let ah ps.get_host()",
+     "    function route_through_arch(ps: pointer[ParserState])\n    {\n"
+     "        let sb_a Page.sb_phase(17)\n        let ah ps.get_host()"),
+    ("        ArcEngine.transform(ah, ps, names)\n    }",
+     "        ArcEngine.transform(ah, ps, names)\n        Page.sb_phase(sb_a)\n    }"),
     ("    function load_external_doc(this: pointer[DssslSpecEventHandler], doc: pointer[Doc])\n    {\n        let host this.host",
      "    function load_external_doc(this: pointer[DssslSpecEventHandler], doc: pointer[Doc])\n    {\n"
      "        let sb_x Page.sb_phase(8)\n        this.load_external_doc_inner(doc)\n"
