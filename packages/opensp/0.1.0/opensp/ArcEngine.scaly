@@ -6,7 +6,9 @@ use opensp.Location.Location
 use opensp.ParserState.ParserState
 use opensp.ParserOptions.ParserOptions
 use opensp.Event.Event
+use opensp.Attribute.Attribute
 use opensp.Attribute.AttributeValue
+use opensp.Attribute.AttributeSemantics
 use opensp.Attribute.AttributeContext
 use opensp.Attribute.AttributeDefinition
 use opensp.Attribute.DeclaredValue
@@ -58,14 +60,24 @@ use opensp.Storage.Storage
 ; ArcDTD plus the catalog-resolved FSI (or the DSSSL architecture resolves to
 ; nothing at all), and the end tag's markup location in the parser.
 ;
+; Since 2026-08-09 also mungeMetaDtd/mungeDataEntity plus the arch-space
+; ENTITY/NOTATION attribute semantics (note_semantics): the meta-DTD has no
+; entity table of its own, so without the copy every ENTITY-declared
+; architectural attribute came out as a bare token (`ACONTENT TOKEN body-ent`
+; instead of `ACONTENT ENTITY body-ent`) — and the DSSSL specification's
+; `document`/`content` attributes are exactly that, which is what a routing of
+; the spec parse through this engine depends on.
+;
 ; NOT ported, and each is why a message here still has no caller:
 ; considerSupr/considerIgnD (so invalidData/invalidSuppress/invalidIgnD and the
 ; documentElementNotArc branch are unreachable), considerNamer + token maps
-; (the rename diagnostics), #ARCCONT/emitArcContent, ArcQuant, PI-declared
-; architectures, and mungeMetaDtd — the last is what an ENTITY-declared
-; attribute needs before an architectural stream can carry entity semantics,
-; and therefore what the DSSSL specification parse would need before it could
-; be routed through here (tests/dazzle/COMPLETENESS.md, last section).
+; (the rename diagnostics), #ARCCONT/emitArcContent, ArcQuant, and PI-declared
+; architectures. Also deliberately not carried across: the GRPCNT tally of the
+; arch list's idref/entity-name tokens (idrefGrpcnt/entityNameGrpcnt). The
+; reference counts inside setValue, i.e. before finish; this port's semantics
+; walk runs AFTER finish, so the count would have to be re-plumbed for a
+; message that needs more than 32 tokens in one architectural attribute to
+; fire, and there is no fixture that reaches it.
 
 ; openElementFlags_ bits (ArcEngine.cxx suppressForm/…): only the ones the
 ; af-1 path needs plus the frame marker.
@@ -92,6 +104,9 @@ define ArcProcessor
     supr_f: StringC
     brid_f: StringC
     data_f: StringC
+    ; supportAttsText_[rArcDataF]->charLocation(0) — the only support attribute
+    ; whose VALUE anchors a diagnostic (noArcDataF, ArcEngine.cxx:940).
+    data_f_loc: Location
     arc_auto: bool
     host: pointer[Page]
     ps: pointer[ParserState]
@@ -127,6 +142,7 @@ define ArcProcessor
         set p.supr_f: StringC()
         set p.brid_f: StringC()
         set p.data_f: StringC()
+        set p.data_f_loc: Location()
         set p.arc_auto: true
         set p.host: host
         set p.ps: null
@@ -197,6 +213,7 @@ define ArcProcessor
             set this.supr_f: ArcEngine.support_att(host, syntax, al, StringC("ArcSuprF"), true)
             set this.brid_f: ArcEngine.support_att(host, syntax, al, StringC("ArcBridF"), true)
             set this.data_f: ArcEngine.support_att(host, syntax, al, StringC("ArcDataF"), true)
+            set this.data_f_loc: ArcEngine.support_att_loc(host, syntax, al, StringC("ArcDataF"))
             set arc_dtd: ArcEngine.support_att(host, syntax, al, StringC("ArcDTD"), false)
             ; ArcAuto: "ArcAuto" (default, auto on) vs "nArcAuto" (auto off).
             let auto_v ArcEngine.support_att(host, syntax, al, StringC("ArcAuto"), true)
@@ -328,10 +345,22 @@ define ArcProcessor
         if def.undefined()
             return
 
+        ; ★The attribute context must exist BEFORE munge_meta_dtd: a data
+        ; entity's mapped attribute list is finished against it (the reference
+        ; IS the context, so it cannot have this ordering problem). Setting it
+        ; after cost a SIGSEGV in synth-arc-16, whose document DTD declares its
+        ; meta-DTD as an external data entity — i.e. every nested-architecture
+        ; model reaches this path.
+        set this.ctx: AttributeContext.make(host, this.meta_syntax, true, true)
+
+        ; ArcEngine.cxx:926 — between accepting the meta-DTD and starting its
+        ; content. It must run before the content state exists because it can
+        ; ADD to the meta-DTD (the ArcDataF notation).
+        this.munge_meta_dtd(host)
+
         let cs ContentState.make(host)
         cs.start_content(host, mdtd)
         set this.cs: cs
-        set this.ctx: AttributeContext.make(host, this.meta_syntax, true, true)
         ; errorIdref_ = parentParser->options().errorIdref (ArcEngine.cxx:904):
         ; -wno-idref silences the arch-space missingId exactly as it does the
         ; document's.
@@ -352,11 +381,126 @@ define ArcProcessor
         rep.report1_at(mt, a1, loc)
     }
 
-    ; --- the arch-space id table (defineId/noteIdref/checkIdrefs) ----------
-    ; ArcEngine.cxx:695/709/728. In the reference these are the AttributeContext
-    ; the mapped list is finished against; this port books IDs in the parser's
-    ; attribute tokenizer instead, so the arch side walks the FINISHED list.
-    function note_ids(this: pointer[ArcProcessor], to: pointer[AttributeList])
+    ; --- mungeMetaDtd (ArcEngine.cxx:936) ----------------------------------
+    ; The architectural stream is parsed against the meta-DTD, so an ENTITY-
+    ; declared architectural attribute resolves its tokens in the META-DTD's
+    ; general entity table (getAttributeEntity, :671) — a table the meta-DTD
+    ; source never fills, because the entities are the DOCUMENT's. This copies
+    ; them across, and re-points each external DATA entity at the
+    ; architecture's own data form; without it every ENTITY attribute in the
+    ; arch space comes out as a plain token (`ACONTENT TOKEN body-ent` instead
+    ; of `ACONTENT ENTITY body-ent`), which is precisely what the DSSSL
+    ; specification's `document` and `content` attributes are.
+    function munge_meta_dtd(this: pointer[ArcProcessor], host: pointer[Page])
+    {
+        let mdtd this.meta_dtd
+        let ddtd this.doc_dtd
+        ; ArcEngine.cxx:938 — the data form must EXIST in the meta-DTD; when it
+        ; does not, the reference reports it and declares it anyway, so the
+        ; entities below still get a notation to point at.
+        if this.data_f.get_size() > 0
+        {
+            if mdtd.lookup_notation(this.data_f) = null
+            {
+                this.arc_report1(ArcEngineMessages.noArcDataF(), this.data_f, this.data_f_loc)
+                mdtd.insert_notation(Notation.make(host, this.data_f, mdtd.get_name(), mdtd.get_is_base()))
+            }
+        }
+        ; (the reference's `// FIXME check for ArcAutoF` sits here too)
+        let n ddtd.n_entities(false)
+        var i: size_t 0
+        while i < n
+        {
+            let ent ddtd.entity_at(false, i)
+            if ent <> null
+            {
+                ; a COPY, not the document's entity: munge_data_entity rewrites
+                ; the notation, and the document's own stream must keep seeing
+                ; its declared one.
+                let copy ent.copy_with_name(host, ent.get_name())
+                var keep true
+                if copy.is_external_data()
+                    set keep: this.munge_data_entity(host, copy)
+                if keep
+                    mdtd.insert_entity(copy, false, true)
+            }
+            set i: i + 1
+        }
+    }
+
+    ; mungeDataEntity (ArcEngine.cxx:960): map the entity's DOCUMENT notation
+    ; onto an architectural one and its data attributes with it. False = the
+    ; architecture has no form for this notation, and the reference then does
+    ; not copy the entity into the meta-DTD at all.
+    function munge_data_entity(this: pointer[ArcProcessor], host: pointer[Page], ent: pointer[Entity]) returns bool
+    {
+        let doc_nt ent.get_data_notation() as pointer[Notation]
+        if doc_nt = null
+            return false
+        let from_atts ent.get_data_attributes() as pointer[AttributeList]
+        let meta_nt this.consider_form_notation(from_atts, doc_nt)
+        if meta_nt = null
+            return false
+        let to this.map_attributes_def(host, from_atts, meta_nt.get_attribute_def())
+        ent.set_data_notation(meta_nt as pointer[void], to as pointer[void])
+        true
+    }
+
+    ; considerForm/autoForm in their isNotation form (ArcEngine.cxx:1770/1819).
+    ; ★Two differences from the element side, both load-bearing: there is no
+    ; CONSTDTD fallback (an unknown form yields nothing, so the entity is
+    ; dropped rather than declared against an undefined notation), and the
+    ; auto path falls back to ArcDataF — which is how the DSSSL architecture
+    ; maps a `CDATA DSSSL` entity onto its `dsssl-specification` notation.
+    function consider_form_notation(this: pointer[ArcProcessor], atts: pointer[AttributeList], doc_nt: pointer[Notation]) returns pointer[Notation]
+    {
+        if atts <> null
+        {
+            let idx atts.attribute_index(this.form_att_name)
+            if idx >= 0
+            {
+                let val atts.value(idx as size_t)
+                if val = null
+                    return null
+                let txt val.get_text()
+                if txt = null
+                    return null
+                let meta_name ArcEngine.fold_sc(this.host, this.meta_syntax, (*txt).string())
+                return this.meta_dtd.lookup_notation(meta_name)
+            }
+        }
+        var nt: pointer[Notation] null
+        if this.arc_auto
+            set nt: this.meta_dtd.lookup_notation(doc_nt.get_name())
+        if nt <> null
+            return nt
+        if this.data_f.get_size() > 0
+            return this.meta_dtd.lookup_notation(this.data_f)
+        null
+    }
+
+    ; TokenizedAttributeValue::tokenLocation(k) as an OFFSET into the value's
+    ; text: token 0 starts at 0, every later one one past its preceding
+    ; separator.
+    function token_offset(v: pointer[AttributeValue], k: size_t) returns size_t
+    {
+        if k = 0
+            return 0 as size_t
+        let si (*v).get_space_index()
+        *(si.get_buffer() + (k - 1)) + 1
+    }
+
+    ; --- the arch-space attribute semantics --------------------------------
+    ; defineId/noteIdref (ArcEngine.cxx:695/709) plus getAttributeEntity /
+    ; getAttributeNotation (:671/663). In the reference all four are
+    ; AttributeContext overrides that the mapped list's own setValue/finish
+    ; calls into; this port books id and entity semantics in the parser's
+    ; attribute tokenizer (Parser.check_value_semantics) rather than in the
+    ; context, so the arch side does the same walk over the FINISHED list.
+    ; ★The resolution TABLES are the architecture's, not the document's: the
+    ; id table is a second one (field comment above) and the entity/notation
+    ; lookups go to the meta-DTD, which munge_meta_dtd filled.
+    function note_semantics(this: pointer[ArcProcessor], host: pointer[Page], to: pointer[AttributeList])
     {
         if this.id_table = null
             return
@@ -364,56 +508,99 @@ define ArcProcessor
         var i: size_t 0
         while i < n
         {
-            let v to.value(i)
-            if v <> null
-            {
-                let txt (*v).get_text()
-                if txt <> null
-                {
-                    if to.id(i)
-                    {
-                        let name (*v).get_string()
-                        if name.get_size() > 0
-                        {
-                            let id this.id_table.lookup_create(this.host, name)
-                            if id.defined()
-                                this.arc_report1(ParserMessages.duplicateId(), name, (*txt).loc_at(0))
-                            else
-                                id.mark_defined((*txt).loc_at(0))
-                        }
-                    }
-                    else if to.idref(i)
-                    {
-                        if this.error_idref
-                        {
-                            let m (*v).n_tokens()
-                            var k: size_t 0
-                            while k < m
-                            {
-                                let tok (*v).token(k)
-                                if tok.get_size() > 0
-                                {
-                                    ; TokenizedAttributeValue::tokenLocation(k):
-                                    ; token 0 starts at 0, every later one one
-                                    ; past its preceding separator.
-                                    var off: size_t 0
-                                    if k <> 0
-                                    {
-                                        let si (*v).get_space_index()
-                                        set off: *(si.get_buffer() + (k - 1)) + 1
-                                    }
-                                    let id this.id_table.lookup_create(this.host, tok)
-                                    if id.defined() = false
-                                        id.add_pending_ref((*txt).loc_at(off))
-                                }
-                                set k: k + 1
-                            }
-                        }
-                    }
-                }
-            }
+            this.note_semantics_one(host, to, i)
             set i: i + 1
         }
+    }
+
+    function note_semantics_one(this: pointer[ArcProcessor], host: pointer[Page], to: pointer[AttributeList], i: size_t)
+    {
+        let v to.value(i)
+        if v = null
+            return
+        let txt (*v).get_text()
+        if txt = null
+            return
+        ; TokenizedAttributeValue::makeSemantics (Attribute.cxx:1077) — an empty
+        ; value has no semantics: no lookups, no messages.
+        if (*txt).size() = 0
+            return
+        if to.id(i)
+        {
+            let name (*v).get_string()
+            if name.get_size() > 0
+            {
+                let id this.id_table.lookup_create(this.host, name)
+                if id.defined()
+                    this.arc_report1(ParserMessages.duplicateId(), name, (*txt).loc_at(0))
+                else
+                    id.mark_defined((*txt).loc_at(0))
+            }
+            return
+        }
+        if to.idref(i)
+        {
+            if this.error_idref = false
+                return
+            let m (*v).n_tokens()
+            var k: size_t 0
+            while k < m
+            {
+                let tok (*v).token(k)
+                if tok.get_size() > 0
+                {
+                    let off ArcProcessor.token_offset(v, k)
+                    let id this.id_table.lookup_create(this.host, tok)
+                    if id.defined() = false
+                        id.add_pending_ref((*txt).loc_at(off))
+                }
+                set k: k + 1
+            }
+            return
+        }
+        if to.notation(i)
+        {
+            ; NotationDeclaredValue::makeSemantics (Attribute.cxx:430) — the
+            ; WHOLE value is the name; unknown leaves no semantics.
+            let s (*v).get_string()
+            let nt this.meta_dtd.lookup_notation(s)
+            if nt = null
+                this.arc_report1(ParserMessages.invalidNotationAttribute(), s, (*txt).loc_at(0))
+            else
+                to.attribute(i).set_semantics(AttributeSemantics.make_notation(host, nt as pointer[void]))
+            return
+        }
+        if to.entity(i) = false
+            return
+        ; EntityDeclaredValue::makeSemantics (Attribute.cxx:472): ALL tokens must
+        ; resolve to a data-or-subdoc entity, and a single bad one leaves the
+        ; value with NO semantics — the ESIS line then says TOKEN, which is the
+        ; state this whole seam exists to get out of.
+        let m (*v).n_tokens()
+        var ok true
+        let ents Array[pointer[void]]^host()
+        var k: size_t 0
+        while k < m
+        {
+            let tok (*v).token(k)
+            let off ArcProcessor.token_offset(v, k)
+            let e this.meta_dtd.lookup_entity(false, tok)
+            if e = null
+            {
+                this.arc_report1(ParserMessages.invalidEntityAttribute(), tok, (*txt).loc_at(off))
+                set ok: false
+            }
+            else if e.is_data_or_subdoc() = false
+            {
+                this.arc_report1(ParserMessages.notDataOrSubdocEntity(), tok, (*txt).loc_at(off))
+                set ok: false
+            }
+            else
+                ents.add(e as pointer[void])
+            set k: k + 1
+        }
+        if ok
+            to.attribute(i).set_semantics(AttributeSemantics.make_entity(host, &ents))
     }
 
     ; checkIdrefs (ArcEngine.cxx:728), run when the base stream is exhausted —
@@ -555,9 +742,16 @@ define ArcProcessor
     ; mapAttributes (ArcEngine.cxx:1432): apply the renamer (considerNamer +
     ; buildAttributeMapRename) then fill the remaining meta attributes by
     ; same-name match (buildAttributeMapRest).
+    ; ★The reference's `map.attributed` is an ElementType OR a Notation
+    ; (buildMetaMap takes both — mungeDataEntity goes through the notation
+    ; side), and everything below reads only its attributeDef(), so the
+    ; attribute def is the parameter and `map_attributes` is the element-typed
+    ; caller.
     function map_attributes(this: pointer[ArcProcessor], host: pointer[Page], from_atts: pointer[AttributeList], meta_et: pointer[ElementType]) returns pointer[AttributeList]
+        this.map_attributes_def(host, from_atts, meta_et.get_attribute_def())
+
+    function map_attributes_def(this: pointer[ArcProcessor], host: pointer[Page], from_atts: pointer[AttributeList], meta_def: pointer[AttributeDefinitionList]) returns pointer[AttributeList]
     {
-        let meta_def meta_et.get_attribute_def()
         let to AttributeList.make(host, meta_def)
         if (meta_def <> null) and (from_atts <> null)
         {
@@ -678,7 +872,7 @@ define ArcProcessor
         }
         else
             set to: this.map_attributes(host, atts, meta_et)
-        this.note_ids(to)
+        this.note_semantics(host, to)
         let gen Event.make_start(host, meta_et, ev.get_loc())
         gen.set_attributes(to)
         ; ArcEngine.cxx:1337-1352 — the meta-DTD content check. Note the ORDER:
@@ -792,6 +986,26 @@ define ArcEngine ( )
         if do_fold
             return ArcEngine.fold_sc(host, syntax, s)
         s
+    }
+
+    ; the LOCATION a support attribute's diagnostics anchor at:
+    ; supportAttsText_[i]->charLocation(0) (ArcEngine.cxx:940) — the first
+    ; character of the attribute's value, not the notation's declaration. An
+    ; unset attribute has no text and answers an invalid Location, which is
+    ; what the reference would print for a value it never read.
+    function support_att_loc(host: pointer[Page], syntax: pointer[Syntax], al: pointer[AttributeList], name: StringC) returns Location
+    {
+        let folded ArcEngine.fold_sc(host, syntax, name)
+        let idx al.attribute_index(folded)
+        if idx < 0
+            return Location()
+        let v al.value(idx as size_t)
+        if v = null
+            return Location()
+        let t v.get_text()
+        if t = null
+            return Location()
+        (*t).loc_at(0)
     }
 
     ; split a StringC on whitespace into raw (unfolded) tokens. ★The tokens are
