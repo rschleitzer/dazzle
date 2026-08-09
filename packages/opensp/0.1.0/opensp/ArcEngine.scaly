@@ -4,6 +4,7 @@ use scaly.containers.String
 use opensp.StringC.StringC
 use opensp.Location.Location
 use opensp.ParserState.ParserState
+use opensp.ParserOptions.ParserOptions
 use opensp.Event.Event
 use opensp.Attribute.AttributeValue
 use opensp.Attribute.AttributeContext
@@ -11,6 +12,10 @@ use opensp.Attribute.AttributeDefinition
 use opensp.Attribute.DeclaredValue
 use opensp.Attribute.Text
 use opensp.ParserMessages.ParserMessages
+use opensp.ArcEngineMessages.ArcEngineMessages
+use opensp.Message.MessageType
+use opensp.Id.Id
+use opensp.Id.IdTable
 use opensp.AttributeList.AttributeList
 use opensp.AttributeList.AttributeDefinitionList
 use opensp.ElementType.ElementType
@@ -43,10 +48,24 @@ use opensp.Storage.Storage
 ;
 ; STATUS: the af-1 core path (single ArcBase, ArcFormA=architecture name, plain
 ; CDATA/#REQUIRED attribute mapping via buildAttributeMapRest, no suppression /
-; renamer / token-map / #CONTENT / notation-data-form). The remaining reference
-; surface (considerSupr/considerIgnD/considerNamer, token maps, emitArcContent,
-; autoForm bridge, ArcQuant, the full supportAttributes table, mungeMetaDtd
-; data entities) lands as the af-2..19 fixtures are driven green.
+; renamer / token-map / #CONTENT / notation-data-form), PLUS since 2026-08-09
+; the VALIDATING half: the meta-DTD content check (undefinedElement /
+; elementExcluded / invalidElement / unfinishedElement), the `included` flag and
+; the arch-space id table with missingId — before that, ArcEngineMessages had
+; forty accessors and not one caller. With it came its three prerequisites,
+; each of which had been silently wrong: ArcOpt -> options.includes (or every
+; marked section of the meta-DTD resolves to IGNORE), the PARAMETER form of
+; ArcDTD plus the catalog-resolved FSI (or the DSSSL architecture resolves to
+; nothing at all), and the end tag's markup location in the parser.
+;
+; NOT ported, and each is why a message here still has no caller:
+; considerSupr/considerIgnD (so invalidData/invalidSuppress/invalidIgnD and the
+; documentElementNotArc branch are unreachable), considerNamer + token maps
+; (the rename diagnostics), #ARCCONT/emitArcContent, ArcQuant, PI-declared
+; architectures, and mungeMetaDtd — the last is what an ENTITY-declared
+; attribute needs before an architectural stream can carry entity semantics,
+; and therefore what the DSSSL specification parse would need before it could
+; be routed through here (tests/dazzle/COMPLETENESS.md, last section).
 
 ; openElementFlags_ bits (ArcEngine.cxx suppressForm/…): only the ones the
 ; af-1 path needs plus the frame marker.
@@ -80,6 +99,12 @@ define ArcProcessor
     out: pointer[Array[pointer[Event]]]
     open_flags: pointer[Array[u32]]
     n_flags: size_t
+    ; the ARCH-SPACE id table (ArcProcessor::idTable_, ArcProcessor.h). It is a
+    ; SECOND table, independent of the document's: the same IDREF is reported
+    ; twice when it resolves in neither space, once by the parser
+    ; (ParserMessages.missingId) and once here (ArcEngineMessages.missingId).
+    id_table: pointer[IdTable]
+    error_idref: bool
 )
 {
     function make(host: pointer[Page], name: StringC) returns pointer[ArcProcessor]
@@ -109,6 +134,8 @@ define ArcProcessor
         set p.out: null
         set p.open_flags: Array[u32]^host()
         set p.n_flags: 0
+        set p.id_table: null
+        set p.error_idref: true
         p
     }
 
@@ -148,6 +175,7 @@ define ArcProcessor
         let notation doc_dtd.lookup_notation(this.name)
         if notation = null
             return
+        var arc_opts: pointer[Array[StringC]] Array[StringC]^host()
 
         ; read the support attributes off the notation's attribute definition
         ; (supportAttributes, ArcEngine.cxx:1093, notation column). The doc-side
@@ -177,6 +205,39 @@ define ArcProcessor
                 if auto_v.equals(ArcEngine.fold_sc(host, syntax, StringC("nArcAuto")))
                     set this.arc_auto: false
             }
+            ; processArcOpts (ArcEngine.cxx:1192): ArcOptSA names the attributes
+            ; that carry the architecture's OPTIONS; without it the single name
+            ; is `ArcOpt`. Each named attribute's tokens become parameter
+            ; entities defined as INCLUDE while the meta-DTD is parsed
+            ; (options.includes, ArcEngine.cxx:906) — i.e. the meta-DTD's own
+            ; marked sections select its content models, so this is a
+            ; PREREQUISITE for validating against it at all.
+            let opt_sa ArcEngine.support_att(host, syntax, al, StringC("ArcOptSA"), false)
+            var opt_names: pointer[Array[StringC]] null
+            if opt_sa.get_size() > 0
+                set opt_names: ArcEngine.split_ws(host, syntax, opt_sa)
+            else
+            {
+                set opt_names: Array[StringC]^host()
+                opt_names.add(StringC^host("ArcOpt"))
+            }
+            var oi: size_t 0
+            while oi < opt_names.get_length()
+            {
+                let on *(opt_names.get_buffer() + oi)
+                let ov ArcEngine.support_att(host, syntax, al, on, false)
+                if ov.get_size() > 0
+                {
+                    let toks ArcEngine.split_ws(host, syntax, ov)
+                    var ti: size_t 0
+                    while ti < toks.get_length()
+                    {
+                        arc_opts.add(*(toks.get_buffer() + ti))
+                        set ti: ti + 1
+                    }
+                }
+                set oi: oi + 1
+            }
         }
         if arc_dtd.get_size() = 0
             return
@@ -187,16 +248,73 @@ define ArcProcessor
         if this.form_att_name.get_size() = 0
             set this.form_att_name: this.name
 
-        ; the meta-DTD entity (ArcDTD names a general entity in the doc DTD).
-        let ent doc_dtd.lookup_entity(false, arc_dtd)
+        ; the meta-DTD entity. ★ArcDTD may name a PARAMETER entity: a value
+        ; that begins with the PERO delimiter loses it and is looked up in the
+        ; parameter table (ArcEngine.cxx:1168, arcDtdIsParam_). The DSSSL
+        ; architecture itself is declared that way (`ArcDTD CDATA #FIXED
+        ; "%DSSSLDTD"` in style-sheet.dtd), so without this the whole DSSSL
+        ; architecture resolves to nothing.
+        var arc_dtd_is_param false
+        let pero_len syntax.delim_general_len(dPERO)
+        if (pero_len > 0) and (arc_dtd.get_size() >= pero_len)
+        {
+            var pi2: size_t 0
+            var matched true
+            while pi2 < pero_len
+            {
+                if syntax.fold(arc_dtd.get(pi2)) <> syntax.delim_general_char(dPERO, pi2)
+                    set matched: false
+                set pi2: pi2 + 1
+            }
+            if matched
+            {
+                set arc_dtd_is_param: true
+                ; ★page-hosted, not `substr`: the copying init allocates through
+                ; Page.get(this) = this frame's return slot, and the value is
+                ; kept past the expression (CLAUDE.md, "Strings").
+                let tail StringC^host(arc_dtd.data_ptr() + pero_len, arc_dtd.get_size() - pero_len)
+                set arc_dtd: *tail
+            }
+        }
+        let ent doc_dtd.lookup_entity(arc_dtd_is_param, arc_dtd)
         if ent = null
             return
         if ent.is_external() = false
             return
-        let meta_sysid ent.get_external_id().get_system_id()
-        let base_dir ps.get_decl_base_dir()
+        ; ★an architecture may be declared by PUBLIC identifier alone (the DSSSL
+        ; one is: `<!ENTITY % DSSSLDTD PUBLIC "ISO/IEC 10179:1996//DTD DSSSL
+        ; Architecture//EN">`), so the declared system id is empty and the
+        ; catalog's answer — stamped on the entity when it was declared — is the
+        ; only way to the file. It is already fully resolved, so it must NOT be
+        ; joined with the declaration's base directory.
+        let xid ent.get_external_id()
+        var meta_sysid xid.get_system_id()
+        var base_dir ps.get_decl_base_dir()
+        if xid.has_effective_system()
+        {
+            let eff xid.get_effective_system()
+            if eff.get_length() > 0
+            {
+                ; the stamped id is an FSI (`<OSFILE>path`), not a path — the
+                ; storage manager wants the bare path. Only the plain OSFILE
+                ; form is opened here; a SOIBASE or CATALOG-DELEGATE FSI keeps
+                ; the declared system id and fails as before.
+                let rp Parser.make(host, ps)
+                var kind 0
+                var pas: size_t 0
+                var pal: size_t 0
+                var pbs: size_t 0
+                var pbl: size_t 0
+                rp.fsi_parse(eff, &kind, &pas, &pal, &pbs, &pbl)
+                if kind = 0
+                {
+                    set meta_sysid: rp.substr(eff, pas, pal)
+                    set base_dir: String()
+                }
+            }
+        }
 
-        let mdtd ArcEngine.parse_meta_dtd(host, ps, this.arc_doc_f, base_dir, meta_sysid, sd, syntax)
+        let mdtd ArcEngine.parse_meta_dtd(host, ps, this.arc_doc_f, base_dir, meta_sysid, sd, syntax, arc_opts)
         if mdtd = null
             return
         set this.meta_dtd: mdtd
@@ -214,7 +332,117 @@ define ArcProcessor
         cs.start_content(host, mdtd)
         set this.cs: cs
         set this.ctx: AttributeContext.make(host, this.meta_syntax, true, true)
+        ; errorIdref_ = parentParser->options().errorIdref (ArcEngine.cxx:904):
+        ; -wno-idref silences the arch-space missingId exactly as it does the
+        ; document's.
+        set this.id_table: IdTable.make(host)
+        let opts ps.get_options()
+        if opts <> null
+            set this.error_idref: opts.error_idref
         set this.valid: true
+    }
+
+    ; --- diagnostics -------------------------------------------------------
+    ; ArcProcessor is a Messenger in the reference; here the post-parse pass
+    ; borrows the Parser's reporter, the same way the attribute-group check
+    ; below already does.
+    function arc_report1(this: pointer[ArcProcessor], mt: MessageType, a1: StringC, loc: Location)
+    {
+        let rep Parser.make(this.host, this.ps)
+        rep.report1_at(mt, a1, loc)
+    }
+
+    ; --- the arch-space id table (defineId/noteIdref/checkIdrefs) ----------
+    ; ArcEngine.cxx:695/709/728. In the reference these are the AttributeContext
+    ; the mapped list is finished against; this port books IDs in the parser's
+    ; attribute tokenizer instead, so the arch side walks the FINISHED list.
+    function note_ids(this: pointer[ArcProcessor], to: pointer[AttributeList])
+    {
+        if this.id_table = null
+            return
+        let n to.size()
+        var i: size_t 0
+        while i < n
+        {
+            let v to.value(i)
+            if v <> null
+            {
+                let txt (*v).get_text()
+                if txt <> null
+                {
+                    if to.id(i)
+                    {
+                        let name (*v).get_string()
+                        if name.get_size() > 0
+                        {
+                            let id this.id_table.lookup_create(this.host, name)
+                            if id.defined()
+                                this.arc_report1(ParserMessages.duplicateId(), name, (*txt).loc_at(0))
+                            else
+                                id.mark_defined((*txt).loc_at(0))
+                        }
+                    }
+                    else if to.idref(i)
+                    {
+                        if this.error_idref
+                        {
+                            let m (*v).n_tokens()
+                            var k: size_t 0
+                            while k < m
+                            {
+                                let tok (*v).token(k)
+                                if tok.get_size() > 0
+                                {
+                                    ; TokenizedAttributeValue::tokenLocation(k):
+                                    ; token 0 starts at 0, every later one one
+                                    ; past its preceding separator.
+                                    var off: size_t 0
+                                    if k <> 0
+                                    {
+                                        let si (*v).get_space_index()
+                                        set off: *(si.get_buffer() + (k - 1)) + 1
+                                    }
+                                    let id this.id_table.lookup_create(this.host, tok)
+                                    if id.defined() = false
+                                        id.add_pending_ref((*txt).loc_at(off))
+                                }
+                                set k: k + 1
+                            }
+                        }
+                    }
+                }
+            }
+            set i: i + 1
+        }
+    }
+
+    ; checkIdrefs (ArcEngine.cxx:728), run when the base stream is exhausted —
+    ; the reference does it in ~ArcEngineImpl for every VALID processor.
+    ; ★The iteration is the id table's raw bucket order, not document order,
+    ; exactly as the parser's own check_idrefs: that order IS the message order
+    ; the reference prints (useloss reports OTHER before NOSUCHPART).
+    function check_idrefs(this: pointer[ArcProcessor])
+    {
+        if this.id_table = null
+            return
+        let t this.id_table
+        let n t.bucket_count()
+        var i: size_t 0
+        while i < n
+        {
+            let id t.bucket_at(i)
+            if id <> null
+            {
+                let m id.n_pending_refs()
+                var j: size_t 0
+                while j < m
+                {
+                    this.arc_report1(ArcEngineMessages.missingId(), id.get_name(), id.pending_ref_at(j))
+                    set j: j + 1
+                }
+            }
+            set i: i + 1
+        }
     }
 
     ; considerForm (ArcEngine.cxx:1727, af-1 subset): the ArcFormA attribute on
@@ -233,7 +461,16 @@ define ArcProcessor
                     if txt <> null
                     {
                         let meta_name ArcEngine.fold_sc(this.host, this.meta_syntax, (*txt).string())
-                        return this.meta_dtd.lookup_element_type(meta_name)
+                        let found this.meta_dtd.lookup_element_type(meta_name)
+                        if found <> null
+                            return found
+                        ; ArcEngine.cxx:1769 (CONSTDTD): a form the meta-DTD
+                        ; does not declare still MAPS — to a freshly created
+                        ; UNDEFINED element type, so the element is generated
+                        ; and processStartElement reports undefinedElement.
+                        ; Returning null here instead made the whole element
+                        ; non-architectural and swallowed the diagnostic.
+                        return this.cs.lookup_create_undefined_element(this.host, meta_name, Location(), this.meta_dtd, true)
                     }
                 }
             }
@@ -408,17 +645,63 @@ define ArcProcessor
     {
         set this.cur_loc: ev.get_markup_loc()
         let atts ev.get_attributes()
-        let meta_et this.consider_form(atts, ev.get_element_type())
+        var meta_et this.consider_form(atts, ev.get_element_type())
+        var to: pointer[AttributeList] null
         if meta_et = null
         {
-            this.flags_push(0)
-            return
+            ; ArcEngine.cxx:1306 — no architectural form. Everywhere but at the
+            ; very top that just means "not architectural"; on the DOCUMENT
+            ; element the reference reports documentElementNotArc and carries on
+            ; with the meta-DTD's own document element type, so the rest of the
+            ; instance is still validated against it.
+            ; ★both operands in LOCALS: a parenless CHAINED call as the right
+            ; operand of `or` collapses to the chain's FIRST call and silently
+            ; drops the rest — here `current_element()` alone, which then emits
+            ; a `phi i1 [.., ptr]` that only `opt`'s verifier rejects.
+            let lvl this.cs.tag_level_of()
+            let cur this.cs.current_element()
+            let fin cur.is_finished()
+            if (lvl <> 0) or fin
+            {
+                this.flags_push(0)
+                return
+            }
+            set meta_et: this.meta_dtd.get_document_element_type()
+            if meta_et = null
+            {
+                this.flags_push(0)
+                return
+            }
+            this.arc_report1(ArcEngineMessages.documentElementNotArc(), meta_et.get_name(), this.cur_loc)
+            set to: AttributeList.make(host, meta_et.get_attribute_def())
+            to.finish(this.ctx)
         }
-        let to this.map_attributes(host, atts, meta_et)
+        else
+            set to: this.map_attributes(host, atts, meta_et)
+        this.note_ids(to)
         let gen Event.make_start(host, meta_et, ev.get_loc())
         gen.set_attributes(to)
-        this.cs.current_element().try_transition(meta_et)
-        this.cs.push_element(OpenElement.make(host, meta_et, false, false, this.cs.get_the_empty_map(), ev.get_loc()))
+        ; ArcEngine.cxx:1337-1352 — the meta-DTD content check. Note the ORDER:
+        ; an undefined or excluded type is reported and does NOT advance the
+        ; content state, an included one does not advance it either (it is
+        ; allowed anywhere), and only the remaining case consults the model.
+        var included false
+        let def meta_et.get_definition()
+        var undef true
+        if def <> null
+            set undef: def.undefined()
+        if undef
+            this.arc_report1(ArcEngineMessages.undefinedElement(), meta_et.get_name(), this.cur_loc)
+        else if this.cs.element_is_excluded(meta_et)
+            this.arc_report1(ArcEngineMessages.elementExcluded(), meta_et.get_name(), this.cur_loc)
+        else if this.cs.element_is_included(meta_et)
+        {
+            set included: true
+            gen.set_included()
+        }
+        else if this.cs.current_element().try_transition(meta_et) = false
+            this.arc_report1(ArcEngineMessages.invalidElement(), meta_et.get_name(), this.cur_loc)
+        this.cs.push_element(OpenElement.make(host, meta_et, false, included, this.cs.get_the_empty_map(), ev.get_loc()))
         this.out.add(gen)
         this.flags_push(ARC_IS_ARC)
     }
@@ -438,13 +721,23 @@ define ArcProcessor
     ; processEndElement (ArcEngine.cxx:2029).
     function process_end_element(this: pointer[ArcProcessor], host: pointer[Page], ev: pointer[Event])
     {
+        set this.cur_loc: ev.get_markup_loc()
         let was_arc (this.flags_top() & ARC_IS_ARC) <> 0
         this.flags_pop()
         if was_arc
         {
-            let et this.cs.current_element().get_type()
+            let ce this.cs.current_element()
+            let et ce.get_type()
             let gen Event.make_end(host, et, ev.get_loc())
+            if ce.get_included()
+                gen.set_included()
             this.out.add(gen)
+            ; ArcEngine.cxx:2043 — the element closed before its content model
+            ; was satisfied. Reported AFTER the end event is generated and
+            ; BEFORE the pop, so the location is this element's, not its
+            ; parent's.
+            if ce.is_finished() = false
+                this.arc_report1(ArcEngineMessages.unfinishedElement(), et.get_name(), this.cur_loc)
             this.cs.pop_element()
         }
     }
@@ -558,10 +851,21 @@ define ArcEngine ( )
     ; declaration-subset parser on a child ParserState sharing the parent's
     ; entity manager / catalog / options; the Dtd is queried straight off the
     ; local pointer (no end_dtd, which would move it to the stack).
-    function parse_meta_dtd(host: pointer[Page], ps: pointer[ParserState], doctype_name: StringC, base_dir: String, sysid: String, sd: pointer[Sd], syntax: pointer[Syntax]) returns pointer[Dtd]
+    function parse_meta_dtd(host: pointer[Page], ps: pointer[ParserState], doctype_name: StringC, base_dir: String, sysid: String, sd: pointer[Sd], syntax: pointer[Syntax], includes: pointer[Array[StringC]]) returns pointer[Dtd]
     {
         let child ParserState.make(host, null, 0, PHASE_DECL_SUBSET)
         child.set_sd(sd)
+        ; options.includes = arcOpts_ (ArcEngine.cxx:906) — the architecture's
+        ; options are parameter entities defined as INCLUDE for this parse.
+        if includes <> null
+        {
+            if includes.get_length() > 0
+            {
+                let copts child.get_options()
+                if copts <> null
+                    set copts.includes: includes
+            }
+        }
         let meta_syn Syntax^host(*sd)
         ; the meta-DTD parses under the same (implied) SGML declaration as the
         ; document: an implied declaration uses the ParserOptions near-unlimited
@@ -577,6 +881,11 @@ define ArcEngine ( )
         let p Parser.make(host, child)
         let table ModeInfo.build_table(host)
         p.install_recognizers(table)
+        ; ★this parse does NOT go through parse_doctype, so the two `-i` hooks
+        ; there never run for it: the architecture's options have to be planted
+        ; here or the meta-DTD's own marked sections all resolve to IGNORE and
+        ; every content model is the wrong one.
+        p.insert_include_entities(mdtd)
 
         let storage Storage.OsFile(base_dir)
         let bytes storage.read(sysid)
@@ -821,6 +1130,10 @@ define ArcEngine ( )
                 {
                     set p.out: result
                     ArcEngine.run_events(host, ps, p)
+                    ; ~ArcEngineImpl (ArcEngine.cxx:213) checks the pending
+                    ; arch-space IDREFs of every valid processor once the base
+                    ; stream is exhausted.
+                    p.check_idrefs()
                 }
             }
             set pi: pi + 1
