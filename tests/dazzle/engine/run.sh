@@ -280,6 +280,22 @@ run_case diag5b diagdoc.sgml diag5b.experr
 run_case diag6  diagdoc.sgml diag6.experr
 run_case diag6b diagdoc.sgml diag6b.experr
 
+# diag7..diag7c: the LAST site of the audit's class, and it has the other form
+# — not a missing message but a missing CHECK. Seven reference DEFPRIMITIVEs
+# begin with `if (!context.processingMode)`; this port had the guard on four
+# of them and let process-children, process-children-trim and
+# process-node-list build a sosofo with a NULL mode instead. ★diag7's third
+# line is an ORDER probe: the mode test runs BEFORE the argument test, so
+# `(process-node-list 42)` outside a rule reports the CONTEXT — diag7b is the
+# control that shows the same call inside a rule reporting the ARGUMENT.
+# ★★★diag7c is the one that matters: it pins the OUTPUT. A sosofo with a null
+# mode is not an inert error, it PROCESSES — measured `oneonetwotwo` against
+# the reference's `onetwo` — so this was never a diagnosis-only gap, and the
+# .expected file is what proves it (the other two are stderr-only).
+run_case diag7  diagdoc.sgml diag7.experr
+run_case diag7b diagdoc.sgml diag7b.experr
+run_case diag7c diagdoc.sgml diag7c.experr
+
 # decl1..decl4 (diagdoc.sgml): the DECLARATION PHASE of the specification
 # (StyleEngine.cxx:40-80), gathered by DssslSpecEventHandler since forever and
 # never executed until 2026-08-08. decl1 is the DOC-level list, decl2 the
