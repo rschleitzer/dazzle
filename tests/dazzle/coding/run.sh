@@ -100,6 +100,31 @@ b-eucjp|-bEUC-JP
 b-unknown|-bNO-SUCH-CS
 "
 
+# ★A BYTE DUMP THAT EVERY `od` AGREES ON (2026-08-10, stage 7 rung 8). This
+# used to be `od -An -c`, whose COLUMN LAYOUT is implementation-defined: BSD od
+# (the dev box, where the goldens were minted) pads far wider than the GNU od in
+# Git Bash, so on Windows all 228 cells "differed" while every byte was in fact
+# identical — a whole suite red for a formatting convention.
+#
+# ★The obvious repair is wrong and was measured before being discarded:
+# squeezing the spaces out of `-c` output is AMBIGUOUS, because a space BYTE is
+# rendered as spaces too — `a b` and `ab` both collapse to ` a b `, so two
+# different byte streams would compare equal. That is a silent loosening of the
+# very test that exists to catch byte differences. `-tx1` has no such hole:
+# every byte is exactly two hex digits, so squeezing separators cannot conflate
+# anything. Leading and trailing padding go too, since BSD pads the line and GNU
+# does not.
+# ★The blank line goes too: `od` ends with a TOTAL-LENGTH offset line, which
+# `-An` renders as an empty line — and whether a given implementation emits it
+# at all is exactly the kind of thing this helper exists to stop mattering. It
+# carries no information here (sections are delimited by `--- ` markers), and a
+# zero-byte stream still dumps to no lines, which is unambiguous.
+dump() {
+  od -An -tx1 "$@" \
+    | LC_ALL=C tr -s ' ' \
+    | LC_ALL=C sed 's/^ *//; s/ *$//; /^$/d'
+}
+
 cell() { # label, then the dazzle arguments
   local label="$1"; shift
   local d="$WORK/run"
@@ -110,10 +135,10 @@ cell() { # label, then the dazzle arguments
   local rc=$?
   {
     printf '=== %s rc=%d\n' "$label" "$rc"
-    od -An -c "$d/cell.out"
+    dump "$d/cell.out"
     printf -- '--- stderr\n'
     # the argv0 prefix differs per binary; everything else is compared raw
-    LC_ALL=C sed 's|^[^:]*:|PROG:|' "$d/cell.err" | od -An -c
+    LC_ALL=C sed 's|^[^:]*:|PROG:|' "$d/cell.err" | dump
     # every file the backend wrote itself, in name order
     local f
     for f in $(cd "$d" && ls | LC_ALL=C sort); do
@@ -121,7 +146,7 @@ cell() { # label, then the dazzle arguments
         d.sgml|plain.sgml|*.dsl|*.scm|cell.out|cell.err) continue ;;
       esac
       printf -- '--- file %s\n' "$f"
-      od -An -c "$d/$f"
+      dump "$d/$f"
     done
   } >> "$MATRIX"
 }
