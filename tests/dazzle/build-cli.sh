@@ -21,6 +21,36 @@ cd "$ROOT"
 source tools/llvm-env.sh >/dev/null 2>&1
 set -u
 
+# ★A PREBUILT CLI (stage 7, rung 8). On the Windows runner nothing can compile
+# — the objects are cross-emitted on the Linux leg — but the suites are worth
+# running there, and a suite that had to be reimplemented for one platform
+# would be a SECOND ORACLE, which is the one thing the corpus discipline in
+# this tree does not allow. So the single place that produces the binary is
+# also the place that can be told one already exists.
+#
+# What lands at $OUT is not the .exe but tests/win32/lf-wrapper.sh, because the
+# suites compare bytes and Windows' CRT hands us a TEXT-mode stdout; the
+# wrapper's header has the full reasoning, including why it must NOT touch a
+# file the program writes itself. Every suite that calls this script therefore
+# works unchanged on Windows.
+if [ -n "${DAZZLE_PREBUILT:-}" ]; then
+  if [ ! -x "$DAZZLE_PREBUILT" ]; then
+    echo "dazzle-cli: FAIL (DAZZLE_PREBUILT=$DAZZLE_PREBUILT is not executable)"
+    exit 1
+  fi
+  # A two-line front end rather than three environment variables the caller
+  # would have to keep in step: what the suites invoke IS $OUT, so $OUT is the
+  # place that knows which binary it stands for.
+  # `exec -a "$0"` inside the front end matters: the wrapper reports argv[0] as
+  # the path IT was invoked as, and tests/dazzle/cli/run.sh normalises stderr by
+  # substituting exactly that path.
+  printf '#!/bin/bash\nLFW_BIN=%s LFW_NAME="$0" exec %s "$@"\n' \
+         "$DAZZLE_PREBUILT" "$ROOT/tests/win32/lf-wrapper.sh" > "$OUT" || exit 1
+  chmod +x "$OUT"
+  echo "dazzle-cli: using prebuilt $DAZZLE_PREBUILT (via lf-wrapper)"
+  exit 0
+fi
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
