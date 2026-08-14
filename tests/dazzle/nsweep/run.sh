@@ -62,6 +62,32 @@ if [ -n "$REF" ] && ! command -v "$REF" >/dev/null 2>&1; then
   echo "nsweep: REF_JADE=\"$REF\" is not executable — running without a reference."
   REF=""
 fi
+# ★Check WHICH engine answered, not just that one did. The baseline is the
+# PORTING-SOURCE build, and whatever sits on PATH may be something else:
+# Ubuntu 24.04 ships OpenJade 1.4devel, a different program. Comparing against
+# it would still print a comparison, which is the bad outcome — a silently
+# substituted oracle reads exactly like a correct one. Running WITHOUT a
+# reference is the honest state and this script already supports it.
+#
+# ★Keyed on IDENTITY, not on one version string. The first version of this
+# check pinned "1.3.3-pre1" and was wrong within the hour (2026-08-14): the
+# porting source renamed itself, so the December build says
+# `"openjade" version "1.3.3-pre1"` and a build from current source says
+# `"dazzle" version "1.3.3"`, while the distribution says
+# `"OpenJade" version "1.4devel"`. The name `dazzle` identifies the fork on its
+# own; the historical spelling is admitted by its version.
+# REF_JADE names a binary deliberately, NSWEEP_REF_VERSION admits a further one.
+if [ -n "$REF" ]; then
+  ref_id="$("$REF" -v < /dev/null 2>&1 \
+            | sed -n 's/.*"\([^"]*\)" version "\([^"]*\)".*/\1 \2/p' | head -1)"
+  ref_name="${ref_id% *}"; ref_ver="${ref_id#* }"
+  if [ "$ref_name" != dazzle ] && [ "$ref_ver" != "1.3.3-pre1" ] \
+     && { [ -z "${NSWEEP_REF_VERSION:-}" ] || [ "$ref_ver" != "$NSWEEP_REF_VERSION" ]; }; then
+    echo "nsweep: reference \"$REF\" identifies as [${ref_id:-unknown}], not the" \
+         "porting-source build — running without a reference."
+    REF=""
+  fi
+fi
 if [ -z "$REF" ]; then
   echo "nsweep: no reference engine (dazzle/openjade) — the run can only say"
   echo "        'quadratic', not 'quadratic where the reference is not'."
