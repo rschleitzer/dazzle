@@ -106,11 +106,15 @@ while IFS='|' read -r name env; do
     rc=$?
     {
       printf '=== %s %s rc=%d\n' "$name" "$doc" "$rc"
-      # stdout and stderr are BINARY in some cells (UTF-16 output), so both go
-      # through od; stderr loses its argv0 prefix first (it differs per binary).
-      od -An -c "$WORK/cell.out"
+      # stdout and stderr are BINARY in some cells (UTF-16 output), so both are
+      # dumped byte-wise; stderr loses its argv0 prefix first (differs per
+      # binary). ★The dump is ./dump.py and NOT `od`, because `od -c` bakes its
+      # host into the golden two ways at once — a locale-dependent multibyte
+      # rendering AND an implementation-dependent column padding. dump.py has
+      # the full account and is checked against GNU od byte for byte.
+      python3 "$HERE/dump.py" "$WORK/cell.out"
       printf -- '--- stderr\n'
-      sed 's/^[^:]*:/PROG:/' "$WORK/cell.err" | od -An -c
+      sed 's/^[^:]*:/PROG:/' "$WORK/cell.err" | python3 "$HERE/dump.py"
     } >> "$OUT"
   done
 done <<< "$CONFIGS"
