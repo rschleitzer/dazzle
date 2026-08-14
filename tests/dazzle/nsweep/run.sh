@@ -62,6 +62,23 @@ if [ -n "$REF" ] && ! command -v "$REF" >/dev/null 2>&1; then
   echo "nsweep: REF_JADE=\"$REF\" is not executable — running without a reference."
   REF=""
 fi
+# ★Check WHICH openjade answered, not just that one did. The baseline above is
+# a specific BUILD — 1.3.3-pre1 from the porting source — and the `openjade`
+# fallback on PATH may be something else entirely: Ubuntu 24.04 ships OpenJade
+# 1.4devel, a different program version. Comparing against it would still print
+# a comparison, which is the bad outcome: a silently substituted oracle reads
+# exactly like a correct one. Running WITHOUT a reference is the honest state
+# and the script already supports it. REF_JADE names a binary deliberately;
+# NSWEEP_REF_VERSION relaxes the expected version for it.
+if [ -n "$REF" ]; then
+  ref_want="${NSWEEP_REF_VERSION:-1.3.3-pre1}"
+  ref_ver="$("$REF" -v < /dev/null 2>&1 | sed -n 's/.*version "\([^"]*\)".*/\1/p' | head -1)"
+  if [ "$ref_ver" != "$ref_want" ]; then
+    echo "nsweep: reference \"$REF\" reports version '${ref_ver:-unknown}', expected" \
+         "$ref_want (the porting source) — running without a reference."
+    REF=""
+  fi
+fi
 if [ -z "$REF" ]; then
   echo "nsweep: no reference engine (dazzle/openjade) — the run can only say"
   echo "        'quadratic', not 'quadratic where the reference is not'."

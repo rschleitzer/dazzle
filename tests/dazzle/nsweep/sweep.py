@@ -81,13 +81,35 @@ def write_doc(path, n, mixed):
     open(path, "w").write("".join(parts))
 
 
+_TIME_FLAG = None
+
+
+def time_flag():
+    """`-l` on BSD/macOS, `-v` on GNU. Probed once against /usr/bin/time itself.
+
+    ★Not chosen by platform name: the question is which flag THIS `time`
+    accepts, and probing answers it directly. GNU rejects `-l` with a usage
+    error and exit 125, so a hardcoded `-l` fails every measurement on Linux
+    before the engine ever starts — which is what happened (2026-08-14), while
+    the comment below claimed run.sh passed `-v` there. It never did; nothing
+    threaded a flag at all. The parsing further down already handles both
+    output shapes, so the flag was the only missing half.
+    """
+    global _TIME_FLAG
+    if _TIME_FLAG is None:
+        probe = subprocess.run(["/usr/bin/time", "-l", "true"],
+                               capture_output=True, text=True)
+        _TIME_FLAG = "-l" if probe.returncode == 0 else "-v"
+    return _TIME_FLAG
+
+
 def measure(engine, flags, sheet_path, doc_path, home):
     """-> (cost, unit, error). Instructions where the OS reports them, else cpu."""
     env = dict(os.environ)
     if home:
         env["SCALY_HOME"] = home
     try:
-        r = subprocess.run(["/usr/bin/time", "-l", engine] + flags +
+        r = subprocess.run(["/usr/bin/time", time_flag(), engine] + flags +
                            ["-d", sheet_path, doc_path],
                            capture_output=True, text=True, env=env)
     except OSError as e:
@@ -108,8 +130,8 @@ def measure(engine, flags, sheet_path, doc_path, home):
     m = re.search(r"(\d+)\s+instructions retired", err)
     if m:
         return int(m.group(1)), "instr", None
-    # Linux `/usr/bin/time -l` is not a thing; run.sh passes -v there and the
-    # counter does not exist at all, so fall back to cpu seconds and say so.
+    # Only macOS reports retired instructions. Under GNU `-v` (see time_flag)
+    # the counter does not exist at all, so fall back to cpu seconds and say so.
     m = re.search(r"([\d.]+)\s+real\s+([\d.]+)\s+user\s+([\d.]+)\s+sys", err)
     if m:
         return (float(m.group(2)) + float(m.group(3))) * 1e6, "us", None
