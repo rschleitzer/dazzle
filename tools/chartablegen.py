@@ -17,6 +17,15 @@
 import re
 import sys
 
+# ★★★THE CONVERSIONS BELONG IN THE GENERATOR, NOT ONLY IN THE OUTPUT.
+# Two campaigns had touched `CharNames.scaly`/`Sdata.scaly` without bringing
+# this script into line: pointer[Interpreter] -> ref[Interpreter] (7 signatures
+# per file) and the literal-cast sweep that removed the ` as u32` at each of
+# the ~890 entries.  A regeneration run would have silently reverted
+# both -- measured 2026-09-04 with a source table RECONSTRUCTED
+# from the output: 1830 diff lines.  The openjade sources are missing
+# on the development machine, so such a step back is NOT noticed here;
+# `./mkp` only reports "skipping" for it.
 CHUNK = 150  # entries per install_<i> function (keeps single bodies small)
 
 def main():
@@ -53,17 +62,17 @@ def main():
     out.write("define %s ()\n" % concept)
     out.write("{\n")
     chunks = [entries[i:i + CHUNK] for i in range(0, len(entries), CHUNK)]
-    out.write("    function install(interp: pointer[Interpreter])\n")
+    out.write("    function install(interp: ref[Interpreter])\n")
     out.write("    {\n")
     for i in range(len(chunks)):
         out.write("        %s.install_%d(interp)\n" % (concept, i))
     out.write("    }\n")
     for i, chunk in enumerate(chunks):
         out.write("\n")
-        out.write("    function install_%d(interp: pointer[Interpreter])\n" % i)
+        out.write("    function install_%d(interp: ref[Interpreter])\n" % i)
         out.write("    {\n")
         for code, name in chunk:
-            out.write('        interp.%s("%s", 0x%04X as u32)\n' % (call, name, code))
+            out.write('        interp.%s("%s", 0x%04X)\n' % (call, name, code))
         out.write("    }\n")
     out.write("}\n")
     return 0
