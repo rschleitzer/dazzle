@@ -69,24 +69,24 @@ patch('/packages/dazzle/0.1.0/dazzle/ELObj.scaly', [
 
 # 3. names for the report + arming the timer once, at engine setup.
 patch('/packages/dazzle/0.1.0/dazzle/Interpreter.scaly', [
-    ("use dazzle.NameTable.NameTable",
-     "use dazzle.PrimProf.PrimProf\nuse dazzle.NameTable.NameTable"),
-    ("    function install_primitive(this: pointer[Interpreter], name: pointer[const_char], prim_id: int, sig: Signature)\n"
+    ("use dazzle.NameTable.NamedTable",
+     "use dazzle.PrimProf.PrimProf\nuse dazzle.NameTable.NamedTable"),
+    ("    function install_primitive(this: ref[Interpreter], name: pointer[const_char], prim_id: int, sig: Signature)\n"
      "    {\n"
      "        let ident this.lookup(StringC(name))",
-     "    function install_primitive(this: pointer[Interpreter], name: pointer[const_char], prim_id: int, sig: Signature)\n"
+     "    function install_primitive(this: ref[Interpreter], name: pointer[const_char], prim_id: int, sig: Signature)\n"
      "    {\n"
      "        PrimProf.name_id(name, prim_id)\n"
      "        let ident this.lookup(StringC(name))"),
-    ("    function install_x_primitive(this: pointer[Interpreter], prefix: pointer[const_char], name: pointer[const_char], prim_id: int, sig: Signature)\n"
+    ("    function install_x_primitive(this: ref[Interpreter], prefix: pointer[const_char], name: pointer[const_char], prim_id: int, sig: Signature)\n"
      "    {\n"
      "        let ident this.lookup(StringC(name))",
-     "    function install_x_primitive(this: pointer[Interpreter], prefix: pointer[const_char], name: pointer[const_char], prim_id: int, sig: Signature)\n"
+     "    function install_x_primitive(this: ref[Interpreter], prefix: pointer[const_char], name: pointer[const_char], prim_id: int, sig: Signature)\n"
      "    {\n"
      "        PrimProf.name_id(name, prim_id)\n"
      "        let ident this.lookup(StringC(name))"),
-    ("    function install_primitives(this: pointer[Interpreter])\n    {\n",
-     "    function install_primitives(this: pointer[Interpreter])\n    {\n"
+    ("    function install_primitives(this: ref[Interpreter])\n    {\n",
+     "    function install_primitives(this: ref[Interpreter])\n    {\n"
      "        PrimProf.start()\n")])
 
 # 4. the shim object on the LTO link line, ahead of -lm (a left-to-right ELF
