@@ -92,8 +92,8 @@ patch('/packages/dazzle/0.1.0/dazzle/Interpreter.scaly', [
 # 4. the shim object on the LTO link line, ahead of -lm (a left-to-right ELF
 #    linker only pulls a library for symbols undefined so far).
 patch('/tools/link-lto.sh', [(
-    '"$WORK/whole.o" "$WORK/fcontext.o" "$WORK/eio.o" "$WORK/ctime.o" ${EXTRA[@]+"${EXTRA[@]}"} -lm -o "$OUT"',
-    '"$WORK/whole.o" "$WORK/fcontext.o" "$WORK/eio.o" "$WORK/ctime.o" ${LTO_EXTRA_OBJS:-} ${EXTRA[@]+"${EXTRA[@]}"} -lm -o "$OUT"')])
+    '"$WORK/whole.o" "$WORK/fcontext.o" "$WORK/eio.o" "$WORK/ctime.o" "$WORK/panic.o" ${EXTRA[@]+"${EXTRA[@]}"} -lm -o "$OUT"',
+    '"$WORK/whole.o" "$WORK/fcontext.o" "$WORK/eio.o" "$WORK/ctime.o" "$WORK/panic.o" ${LTO_EXTRA_OBJS:-} ${EXTRA[@]+"${EXTRA[@]}"} -lm -o "$OUT"')])
 PY
 
 TMP="$(mktemp -d)"

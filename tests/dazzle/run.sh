@@ -43,7 +43,8 @@ if [ ! -f /tmp/libscaly.a ]; then
   tools/fcontext.sh /tmp/fcontext.o >> "$TMP/rt.log" 2>&1
   tools/eio.sh /tmp/eio.o >> "$TMP/rt.log" 2>&1
   tools/ctime.sh /tmp/ctime.o >> "$TMP/rt.log" 2>&1
-  ar rcs /tmp/libscaly.a /tmp/libscaly.o /tmp/fcontext.o /tmp/eio.o /tmp/ctime.o
+  tools/panic.sh /tmp/panic.o >> "$TMP/rt.log" 2>&1
+  ar rcs /tmp/libscaly.a /tmp/libscaly.o /tmp/fcontext.o /tmp/eio.o /tmp/ctime.o /tmp/panic.o
 fi
 
 # --- 3. Link + run the unit harness ---------------------------------------

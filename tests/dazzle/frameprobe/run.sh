@@ -91,8 +91,8 @@ patch('/packages/dazzle/0.1.0/dazzle/Primitive.scaly', [
 # (that is why f2c06204 put it there, and why re-aiming this anchor means
 # inserting ahead of it rather than appending).
 patch('/tools/link-lto.sh', [(
-    '"$WORK/whole.o" "$WORK/fcontext.o" "$WORK/eio.o" "$WORK/ctime.o" ${EXTRA[@]+"${EXTRA[@]}"} -lm -o "$OUT"',
-    '"$WORK/whole.o" "$WORK/fcontext.o" "$WORK/eio.o" "$WORK/ctime.o" ${LTO_EXTRA_OBJS:-} ${EXTRA[@]+"${EXTRA[@]}"} -lm -o "$OUT"')])
+    '"$WORK/whole.o" "$WORK/fcontext.o" "$WORK/eio.o" "$WORK/ctime.o" "$WORK/panic.o" ${EXTRA[@]+"${EXTRA[@]}"} -lm -o "$OUT"',
+    '"$WORK/whole.o" "$WORK/fcontext.o" "$WORK/eio.o" "$WORK/ctime.o" "$WORK/panic.o" ${LTO_EXTRA_OBJS:-} ${EXTRA[@]+"${EXTRA[@]}"} -lm -o "$OUT"')])
 
 patch('/packages/dazzle/0.1.0/dazzle/Interpreter.scaly', [
     ("use dazzle.NameTable.NameTable",
