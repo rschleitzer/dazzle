@@ -15,20 +15,16 @@
 # through `Page.get(the Array)`, i.e. the node's own page, so it is unaffected
 # by which page the analysis ran on.
 #
-# ★Three things are checked, and the third is the one that matters:
+# ★Two things are checked:
 #
 #   1. ESIS + stderr + exit code identical in BOTH modes over the DTD-heavy
 #      fixtures. The DTD path is what the 469 ESIS models validate and a
 #      content-model DFA decides validity, so identity is the whole licence.
-#   2. The COUNTER says the seam engaged, and that it can fall: default mode
-#      reports arenas > 0 / on-host 0, `SP_CM_SCRATCH=0` the reverse. A seam
-#      whose absence is invisible in the output needs a counter as its
-#      checksum, or a build that silently stopped scratching passes every
-#      byte-identity gate (the lesson the switched-off escape gate cost once).
-#   3. The MEMORY actually drops. A counter can be right while the release is
-#      a no-op, so the gate measures peak RSS in both modes and requires the
-#      scratch run to be strictly smaller. That is the only assertion here
-#      that would notice a `deallocate_exclusive_page` that stopped freeing.
+#   2. The MEMORY actually drops: peak RSS in both modes on the 198-KB DocBook
+#      DTD, the scratch run strictly smaller. That is what shows the seam
+#      engaged and that the release really frees — the counters that used to
+#      say so went with the port's instruments (2026-09-19), and a seam whose
+#      absence is invisible in the output needs this leg or nothing notices.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -77,38 +73,7 @@ for c in $CASES; do
 done
 [ "$n" -ge 8 ] || fail "only $n fixtures ran — the corpus moved, re-aim the list"
 
-# --- 2. the counter, in both directions -----------------------------------
-# The repo's own grammar (BASE=repo, so the workdir is the checkout root) is
-# the biggest content-model population in the public tier.
-CDIR="$ROOT"
-CDOC="scaly.sgm"
-stats_on=$( ( cd "$CDIR" && SP_CM_SCRATCH_STATS=1 "$BIN" -s "$CDOC" ) 2>&1 >/dev/null | grep '^cm-scratch:' )
-stats_off=$( ( cd "$CDIR" && SP_CM_SCRATCH=0 SP_CM_SCRATCH_STATS=1 "$BIN" -s "$CDOC" ) 2>&1 >/dev/null | grep '^cm-scratch:' )
-
-a_on=$(printf '%s' "$stats_on" | sed -n 's/.*arenas \([0-9]*\).*/\1/p')
-h_on=$(printf '%s' "$stats_on" | sed -n 's/.*on host \([0-9]*\).*/\1/p')
-a_off=$(printf '%s' "$stats_off" | sed -n 's/.*arenas \([0-9]*\).*/\1/p')
-h_off=$(printf '%s' "$stats_off" | sed -n 's/.*on host \([0-9]*\).*/\1/p')
-
-[ -n "$a_on" ] || fail "no counter line with the stats switch on"
-[ "$a_on" -gt 0 ] || fail "default mode scratched nothing (arenas=$a_on) — the seam is off"
-[ "$h_on" = 0 ] || fail "default mode compiled $h_on models on the host"
-[ "$a_off" = 0 ] || fail "SP_CM_SCRATCH=0 still made $a_off arenas — the hatch is decoration"
-[ "$h_off" -gt 0 ] || fail "SP_CM_SCRATCH=0 compiled nothing on the host"
-[ "$a_on" = "$h_off" ] || fail "the two modes compiled different numbers of models ($a_on vs $h_off)"
-
-# --- 3. the pages really came back ----------------------------------------
-# A counter can be right while the release is a no-op, so the seam counts the
-# scratch pages it hands to deallocate_exclusive_page. Every arena owns at
-# least its own page, so pages >= arenas, and zero pages with a positive arena
-# count is exactly the silent-no-op failure this leg exists for.
-pg_on=$(printf '%s' "$stats_on" | sed -n 's/.*pages returned \([0-9]*\).*/\1/p')
-pg_off=$(printf '%s' "$stats_off" | sed -n 's/.*pages returned \([0-9]*\).*/\1/p')
-[ -n "$pg_on" ] || fail "the counter line has no page column"
-[ "$pg_on" -ge "$a_on" ] || fail "only $pg_on pages returned for $a_on arenas — the release is a no-op"
-[ "$pg_off" = 0 ] || fail "SP_CM_SCRATCH=0 returned $pg_off scratch pages"
-
-# --- 4. and on a REAL DTD, the peak drops ---------------------------------
+# --- 2. and on a REAL DTD, the peak drops ---------------------------------
 # The public tier's grammar is too small for the effect to clear page
 # granularity (measured: identical to the byte on scaly.sgm), so this leg runs
 # on the 198-KB DocBook DTD when it is available. ★It is reported either way —
@@ -133,4 +98,4 @@ if [ -f "$DD/tiny.xml" ] && [ -f "$DD/docbook.dtd" ]; then
   peak_note="DocBook-DTD peak RSS -$(awk -v a="$p_on" -v b="$p_off" 'BEGIN{printf "%.1f", (b-a)*100/b}') %"
 fi
 
-echo "cmscratch: PASS ($n fixtures x 2 modes; $a_on models scratched, $pg_on pages returned, hatch disables; $peak_note)"
+echo "cmscratch: PASS ($n fixtures x 2 modes; $peak_note)"

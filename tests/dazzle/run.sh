@@ -48,10 +48,7 @@ if [ ! -f /tmp/libscaly.a ]; then
 fi
 
 # --- 3. Link + run the unit harness ---------------------------------------
-# -L/-l LLVM: since Stage 6b the dazzle package contains the JIT
-# (dazzle/Jit.scaly + dazzle/Llvm.scaly), so ANY program linking libdazzle.a
-# pulls in LLVM-C/ORC — not only the CLI. tools/llvm-env.sh resolves it.
-if ! "$BIN" -o "$TMP/unit" "$HERE/unit.scaly" "$TMP/libdazzle.a" "$TMP/libopensp.a" "-L$LLVM_LIBDIR" "-l$LLVM_LIBNAME" > "$TMP/link.log" 2>&1; then
+if ! "$BIN" -o "$TMP/unit" "$HERE/unit.scaly" "$TMP/libdazzle.a" "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
   echo "dazzle: FAIL (link)"; tail -8 "$TMP/link.log"; exit 1
 fi
 

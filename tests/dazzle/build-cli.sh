@@ -114,11 +114,6 @@ fi
 # (tests/dazzle/PERFORMANCE.md): the hot RBMM prologue/epilogue calls stop going
 # through the stub table and become inlinable. SCALYC_NO_LTO=1, or a checkout
 # without llvm-link/opt, falls back to the archive link below.
-# The Stage-6b JIT links against LLVM-C/ORC (packages/dazzle/0.1.0/dazzle/
-# Llvm.scaly). tools/llvm-env.sh resolves the library; without it the binary
-# still builds only if nothing references those symbols, so this is required
-# rather than optional.
-export LINK_EXTRA="-L$LLVM_LIBDIR -l$LLVM_LIBNAME"
 
 LTO_OK=0
 RT_LL=""
@@ -144,7 +139,7 @@ if [ -n "$RT_LL" ]; then
 fi
 
 if [ "$LTO_OK" = 0 ]; then
-  if ! "$BIN" -o "$OUT" packages/dazzle/0.1.0/dazzle_cli.scaly "$TMP/libdazzle.a" "$TMP/libopensp.a" "-L$LLVM_LIBDIR" "-l$LLVM_LIBNAME" > "$TMP/link.log" 2>&1; then
+  if ! "$BIN" -o "$OUT" packages/dazzle/0.1.0/dazzle_cli.scaly "$TMP/libdazzle.a" "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
     echo "dazzle-cli: FAIL (link)"; tail -8 "$TMP/link.log"; exit 1
   fi
   echo "dazzle-cli: built $OUT"

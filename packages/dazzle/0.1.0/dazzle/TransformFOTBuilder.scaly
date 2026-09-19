@@ -44,65 +44,6 @@ function scaly_eio_errno() returns i32 extern
 procedure scaly_eputs(s: pointer[const_char]) extern
 procedure scaly_eputnl() extern
 
-; ---- measurement hook: DZ_REGION_BYTES=1 ---------------------------------
-; Not a feature — the codegen counterpart of onsgmls' SP_REGION_BYTES (see
-; tests/dazzle/PERFORMANCE.md, "Wo der Speicher liegt"). Peak RSS alone cannot
-; say how much of it is ONE region that dies only at run end, nor how much of
-; that region is built INSIDE an entity-file bracket, which is exactly the
-; question lever 2 asks. This walks the run region the way
-; deallocate_extensions does (next_page chain + exclusive pages, oversized ones
-; by their recorded block length) and sums the bytes; the entity hooks sample
-; it at the outermost start/end-entity pair and accumulate the difference.
-; PAGE_SIZE is spelled 4096 on purpose: a module-level `define` of another
-; package is invisible from inside a module (CLAUDE.md).
-function getenv(name: pointer[const_char]) returns pointer[const_char] extern
-procedure scaly_eputi(value: i64) extern
-
-function tfb_region_bytes(p: ref[Page]) returns size_t
-{
-    var total: size_t 0
-    ; `q` walks the next_page chain and genuinely reaches null at its end, so the
-    ; local is the nullable form even though the parameter always refers to a page.
-    var q: ref[Page]? p
-    while q <> null
-    {
-        set total: total + 4096
-        var nd q.exclusive_pages.head
-        while nd <> null
-        {
-            let excl nd.page
-            if excl.next_object = null
-                set total: total + Page.oversized_size(excl)
-            else
-                set total: total + tfb_region_bytes(excl)
-            set nd: nd.next
-        }
-        set q: q.next_page
-    }
-    total
-}
-
-; 0 = not yet asked, 1 = on, 2 = off
-shared tfb_probe: int 0
-; DZ_REGION_ENTITY=1 additionally samples the region at every outermost entity
-; bracket. That walk is O(region) per file, so it is its own switch: on a
-; multi-GB region it turns a 30 s run into an hour.
-shared tfb_probe_ent: int 0
-; run-region bytes at the outermost start_entity
-shared tfb_probe_mark: size_t 0
-; summed growth across all outermost entity brackets, and their count
-shared tfb_probe_bytes: size_t 0
-shared tfb_probe_files: size_t 0
-; summed capacity (in u32 slots) of the entity output buffers
-shared tfb_probe_bufcap: size_t 0
-; region bytes before processing starts, and at the first / last outermost
-; end_entity. Those two are sampled at the SAME nesting depth, so their
-; difference is the PERSISTENT per-file residue; a start/end delta also counts
-; the eval scratch that is live at that moment and dies later.
-shared tfb_probe_base: size_t 0
-shared tfb_probe_first: size_t 0
-shared tfb_probe_last: size_t 0
-
 ; argv0 for the app-message prefix: the reference reports entity-file
 ; failures through CmdLineApp::message, which renders `<argv0>:E: <text>`.
 ; The CLI driver sets this once (set_prog_name). A `shared` module global,
@@ -500,60 +441,6 @@ define TransformFOTBuilder
         scaly_eputnl()
     }
 
-    ; DZ_REGION_BYTES probe — see the hook comment at the top of the file.
-    procedure probe_on() returns bool mutable tfb_probe
-    {
-        if tfb_probe = 0
-        {
-            set tfb_probe: 2
-            if getenv("DZ_REGION_BYTES") <> null
-                set tfb_probe: 1
-        }
-        tfb_probe = 1
-    }
-
-    procedure probe_entity_on() returns bool mutable tfb_probe_ent
-    {
-        if tfb_probe_ent = 0
-        {
-            set tfb_probe_ent: 2
-            if getenv("DZ_REGION_ENTITY") <> null
-                set tfb_probe_ent: 1
-        }
-        tfb_probe_ent = 1
-    }
-
-    procedure mark_base(host: ref[Page]) mutable tfb_probe, tfb_probe_base
-    {
-        if TransformFOTBuilder.probe_on()
-            set tfb_probe_base: tfb_region_bytes(host)
-    }
-
-    procedure report_region(host: ref[Page]) mutable tfb_probe
-    {
-        if TransformFOTBuilder.probe_on() = false
-            return
-        scaly_eputs "dazzle: run region bytes: "
-        scaly_eputi(tfb_region_bytes(host) as i64)
-        scaly_eputs "  base before processing: "
-        scaly_eputi(tfb_probe_base as i64)
-        scaly_eputnl()
-        scaly_eputs "dazzle: entity-bracket bytes: "
-        scaly_eputi(tfb_probe_bytes as i64)
-        scaly_eputs " over "
-        scaly_eputi(tfb_probe_files as i64)
-        scaly_eputs " files"
-        scaly_eputnl()
-        scaly_eputs "dazzle: entity buffer capacity (u32 slots): "
-        scaly_eputi(tfb_probe_bufcap as i64)
-        scaly_eputnl()
-        scaly_eputs "dazzle: region at first/last outermost end_entity: "
-        scaly_eputi(tfb_probe_first as i64)
-        scaly_eputs " / "
-        scaly_eputi(tfb_probe_last as i64)
-        scaly_eputnl()
-    }
-
     ; --- entity flow object: redirect output to a file ----------------------
     ; startEntity (TransformFOTBuilder.cxx): the output file is opened HERE.
     ; A failed open reports cannotOpenOutputError and leaves os_ on the
@@ -561,11 +448,8 @@ define TransformFOTBuilder
     ; stdout). Only a successful open redirects. Our sink buffers and writes
     ; on end, so the open is a probe (create/truncate, like the reference's
     ; eager FileOutputByteStream::open) whose failure routes the content.
-    procedure start_entity(mutable this: ref[TransformFOTBuilder], system_id: StringC) mutable tfb_probe_ent, tfb_probe_mark
+    procedure start_entity(mutable this: ref[TransformFOTBuilder], system_id: StringC)
     {
-        if TransformFOTBuilder.probe_entity_on()
-            if this.file_count = 0
-                set tfb_probe_mark: tfb_region_bytes(this.host)
         this.flush_pending_re()
         let name_str this.stringc_to_string(system_id)
         var filename name_str
@@ -610,7 +494,7 @@ define TransformFOTBuilder
         set this.file_count: this.file_count + 1
     }
 
-    procedure end_entity(mutable this: ref[TransformFOTBuilder]) mutable tfb_probe, tfb_probe_bufcap, tfb_probe_bytes, tfb_probe_ent, tfb_probe_files, tfb_probe_first, tfb_probe_last
+    procedure end_entity(mutable this: ref[TransformFOTBuilder])
     {
         this.flush_pending_re()
         if this.file_count > 0
@@ -630,8 +514,6 @@ define TransformFOTBuilder
                         set scratch: of.region as ref[Page]
                     if this.flush_buffer_to_file(scratch, of.buf, of.filename) = false
                         this.file_error("cannot close output file ", of.sysid, scaly_eio_errno())
-                    if TransformFOTBuilder.probe_on()
-                        set tfb_probe_bufcap: tfb_probe_bufcap + of.buf.get_capacity()
                 }
                 set this.out: of.save as ref[Array[u32]]
                 ; the file is written and `out` is back on the parent stream:
@@ -640,17 +522,6 @@ define TransformFOTBuilder
                     this.host.deallocate_exclusive_page(of.region as ref[Page])
             }
         }
-        if TransformFOTBuilder.probe_entity_on()
-            if this.file_count = 0
-            {
-                let now tfb_region_bytes(this.host)
-                if now > tfb_probe_mark
-                    set tfb_probe_bytes: tfb_probe_bytes + (now - tfb_probe_mark)
-                if tfb_probe_files = 0
-                    set tfb_probe_first: now
-                set tfb_probe_last: now
-                set tfb_probe_files: tfb_probe_files + 1
-            }
     }
 
     ; --- directory flow object: mkdir + prefix entity filenames -------------
@@ -778,7 +649,7 @@ define TransformFOTBuilder
     procedure root_to_utf8(mutable this: ref[TransformFOTBuilder]) returns String
         this.encode_records(this.host, this.root.as_slice())
 
-    procedure test() returns int mutable tfb_probe, tfb_probe_bufcap, tfb_probe_bytes, tfb_probe_ent, tfb_probe_files, tfb_probe_first, tfb_probe_last, tfb_probe_mark
+    procedure test() returns int
     {
         ; bootstrap the run region (the established test idiom)
         let anchor StringC("x")

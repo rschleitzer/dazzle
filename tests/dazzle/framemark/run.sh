@@ -38,11 +38,11 @@ fi
 # ★ NEVER restore with `git checkout -- .` here. An earlier draft did, and it
 # reverted every uncommitted source change in the tree. The codegen regenerates
 # its outputs byte-identically, so there is nothing to restore in the first place.
-DAZZLE_FRAME_MARK_STATS=1 "$DZ" \
+"$DZ" --frame-mark-stats \
   -t sgml -d codegen/scaly.dsl scaly.sgm > /dev/null 2> "$TMP/on"
-REWOUND="$(sed -n 's/^frame-mark: [0-9]* frames, \([0-9]*\) rewound.*/\1/p' "$TMP/on")"
+REWOUND="$(sed -n 's/^frame-mark: \([0-9]*\) rewound.*/\1/p' "$TMP/on")"
 if [ -z "$REWOUND" ]; then
-  echo "framemark: FAIL (no stats line by default — the mark is not on)"
+  echo "framemark: FAIL (no --frame-mark-stats line)"
   cat "$TMP/on"; rc=1
 elif [ "$REWOUND" -lt 100 ]; then
   echo "framemark: FAIL (the mark engaged $REWOUND times by default)"; rc=1
@@ -53,13 +53,13 @@ fi
 # --- 2. both escape hatches turn it OFF ----------------------------------
 for way in env cli; do
   if [ "$way" = env ]; then
-    DAZZLE_FRAME_MARK=0 DAZZLE_FRAME_MARK_STATS=1 "$DZ" \
+    DAZZLE_FRAME_MARK=0 "$DZ" --frame-mark-stats \
       -t sgml -d codegen/scaly.dsl scaly.sgm > /dev/null 2> "$TMP/off.$way"
   else
-    DAZZLE_FRAME_MARK_STATS=1 "$DZ" --no-frame-mark \
+    "$DZ" --frame-mark-stats --no-frame-mark \
       -t sgml -d codegen/scaly.dsl scaly.sgm > /dev/null 2> "$TMP/off.$way"
   fi
-  if [ -s "$TMP/off.$way" ]; then
+  if [ "$(sed -n 's/^frame-mark: \([0-9]*\) rewound.*/\1/p' "$TMP/off.$way")" != 0 ]; then
     echo "framemark: FAIL (the $way escape hatch did not turn the mark off)"
     head -3 "$TMP/off.$way"; rc=1
   else
