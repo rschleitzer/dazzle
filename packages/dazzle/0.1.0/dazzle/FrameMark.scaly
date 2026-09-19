@@ -214,31 +214,47 @@ define FrameMark
     procedure force_off() mutable fm_state
         set fm_state: 2
 
-    ; --- the region, read and written by documented OFFSET ------------------
+    ; --- the region's pages, read through their typed fields ---------------
     ;
-    ; ★★★Why by offset and not through a `Page.mark`/`Page.rewind` pair in the
-    ; stdlib, which is where this knowledge belongs: the planner is
-    ; DEMAND-DRIVEN, so a stdlib function nothing in the COMPILER calls is never
-    ; emitted into the compiler image, and the `--jit` leg of tests/dazzle/run.sh
-    ; materialises this package INSIDE the compiler process and resolves its
-    ; externals there (`Failed to materialize symbols: { _ZN4Page6rewindE… }`).
-    ; **A new stdlib entry point may only be called from a package that the
-    ; --jit leg exercises if the compiler itself also reaches it.** So the four
-    ; slots are read here, against the comment in `Page.scaly` that declares them
-    ; load-bearing by number:
-    ;
-    ;   0 next_object   1 current_page   2 next_page   3 exclusive_pages.head
-    ;
-    ; `Page.get` and `Page.release_page` ARE used by the compiler and therefore
-    ; resolve — those two stay ordinary calls.
+    ; A page travels through the hot state as a word (the columns are i64), so
+    ; these read the `Page` field under the word. Rewinding — the one place a
+    ; region's structure CHANGES — is the stdlib's (`Page.rewind`); this file
+    ; only reads.
 
-    function slot(p: i64, i: int) returns i64
-        *((p as pointer[i64]) + i)
+    function bump(p: i64) returns i64
+    {
+        let pg p as pointer[Page]
+        pg.next_object as i64
+    }
+
+    function end_page(p: i64) returns i64
+    {
+        let pg p as pointer[Page]
+        pg.current_page as i64
+    }
+
+    function next_page(p: i64) returns i64
+    {
+        let pg p as pointer[Page]
+        pg.next_page as i64
+    }
+
+    function exclusive(p: i64) returns i64
+    {
+        let pg p as pointer[Page]
+        pg.exclusive_pages.head as i64
+    }
+
+    function head_of(p: i64) returns i64
+    {
+        let pg p as pointer[Page]
+        pg.region as i64
+    }
 
     ; the END of the marked region's extension chain
     function tail(head: i64) returns i64
     {
-        let cp FrameMark.slot(head, 1)
+        let cp FrameMark.end_page(head)
         if cp = 0
             return head
         cp
@@ -305,7 +321,7 @@ define FrameMark
             return
         }
         let t FrameMark.tail(head)
-        let b FrameMark.slot(t, 0)
+        let b FrameMark.bump(t)
         if b = 0
         {
             set *(c + FC_GEN): 0 - 1
@@ -313,9 +329,9 @@ define FrameMark
         }
         set *(c + FC_PAGE): t
         set *(c + FC_OFF): b
-        set *(c + FC_EXCL): FrameMark.slot(t, 3)
-        set *(c + FC_HEXCL): FrameMark.slot(head, 3)
-        set *(c + FC_HEADAT): FrameMark.slot(head, 0)
+        set *(c + FC_EXCL): FrameMark.exclusive(t)
+        set *(c + FC_HEXCL): FrameMark.exclusive(head)
+        set *(c + FC_HEADAT): FrameMark.bump(head)
         set *(c + FC_GEN): *(f + FM_GEN)
         set *(c + FC_EPOCH): *(f + FM_EPOCH)
     }
@@ -354,14 +370,14 @@ define FrameMark
         ; (measured: 92 refusals instead of 3, and the 89 are all this case).
         if *(c + FC_PAGE) <> head
         {
-            if FrameMark.slot(head, 0) <> *(c + FC_HEADAT)
+            if FrameMark.bump(head) <> *(c + FC_HEADAT)
                 return
         }
         ; 2. THE CHAIN and 3. EXCLUSIVE both live in `rewind`, which changes
         ; nothing when it cannot honour the mark. The count is the one number
         ; that shows the mark engaged: a silently disabled mark passes every
         ; differential there is.
-        if FrameMark.rewind(f, c, head)
+        if FrameMark.rewind(c, head)
             set *(f + FM_REWOUND): *(f + FM_REWOUND) + 1
     }
 
@@ -411,97 +427,28 @@ define FrameMark
         }
         ; another region can never be in the span: a container growing off an
         ; object there allocates at THAT region's end
-        if FrameMark.slot(vp, 4) <> head
+        if FrameMark.head_of(vp) <> head
             return false
         ; same region — only the pages AFTER the mark's page are in the span, and
         ; a frame appends none in 99.7 % of cases, so this walk is usually empty
-        var p FrameMark.slot(mp, 2)
+        var p FrameMark.next_page(mp)
         while p <> 0
         {
             if p = vp
                 return true
-            set p: FrameMark.slot(p, 2)
+            set p: FrameMark.next_page(p)
         }
         false
     }
 
-    ; Give back everything allocated in the marked region since the frame's mark.
-    ; Answers false and changes NOTHING when the mark cannot be honoured.
-    ;
-    ; Two passes on purpose: VALIDATE the chain first, then release. A page whose
-    ; own exclusive-page list grew since the mark must not be dropped half way,
-    ; and `allocate_oversized` attaches to the page it was CALLED on rather than
-    ; to the head, so the check is per page.
-    procedure rewind(mutable f: pointer[i64], c: pointer[i64], head: i64) returns bool
+    ; Give back everything allocated in the marked region since the frame's mark
+    ; — `Page.rewind` on the region head, with what the push recorded. It
+    ; answers false and changes NOTHING when the mark cannot be honoured
+    ; (conditions 2 and 3 live there).
+    procedure rewind(c: pointer[i64], head: i64) returns bool
     {
-        let mp *(c + FC_PAGE)
-        let mark *(c + FC_OFF)
-        ; NO "the mark's page must still be the end" test — that was the
-        ; single-page restriction, and dropping it is the point: pages appended
-        ; after `mp` are exactly what this frame added, because `allocate` only
-        ; ever appends at the region's end.
-        ; an oversized page has no bump pointer and cannot carry a mark
-        let now FrameMark.slot(mp, 0)
-        if now = 0
-            return false
-        if mark < mp
-            return false
-        if mark > now
-            return false
-        ; the mark page's own exclusive list must not have moved: an oversized
-        ; allocation since the mark put its PageNode inside the span, so the
-        ; surviving list head would dangle
-        if FrameMark.slot(mp, 3) <> *(c + FC_EXCL)
-            return false
-        ; ★★And the region HEAD's list as well, which is a DIFFERENT list as soon
-        ; as the mark sits on an extension page. `allocate` forwards an oversized
-        ; request to `allocate_oversized` on the page it was CALLED on, and a
-        ; frame allocates on its host — the head. Its PageNode is then
-        ; bump-allocated at the region's end, i.e. inside the span, so the
-        ; surviving head's list would dangle. Leaving this out cost 3 of the 48
-        ; real-world codegens; the gate is what found it.
-        if FrameMark.slot(head, 3) <> *(c + FC_HEXCL)
-            return false
-        ; the pages this frame APPENDED go back too. It is not the frame's size
-        ; that makes that necessary — 99.7 % allocate under 4 KB — but where the
-        ; bump pointer happened to stand at entry; measured, it decides 19 % of
-        ; all frames. VALIDATE the whole chain first: a page whose own exclusive
-        ; list is non-empty must not be dropped (its PageNode sits in the span we
-        ; are about to reclaim), and noticing that half way through the release
-        ; would leave the region in pieces.
-        var p FrameMark.slot(mp, 2)
-        var pages: i64 0
-        while p <> 0
-        {
-            if FrameMark.slot(p, 3) <> 0
-                return false
-            set pages: pages + 1
-            set p: FrameMark.slot(p, 2)
-        }
-        if now = mark
-        {
-            if pages = 0
-                return true
-        }
-        var q FrameMark.slot(mp, 2)
-        while q <> 0
-        {
-            let following FrameMark.slot(q, 2)
-            Page.release_page(q as pointer[Page])
-            set q: following
-        }
-        let w mp as pointer[i64]
-        ; cut the chain and make the mark's page the end again. The head records
-        ; the end, and null means "the head IS the end" — the state `allocate`
-        ; expects, it appends on demand.
-        set *(w + 2): 0
-        let hw head as pointer[i64]
-        if mp = head
-            set *(hw + 1): 0
-        else
-            set *(hw + 1): mp
-        set *w: mark
-        true
+        let hp head as pointer[Page]
+        hp.rewind(*(c + FC_PAGE) as pointer[Page], *(c + FC_OFF) as pointer[void], *(c + FC_EXCL) as pointer[PageNode], *(c + FC_HEXCL) as pointer[PageNode])
     }
 
     procedure publish_on() mutable fm_s
@@ -525,7 +472,7 @@ define FrameMark
         if head = 0
             return
         let tp Page.get(target) as i64
-        if FrameMark.slot(tp, 4) <> head
+        if FrameMark.head_of(tp) <> head
             return
         let top *(f + FM_TOP)
         if top < 0
@@ -560,7 +507,7 @@ define FrameMark
         let r target as i64
         if r >= *(c + FC_OFF)
         {
-            if r < FrameMark.slot(t, 0)
+            if r < FrameMark.bump(t)
                 return
         }
         FrameMark.publish_on()
