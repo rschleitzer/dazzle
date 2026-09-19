@@ -41,10 +41,25 @@ use scaly.memory.Page
 ; ★★A publication is a store that could put a pointer into a marked span into
 ; something that survives it. The audited list: the three `SetBox` variants, a
 ; control-stack unwind (call/cc), a frame popped without a reported result, and
-; the four lazy MEMOISATIONS the hot primitives reach (`force_select`,
-; `concat_fill`, the string rope's flatten, the grove's view arrays). `store`
-; decides each by TARGET — in another region it can never receive such a pointer,
-; and inside the running frame's own span it dies together with it.
+; the lazy MEMOISATIONS the hot primitives reach (`force_select`, `force_axis`,
+; `concat_fill`, the view prefix and path). `store` decides each by TARGET — in
+; another region it can never receive such a pointer, and inside the running
+; frame's own span it dies together with it.
+;
+; Three memos carry NO hook, because their target can never lie in a marked
+; region — the decision `store` would reach anyway, made once here instead of
+; per call (2026-09-19, when the hooks lost their global state):
+;   * the grove's view arrays and SDATA views (`chunk_views`, `attr_views`,
+;     `attr_value_views`, `set_sdata_view`): a grove is built on the run arena
+;     (the document) or on the grove manager's host (the run arena too), and
+;     every view goes on its node's OWN page;
+;   * the builtin shadow of an Identifier (`maybe_save_builtin`): identifiers
+;     are interned on the run arena (Interpreter.lookup), the shadow beside them;
+;   * the string rope's flatten: its memo page is fixed when the rope is made
+;     (`StrCatObj.memo`) — the run arena while the mark is on, where the store
+;     is a pointer to something OLDER than the rope.
+; ★A grove or identifier built on an EVAL region would break the first two —
+; nothing does today; whoever adds one owes the hook back.
 ;
 ; ★★★The class that made the audit worth doing: the engine's `Page.get(object)`
 ; idiom protects BRACKET granularity — object region and caller scratch are
@@ -131,9 +146,9 @@ use scaly.memory.Page
 ;      per GLOBAL, not per 4 KB page: every one of these globals lives in the
 ;      same page and the hot path still paid ~25 `adrp` per frame. So the whole
 ;      hot state — the scalars AND the per-frame columns — sits in one calloc'd
-;      block behind `fm_s`, read once into a register (`let f fm_s`) and
-;      addressed by the FM_*/FC_* word offsets below. A new hot field goes in
-;      the block.
+;      block, held in a register as `f` (the VM's `frame_mark` copy on the
+;      frame path) and addressed by the FM_*/FC_* word offsets below. A new
+;      hot field goes in the block.
 ;   2. The per-frame columns are ONE 64-byte line per frame (FM_COLS = 8), not
 ;      seven parallel arrays. Same instruction count for the stores, one cache
 ;      line instead of seven.
@@ -169,50 +184,32 @@ define FC_HEADAT: i64 4     ; the head's bump at the push — condition 6
 define FC_GEN: i64 5        ; -1 means "this frame carries no mark"
 define FC_EPOCH: i64 6
 
-; 0 = not asked yet, 1 = on, 2 = off. Its own global: the thin wrappers below
-; are inlined into their callers, where the block pointer is not live.
-shared fm_state: int 0
-shared fm_s: pointer[i64] null
+; The state block is the ENGINE's, not the process's: `Interpreter.make` asks
+; `create` for one and keeps it in `frame_mark`, every VM copies it (the frame
+; hooks run on the VM's hot path), and a null block is the mark switched off.
+; The hooks below take it as their first argument.
 
 define FrameMark
 {
-    procedure on() returns bool mutable fm_s, fm_state
-    {
-        if fm_state = 0
-            FrameMark.setup()
-        fm_state = 1
-    }
-
     ; ★ON by default since 2026-08-07; `DAZZLE_FRAME_MARK=0` (or the CLI's
-    ; `--no-frame-mark`) is the OPT-OUT, and it is meant to be used: if a tree
-    ; ever comes out wrong, that switch is the answer, and the difference it
-    ; makes is the diagnosis. Anything else, including the variable being unset,
-    ; turns the mark on. `FrameMark.force_off` short-circuits this whole
-    ; procedure and must therefore run before the first frame push.
-    procedure setup() mutable fm_s, fm_state
+    ; `--no-frame-mark`, Interpreter.disable_frame_mark) is the OPT-OUT, and it
+    ; is meant to be used: if a tree ever comes out wrong, that switch is the
+    ; answer, and the difference it makes is the diagnosis. Anything else,
+    ; including the variable being unset, turns the mark on. Null means off.
+    procedure create() returns pointer[i64]
     {
-        set fm_state: 2
         let e getenv("DAZZLE_FRAME_MARK")
         if e <> null
         {
             let zero "0" as char
             if (*e as u32) = 0
-                return
+                return null
             if (*e as u32) = (zero as u32)
-                return
+                return null
         }
         ; ONE block for the whole hot state — see finding 1 in the header.
-        set fm_s: calloc((FM_HDR + (FM_MAX_DEPTH * FM_COLS)) as size_t, 8) as pointer[i64]
-        if fm_s = null
-            return
-        set fm_state: 1
+        calloc((FM_HDR + (FM_MAX_DEPTH * FM_COLS)) as size_t, 8) as pointer[i64]
     }
-
-    ; The CLI's `--no-frame-mark`. Setting the state to "off" before anything
-    ; asks makes `on()` skip `setup` entirely, which is why this is a state
-    ; write and not a flag `setup` would read: it has to beat the lazy init.
-    procedure force_off() mutable fm_state
-        set fm_state: 2
 
     ; --- the region's pages, read through their typed fields ---------------
     ;
@@ -269,42 +266,41 @@ define FrameMark
     ; 2026-08-07 at 2.0 % of a codegen run (`FrameMark::push` 1.10 %,
     ; `::pop` 0.80 %, `::store` 0.09 % of self time, with the mark OFF). Split
     ; this way, LTO inlines the wrapper into its callers and the off path is a
-    ; load of `fm_state` plus a branch.
+    ; null test of the block plus a branch.
 
     ; VM.push_frame, after csp was incremented: the new frame's index is csp-1
-    procedure push(csp: int) mutable fm_s, fm_state
+    procedure push(mutable f: pointer[i64], csp: int)
     {
-        if FrameMark.on()
-            FrameMark.push_on(csp)
+        if f <> null
+            FrameMark.push_on(f, csp)
     }
 
-    procedure pop(csp: int, result: pointer[void]) mutable fm_s, fm_state
+    procedure pop(mutable f: pointer[i64], csp: int, result: pointer[void])
     {
-        if FrameMark.on()
-            FrameMark.pop_on(csp, result)
+        if f <> null
+            FrameMark.pop_on(f, csp, result)
     }
 
-    procedure pop_unknown() mutable fm_s, fm_state
+    procedure pop_unknown(mutable f: pointer[i64])
     {
-        if FrameMark.on()
-            FrameMark.publish_on()
+        if f <> null
+            FrameMark.publish_on(f)
     }
 
-    procedure store(target: pointer[void]) mutable fm_s, fm_state
+    procedure store(mutable f: pointer[i64], target: pointer[void])
     {
-        if FrameMark.on()
-            FrameMark.store_on(target)
+        if f <> null
+            FrameMark.store_on(f, target)
     }
 
-    procedure publish() mutable fm_s, fm_state
+    procedure publish(mutable f: pointer[i64])
     {
-        if FrameMark.on()
-            FrameMark.publish_on()
+        if f <> null
+            FrameMark.publish_on(f)
     }
 
-    procedure push_on(csp: int) mutable fm_s
+    procedure push_on(mutable f: pointer[i64], csp: int)
     {
-        let f fm_s
         let idx (csp - 1) as i64
         set *(f + FM_TOP): idx
         if idx < 0
@@ -342,9 +338,8 @@ define FrameMark
     ; through the Return insn: a DSSSL body typically ends in a primitive call in
     ; tail position, and treating that path as "no result reported" makes this
     ; whole mechanism report zero.
-    procedure pop_on(csp: int, result: pointer[void]) mutable fm_s
+    procedure pop_on(mutable f: pointer[i64], csp: int, result: pointer[void])
     {
-        let f fm_s
         let idx (csp - 1) as i64
         set *(f + FM_TOP): idx - 1
         if idx < 0
@@ -382,11 +377,11 @@ define FrameMark
     }
 
     ; the rewinds done so far (0 with the mark off)
-    function rewound() returns i64
+    function rewound(f: pointer[i64]) returns i64
     {
-        if fm_s = null
+        if f = null
             return 0
-        *(fm_s + FM_REWOUND)
+        *(f + FM_REWOUND)
     }
 
     ; --- condition 6: BACKFILL ------------------------------------------------
@@ -451,9 +446,8 @@ define FrameMark
         hp.rewind(*(c + FC_PAGE) as pointer[Page], *(c + FC_OFF) as pointer[void], *(c + FC_EXCL) as pointer[PageNode], *(c + FC_HEXCL) as pointer[PageNode])
     }
 
-    procedure publish_on() mutable fm_s
+    procedure publish_on(mutable f: pointer[i64])
     {
-        let f fm_s
         set *(f + FM_EPOCH): *(f + FM_EPOCH) + 1
     }
 
@@ -463,11 +457,10 @@ define FrameMark
     ; the span, while the target survives the rewind. A target in another region
     ; (the grove, the run page) allocates at THAT region's end and can never
     ; point into the span; a target inside the span dies with it.
-    procedure store_on(target: pointer[void]) mutable fm_s
+    procedure store_on(mutable f: pointer[i64], target: pointer[void])
     {
         if target = null
             return
-        let f fm_s
         let head *(f + FM_HEAD)
         if head = 0
             return
@@ -477,18 +470,18 @@ define FrameMark
         let top *(f + FM_TOP)
         if top < 0
         {
-            FrameMark.publish_on()
+            FrameMark.publish_on(f)
             return
         }
         if top >= FM_MAX_DEPTH
         {
-            FrameMark.publish_on()
+            FrameMark.publish_on(f)
             return
         }
         let c f + (FM_HDR + (top * FM_COLS))
         if *(c + FC_GEN) <> *(f + FM_GEN)
         {
-            FrameMark.publish_on()
+            FrameMark.publish_on(f)
             return
         }
         ; ★★★Deliberately STRICTER than `in_span`: the target counts as safe only
@@ -501,7 +494,7 @@ define FrameMark
         let t FrameMark.tail(head)
         if t <> *(c + FC_PAGE)
         {
-            FrameMark.publish_on()
+            FrameMark.publish_on(f)
             return
         }
         let r target as i64
@@ -510,42 +503,31 @@ define FrameMark
             if r < FrameMark.bump(t)
                 return
         }
-        FrameMark.publish_on()
+        FrameMark.publish_on(f)
     }
 
     ; Interpreter.make — the run arena, where the memo seam puts its storage
     ; while the mark is on (the seam follows the mark; see Interpreter.memo_host)
-    procedure set_perm(host: ref[Page]) mutable fm_s, fm_state
+    procedure set_perm(mutable f: pointer[i64], host: ref[Page])
     {
-        if FrameMark.on() = false
+        if f = null
             return
-        set *(fm_s + FM_PERM): host as i64
+        set *(f + FM_PERM): host as i64
     }
 
-    ; the memo seam's host: the run arena while the mark is on, `own` otherwise
-    procedure memo_host(own: ref[Page]) returns ref[Page] mutable fm_s, fm_state
+    ; the memo seam's host: the run arena while the mark is on, null otherwise
+    function perm(f: pointer[i64]) returns pointer[Page]
     {
-        if FrameMark.on() = false
-            return own
-        let p *(fm_s + FM_PERM)
-        if p = 0
-            return own
-        (p as pointer[Page]) as ref[Page]
-    }
-
-    procedure memo_is_perm() returns bool mutable fm_s, fm_state
-    {
-        if FrameMark.on() = false
-            return false
-        *(fm_s + FM_PERM) <> 0
+        if f = null
+            return null
+        *(f + FM_PERM) as pointer[Page]
     }
 
     ; Interpreter.set_eval_region — the region under every live mark changes
-    procedure region(p: ref[Page]?) mutable fm_s, fm_state
+    procedure region(mutable f: pointer[i64], p: ref[Page]?)
     {
-        if FrameMark.on() = false
+        if f = null
             return
-        let f fm_s
         if (p as i64) = *(f + FM_HEAD)
             return
         set *(f + FM_HEAD): p as i64
