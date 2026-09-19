@@ -1,0 +1,149 @@
+use scaly.memory.Page
+
+; Coding systems — the INPUT half of the byte->Char layer: every concrete
+; decoder of the reference kit (IdentityCodingSystem, UTF8CodingSystem,
+; Fixed2/Fixed4, UTF16, Unicode, EUCJP, SJIS, Big5, TranslateCodingSystem and
+; the XML autodetector). The OUTPUT half (encoders, the -b option) lives in
+; CodingSystemKit.scaly; the NAME tables and the TranslateCodingSystem maps
+; that select any of these live there too.
+;
+; The C++ runtime hierarchy (InputCodingSystem + Decoder abstracts + concretes)
+; has no Scaly vtable equivalent, so it ports the same way the output half does:
+; a flat RECORD carrying the kind plus the parameters a decoder needs (byte/word
+; order, the translate map and its sub-BCTF), dispatched on `kind`.
+;
+; STATELESSNESS. The reference's Decoder is a streaming object: it is handed one
+; read block at a time, keeps partial sequences across the boundary, and reports
+; the unconsumed tail through `rest`. Our readers decode a whole entity at once,
+; so `decode_one` answers the one question the fused decode/record-normalize
+; loop in Parser asks — "what is the char at byte i and how many bytes is it?" —
+; and a truncated sequence at the very END of the buffer is dropped, which is
+; what the reference's fill loop does with a tail that never completes.
+; The two genuinely STATEFUL systems (XML autodetect, Unicode BOM sniffing) are
+; resolved BEFORE the loop by CodingSystemKit.resolve_input, which turns them
+; into a byte offset to skip plus the decoder(s) to run.
+
+define OSP_EOF: i32 -1
+; charMax (opensp/include/constant.h): Char is restricted to the UTF-16 range.
+define OSP_CHAR_MAX: u32 0x10FFFF
+define OSP_REPLACEMENT_CHAR: u32 0xFFFD
+
+; decoder kinds (CodingSystemKitImpl::CodingSystemId, input side)
+define IENC_IDENTITY: int 0
+define IENC_UTF8: int 1
+define IENC_XML: int 2
+define IENC_FIXED2: int 3
+define IENC_FIXED4: int 4
+define IENC_UTF16: int 5
+define IENC_UNICODE: int 6
+define IENC_EUC: int 7
+define IENC_SJIS: int 8
+define IENC_BIG5: int 9
+define IENC_TRANSLATE: int 10
+
+; decode_one's "consumed bytes but produced NO char" answer — the SJIS decoder
+; has three such byte classes (128, 160, 240..255 and the two out-of-range
+; second bytes). Not a possible Char: charMax is 0x10FFFF.
+define IENC_NO_CHAR: u32 0xFFFFFFFF
+
+define CodingSystem (kind: int, sub: int, lsb_first: bool, lsw_first: bool, map: Slice[u32])
+{
+    ; the identity system — the reference's default for every app whose
+    ; environment selects nothing (CmdLineApp::initCodingSystem's last resort).
+    init() linked
+
+    function identity() @page true @direct true returns CodingSystem linked
+
+    ; a parameterless kind (identity, utf8, xml, euc, sjis, big5, unicode)
+    function simple(k: int) @page true @direct true returns CodingSystem linked
+
+    function fixed2(lsb: bool) @page true @direct true returns CodingSystem linked
+
+    function fixed4(lsb: bool, lsw: bool) @page true @direct true returns CodingSystem linked
+
+    function utf16(lsb: bool) @page true @direct true returns CodingSystem linked
+
+    ; TranslateCodingSystem: the sub-BCTF's code, then the decode map
+    ; (CodingSystemKit.make_decode_map) from that code to a Char.
+    function translate(sub_kind: int, m: Slice[u32]) @page true @direct true returns CodingSystem linked
+
+    function get_kind(this: CodingSystem) returns int linked
+
+    ; Copy this record into a caller-owned one. `set *out: <returned record>`
+    ; trips the escape checker — the value is built on the callee's frame page
+    ; and the store would outlive it — so the factories write FIELDS, exactly as
+    ; the output side's CodingSystemKit.make_encoder does.
+    procedure store(this: CodingSystem, mutable out: ref[CodingSystem]) linked
+
+    ; CodingSystem::fixedBytesPerChar — 0 for everything variable-width. It is
+    ; load-bearing exactly once: CmdLineApp::initCodingSystem REJECTS a system
+    ; coding system with more than one byte per char (without SP_WIDE_SYSTEM)
+    ; and falls back to identity, so `SP_ENCODING=UCS-2` reads 8-bit.
+    function fixed_bytes_per_char(this: CodingSystem) returns int linked
+
+    ; A leading UTF-8 byte-order mark is skipped by UTF8Decoder itself (and by
+    ; nothing else — under the identity system its three bytes are DATA). The
+    ; XML and Unicode systems handle their own marks in resolve_input.
+    function bom_skip(this: CodingSystem, input: Slice[u8]) returns size_t linked
+
+    ; --- one char at byte offset i -----------------------------------------
+    ; Returns the number of bytes consumed, 0 for "the sequence is truncated at
+    ; the end of the buffer" (the caller stops). `*out_ch` is the Char, or
+    ; IENC_NO_CHAR when the bytes carry no character at all.
+    procedure decode_one(this: CodingSystem, input: Slice[u8], i: size_t, mutable out_ch: ref[u32]) returns size_t linked
+
+    ; UTF8Decoder::decode. Faithful to the reference's table, INCLUDING the
+    ; three places it is not modern UTF-8:
+    ;   * the 5- and 6-byte forms exist;
+    ;   * every sequence of FOUR OR MORE bytes decodes to the replacement char,
+    ;     because the guards `charMax < min5 - 1` / `< min6` / `< max6` all hold
+    ;     with charMax = 0x10FFFF — so an astral character is U+FFFD, not itself
+    ;     (measured against onsgmls: U+1F600 comes back as U+FFFD);
+    ;   * an overlong sequence is decoded and THEN replaced (so its bytes are
+    ;     consumed), while a bad LEAD byte consumes itself plus every following
+    ;     continuation byte and yields ONE replacement char.
+    procedure decode_one_utf8(input: Slice[u8], i: size_t, mutable out_ch: ref[u32]) returns size_t linked
+
+    ; UTF16Decoder::decode. A high surrogate followed by a non-surrogate yields
+    ; the replacement char for the surrogate alone (its partner is then decoded
+    ; on the next step, which is exactly the reference's two-char output), and a
+    ; low surrogate on its own is the replacement char.
+    procedure decode_one_utf16(input: Slice[u8], i: size_t, lsb: bool, mutable out_ch: ref[u32]) returns size_t linked
+
+    ; EUCJPDecoder::decode — G0 direct, SS2 (0x8E) sets the high bit of one
+    ; byte, SS3 (0x8F) builds a two-byte code with the SECOND byte's high bit
+    ; CLEARED, G1 sets the high bit of the second byte.
+    procedure decode_one_euc(input: Slice[u8], i: size_t, mutable out_ch: ref[u32]) returns size_t linked
+
+    ; SJISDecoder::decode — the two lead-byte ranges fold into a JIS0208 code
+    ; with the 0x8080 bits set; 161..223 is single-byte JIS0201; 128, 160 and
+    ; 240..255 (and an out-of-range second byte) produce NO character at all.
+    procedure decode_one_sjis(input: Slice[u8], i: size_t, mutable out_ch: ref[u32]) returns size_t linked
+
+    ; Big5Decoder::decode — a high-bit byte always starts a two-byte code.
+    procedure decode_one_big5(input: Slice[u8], i: size_t, mutable out_ch: ref[u32]) returns size_t linked
+
+    ; --- whole-buffer decode (EntityManager's in-memory sources) -----------
+    ; `result` needs room for one Char per input byte; every system produces at
+    ; most that. XML/Unicode must be resolved by the caller (resolve_input) —
+    ; here they decode as their unresolved default, UTF-8 and UTF-16BE.
+    procedure decode(this: CodingSystem, input: Slice[u8], mutable result: Slice[u32]) returns size_t linked
+
+    ; --- encode (the small half kept here) ---------------------------------
+    ; The real output side is CodingSystemKit's encoder set (the -b option, with
+    ; escaping and the translate maps). This is the plain Char->byte writer the
+    ; dazzle backends use to serialize their own char streams: identity drops a
+    ; Char above 255 (IdentityEncoder has no unencodable handler here) and UTF-8
+    ; encodes the whole range. Any other kind writes UTF-8 — a decoder-only
+    ; system never reaches this path.
+    ; the UTF-8 writer as a STATIC — the dazzle backends' serialization path.
+    ; ★Deliberately not `CodingSystem.simple(IENC_UTF8).encode(…)`: holding the
+    ; returned record in a local of a function that then constructs its own
+    ; return VALUE crashed the fot backend (a String came back with data = 0x1),
+    ; the small-struct-return hazard CLAUDE.md warns about. No record, no hazard.
+    procedure encode_utf8_bytes(chars: Slice[u32], mutable out: Slice[u8]) returns size_t linked
+
+    procedure encode(this: CodingSystem, chars: Slice[u32], mutable out: Slice[u8]) returns size_t linked
+
+    function test() returns int linked
+}

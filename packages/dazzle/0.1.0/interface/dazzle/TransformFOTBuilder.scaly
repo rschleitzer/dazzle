@@ -1,0 +1,207 @@
+; TransformFOTBuilder — the faithful transform SGML/XML output sink (Stage 6a
+; Inc 5b, slice A). Ported from dazzle-net's TransformFOTBuilder.cs (structural
+; mirror) against ~/repos/dazzle/jade/TransformFOTBuilder.cxx (C++ oracle, which
+; owns the `directory` extension). Replaces the Inc 5a character-collecting
+; FOTBuilder in ProcessContext with the real record-end (RE) state machine and
+; the eight transform flow-object callbacks.
+;
+; Slice A is the sink alone, unit-tested by driving the callbacks directly.
+; Slice B wires the `make` special form -> flow-object sosofos -> process_sosofo
+; dispatch that feeds these callbacks from a stylesheet.
+;
+; RBMM: one arena region per run (roadmap doctrine). Output collects into the
+; current u32 buffer; the entity flow object swaps in a fresh buffer, flushed to
+; its file (UTF-8 via opensp's CodingSystem) on end. The directory flow object
+; mkdir's (0755) and prefixes subsequent entity filenames, per the C++/C# source
+; (the DESIGN.md no-mkdir note predated the checked-out C++ dazzle extension).
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String.String
+use scaly.containers.StringBuilder.StringBuilder
+use scaly.os.File.File
+use scaly.os.Directory.Directory
+use opensp.StringC.StringC
+use opensp.CodingSystem.CodingSystem
+use opensp.CodingSystemKit.CodingSystemKit
+use opensp.CodingSystem.IENC_UTF8
+use dazzle.Grove.GroveNode
+
+; RE (record-end) states — SGML line handling, mirrors ReState in the reference.
+define TFB_MIDDLE: int 0
+define TFB_START_OF_ELEMENT: int 1
+define TFB_PENDING_RE: int 2
+
+; libc + shim externs for the entity-FO open probe. Prototypes match the
+; other roots' declarations (runtime.scaly fopen/fclose, Storage.scaly
+; strerror/errno — extern declares must type-match across the whole root).
+; fopen is non-variadic, so a direct extern is fine (open(2) is variadic —
+; containment rule (b) would force the shim).
+function fopen(filename: pointer[const_char], mode: pointer[const_char]) returns pointer[OpaqueFile] extern
+function fclose(stream: pointer[OpaqueFile]) returns i32 extern
+function strerror(code: i32) returns pointer[const_char] extern
+function scaly_eio_errno() returns i32 extern
+procedure scaly_eputs(s: pointer[const_char]) extern
+procedure scaly_eputnl() extern
+
+; argv0 for the app-message prefix: the reference reports entity-file
+; failures through CmdLineApp::message, which renders `<argv0>:E: <text>`.
+; The CLI driver sets this once (set_prog_name). A `shared` module global,
+; not a TransformFOTBuilder field — growing a heap-hosted struct in the
+; dazzle run region trips the S62 page-boundary fragility.
+shared tfb_prog: pointer[const_char] linked
+
+; An open entity file: its content buffer, the parent buffer to restore on
+; end, the resolved output filename (empty = not redirected: open failed or
+; no name — content flows to the parent stream, like the reference leaving
+; os_ untouched), and the raw system id (the close-error message argument —
+; endEntity reports of.systemId, not the directory-joined path).
+; ... and the file's own REGION (null when the entity was not redirected): an
+; exclusive page of the run region that hosts this file's u32 buffer and the
+; encode scratch, released when the file is written. This is where a codegen
+; run's memory goes — 84 % of the peak is per-file work, and the entity flow
+; object is its seam (tests/dazzle/PERFORMANCE.md, lever 2).
+define TfbOpenFile (buf: ref[Array[u32]], save: ref[Array[u32]]?, filename: String, sysid: String, region: ref[Page]?)
+
+define TransformFOTBuilder
+(
+    out: ref[Array[u32]]
+    root: ref[Array[u32]]
+    xml: bool
+    ; the `-t sgml-raw` output option (reference ctor: RE_[0]=0, SP_[0]=' ') —
+    ; tags close with a bare '>' and attributes separate with a space instead
+    ; of the RE-per-attribute default.
+    raw: bool
+    state: int
+    open_elements: ref[Array[StringC]]
+    open_count: size_t
+    file_stack: ref[Array[TfbOpenFile]]
+    file_count: size_t
+    dir_stack: ref[Array[String]]
+    dir_count: size_t
+    host: ref[Page]
+)
+{
+    function make(host: ref[Page], xml: bool) returns ref[TransformFOTBuilder] linked
+
+    procedure set_raw(mutable this: ref[TransformFOTBuilder], raw: bool) linked
+
+    ; --- low-level output to the current buffer -----------------------------
+    procedure output_ascii(mutable this: ref[TransformFOTBuilder], s: Slice[char]) linked
+
+    procedure output_stringc(mutable this: ref[TransformFOTBuilder], s: StringC) linked
+
+    procedure flush_pending_re(mutable this: ref[TransformFOTBuilder]) linked
+
+    procedure flush_pending_re_char_ref(mutable this: ref[TransformFOTBuilder]) linked
+
+    ; TransformFOTBuilder::attributes — quote selection first: a value with no
+    ; `&` takes `"` (or `'` when it contains `"`; raw either way, `<`/`>`
+    ; included); only a value containing `&` (or both quote chars) is emitted
+    ; `"`-quoted with ONLY `"` and `&` escaped — &quot;/&amp; in xml mode,
+    ; numeric &#34;/&#38; in sgml mode (outputNumericCharRef).
+    procedure output_attribute_value(mutable this: ref[TransformFOTBuilder], value: StringC) linked
+
+    procedure output_attributes(mutable this: ref[TransformFOTBuilder], atts: ref[Array[StringC]]?) linked
+
+    ; --- flow-object callbacks ----------------------------------------------
+    ; characters(): the reference RE state machine (TransformFOTBuilder.cxx).
+    ; A pending RE is flushed ONCE up front; a leading RE right after a start
+    ; tag becomes `&#13;`; only the TRAILING RE of the chunk is deferred (so a
+    ; following end tag can drop or re-emit it); every INTERIOR RE is emitted
+    ; verbatim (a real record end, later rendered as the output newline). The
+    ; earlier code ran the pending-RE machine per character and silently lost
+    ; interior REs. Data escaping is mode-split like the reference: &lt;/&gt;/
+    ; &amp; in xml mode, numeric &#60;/&#62;/&#38; in sgml mode.
+    procedure characters(mutable this: ref[TransformFOTBuilder], data: Slice[u32]) linked
+
+    ; charactersFromNode — SDATA substitution is deferred (preserve-sdata?);
+    ; here it is the plain character path (matches the reference default).
+    procedure characters_from_node(mutable this: ref[TransformFOTBuilder], node: ref[GroveNode]?, s: Slice[u32]) linked
+
+    ; start/endElement close their tag with RE_ + '>' (an RE before the `>`,
+    ; rendered as the output newline) and each attribute is preceded by SP_
+    ; (also an RE) — the reference DEFAULTS; the compact single-line form is
+    ; the `-t sgml-raw` output option (the `raw` flag above; empty elements
+    ; close bare in both modes, like the reference).
+    procedure start_element(mutable this: ref[TransformFOTBuilder], gi: StringC, atts: ref[Array[StringC]]?) linked
+
+    procedure end_element(mutable this: ref[TransformFOTBuilder]) linked
+
+    procedure empty_element(mutable this: ref[TransformFOTBuilder], gi: StringC, atts: ref[Array[StringC]]?) linked
+
+    procedure processing_instruction(mutable this: ref[TransformFOTBuilder], data: StringC) linked
+
+    procedure document_type(mutable this: ref[TransformFOTBuilder], name: StringC, public_id: StringC, system_id: StringC) linked
+
+    procedure entity_ref(mutable this: ref[TransformFOTBuilder], name: StringC) linked
+
+    procedure formatting_instruction(mutable this: ref[TransformFOTBuilder], s: StringC) linked
+
+    ; the CLI driver's argv0 — the prefix of the entity-file app messages.
+    procedure set_prog_name(prog: pointer[const_char]) mutable tfb_prog reads tfb_prog linked
+
+    ; render `<argv0>:E: <text-head>"<arg>" (<errno text>)` on stderr — the
+    ; observed CmdLineApp::message shape (%1 StringMessageArg quoted,
+    ; %2 ErrnoMessageArg raw). rc is NOT affected (matches the reference:
+    ; the runs exit 0 with these errors on stderr).
+    procedure file_error(this: ref[TransformFOTBuilder], head: Slice[char], arg: String, err: i32) io reads tfb_prog linked
+
+    ; --- entity flow object: redirect output to a file ----------------------
+    ; startEntity (TransformFOTBuilder.cxx): the output file is opened HERE.
+    ; A failed open reports cannotOpenOutputError and leaves os_ on the
+    ; PARENT stream — the entity's content falls through to it (ultimately
+    ; stdout). Only a successful open redirects. Our sink buffers and writes
+    ; on end, so the open is a probe (create/truncate, like the reference's
+    ; eager FileOutputByteStream::open) whose failure routes the content.
+    procedure start_entity(mutable this: ref[TransformFOTBuilder], system_id: StringC) io reads tfb_prog linked
+
+    procedure end_entity(mutable this: ref[TransformFOTBuilder]) io reads tfb_prog linked
+
+    ; --- directory flow object: mkdir + prefix entity filenames -------------
+    procedure start_directory(mutable this: ref[TransformFOTBuilder], mutable path: StringC) io linked
+
+    procedure end_directory(mutable this: ref[TransformFOTBuilder]) linked
+
+    ; --- helpers ------------------------------------------------------------
+    ; StringC (u32 codepoints) -> scaly String via UTF-8 (opensp CodingSystem).
+    ; NB the returned String's buffer is allocated on `host` (the run region),
+    ; not this frame — filenames/directory paths outlive the call that builds
+    ; them (they are stashed in dir_stack / the open-file record and read back on
+    ; a later entity/flush). A frame-local String would dangle (later overwritten
+    ; -> a garbage filename -> the file silently fails to open).
+    procedure stringc_to_string(mutable this: ref[TransformFOTBuilder], sc: StringC) @page true @direct true returns String linked
+
+    procedure join_path(mutable this: ref[TransformFOTBuilder], dir: String, name: String) @page true @direct true returns String linked
+
+    ; Encode a record buffer through the reference's
+    ; RecordOutputCharStream::outputBuf record discipline: RE (0x0D) renders
+    ; as the output newline, RS (0x0A) is DROPPED (document data keeps BOTH
+    ; per line boundary — a <code> SQL case doubled every newline before
+    ; this). Raw literal CRs already leave the sink as the `&#13;` character
+    ; reference, so every remaining 0x0D is a record end.
+    ; The chars then go through the app's OUTPUT coding system, which every
+    ; stream of this sink shares — the top-level one over stdout
+    ; (TransformFOTBuilder.cxx:363) and one per entity file (:550). Both carry
+    ; outputNumericCharRef as their escaper (:368 / :553), so an unencodable
+    ; char leaves as `&#<decimal>;`. One call per FILE, because the BOM is
+    ; Encoder::startFile.
+    ; `scratch` is where the three conversion buffers go: the file's own region
+    ; while an entity file is being written (they are the same order of
+    ; magnitude as the file and die with it), the run region for the top-level
+    ; stream. NOT named `page`/`rp` — a first parameter of that name is peeled
+    ; into the implicit caller-page slot.
+    procedure encode_records(this: ref[TransformFOTBuilder], scratch: ref[Page], buf: Slice[u32]) @page true @direct true returns String reads OUTPUT_ENC linked
+
+    procedure flush_buffer_to_file(this: ref[TransformFOTBuilder], scratch: ref[Page], buf: ref[Array[u32]], filename: String) returns bool io reads OUTPUT_ENC linked
+
+    ; the top-level (root) output as a StringC — the test observation point.
+    function root_to_stringc(this: ref[TransformFOTBuilder], host: ref[Page]) @page true @direct true returns StringC linked
+
+    ; the top-level (root) output UTF-8-encoded — the CLI's stdout/-o payload.
+    ; (entity/directory flow objects write their own files; this is the main
+    ; stream, exactly what `jade -t sgml`/`xml` sends to its output byte stream.)
+    procedure root_to_utf8(mutable this: ref[TransformFOTBuilder]) @page true @direct true returns String reads OUTPUT_ENC linked
+
+    procedure test() returns int io reads tfb_prog linked
+}

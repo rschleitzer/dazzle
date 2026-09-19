@@ -1,0 +1,522 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.Location.Location
+use opensp.StringC.StringC
+use dazzle.FrameMark.FrameMark
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
+use dazzle.ELObj.FlowObj
+use dazzle.ELObj.MacroDef
+use dazzle.ELObj.OutputCharStream
+use dazzle.VM.VM
+use dazzle.Interpreter.Interpreter
+use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.Style.InheritedC
+use dazzle.Style.Convert
+use dazzle.Style.DisplayNIC
+use dazzle.Style.VarStyleRec
+use dazzle.Style.TableNIC
+use dazzle.Style.TableColumnNIC
+use dazzle.Style.TableCellNIC
+use dazzle.Style.RuleNIC
+use dazzle.Style.CharacterNIC
+use dazzle.Grove.GroveNode
+use dazzle.Primitive.Primitive
+use dazzle.Grove.CN_CHAR
+use dazzle.ProcessingMode.ProcessingMode
+
+; Insn — the threaded-code instruction set (Style/Insn.cxx, Insn2.cxx). Each
+; instruction's execute(vm) mutates the VM stacks and returns its successor
+; (null ends the run). The C++ single-inheritance Insn hierarchy is flattened
+; into one union per the opensp pattern; dispatch is `choose`. InsnPtr's
+; ref-counting is dropped — everything lives on the run arena. The style /
+; sosofo / mode instructions (Insn2.cxx: PushMode, SetStyle, SosofoAppend, ...)
+; join in later increments; this is the pure-eval core.
+;
+; Cross-module rule: VM state is reached only through VM's accessors.
+
+; Signature — a callable's argument shape (Insn.cs). keys is the keyword-arg
+; Identifier table (null unless nKey > 0).
+define Signature
+(
+    n_required: int
+    n_optional: int
+    rest_arg: bool
+    n_key: int
+    keys: pointer[pointer[Identifier]]
+)
+{
+    init(n_required: int, n_optional: int, rest_arg: bool) linked
+}
+
+; --- instruction arm records -----------------------------------------------
+define ErrorInsn ()
+define CondFailInsn (loc: Location)
+define CaseFailInsn (loc: Location)
+define ConstantInsn (value: ref[ELObj]?, next: ref[Insn]?)
+define ResolveQuantitiesInsn (loc: Location, next: ref[Insn]?)
+define TestInsn (consequent: ref[Insn]?, alternative: ref[Insn]?)
+define OrInsn (next_test: ref[Insn]?, next: ref[Insn]?)
+define AndInsn (next_test: ref[Insn]?, next: ref[Insn]?)
+define CaseInsn (obj: ref[ELObj]?, matched: ref[Insn]?, fail: ref[Insn]?)
+define PopInsn (next: ref[Insn]?)
+define ConsInsn (next: ref[Insn]?)
+define AppendInsn (loc: Location, next: ref[Insn]?)
+define ApplyInsn (n_args: int, loc: Location, next: ref[Insn]?)
+define TailApplyInsn (n_caller_args: int, n_args: int, loc: Location)
+define FrameRefInsn (index: int, next: ref[Insn]?)
+define StackRefInsn (index: int, frame_index: int, next: ref[Insn]?)
+define ClosureRefInsn (index: int, next: ref[Insn]?)
+define TopRefInsn (ident: ref[Identifier]?, next: ref[Insn]?)
+define PopBindingsInsn (n: int, next: ref[Insn]?)
+define ReturnInsn (total_args: int)
+define PrimitiveCallInsn (n_args: int, prim: ref[ELObj], loc: Location, next: ref[Insn]?)
+define ClosureInsn (sig: Signature, code: ref[Insn]?, display_length: int, next: ref[Insn]?)
+define FunctionCallInsn (n_args: int, func: ref[ELObj], loc: Location, next: ref[Insn]?)
+define FunctionTailCallInsn (n_args: int, func: ref[ELObj], loc: Location, n_caller_args: int)
+define VarargsInsn (sig: Signature, entry_points: pointer[ref[Insn]?], n_entry: int, loc: Location)
+define SetKeyArgInsn (offset: int, next: ref[Insn]?)
+define TestNullInsn (offset: int, if_null: ref[Insn]?, if_not_null: ref[Insn]?)
+define BoxInsn (next: ref[Insn]?)
+define BoxArgInsn (n: int, next: ref[Insn]?)
+define BoxStackInsn (n: int, next: ref[Insn]?)
+define UnboxInsn (next: ref[Insn]?)
+define SetBoxInsn (n: int, next: ref[Insn]?)
+define SetImmediateInsn (n: int, next: ref[Insn]?)
+define CheckInitInsn (ident: ref[Identifier]?, loc: Location, next: ref[Insn]?)
+define StackSetBoxInsn (index: int, frame_index: int, loc: Location, next: ref[Insn]?)
+define StackSetInsn (index: int, frame_index: int, next: ref[Insn]?)
+define ClosureSetBoxInsn (index: int, loc: Location, next: ref[Insn]?)
+define VectorInsn (n: int, next: ref[Insn]?)
+define ListToVectorInsn (next: ref[Insn]?)
+; MakeFlowObjInsn — the collapsed `make` (MakeExpression::compile). The value
+; stack holds one value per SLOTTED key (KEY_USE/KEY_IGNORE),
+; then n_content content sosofos, then n_bound captured display vars (the
+; VarStyleInsn capture for lazy IC codes); execute pops them, builds a FlowObj
+; + content array, and pushes the SOSO_FLOWOBJ result. Transform classes keep
+; the original collapsed shape (key_class null: keys map to the flat FlowObj
+; fields). For styled classes (Inc 8) key_class/key_ic carry the compile-time
+; keyword classification (Style.KEY_*): NICs convert into the DisplayNIC;
+; IC entries live in the prebuilt force_specs/specs arrays (constants +
+; VarInheritedC codes, StyleExpression::compile) — KEY_IC_CONST keys have no
+; slot; use: chains a style value (CheckStyleInsn semantics inline).
+define MakeFlowObjInsn (foc: int, keys: ref[Array[ref[Identifier]?]]?, key_class: ref[Array[int]]?, nic_code: ref[Insn]?, nic: NICRef, macro_proto: ref[FlowObj]?, dnic: ref[DisplayNIC]?, hf_proto: ref[Array[ref[ELObj]?]]?, force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, n_bound: int, n_content: int, has_cm: bool, cm_loc: Location, loc: Location, next: ref[Insn]?)
+; LabelSosofoInsn (Insn.cxx): stack = [flow-obj sosofo, label value]; a
+; non-symbol label is a hard labelNotASymbol error, else the sosofo is
+; wrapped in a SOSO_LABEL.
+define LabelSosofoInsn (loc: Location, next: ref[Insn]?)
+; SetNicInsn / SetPseudoNonInheritedCInsn (Insn.cxx): pop a value and set it
+; as non-inherited characteristic `ident` on the flow object at the stack top
+; (a FlowObjBox during the lazy resolve, the SOSO_FLOWOBJ result on the main
+; chain for the cell pseudo NICs). `part` >= 0 = a header/footer sosofo slot;
+; `reset_deps` = the SetNonInheritedCInsn actual-deps reset (pseudo skips it).
+define SetNicInsn (ident: ref[Identifier]?, part: int, reset_deps: bool, loc: Location, next: ref[Insn]?)
+; MakeStyleInsn — the pure `(style key: val …)` form (VarStyleInsn): stack =
+; [use value if any][n_bound display vars]; specs prebuilt like the make.
+define MakeStyleInsn (keys: ref[Array[ref[Identifier]?]]?, key_class: ref[Array[int]]?, force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, n_bound: int, loc: Location, next: ref[Insn]?)
+; PushModeInsn / PopModeInsn — with-mode brackets (Insn.cxx): save the VM's
+; EvalContext processingMode, switch to `mode`, restore on pop. The mode is a
+; plain ref[ProcessingMode]? — see VM.processing_mode for why the former
+; pointer[void] spelling was not a module-cycle requirement.
+define PushModeInsn (mode: ref[ProcessingMode]?, next: ref[Insn]?)
+define PopModeInsn (next: ref[Insn]?)
+; CheckSosofoInsn (Insn.cxx:1132): the value on top of the stack must be a
+; sosofo — otherwise `this context requires a sosofo` at `loc` and the whole
+; eval unwinds (sp = 0, no successor), which makes the enclosing construction
+; rule an error and hands the node to process-children. The reference wraps
+; EVERY content expression of a make in one, and the body of a flow-object
+; macro.
+define CheckSosofoInsn (loc: Location, next: ref[Insn]?)
+; UnpackMacroFlowObjInsn (MacroFlowObj.cxx:146) — the entry point of a
+; macro's compiled body: pop the macro flow object and push its characteristic
+; values as frame slots, then (for a compound macro) its content sosofo. A
+; characteristic never set stays NULL, which is what the TestNullInsn chain
+; behind this insn reads to substitute the declared default.
+define UnpackMacroFlowObjInsn (next: ref[Insn]?)
+
+define Insn union
+(
+    ; ★THE ORDER IS LOAD-BEARING, and it is the other half of the thin
+    ; `Insn.execute` (see the comment there). The tag is the union's declaration
+    ; index, and `execute` handles exactly the twelve arms below — so keeping
+    ; them CONTIGUOUS and FIRST is what lets the optimizer emit a range check
+    ; plus a jump table for them. Measured with them scattered over 0..34: the
+    ; same twelve arms came out as a chain of `cmp`/`b.eq` instead, which ate
+    ; the whole prologue saving (4.205 → 4.186 G, i.e. nothing). The rest keep
+    ; their old relative order and get their own table one call deeper.
+    ; `Jit.arm_index` numbers arms for its histogram and is source-level, so it
+    ; is unaffected by this order.
+    StackRef: StackRefInsn
+    Test: TestInsn
+    Unbox: UnboxInsn
+    ClosureRef: ClosureRefInsn
+    Constant: ConstantInsn
+    And: AndInsn
+    Or: OrInsn
+    ; ★`Error` sits in the hot tier because it is CALL-FREE, not because it is
+    ; hot — it is the cheapest filler that keeps the twelve real arms plus
+    ; StackRef/Test at FOURTEEN contiguous tags (AArch64 emits a jump table only
+    ; from thirteen cases up). `Case` used to hold this slot and had to leave:
+    ; its `ELObj.eqv` is recursive, so it cannot be inlined, and one call
+    ; anywhere in `execute` gives EVERY interpreted step a stack frame.
+    Error: ErrorInsn
+    FrameRef: FrameRefInsn
+    Pop: PopInsn
+    PopBindings: PopBindingsInsn
+    SetImmediate: SetImmediateInsn
+    TestNull: TestNullInsn
+    StackSet: StackSetInsn
+    PrimitiveCall: PrimitiveCallInsn
+    Return: ReturnInsn
+    FunctionCall: FunctionCallInsn
+    ResolveQuantities: ResolveQuantitiesInsn
+    Apply: ApplyInsn
+    CheckInit: CheckInitInsn
+    Cons: ConsInsn
+    TopRef: TopRefInsn
+    Box: BoxInsn
+    BoxArg: BoxArgInsn
+    BoxStack: BoxStackInsn
+    SetBox: SetBoxInsn
+    StackSetBox: StackSetBoxInsn
+    ClosureSetBox: ClosureSetBoxInsn
+    ; the last tag of the SECOND tier — `Case` calls out (ELObj.eqv), so it
+    ; belongs here and not in the leaf tier; see the note at `Error` above.
+    Case: CaseInsn
+    CondFail: CondFailInsn
+    CaseFail: CaseFailInsn
+    Append: AppendInsn
+    TailApply: TailApplyInsn
+    ClosureMk: ClosureInsn
+    FunctionTailCall: FunctionTailCallInsn
+    Varargs: VarargsInsn
+    SetKeyArg: SetKeyArgInsn
+    Vector: VectorInsn
+    ListToVector: ListToVectorInsn
+    ; ★BY POINTER, and that is a decision about the whole interpreter loop, not
+    ; about `make`. `Insn` is a flat union, so every instruction node is as wide
+    ; as its widest arm. This arm has 15 fields = 136 bytes and set that width
+    ; alone; the next widest is 72. It is built at ONE site, at stylesheet
+    ; compile time, so the indirection costs nothing a run can measure.
+    ; ★The width used to cost twice over: `execute` destructured with
+    ; `choose *this`, and the DEREF materialises a copy of the whole union in a
+    ; stack temp before the tag is even read — which the optimizer lowered to
+    ; nine unconditional payload loads before the jump table, on every
+    ; interpreted step (read out of the arm64 disassembly, 2026-08-06).
+    ; `choose this` over the pointer emits the same dispatch without the copy
+    ; and each arm loads only its own variant; see PERFORMANCE.md, "Die Kopie
+    ; vor der Sprungtabelle".
+    MakeFlowObj: ref[MakeFlowObjInsn]
+    LabelSosofo: LabelSosofoInsn
+    SetNic: SetNicInsn
+    MakeStyle: MakeStyleInsn
+    PushMode: PushModeInsn
+    PopMode: PopModeInsn
+    CheckSosofo: CheckSosofoInsn
+    UnpackMacroFlowObj: UnpackMacroFlowObjInsn
+)
+{
+    ; --- isReturn / isPopBindings peephole predicates ----------------------
+    function is_return(this: ref[Insn]) returns bool linked
+
+    function return_n(this: ref[Insn]) returns int linked
+
+    function is_pop_bindings(this: ref[Insn]) returns bool linked
+
+    function pop_bindings_n(this: ref[Insn]) returns int linked
+
+    function pop_bindings_next(this: ref[Insn]) returns ref[Insn]? linked
+
+    ; --- constructors (arena-hosted) ---------------------------------------
+    function alloc(host: ref[Page]) returns ref[Insn] linked
+
+    function make_error(host: ref[Page]) returns ref[Insn] linked
+
+    function make_cond_fail(host: ref[Page], loc: Location) returns ref[Insn] linked
+
+    function make_case_fail(host: ref[Page], loc: Location) returns ref[Insn] linked
+
+    function make_constant(host: ref[Page], value: ref[ELObj]?, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_resolve_quantities(host: ref[Page], loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_test(host: ref[Page], consequent: ref[Insn]?, alternative: ref[Insn]?) returns ref[Insn] linked
+
+    function make_or(host: ref[Page], next_test: ref[Insn]?, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_and(host: ref[Page], next_test: ref[Insn]?, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_case(host: ref[Page], obj: ref[ELObj], matched: ref[Insn]?, fail: ref[Insn]?) returns ref[Insn] linked
+
+    function make_pop(host: ref[Page], next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_cons(host: ref[Page], next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_append(host: ref[Page], loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_apply(host: ref[Page], n_args: int, loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_tail_apply(host: ref[Page], n_caller_args: int, n_args: int, loc: Location) returns ref[Insn] linked
+
+    function make_frame_ref(host: ref[Page], index: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_stack_ref(host: ref[Page], index: int, frame_index: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_closure_ref(host: ref[Page], index: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_top_ref(host: ref[Page], ident: ref[Identifier], next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_return(host: ref[Page], total_args: int) returns ref[Insn] linked
+
+    function raw_pop_bindings(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    ; PopBindingsInsn::make — the peephole: fold into a following Return or
+    ; PopBindings so the two never chain.
+    function make_pop_bindings(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_primitive_call(host: ref[Page], n_args: int, prim: ref[ELObj], loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_closure_insn(host: ref[Page], sig: Signature, code: ref[Insn]?, display_length: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_function_call(host: ref[Page], n_args: int, func: ref[ELObj], loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_function_tail_call(host: ref[Page], n_args: int, func: ref[ELObj], loc: Location, n_caller_args: int) returns ref[Insn] linked
+
+    function make_varargs(host: ref[Page], sig: Signature, entry_points: pointer[ref[Insn]?], n_entry: int, loc: Location) returns ref[Insn] linked
+
+    function make_set_key_arg(host: ref[Page], offset: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_test_null(host: ref[Page], offset: int, if_null: ref[Insn]?, if_not_null: ref[Insn]?) returns ref[Insn] linked
+
+    function make_box(host: ref[Page], next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_box_arg(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_box_stack(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_unbox(host: ref[Page], next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_set_box(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_set_immediate(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_check_init(host: ref[Page], ident: ref[Identifier], loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_stack_set_box(host: ref[Page], index: int, frame_index: int, loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_stack_set(host: ref[Page], index: int, frame_index: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_closure_set_box(host: ref[Page], index: int, loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_vector(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_list_to_vector(host: ref[Page], next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_flow_obj(host: ref[Page], foc: int, keys: ref[Array[ref[Identifier]?]]?, key_class: ref[Array[int]]?, nic_code: ref[Insn]?, nic: NICRef, macro_proto: ref[FlowObj]?, dnic: ref[DisplayNIC]?, hf_proto: ref[Array[ref[ELObj]?]]?, force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, n_bound: int, n_content: int, has_cm: bool, cm_loc: Location, loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_check_sosofo(host: ref[Page], loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_unpack_macro(host: ref[Page], next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_label_sosofo_insn(host: ref[Page], loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_set_nic(host: ref[Page], ident: ref[Identifier]?, part: int, reset_deps: bool, loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_style_insn(host: ref[Page], keys: ref[Array[ref[Identifier]?]]?, key_class: ref[Array[int]], force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, n_bound: int, loc: Location, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_push_mode(host: ref[Page], mode: ref[ProcessingMode]?, next: ref[Insn]?) returns ref[Insn] linked
+
+    function make_pop_mode(host: ref[Page], next: ref[Insn]?) returns ref[Insn] linked
+
+    ; --- ApplyBaseInsn::decodeArgs -----------------------------------------
+    ; Pop the function off the top, validate the arg count against its
+    ; signature, and return the function (null on error, having set sp = -1).
+    procedure decode_args(mutable vm: ref[VM], n_args: int, loc: Location) returns ref[ELObj]? io reads msg_prog linked
+
+    ; ApplyInsn::execute / TailApplyInsn::execute, factored so ApplyFn can
+    ; reuse them.
+    procedure exec_apply(mutable vm: ref[VM], n_args: int, mutable loc: Location, next: ref[Insn]?) returns ref[Insn]? io reads msg_prog linked
+
+    procedure exec_tail_apply(mutable vm: ref[VM], n_caller_args: int, n_args: int, mutable loc: Location) returns ref[Insn]? io reads msg_prog linked
+
+    ; --- the execution loop body -------------------------------------------
+    ; ★TWO functions on purpose, and the split is the union lesson applied to
+    ; CODE. One `choose` over all 47 arms is ONE stack frame, sized by the
+    ; WIDEST arm: the shipped build entered `Insn.execute` with `sub sp, sp,
+    ; #0x1b0` plus six `stp` pairs (twelve callee-saved registers) plus a
+    ; region-frame descriptor, on EVERY interpreted step — 21.97 million of them
+    ; on a single-file real-world codegen. The arms that need any of that are
+    ; the ones that call out (PrimitiveCall, Return, MakeFlowObj, the message
+    ; paths); the arms that carry the step count need nothing but the value
+    ; stack.
+    ;
+    ; So the arms sit in THREE tiers, each one call deeper and each with its own
+    ; frame: the call-free ones here, the ones that call out but stage nothing
+    ; wide in `execute_rest`, and the frame-sizing ones in `execute_cold`. That
+    ; is the reference's shape by another road — openjade gives every Insn
+    ; subclass its own virtual `execute`, so StackRefInsn::execute has
+    ; StackRef's frame and nobody else's. Nothing is duplicated: an arm lives in
+    ; exactly one of the three functions.
+    ;
+    ; ★★★And this tier is a LEAF, which is a stronger condition than "cheap
+    ; arms" and has to be maintained deliberately: a function that calls ANYTHING
+    ; on ANY path gets a stack frame, and every step through the jump table then
+    ; pays its entry and exit. Two calls hid here until 2026-08-07 — `ELObj.eqv`
+    ; in the `Case` arm (recursive, so never inlinable ⇒ Case moved down a tier)
+    ; and the `grow_stack` half of `need_stack`, which the optimizer inlined into
+    ; all four pushing arms (⇒ `execute_grow`, below). The check is one line of
+    ; disassembly: `Insn::execute` must contain no `bl` and no `stp`/`ldp` pair.
+    ;
+    ; ★★★It also RUNS the tier rather than stepping it: as long as the successor
+    ; is another arm of this tier, the loop keeps going, and only a cold-tier
+    ; insn (a tail call to `execute_rest`) or a stack growth hands control back.
+    ; What that buys is the ENTRY, not the arm: the jump table's base address is
+    ; loop-invariant (three instructions of `adrp`/`add`/`adr` that used to be
+    ; recomputed on every step), and with it go the `bl`/`ret` of the call from
+    ; `VM.eval` and that loop's own per-iteration tests. The mean run length is a
+    ; MEASURED number, not an estimate — a call consumes exactly one cold-tier
+    ; step, so it is `steps / cold steps`: 2.61 on a single-file codegen, 2.32 on
+    ; the 1804-file one, 2.16 on a styling run (2026-08-07, `--jit --jit-stats`
+    ; with `DAZZLE_JIT_THRESHOLD=2000000000`, before the JIT was removed).
+    procedure execute(mutable this: ref[Insn], mutable vm: ref[VM]) returns ref[Insn]? io reads msg_prog linked
+
+    procedure execute_rest(mutable this: ref[Insn], mutable vm: ref[VM]) @page true @returnpage true returns ref[Insn]? io reads msg_prog linked
+
+    ; ★The GROWTH half of the four PUSHING arms, out of line — and it is what
+    ; keeps `execute` a LEAF. `need_stack` is two loads and a branch, but its
+    ; slow half calls `Page.allocate`, and the optimizer inlined that into all
+    ; four arms: ONE call anywhere in a function gives the WHOLE function a
+    ; frame, so every interpreted step paid three `stp` on entry and three `ldp`
+    ; on exit — read out of the shipped build's disassembly 2026-08-07, 60 % of
+    ; 21.97 M steps on a single-file real-world codegen. Same mechanic as the
+    ; region frame one tier down (PERFORMANCE.md, "Der Rahmen je Primitivaufruf"),
+    ; only with a plain call instead of a region frame.
+    ;
+    ; The four arms are REPEATED here rather than re-entered through `execute`:
+    ; a mutual recursion would let the inliner fold this function back into the
+    ; caller and undo the whole point. Whoever edits an arm above edits it here.
+    procedure execute_grow(this: ref[Insn], mutable vm: ref[VM]) returns ref[Insn]? linked
+
+    ; --- the cold halves of the tier-2 error arms ---------------------------
+    ; ★These exist so the ARM stays a branch. Every one of them reports a
+    ; diagnostic, and reporting allocates (the message's argument vector, a
+    ; printed object) — inlined into `execute_rest` that allocation would be a
+    ; caller-side one, and a region frame is contagious across the whole
+    ; function (the 2026-08-07 measurement: 40 % of all steps enter tier 2 and
+    ; would pay two stores plus a load/branch/release test each). Same standing
+    ; rule as the four `*_error` helpers of `Primitive.dispatch`: no arm of a
+    ; thin shell may demand the caller's side.
+    ;
+    ; CheckInitInsn::execute (Insn.cxx:1036).
+    ; ★A `jit_check_init_fail` mirrors this function for the JIT's pinned
+    ; (void*, void*) C ABI, referenced only by ADDRESS. Changing this
+    ; declaration drops that helper from emission SILENTLY -- rc 0, no
+    ; diagnostic, and `ld: symbol(s) not found` is the only evidence.
+    ; ★★★It REPORTS and nothing else, and that is what the pin costs. It
+    ; used to end `vm.fail() as ref[Insn]` -- an unwrap of a function that
+    ; returns null ALWAYS, so every uninitialized-variable diagnostic exited
+    ; 21 right after printing itself (engine `diag1b`, once the optional
+    ; defaults were repaired and the path became reachable at all). The honest
+    ; `returns ref[Insn]?` is exactly what the warning above forbids, so the
+    ; fail moves to the two CALL SITES, where the return type already is one.
+    procedure check_init_report(mutable vm: ref[VM], ident: ref[Identifier]?, loc: Location) io reads msg_prog linked
+
+    ; StackSetBoxInsn/ClosureSetBoxInsn::execute (Insn.cxx:946/923) — assigning
+    ; through a read-only box.
+    ; ★This one CANNOT fire in this port today, and the reason is the same one
+    ; `Primitive.vector_fill` already carries: `readOnly` is a COLLECTOR bit
+    ; (Collector.h:20, set by makePermanent and the tracing pass) and this port
+    ; has no collector, so `BoxObj.read_only` is initialised false and never
+    ; set. It is ported anyway because the arm that reads the bit IS ported —
+    ; a check whose failure branch says nothing is exactly the class this
+    ; file's audit was about. Measured 2026-08-08: no expression reaches it.
+    procedure read_only_fail(mutable vm: ref[VM], loc: Location) returns ref[Insn]? io reads msg_prog linked
+
+    ; AppendInsn::execute (Insn.cxx:352/363) — the spliced value is not a list.
+    procedure splice_not_list_fail(mutable vm: ref[VM], loc: Location) returns ref[Insn]? io reads msg_prog linked
+
+    ; The third tier: the arms nobody's step count depends on, and the ones that
+    ; make `Insn.execute_rest` expensive to ENTER. What sizes a frame is not how
+    ; much an arm does but what it STAGES for a call: `Signature` by value in
+    ; exec_varargs, nine parameters plus a stack argument in exec_make_style,
+    ; the fifteen of exec_make_styled_flow_obj, an OutputCharStream in CaseFail.
+    ; Together they made every step that entered execute_rest pay `sub sp, sp,
+    ; #0x1b0`, twelve callee-saved registers and a region frame — measured
+    ; 2026-08-07 as 16.1 % of a single-file real-world codegen, with 40 % of the
+    ; steps going in. See the comment on `execute` for the jump-table rule the
+    ; tag layout has to keep.
+    procedure execute_cold(mutable this: ref[Insn], mutable vm: ref[VM]) @page true @returnpage true returns ref[Insn]? io reads msg_prog linked
+
+    ; MakeFlowObjInsn::execute — the transform `make`. The value stack holds the
+    ; n_key characteristic values followed by n_content content sosofos; build a
+    ; FlowObj from the characteristics, collect the content into an array, and
+    ; push a SOSO_FLOWOBJ result. (No inherited-C / style machinery — extension
+    ; flow objects only, the transform backend's whole surface.)
+    procedure exec_make_flow_obj(this: ref[Insn], mutable vm: ref[VM], foc: int, keys: ref[Array[ref[Identifier]?]]?, n_content: int, loc: Location, next: ref[Insn]?) @page true @direct true returns ref[Insn]? io reads msg_prog linked
+
+    ; the styled `make` (Inc 8): keywords were classified at compile
+    ; (Style.KEY_*). Stack = one slot per use:/ignored key (key order),
+    ; n_content sosofos, then n_bound captured display vars (the VarStyleInsn
+    ; capture, shared by the lazy VarInheritedC codes AND the lazy NIC code).
+    ; Constant NIC values were baked into the dnic/tnic/hf prototypes at
+    ; compile (applyConstNonInheritedCs); non-constant ones live in nic_code,
+    ; evaluated per process by ProcessContext.resolve_nics on a fresh copy.
+    ; use: attaches a style chain (CheckStyleInsn: a non-style value is a hard
+    ; styleContext error).
+    procedure exec_make_styled_flow_obj(this: ref[Insn], mutable vm: ref[VM], foc: int, keys: ref[Array[ref[Identifier]?]]?, key_class: ref[Array[int]]?, nic_code: ref[Insn]?, nic_proto: NICRef, macro_proto: ref[FlowObj]?, dnic_proto: ref[DisplayNIC]?, hf_proto: ref[Array[ref[ELObj]?]]?, force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, n_bound: int, n_content: int, has_cm: bool, cm_loc: Location, mutable loc: Location, next: ref[Insn]?) @page true @direct true returns ref[Insn]? io reads msg_prog linked
+
+    function key_has_slot(cls: int) returns bool linked
+
+    ; SetNicInsn::execute — pop the value, set it as non-inherited
+    ; characteristic on the flow object below it (a FlowObjBox seed during the
+    ; lazy resolve; the SOSO_FLOWOBJ make result for the cell pseudo NICs).
+    ; Conversion failures message (at the value location) and continue; only
+    ; an error VALUE (already unwound by the value code) aborts.
+    procedure exec_set_nic(this: ref[Insn], mutable vm: ref[VM], ident: ref[Identifier], part: int, reset_deps: bool, mutable loc: Location, next: ref[Insn]?) @page true @direct true returns ref[Insn]? io reads msg_prog linked
+
+    ; LabelSosofoInsn::execute — stack = [flow-obj sosofo, label value]; a
+    ; non-symbol label is a hard labelNotASymbol error (unwind), else the
+    ; sosofo is wrapped in a SOSO_LABEL carrying the symbol + location.
+    procedure exec_label_sosofo(this: ref[Insn], mutable vm: ref[VM], loc: Location, next: ref[Insn]?) returns ref[Insn]? io reads msg_prog linked
+
+    ; VarStyleInsn's display capture: the top n_bound stack values into a
+    ; null-terminated array (same shape as a closure display).
+    function capture_display(vm: ref[VM], host: ref[Page], from: int, n_bound: int) returns pointer[pointer[ELObj]] linked
+
+    ; MakeStyleInsn::execute — build the style value (VarStyleInsn): stack =
+    ; [use value if any][n_bound display vars]; specs prebuilt at compile.
+    procedure exec_make_style(this: ref[Insn], mutable vm: ref[VM], keys: ref[Array[ref[Identifier]?]]?, key_class: ref[Array[int]], force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, n_bound: int, loc: Location, next: ref[Insn]?) returns ref[Insn]? io reads msg_prog linked
+
+    ; convertStringPairList: a list of ("name" "value") pairs -> a flat StringC
+    ; list [name, value, name, value, …] (output_attributes' pairwise walk).
+    procedure flow_obj_atts(host: ref[Page], mutable val: ref[ELObj]?) returns ref[Array[StringC]] linked
+
+    ; AppendInsn::execute — splice the list at [sp-1] onto [sp-2].
+    procedure exec_append(this: ref[Insn], mutable vm: ref[VM], loc: Location, next: ref[Insn]?) returns ref[Insn]? io reads msg_prog linked
+
+    ; ClosureInsn::execute — capture the display and build a closure.
+    procedure exec_closure(this: ref[Insn], mutable vm: ref[VM], sig: Signature, code: ref[Insn]?, display_length: int, next: ref[Insn]?) returns ref[Insn]? linked
+
+    ; UnpackMacroFlowObjInsn::execute + MacroFlowObj::unpack. The seed on the
+    ; stack is the macro's SOSO_FLOWOBJ sosofo (this port keeps a flow
+    ; object's content in the sosofo, not on the FlowObj, so the seed carries
+    ; both halves); it is POPPED and replaced by one frame slot per declared
+    ; characteristic plus, for a compound macro, the content sosofo. Several
+    ; content sosofos fold into one SOSO_APPEND (the reference's SetContentInsn
+    ; already appended them into a single SosofoObj).
+    procedure exec_unpack_macro(this: ref[Insn], mutable vm: ref[VM], next: ref[Insn]?) returns ref[Insn]? linked
+
+    ; VectorInsn::execute — build a vector from the top n stack slots.
+    procedure exec_vector(this: ref[Insn], mutable vm: ref[VM], n: int, next: ref[Insn]?) returns ref[Insn]? linked
+
+    ; ListToVectorInsn::execute — collect a proper list into a vector.
+    procedure exec_list_to_vector(this: ref[Insn], mutable vm: ref[VM], next: ref[Insn]?) returns ref[Insn]? linked
+
+    ; VarargsInsn::execute — dispatch to the entry point for the actual arg
+    ; count, consing rest args and matching keywords when the signature has
+    ; a rest or key tail.
+    ; Answers the entry point for the actual arity -- an Option, because the
+    ; table holds null for arities the signature cannot take (Expression
+    ; writes them), and `execute` hands the result on as its own `ref[Insn]?`.
+    procedure exec_varargs(this: ref[Insn], mutable vm: ref[VM], sig: Signature, entry_points: pointer[ref[Insn]?], n_entry: int, loc: Location) returns ref[Insn]? io reads msg_prog linked
+}

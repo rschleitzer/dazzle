@@ -1,0 +1,959 @@
+; Style — the inherited-characteristics foundation (Stage 6a Inc 8, slice 1).
+; Ported from ~/repos/dazzle/style/Style.{h,cxx} + InheritedC.cxx (C++ oracle;
+; the C# mirror is openjade-net/src/OpenJade/Style). The reference models an
+; InheritedC as a class hierarchy (six generic kinds + specials) whose set()
+; drives a FOTBuilder setter; here it is one kind-tagged record whose set_ic
+; renders through the SgmlFOTBuilder (the fot backend is the only IC consumer
+; in this slice — the transform backend's setters are no-ops and its path never
+; pushes styles).
+;
+; Lazy IC values (the reference design, replacing the slice-1 eager collapse):
+; a non-constant IC value expression compiles to standalone code (VarInheritedC
+; = a proto + code + loc record) evaluated at style-PUSH time against the
+; style's captured display vars and creation node (VarStyleRec). The push
+; machinery (InheritedCInfo cached_value/spec_level/dependencies, PopList
+; depending_list) supports the inherited-*/actual-* primitives; the VM-facing
+; evaluation glue lives in VM.scaly (Style cannot import VM — VM→Insn→Style).
+;
+; RBMM: prototype ICs + registry live on the interpreter's run page; per-make
+; constant ICs + VarInheritedC records + spec arrays on the compile host (with
+; the insn chain); push-time conversions and StyleStack push nodes
+; (InheritedCInfo/PopList) on the current node's eval scratch region — they are
+; popped inside the same bracket (inner→outer pointers only). The StyleStack
+; record + its info array live on the run page.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
+use dazzle.ELObj.FlowObj
+use dazzle.ELObj.QuantityValue
+use dazzle.ELObj.EngLenSpec
+use dazzle.ELObj.GlyphSubstTableRec
+use dazzle.ELObj.AddressRec
+use dazzle.Interpreter.Interpreter
+use dazzle.ProcessingMode.Rule
+use dazzle.ProcessingMode.Action
+use dazzle.InterpreterMessages.InterpreterMessages
+use opensp.Location.Location
+use dazzle.Grove.GroveNode
+use dazzle.Insn.Insn
+
+; Interpreter::convertFromString hints (Interpreter.h:463) — which shapes a
+; STRING may be reinterpreted as under `-2`; each converter names its own.
+; ★They live in THIS module, not in Interpreter, because a module may only
+; read the globals of a module declared BEFORE it (dazzle.scaly's order) —
+; and read the wrong way round they do not merely fail to resolve: passed as
+; a call ARGUMENT the whole call is silently dropped and the result is
+; garbage (measured 2026-07-31, every gated characteristic then failing to
+; convert). Beside a binary operator the same read is a hard diagnostic.
+define CONVERT_ALLOW_BOOLEAN: int 1
+define CONVERT_ALLOW_SYMBOL: int 2
+define CONVERT_ALLOW_NUMBER: int 4
+
+; --- InheritedC kinds (the generic classes of InheritedC.cxx) ---------------
+define IC_BOOL: int 0
+define IC_LENGTH: int 1
+define IC_LENGTH_SPEC: int 2
+define IC_SYMBOL: int 3
+define IC_STRING: int 4
+define IC_INT: int 5
+define IC_PUBLIC_ID: int 6
+define IC_LETTER2: int 7
+; #f or strictly positive integer (GenericMaybeIntegerInheritedC); lval 0 = #f.
+define IC_MAYBE_INT: int 8
+; an ignored characteristic (IgnoredC): any value accepted, set() emits
+; nothing, value() returns the stored ELObj.
+define IC_IGNORED: int 9
+; BorderC (table-border / cell-*-border): like IgnoredC (set() silent, value()
+; = stored obj) but the value must be a table-border sosofo or a boolean
+; (canonicalized to #t/#f).
+define IC_BORDER: int 10
+; ColorC: obj = a ColorObj ELObj (never null; initial device-RGB black).
+define IC_COLOR: int 11
+; BackgroundColorC: obj = a ColorObj or null (#f -> the no-arg
+; setBackgroundColor).
+define IC_OPT_COLOR: int 12
+; GenericOptLengthSpecInheritedC: #f or a length-spec; bval true = #f
+; (hasLength 0), else ls holds the value.
+define IC_OPT_LENGTH_SPEC: int 13
+; GenericInlineSpaceInheritedC: obj = an InlineSpaceObj ELObj (never null).
+define IC_INLINE_SPACE: int 14
+; GenericOptInlineSpaceInheritedC: obj = an InlineSpaceObj or null (#f).
+; set() renders nothing in the fot backend (setInlineSpaceSpace is not
+; overridden in the reference SgmlFOTBuilder).
+define IC_OPT_INLINE_SPACE: int 15
+; GlyphSubstTableC: gst holds the table payloads, bval distinguishes the
+; list form from #f/single (inherited-glyph-subst-table rewraps).
+define IC_GST: int 16
+; RuleC (fraction-bar): like IgnoredC (set() silent, value() = stored obj)
+; but the value must be a rule-FO sosofo (the rule class binding included).
+define IC_RULE: int 17
+
+; --- make-keyword classification (MakeExpression::compile split) ------------
+define KEY_NIC: int 0
+; an IC key, fully handled at compile (constant or VarInheritedC entry in the
+; insn's prebuilt spec arrays) — no stack slot, nothing to do at exec.
+define KEY_IC_CONST: int 1
+; an unknown keyword (messaged at compile): the reference never compiles its
+; value expression — no stack slot.
+define KEY_DROP: int 2
+define KEY_USE: int 3
+; evaluated and dropped (label:/content-map:, line-field priorities).
+define KEY_IGNORE: int 4
+; HISTORICAL (Inc 8 slices 2-4): the simple-page-sequence header/footer sosofo
+; NICs had their own slotted class; they now ride the NIC machinery (constants
+; into the insn's hf prototype, non-constants into the lazy nic_code chain
+; with a part index on the SetNic insn). The constant stays reserved.
+define KEY_HF: int 5
+; a NIC-family key with a CONSTANT value, fully converted at compile into the
+; insn's prototype records (applyConstNonInheritedCs: display NIC, table NIC,
+; header/footer sosofo) — no stack slot, nothing to do at exec.
+define KEY_TABLE_CONST: int 6
+; a table-cell pseudo NIC (column-number / n-columns-spanned / starts-row? /
+; ends-row?) with a non-constant value: evaluated at CONSTRUCTION on the main
+; insn chain (SetPseudoNonInheritedCInsn) — the cell's pushStyle needs them
+; before the lazy NIC resolve.
+define KEY_PSEUDO_NIC: int 7
+; label: — the value expr compiles onto the post-make chain, a LabelSosofo
+; insn wraps the finished flow object (no key slot).
+define KEY_LABEL: int 8
+; content-map: — the value expr evaluates right after the content sosofos;
+; the make insn wraps the content with a SOSO_CONTENT_MAP (no key slot).
+define KEY_CONTENT_MAP: int 9
+
+; --- FOTBuilder::Symbol codes the NIC enum sets need ------------------------
+; (full table installed as symbol c-values by Interpreter.install_c_value_
+; symbols; codes = enum order in FOTBuilder.h)
+define SYM_FALSE: int 0
+define SYM_TRUE: int 1
+define SYM_HORIZONTAL: int 47
+define SYM_VERTICAL: int 48
+define SYM_ESCAPEMENT: int 49
+define SYM_LINE_PROGRESSION: int 50
+define SYM_PAGE: int 61
+define SYM_PAGE_REGION: int 62
+define SYM_COLUMN_SET: int 63
+define SYM_COLUMN: int 64
+define SYM_TOP: int 88
+define SYM_BOTTOM: int 89
+define SYM_FORCE: int 95
+define SYM_BEFORE: int 38
+define SYM_THROUGH: int 39
+define SYM_AFTER: int 40
+define SYM_TOP_TO_BOTTOM: int 41
+define SYM_LEFT_TO_RIGHT: int 42
+define SYM_BOTTOM_TO_TOP: int 43
+define SYM_RIGHT_TO_LEFT: int 44
+define SYM_MAX_SCALE: int 65
+define SYM_MAX_UNIFORM: int 66
+
+; FOTBuilder::LengthSpec — length in units (millipoints at 72000 upi) plus a
+; display-size factor (display-size-relative specs; slice 1 produces factors
+; only through length-spec VALUES, not arithmetic — see DESIGN.md).
+define LengthSpec (length: int, factor: double)
+{
+    init() linked
+
+    function is_set(this: LengthSpec) returns bool linked
+
+    function differs(this: LengthSpec, other: LengthSpec) returns bool linked
+}
+
+; FOTBuilder::DisplaySpace (defaults per its ctor: priority 0, conditional 1,
+; force 0).
+define DisplaySpace (nominal: LengthSpec, min: LengthSpec, max: LengthSpec, priority: int, conditional: bool, force: bool)
+{
+    init() linked
+
+    function make(host: ref[Page]) returns ref[DisplaySpace] linked
+}
+
+; FOTBuilder::InlineSpace.
+define InlineSpace (nominal: LengthSpec, min: LengthSpec, max: LengthSpec)
+{
+    init() linked
+
+    function make(host: ref[Page]) returns ref[InlineSpace] linked
+}
+
+; a validated FOT symbol value: the c-value code plus the interned print name
+; (code 0 = false, 1 = true; names render as "false"/"true").
+define FotSym (code: int, name: StringC)
+{
+    init() linked
+}
+
+; The class-specific non-inherited characteristics of a flow object.
+; Upstream gives every FlowObj subclass an `Owner<FOTBuilder::XNIC> nic_` of
+; its own type; the port's single FlowObj record (tagged by `foc`) holds ONE
+; of the twenty-two NIC records behind this pointer alias and reads it back
+; under the class's type (`fo.get_nic() as ref[TableNIC]`). One declaration
+; per opaque kind is the accepted form (CLAUDE.md, pointer[void]); a NICRef
+; handed where a grove declaration or a page belongs is a planner error.
+define NIC()
+define NICRef pointer[NIC]
+
+; FOTBuilder::DisplayNIC (+ DisplayGroupNIC's coalesce-id, carried flat).
+define DisplayNIC
+(
+    space_before: DisplaySpace
+    space_after: DisplaySpace
+    position_preference: FotSym
+    keep: FotSym
+    break_before: FotSym
+    break_after: FotSym
+    keep_with_previous: bool
+    keep_with_next: bool
+    may_violate_keep_before: bool
+    may_violate_keep_after: bool
+    has_coalesce_id: bool
+    coalesce_id: StringC
+)
+{
+    function make(host: ref[Page]) returns ref[DisplayNIC] linked
+
+    function copy(this: ref[DisplayNIC], host: ref[Page]) returns ref[DisplayNIC] linked
+}
+
+; --- table-family NIC records (FOTBuilder.h TableNIC/TableColumnNIC/
+; TableCellNIC + the FlowObj.cxx NIC extensions, flattened) -----------------
+define TABLE_WIDTH_FULL: int 0
+define TABLE_WIDTH_MINIMUM: int 1
+define TABLE_WIDTH_EXPLICIT: int 2
+
+; TableFlowObj::NIC: width + the four border styles (a style ELObj, resolved
+; from a table-border sosofo or a boolean; null = unspecified -> the
+; table-border IC fallback at process).
+define TableNIC
+(
+    width_type: int
+    width: LengthSpec
+    before_row_border: ref[ELObj]?
+    after_row_border: ref[ELObj]?
+    before_column_border: ref[ELObj]?
+    after_column_border: ref[ELObj]?
+)
+{
+    function make(host: ref[Page]) returns ref[TableNIC] linked
+
+    function copy(this: ref[TableNIC], host: ref[Page]) returns ref[TableNIC] linked
+}
+
+; TableColumnFlowObj::NIC (columnIndex zero-based; the width is a
+; TableLengthSpec — the FOT LengthSpec plus the table-unit factor, flattened
+; into width + width_tfactor).
+define TableColumnNIC
+(
+    column_index: int
+    n_columns_spanned: int
+    has_column_number: bool
+    has_width: bool
+    width: LengthSpec
+    width_tfactor: double
+)
+{
+    function make(host: ref[Page]) returns ref[TableColumnNIC] linked
+
+    function copy(this: ref[TableColumnNIC], host: ref[Page]) returns ref[TableColumnNIC] linked
+}
+
+; TableCellFlowObj::NIC (missing marks the synthesized filler cells).
+define TableCellNIC
+(
+    missing: bool
+    column_index: int
+    n_columns_spanned: int
+    n_rows_spanned: int
+    has_column_number: bool
+    starts_row: bool
+    ends_row: bool
+)
+{
+    function make(host: ref[Page]) returns ref[TableCellNIC] linked
+
+    function copy(this: ref[TableCellNIC], host: ref[Page]) returns ref[TableCellNIC] linked
+}
+
+; FOTBuilder::RuleNIC minus the embedded DisplayNIC/InlineNIC bases (the
+; display half rides in FlowObj.dnic as usual; the InlineNIC break
+; priorities live here — the rule dump prints them for the non-display
+; orientations). orientation defaults to horizontal (RuleNIC()).
+define RuleNIC
+(
+    orientation: FotSym
+    has_length: bool
+    length: LengthSpec
+    break_before_priority: int
+    break_after_priority: int
+)
+{
+    function make(host: ref[Page]) returns ref[RuleNIC] linked
+
+    function copy(this: ref[RuleNIC], host: ref[Page]) returns ref[RuleNIC] linked
+}
+
+; FOTBuilder::Address::Type — all eight, in the reference's enum order
+; (FOTBuilder.h:433). `tei` and `html` are declared but no primitive of the
+; reference ever produces them; they exist because TeXFOTBuilder::startLink
+; switches over the full enum, and this port keeps both arms for the same
+; reason.
+define ADDR_NONE: int 0
+define ADDR_RESOLVED_NODE: int 1
+define ADDR_IDREF: int 2
+define ADDR_ENTITY: int 3
+define ADDR_SGML_DOCUMENT: int 4
+define ADDR_HYTIME_LINKEND: int 5
+define ADDR_TEI: int 6
+define ADDR_HTML: int 7
+
+; link NIC (destination:) — node is a ref[GroveNode]?, as Clark's Address is.
+; FOTBuilder::LineFieldNIC — the InlineNIC break priorities of a line-field.
+; The fot dump drops them (SgmlFOTBuilder::startLineField ignores its NIC) but
+; the TeX backend prints them, so they ride the ordinary tnic machinery.
+define LineFieldNIC (break_before_priority: int, break_after_priority: int)
+{
+    function make(host: ref[Page]) returns ref[LineFieldNIC] linked
+
+    function copy(this: ref[LineFieldNIC], host: ref[Page]) returns ref[LineFieldNIC] linked
+}
+
+; the `specifiedC` bit indices of FOTBuilder::CharacterNIC (enum order — the
+; fot dump renders in exactly this order, so the numbering is a contract).
+define CNIC_IS_DROP_AFTER_LINE_BREAK: int 0
+define CNIC_IS_DROP_UNLESS_BEFORE_LINE_BREAK: int 1
+define CNIC_IS_PUNCT: int 2
+define CNIC_IS_INPUT_WHITESPACE: int 3
+define CNIC_IS_INPUT_TAB: int 4
+define CNIC_IS_RECORD_END: int 5
+define CNIC_IS_SPACE: int 6
+define CNIC_CHAR: int 7
+define CNIC_GLYPH_ID: int 8
+define CNIC_SCRIPT: int 9
+define CNIC_MATH_CLASS: int 10
+define CNIC_MATH_FONT_POSTURE: int 11
+define CNIC_BREAK_BEFORE_PRIORITY: int 12
+define CNIC_BREAK_AFTER_PRIORITY: int 13
+
+; the math-class / math-font-posture enum sets (FOTBuilder::Symbol codes).
+define SYM_NOT_APPLICABLE: int 2
+define SYM_UPRIGHT: int 20
+define SYM_OBLIQUE: int 21
+define SYM_BACK_SLANTED_OBLIQUE: int 22
+define SYM_ITALIC: int 23
+define SYM_BACK_SLANTED_ITALIC: int 24
+define SYM_ORDINARY: int 52
+define SYM_OPERATOR: int 53
+define SYM_BINARY: int 54
+define SYM_RELATION: int 55
+define SYM_OPENING: int 56
+define SYM_CLOSING: int 57
+define SYM_PUNCTUATION: int 58
+define SYM_INNER: int 59
+define SYM_SPACE: int 60
+
+; FOTBuilder::CharacterNIC — the `character` flow object's non-inherited
+; characteristics. `specified` is the bit set above: the fot dump prints a
+; field only when its bit is set, and setImplicitChar fills every UNSET field
+; from the character properties of `ch`. `glyph_id` is a GlyphId-arm ELObj
+; (null = the reference's id-less FOTBuilder::GlyphId(), which prints "false");
+; `script` is a public identifier (empty = the reference's null PublicId).
+; ★The reference ctor initializes only valid/specifiedC/stretchFactor — every
+; other field is left indeterminate and is read only under `valid` or under
+; its own specified bit, so zeroing here is observationally identical.
+define CharacterNIC
+(
+    valid: bool
+    specified: int
+    ch: u32
+    glyph_id: ref[ELObj]?
+    break_before_priority: int
+    break_after_priority: int
+    math_class: FotSym
+    math_font_posture: FotSym
+    script: StringC
+    is_drop_after_line_break: bool
+    is_drop_unless_before_line_break: bool
+    is_punct: bool
+    is_input_whitespace: bool
+    is_input_tab: bool
+    is_record_end: bool
+    is_space: bool
+    stretch_factor: double
+)
+{
+    function make(host: ref[Page]) returns ref[CharacterNIC] linked
+
+    function copy(this: ref[CharacterNIC], host: ref[Page]) returns ref[CharacterNIC] linked
+
+    function is_specified(this: ref[CharacterNIC], bit: int) returns bool linked
+
+    procedure set_specified(mutable this: ref[CharacterNIC], bit: int) linked
+}
+
+; FOTBuilder::AnchorNIC (style/Anchor.cxx) — the inline break priorities plus
+; the display? flag.
+define AnchorNIC (is_display: bool, break_before_priority: int, break_after_priority: int)
+{
+    function make(host: ref[Page]) returns ref[AnchorNIC] linked
+
+    function copy(this: ref[AnchorNIC], host: ref[Page]) returns ref[AnchorNIC] linked
+}
+
+; FOTBuilder::GlyphAnnotationNIC (style/GlyphAnnotation.cxx) — two priorities.
+define GlyphAnnotationNIC (break_before_priority: int, break_after_priority: int)
+{
+    function make(host: ref[Page]) returns ref[GlyphAnnotationNIC] linked
+
+    function copy(this: ref[GlyphAnnotationNIC], host: ref[Page]) returns ref[GlyphAnnotationNIC] linked
+}
+
+; FOTBuilder::EmphasizingMarkNIC plus EmphasizingMarkFlowObj::emphmark_ — the
+; two priorities and the `mark:` sosofo (which the reference keeps in the flow
+; object, not in the NIC; here both travel in the tnic record so one copy
+; carries the whole state).
+define EmphasizingMarkNIC (break_before_priority: int, break_after_priority: int, mark: ref[ELObj]?)
+{
+    function make(host: ref[Page]) returns ref[EmphasizingMarkNIC] linked
+
+    function copy(this: ref[EmphasizingMarkNIC], host: ref[Page]) returns ref[EmphasizingMarkNIC] linked
+}
+
+; RadicalFlowObj::radical_ (FlowObj.cxx:1879) — the ONE characteristic of the
+; class, a sosofo that must answer isCharacter (the `character` flow object's
+; CharacterNIC is what startRadical's radicalRadical hands the backend). There
+; is no FOTBuilder::RadicalNIC; the record exists so the shared tnic machinery
+; can carry the sosofo through the constant path and the lazy chain.
+define RadicalNIC (radical: ref[ELObj]?)
+{
+    function make(host: ref[Page]) returns ref[RadicalNIC] linked
+
+    function copy(this: ref[RadicalNIC], host: ref[Page]) returns ref[RadicalNIC] linked
+}
+
+; FOTBuilder::GridNIC (FOTBuilder.h:558) — two counts, both zero by default
+; (the fot dump prints an attribute only for a non-zero one).
+define GridNIC (n_columns: int, n_rows: int)
+{
+    function make(host: ref[Page]) returns ref[GridNIC] linked
+
+    function copy(this: ref[GridNIC], host: ref[Page]) returns ref[GridNIC] linked
+}
+
+; FOTBuilder::GridCellNIC (FOTBuilder.h:566) — the cell's position, same
+; defaults and same print rule.
+define GridCellNIC (column_number: int, row_number: int)
+{
+    function make(host: ref[Page]) returns ref[GridCellNIC] linked
+
+    function copy(this: ref[GridCellNIC], host: ref[Page]) returns ref[GridCellNIC] linked
+}
+
+; FOTBuilder::EmbeddedTextNIC (FOTBuilder.h:367) — one symbol, defaulting to
+; symbolFalse. ★Its allowed set has NO symbolFalse entry (the reference
+; comments the omission: "hay que definir uno de los dos obligatoriamente"),
+; so `direction: #f` is an invalid value even though #f is the initial state.
+define EmbeddedTextNIC (direction: FotSym)
+{
+    function make(host: ref[Page]) returns ref[EmbeddedTextNIC] linked
+
+    function copy(this: ref[EmbeddedTextNIC], host: ref[Page]) returns ref[EmbeddedTextNIC] linked
+}
+
+define ICA_WIDTH_FULL: int 0
+define ICA_WIDTH_MINIMUM: int 1
+define ICA_WIDTH_EXPLICIT: int 2
+define ICA_HEIGHT_FULL: int 0
+define ICA_HEIGHT_MINIMUM: int 1
+define ICA_HEIGHT_EXPLICIT: int 2
+
+; FOTBuilder::IncludedContainerAreaNIC (FOTBuilder.h:377) — the one NIC record
+; of this family that derives from BOTH DisplayNIC and InlineNIC. The display
+; half travels in the shared DisplayNIC slot (the class is a display_foc), the
+; two inline break priorities and the nine own fields live here.
+; ★`scaleType` defaults to symbolMaxUniform, NOT symbolFalse — so an
+; untouched included-container-area still prints scale="max-uniform", while a
+; NUMERIC or PAIR scale sets the type to symbolFalse and prints scale-x/-y.
+define IncludedContainerAreaNIC
+(
+    escapement_direction: FotSym
+    is_display: bool
+    width_type: int
+    width: LengthSpec
+    height_type: int
+    height: LengthSpec
+    position_point_x: LengthSpec
+    position_point_y: LengthSpec
+    contents_rotation: int
+    scale_type: FotSym
+    scale_x: double
+    scale_y: double
+    break_before_priority: int
+    break_after_priority: int
+)
+{
+    function make(host: ref[Page]) returns ref[IncludedContainerAreaNIC] linked
+
+    function copy(this: ref[IncludedContainerAreaNIC], host: ref[Page]) returns ref[IncludedContainerAreaNIC] linked
+}
+
+; FOTBuilder::MultiMode (FOTBuilder.h:426) — one entry of the multi-mode
+; class's port list: a name (empty for the principal mode) and an optional
+; description.
+define MultiModeRec (has_desc: bool, name: StringC, desc: StringC)
+{
+    function make(host: ref[Page]) returns ref[MultiModeRec] linked
+}
+
+; MultiModeFlowObj::NIC (FlowObj.cxx:964) — the `multi-modes:` list, split
+; into the optional PRINCIPAL mode and the named ones in declaration order.
+; ★The named modes ARE the flow object's ports; no other class in the port
+; decides its port list at run time.
+define MultiModeNIC (has_principal_mode: bool, principal_has_desc: bool, principal_desc: StringC, named: ref[Array[ref[MultiModeRec]?]])
+{
+    function make(host: ref[Page]) returns ref[MultiModeNIC] linked
+
+    function copy(this: ref[MultiModeNIC], host: ref[Page]) returns ref[MultiModeNIC] linked
+}
+
+; TeXFOTBuilder::PageFloatNIC — the page-float extension flow object's one
+; NIC (a string; hasNIC accepts only "placement").
+; MifFOTBuilder::IndexEntryNIC — the ISOGEN index-entry extension flow
+; object's non-inherited characteristics.
+define IndexEntryNIC (components: ref[Array[StringC]], sort_string: StringC, page_number: bool, starts_page_range: bool, ends_page_range: bool)
+{
+    function make(host: ref[Page]) returns ref[IndexEntryNIC] linked
+
+    function copy(this: ref[IndexEntryNIC], host: ref[Page]) returns ref[IndexEntryNIC] linked
+}
+
+define PageFloatNIC (placement: StringC)
+{
+    function make(host: ref[Page]) returns ref[PageFloatNIC] linked
+
+    function copy(this: ref[PageFloatNIC], host: ref[Page]) returns ref[PageFloatNIC] linked
+}
+
+define LinkNIC (addr_type: int, node: ref[GroveNode]?, p0: StringC, p1: StringC, p2: StringC)
+{
+    function make(host: ref[Page]) returns ref[LinkNIC] linked
+
+    function copy(this: ref[LinkNIC], host: ref[Page]) returns ref[LinkNIC] linked
+}
+
+; FOTBuilder::ExternalGraphicNIC minus the DisplayNIC/InlineNIC bases (the
+; display half rides in FlowObj.dnic; the break priorities live here).
+; Reference defaults: scale 1/1 with scaleType symbolFalse, isDisplay false.
+define ExternalGraphicNIC
+(
+    entity_system_id: StringC
+    notation_system_id: StringC
+    scale_type: FotSym
+    scale_x: double
+    scale_y: double
+    has_max_width: bool
+    max_width: LengthSpec
+    has_max_height: bool
+    max_height: LengthSpec
+    is_display: bool
+    escapement_direction: FotSym
+    position_point_x: LengthSpec
+    position_point_y: LengthSpec
+    break_before_priority: int
+    break_after_priority: int
+)
+{
+    function make(host: ref[Page]) returns ref[ExternalGraphicNIC] linked
+
+    function copy(this: ref[ExternalGraphicNIC], host: ref[Page]) returns ref[ExternalGraphicNIC] linked
+}
+
+; ScoreFlowObj::Type — type: is a char, a length(-spec), or one of the
+; symbols before/through/after; absent = the plain-sequence fallback.
+define SCORE_NONE: int 0
+define SCORE_CHAR: int 1
+define SCORE_LENGTH: int 2
+define SCORE_SYMBOL: int 3
+
+define ScoreNIC (kind: int, ch: u32, length: LengthSpec, sym: FotSym)
+{
+    function make(host: ref[Page]) returns ref[ScoreNIC] linked
+
+    function copy(this: ref[ScoreNIC], host: ref[Page]) returns ref[ScoreNIC] linked
+}
+
+; FOTBuilder::BoxNIC minus the DisplayNIC base.
+define BoxNIC (is_display: bool, break_before_priority: int, break_after_priority: int)
+{
+    function make(host: ref[Page]) returns ref[BoxNIC] linked
+
+    function copy(this: ref[BoxNIC], host: ref[Page]) returns ref[BoxNIC] linked
+}
+
+; FOTBuilder::LeaderNIC.
+define LeaderNIC (has_length: bool, length: LengthSpec, break_before_priority: int, break_after_priority: int)
+{
+    function make(host: ref[Page]) returns ref[LeaderNIC] linked
+
+    function copy(this: ref[LeaderNIC], host: ref[Page]) returns ref[LeaderNIC] linked
+}
+
+; InheritedC — one record for the reference's class family. `kind` selects the
+; payload; `slot` <> -1 marks a pending entry (value converted from the VM
+; stack at make-exec); `proto` is the registry prototype a pending/converted
+; entry derives from. `print_name` is the exact attribute name SgmlFOTBuilder
+; emits (faithful quirks included: "inhibit-line-breaks?" keeps its '?',
+; justify-spread? prints "jystify-spread").
+define InheritedC
+(
+    kind: int
+    ident: ref[Identifier]?
+    index: int
+    print_name: StringC
+    bval: bool
+    lval: int
+    sym: FotSym
+    sval: StringC
+    ls: LengthSpec
+    obj: ref[ELObj]?
+    gst: ref[Array[ref[GlyphSubstTableRec]?]]?
+    code: ref[Insn]?
+    proto: ref[InheritedC]?
+    loc: Location
+    ; rtf-backend extension characteristic setter id (0 = none; the 12-entry
+    ; jade.cxx extension table, RtfFOTBuilder.set_extension_ic)
+    ext_setter: int
+    ; Identifier::inheritedCPart_ / inheritedCLoc_ (the reference keeps them on
+    ; the Identifier; here they ride the prototype, the only cell a
+    ; declare-characteristic install writes). -1 = a BUILT-IN characteristic,
+    ; which is what makes `defPart <= currentPartIndex()` false for every
+    ; builtin and true only for one the stylesheet declared itself.
+    def_part: u32
+    def_loc: Location
+)
+{
+    function make(host: ref[Page], kind: int, ident: ref[Identifier]?, index: int, print_name: StringC) returns ref[InheritedC] linked
+
+    ; InheritedC::identifier()->name() — the characteristic's name, which only
+    ; the ambiguousStyle diagnostic needs.
+    function get_ident_name(this: InheritedC) @page true @direct true returns StringC linked
+
+    function get_index(this: InheritedC) returns int linked
+
+    function get_kind(this: InheritedC) returns int linked
+
+    function get_proto(this: InheritedC) returns ref[InheritedC]? linked
+
+    ; VarInheritedC (Style.cxx): a non-constant spec — `code` (an Insn chain,
+    ; typed void: Style cannot import Insn) evaluated at style-push against the
+    ; owning style's display + node; `loc` anchors the invalid-value message.
+    procedure make_var(host: ref[Page], mutable proto: ref[InheritedC], code: ref[Insn]?, loc: Location) returns ref[InheritedC] linked
+
+    function is_var(this: InheritedC) returns bool linked
+
+    ; pin a StringC's bytes onto `host` (empty stays empty) — the save-queue
+    ; records outlive the eval bracket the conversion ran under.
+    function pin_string(host: ref[Page], s: StringC) @page true @direct true returns StringC linked
+
+    function pin_fotsym(host: ref[Page], s: FotSym) @page true @direct true returns FotSym linked
+
+    ; the SaveFOTBuilder deep copy: everything set_ic reads at replay time
+    ; must live on the queue's host (the reference Call records copy their
+    ; args by value). Payload ELObjs are rematerialized for the kinds the
+    ; sinks dereference (color / inline-space); other object payloads are
+    ; consumed at capture time and dropped here.
+    procedure copy_for_save(mutable this: ref[InheritedC], host: ref[Page]) returns ref[InheritedC] linked
+
+}
+
+; --- value conversions (Interpreter::convert*C, InheritedC.cxx make()) ------
+define Convert
+{
+    ; ★The identifier is NULLABLE, in Primitive.arg_error#'s shape and for its
+    ; reason: the characteristic's name is materialised HERE and nowhere else,
+    ; the reference recovers it from a `const Identifier *`, and a value that
+    ; has no identifier still has an invalid value to report. An empty name is
+    ; what the reference's own message machinery prints for one.
+    procedure invalid_value(mutable interp: ref[Interpreter], ident: ref[Identifier]?, loc: Location) io reads msg_prog linked
+
+    ; convertLengthC: an exact/inexact quantity of dimension 1.
+    procedure convert_length(mutable val_in: ref[ELObj], mutable out: ref[int], mutable interp: ref[Interpreter], loc: Location) returns bool io reads msg_prog linked
+
+    ; convertLengthSpecC: the characteristic form — the `-2` string leniency
+    ; first, then the raw conversion below. ★The two are separate in the
+    ; reference too (Interpreter.h:388 declares the raw one on its own), and
+    ; the difference is observable: the display-space/inline-space PRIMITIVES
+    ; call the raw form, so a string argument stays invalid there even under
+    ; `-2`.
+    procedure convert_length_spec_c(mutable val_in: ref[ELObj]?, mutable out: ref[LengthSpec], mutable interp: ref[Interpreter], loc: Location) returns bool io reads msg_prog linked
+
+    ; convertLengthSpec: a length quantity, or an engine length-spec
+    ; (display-size / arithmetic results) — LengthSpec::convert rounds the
+    ; length component and carries the display-size factor (the table-unit
+    ; component is dropped; the TableLengthSpec variant keeps it).
+    procedure convert_length_spec(val: ref[ELObj], mutable out: ref[LengthSpec]) returns bool linked
+
+    ; long(v < 0 ? v - .5 : v + .5) — LengthSpec::convert's rounding.
+    function round_length(v: double) returns int linked
+
+    ; LengthSpec::convert(FOTBuilder::TableLengthSpec &) — like
+    ; convert_length_spec but the table-unit factor survives.
+    procedure convert_table_length_spec(mutable val: ref[ELObj], mutable out: ref[LengthSpec], mutable out_tfactor: ref[double], mutable interp: ref[Interpreter], loc: Location) returns bool io reads msg_prog linked
+
+    ; convertBooleanC is STRICT: only the #t/#f singletons convert (is_true
+    ; is truthiness — any non-#f object — and must NOT be used here). Under
+    ; `-2` the strings "yes"/"no"/"true"/"false" become those singletons
+    ; first; every other string stays invalid.
+    procedure convert_boolean(mutable val_in: ref[ELObj]?, mutable out: ref[bool], mutable interp: ref[Interpreter], loc: Location) returns bool io reads msg_prog linked
+
+    ; convertEnumC (identifier-less overload): #f / #t / any symbol installed
+    ; with a c-value. Under `-2` a string may name one of them.
+    procedure convert_enum(mutable val_in: ref[ELObj]?, mutable out: ref[FotSym], mutable interp: ref[Interpreter], loc: Location) returns bool io reads msg_prog linked
+
+    ; convertEnumC (allowed-set overload, the NIC form): the value must convert
+    ; AND its code must be in `allowed` (codes array, n entries).
+    procedure convert_enum_set(mutable val: ref[ELObj]?, allowed: Slice[int], mutable out: ref[FotSym], mutable interp: ref[Interpreter], loc: Location) returns bool io reads msg_prog linked
+
+    procedure convert_string(host: ref[Page], mutable val: ref[ELObj], mutable out: ref[StringC]) returns bool linked
+
+    ; ELObjExtensionFlowObjValue::convertStringList — a proper list of
+    ; strings; a malformed tail keeps the prefix already collected and fails.
+    procedure convert_string_list(host: ref[Page], mutable val: ref[ELObj], mutable out: ref[Array[StringC]]) returns bool linked
+
+    procedure convert_integer(mutable val_in: ref[ELObj]?, mutable out: ref[int], mutable interp: ref[Interpreter], loc: Location) returns bool io reads msg_prog linked
+
+    ; convertPublicIdC: #f (empty) or a (possibly empty) string.
+    procedure convert_public_id(host: ref[Page], mutable val: ref[ELObj], mutable out: ref[StringC], mutable out_false: ref[bool]) returns bool linked
+
+    ; convertLetter2C: #f clears; a STRING of exactly two UPPERCASE letters
+    ; (the reference accepts no symbols and does not case-fold — "de" is an
+    ; invalid value); the empty string also clears.
+    procedure convert_letter2(host: ref[Page], mutable val: ref[ELObj], mutable out: ref[StringC], mutable out_false: ref[bool]) returns bool linked
+
+    ; InheritedC::make(value, loc, interp) — derive a constant IC from the
+    ; prototype `proto` with the converted value; null + message on invalid.
+    ; Quantities resolve first (a parse-time datum like 18pt is an
+    ; UnresolvedLengthObj until forced — ResolveQuantitiesInsn's job on the
+    ; eval path; the compile-time constant path forces here).
+    procedure ic_from_value(host: ref[Page], mutable proto: ref[InheritedC], mutable val_in: ref[ELObj], mutable loc: Location, mutable interp: ref[Interpreter]) @page true @direct true returns ref[InheritedC]? io reads msg_prog linked
+
+    ; FlowObj::setDisplayNIC — returns true when `sk` is a display NIC key
+    ; (value converted into `nic`; an invalid value messages and leaves the
+    ; default, per the reference convert*C behaviour).
+    procedure set_display_nic(mutable nic: ref[DisplayNIC], sk: int, mutable val: ref[ELObj], ident: ref[Identifier]?, loc: Location, mutable interp: ref[Interpreter], host: ref[Page]) returns bool io reads msg_prog linked
+
+    ; a (make table-border …) sosofo — the only sosofo with a border style
+    ; (SosofoObj::tableBorderStyle).
+    function is_table_border_sosofo(val: ref[ELObj]) returns bool linked
+
+    ; RuleC::make's test — a rule-FO sosofo, or the rule class binding's
+    ; FlowObj prototype itself (a FlowObj IS a sosofo in the reference;
+    ; fraction-bar's initial value is lookup("rule")->flowObj()).
+    function is_rule_value(val: ref[ELObj]) returns bool linked
+
+    ; a border characteristic VALUE resolved to the style to push: a
+    ; table-border sosofo's style, or a boolean -> the canned border-present
+    ; styles; null = invalid (caller messages).
+    procedure border_style_from(mutable val: ref[ELObj], mutable interp: ref[Interpreter], loc: Location) returns ref[ELObj]? io reads msg_prog linked
+
+    ; TableFlowObj::setNonInheritedC, the table-specific keys (the display
+    ; NICs go through set_display_nic).
+    procedure set_table_nic(mutable rec: ref[TableNIC], sk: int, mutable val: ref[ELObj], ident: ref[Identifier]?, loc: Location, mutable interp: ref[Interpreter]) io reads msg_prog linked
+
+    ; TableColumnFlowObj::setNonInheritedC.
+    procedure set_table_column_nic(mutable rec: ref[TableColumnNIC], sk: int, mutable val: ref[ELObj]?, ident: ref[Identifier]?, loc: Location, mutable interp: ref[Interpreter]) io reads msg_prog linked
+
+    ; TableCellFlowObj::setNonInheritedC.
+    procedure set_table_cell_nic(mutable rec: ref[TableCellNIC], sk: int, mutable val: ref[ELObj]?, ident: ref[Identifier]?, loc: Location, mutable interp: ref[Interpreter]) io reads msg_prog linked
+
+    ; the table-family NIC key sets (Table*FlowObj::hasNonInheritedC +
+    ; hasPseudoNonInheritedC — both classes route the same way here).
+    function is_table_nic_key(foc: int, sk: int) returns bool linked
+
+    ; dispatch a table-family NIC key into the FO's record (created on demand
+    ; on `host`); `tnic` is the in/out record slot.
+    procedure apply_table_nic(foc: int, mutable nic_in: NICRef, sk: int, mutable val: ref[ELObj]?, ident: ref[Identifier]?, loc: Location, mutable interp: ref[Interpreter], host: ref[Page]) @direct true returns NICRef io reads msg_prog linked
+
+    ; RuleFlowObj::hasNonInheritedC — the rule extras beyond the display NICs.
+    function is_rule_nic_key(foc: int, sk: int) returns bool linked
+
+    ; RuleFlowObj::setNonInheritedC (the non-display keys).
+    procedure apply_rule_nic(mutable nic_in: NICRef, sk: int, mutable val: ref[ELObj]?, ident: ref[Identifier]?, loc: Location, mutable interp: ref[Interpreter], host: ref[Page]) @direct true returns NICRef io reads msg_prog linked
+
+    ; the link/external-graphic/leader/box/score NIC keys (each class's
+    ; hasNonInheritedC minus the display-NIC base, which rides the shared
+    ; display_foc admission).
+    function is_fo_nic_key(foc: int, sk: int) returns bool linked
+
+    ; the ident-aware admission: is_fo_nic_key plus the ONE case that is not a
+    ; syntactic key at all — a name registered as a char NIC by
+    ; `declare-char-characteristic+property` is a non-inherited characteristic
+    ; of the `character` flow object (CharacterFlowObj::hasNonInheritedC's
+    ; charNICDefined tail).
+    function is_fo_nic_ident(foc: int, sk: int, ident: ref[Identifier]?) returns bool linked
+
+    ; the SGML-transformation classes' hasNIC, by NAME (TransformFOTBuilder.cxx
+    ; — an ExtensionFlowObj cannot extend the syntactic-key enum, so the
+    ; reference compares strings: `name == "gi"`, `name == "attributes"`, …).
+    ; Everything a class does NOT claim here is an ordinary inherited
+    ; characteristic, exactly as for any other flow object; that is why these
+    ; classes take the styled make path.
+    function is_transform_nic_name(foc: int, name: StringC) returns bool linked
+
+    function is_transform_foc(foc: int) returns bool linked
+
+    function make_fo_nic(foc: int, host: ref[Page]) @direct true returns NICRef linked
+
+    function copy_fo_nic(foc: int, p: NICRef, host: ref[Page]) @direct true returns NICRef linked
+
+    ; Link/ExternalGraphic/Box/Leader/Score FlowObj::setNonInheritedC.
+    procedure apply_fo_nic(foc: int, mutable nic_in: NICRef, sk: int, mutable val: ref[ELObj], ident: ref[Identifier]?, mutable loc: Location, mutable interp: ref[Interpreter], host: ref[Page]) @direct true returns NICRef io reads msg_prog linked
+
+    ; MultiModeFlowObj::handleMultiModesMember — the four accepted shapes of a
+    ; `multi-modes:` member: `#f` (the principal mode), a symbol (a named
+    ; mode), `(#f "desc")` and `(sym "desc")`.
+    procedure multi_modes_member(mutable r: ref[MultiModeNIC], mutable obj: ref[ELObj], host: ref[Page]) returns bool linked
+
+    ; SosofoObj::isCharacter (ProcessContext.cxx:535) — only a `character`
+    ; flow-object sosofo answers true; it is what `radical:` demands.
+    function is_character_sosofo(val: ref[ELObj]?) returns bool linked
+
+    ; convertRealC.
+    procedure convert_real(mutable val_in: ref[ELObj], mutable out: ref[double], mutable interp: ref[Interpreter], loc: Location) returns bool io reads msg_prog linked
+
+    ; convertCharC: a char object, or a string of exactly one character.
+    procedure convert_char(host: ref[Page], mutable val: ref[ELObj], mutable out: ref[u32]) returns bool linked
+
+    ; the math-class enum set (CharacterFlowObj::setNonInheritedC).
+    procedure convert_math_class(mutable val: ref[ELObj], mutable out: ref[FotSym], host: ref[Page], mutable interp: ref[Interpreter], loc: Location) returns bool io reads msg_prog linked
+
+    ; the math-font-posture enum set — #f is IN the set here (symbolFalse is
+    ; the first allowed value), so `math-font-posture: #f` is valid.
+    procedure convert_math_font_posture(mutable val: ref[ELObj], mutable out: ref[FotSym], host: ref[Page], mutable interp: ref[Interpreter], loc: Location) returns bool io reads msg_prog linked
+
+    ; CharacterFlowObj::setNonInheritedC. Every branch marks its `specified`
+    ; bit ONLY on a successful conversion (the reference's `if (convert…)`
+    ; shape) — an invalid value leaves the field unspecified and the fot dump
+    ; silent. `stretch-factor` is the one field with no bit: it renders
+    ; whenever it differs from 1.0.
+    ; ★A name that is a DECLARED char NIC (not a syntactic key) is accepted by
+    ; hasNonInheritedC and then does NOTHING here — the reference's
+    ; charNICDefined arm returns before the CANNOT_HAPPEN, so the value is
+    ; swallowed without a diagnostic. Measured against the reference binary.
+    procedure set_character_nic(mutable r: ref[CharacterNIC], sk: int, mutable val: ref[ELObj], ident: ref[Identifier]?, mutable loc: Location, mutable interp: ref[Interpreter], host: ref[Page]) io reads msg_prog linked
+
+    ; CharacterFlowObj::setImplicitChar — the heart of the class: once `char`
+    ; is known, every characteristic still UNSPECIFIED is filled from that
+    ; character's PROPERTIES (the thirteen built-ins of installCharProperties
+    ; plus whatever a stylesheet declared). Answers false when the char does
+    ; not convert or was already specified — the reference then leaves the NIC
+    ; alone (and, on the `char:` branch, skips the specified bit as well).
+    procedure set_implicit_char(mutable r: ref[CharacterNIC], mutable val: ref[ELObj], ident: ref[Identifier]?, mutable loc: Location, mutable interp: ref[Interpreter], host: ref[Page]) returns bool io reads msg_prog linked
+
+    procedure char_prop_bool(mutable name: Slice[char], ch: u32, mutable loc: Location, mutable interp: ref[Interpreter], ident: ref[Identifier]?, mutable out: ref[bool]) io reads msg_prog linked
+
+    procedure char_prop_int(mutable name: Slice[char], ch: u32, mutable loc: Location, mutable interp: ref[Interpreter], ident: ref[Identifier]?, mutable out: ref[int]) io reads msg_prog linked
+
+    function is_display_nic_key(sk: int) returns bool linked
+}
+
+; --- StyleStack (Style.cxx) --------------------------------------------------
+; VarStyleObj's payload (the ELObj Style arm keeps its two-pointer shape: spec
+; points here, use_chain stays in the arm). `display` is the captured closure
+; vars of the style's VarInheritedC codes (null-terminated, like a closure
+; display); `node` the current node at style creation (typed void: Style does
+; not import Grove — only the VM glue dereferences it).
+define VarStyleRec
+(
+    force_specs: ref[Array[ref[InheritedC]?]]?
+    specs: ref[Array[ref[InheritedC]?]]?
+    display: pointer[pointer[ELObj]]
+    node: ref[GroveNode]?
+)
+{
+    function make(host: ref[Page], force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, display: pointer[pointer[ELObj]], node: ref[GroveNode]?) returns ref[VarStyleRec] linked
+}
+
+; InheritedCInfo — one pushed spec for one characteristic index; `prev` chains
+; to the spec shadowed at an outer level (restored by pop). `style` is the
+; VarStyleRec the spec came from (display + node for VarInheritedC evaluation);
+; `cached_value` the push-time evaluated value (valid only while none of
+; `dependencies` — indices this value read via actual-*/inherited-* — changed).
+define InheritedCInfo
+(
+    spec: ref[InheritedC]
+    prev: ref[InheritedCInfo]?
+    val_level: int
+    spec_level: int
+    style: ref[VarStyleRec]
+    cached_value: ref[ELObj]?
+    dependencies: ref[Array[int]]
+    ; the STYLE RULE that specified this characteristic at this level, null for
+    ; a style pushed by `make` (which has no rule). Only ambiguousStyle reads
+    ; it: two rules of EQUAL specificity setting the same characteristic at
+    ; the same level is the one case the reference reports.
+    rule: ref[Rule]?
+)
+{
+    function make(host: ref[Page], spec: ref[InheritedC], style: ref[VarStyleRec], prev: ref[InheritedCInfo], val_level: int, spec_level: int) returns ref[InheritedCInfo] linked
+
+    function make_ruled(host: ref[Page], spec: ref[InheritedC], style: ref[VarStyleRec], prev: ref[InheritedCInfo]?, val_level: int, spec_level: int, rule: ref[Rule]?) returns ref[InheritedCInfo] linked
+}
+
+define PopList (list: ref[Array[int]]?, depending_list: ref[Array[int]], prev: ref[PopList]?)
+{
+    function make(host: ref[Page], prev: ref[PopList]?) returns ref[PopList] linked
+}
+
+define StyleStack (info: ref[Array[ref[InheritedCInfo]?]], level: int, pop_list: ref[PopList]?, host: ref[Page])
+{
+    function make(host: ref[Page]) returns ref[StyleStack] linked
+
+    procedure push_start(mutable this: ref[StyleStack], scratch: ref[Page]) linked
+
+    ; the C++ StyleStack copy (Connectable/Connection snapshots): a shallow
+    ; copy of the info vector (the InheritedCInfo chains are immutable and
+    ; shared), same level, SHARED pop-list pointer — balanced push/pop on the
+    ; copy builds and unwinds its own PopLists on top and never mutates the
+    ; shared tail (push_end_prologue only READS prev's depending list).
+    function copy(this: ref[StyleStack], host: ref[Page]) returns ref[StyleStack] linked
+
+    ; grow the info vector to cover index `ind`.
+    function info_at(this: ref[StyleStack], ind: int) returns ref[InheritedCInfo]? linked
+
+    procedure info_set(mutable this: ref[StyleStack], ind: int, v: ref[InheritedCInfo]?) @persists true linked
+
+    ; StyleStack::pushContinue — walk the style chain per VarStyleObj::
+    ; appendIter: own force! specs, own specs, then the use chain (its force
+    ; and normal specs at that point); first spec per characteristic wins
+    ; within this level.
+    procedure push_continue(mutable this: ref[StyleStack], style: ref[ELObj]?, scratch: ref[Page], rule: ref[Rule]?, mutable interp: ref[Interpreter]) io reads msg_prog linked
+
+    procedure push_spec_array(mutable this: ref[StyleStack], arr: ref[Array[ref[InheritedC]?]]?, rec: ref[VarStyleRec], scratch: ref[Page], rule: ref[Rule]?, mutable interp: ref[Interpreter]) io reads msg_prog linked
+
+    procedure push_spec(mutable this: ref[StyleStack], spec: ref[InheritedC], rec: ref[VarStyleRec], scratch: ref[Page], rule: ref[Rule]?, mutable interp: ref[Interpreter]) io reads msg_prog linked
+
+    ; StyleStack::pushEnd's prologue: a characteristic that DEPENDS (via
+    ; actual-*) on another characteristic re-evaluates at this level when any
+    ; of its dependencies was re-specified here — re-push it (keeping its
+    ; original spec_level); otherwise it keeps depending at this level too.
+    procedure push_end_prologue(mutable this: ref[StyleStack], scratch: ref[Page]) linked
+
+    ; pushEnd's per-spec epilogue: a spec whose evaluation recorded
+    ; dependencies keeps re-evaluating at deeper levels (see prologue).
+    procedure note_depending(mutable this: ref[StyleStack], ind: int) linked
+
+    procedure pop(mutable this: ref[StyleStack]) linked
+
+    procedure push_empty(mutable this: ref[StyleStack]) linked
+
+    procedure pop_empty(mutable this: ref[StyleStack]) linked
+
+    function get_level(this: ref[StyleStack]) returns int linked
+
+    ; the specs pushed at the CURRENT level, in push order — the set* feed for
+    ; pushEnd (the caller renders them through its sink).
+    function current_specs(this: ref[StyleStack]) returns ref[Array[int]]? linked
+
+}

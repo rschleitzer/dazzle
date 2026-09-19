@@ -1,0 +1,929 @@
+use scaly.memory.Page
+use dazzle.FrameMark.FrameMark
+use scaly.containers.Array
+use dazzle.NameTable.NamedTable
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.Location.Origin
+use opensp.ElementType.ElementType
+use opensp.AttributeList.AttributeList
+use opensp.Attribute.AttributeValue
+use opensp.Attribute.AttributeDefinition
+use opensp.Attribute.Text
+use opensp.ElementType.ElementDefinition
+use opensp.Entity.Entity
+use opensp.Event.Event
+use opensp.ParserState.ParserState
+use opensp.Dtd.Dtd
+
+; opensp Event.event_type discriminants — mirrored locally (cross-package
+; module consts don't resolve via `use`, and the shared EVK_* mirror lives in
+; DssslSpecEventHandler; these GEV_* mirror the same stable Event ABI).
+define GEV_START_ELEMENT: int 0
+define GEV_END_ELEMENT: int 1
+define GEV_DATA: int 2
+define GEV_PI: int 3
+; ExternalDataEntityEvent (an NDATA entity reference in content) and
+; SubdocEntityEvent — the grove's external-data and subdocument nodes. The
+; port's parser names the subdoc event START_SUBDOC because the ESIS writer
+; brackets its own sub-parse with it; under dazzle no sub-parse happens (see
+; ParserState.app_parses_subdocs), so exactly one event arrives, as in the
+; reference's GroveBuilderEventHandler::subdocEntity.
+define GEV_ENTITY_REF: int 4
+define GEV_START_SUBDOC: int 6
+define GEV_END_PROLOG: int 8
+define GEV_SDATA: int 9
+; NonSgmlCharEvent — a numeric character reference to a character the SGML
+; declaration does not describe.
+define GEV_NONSGML: int 11
+define GEV_APPINFO: int 5
+define GEV_ENTITY_DEFAULTED: int 12
+
+; opensp ElementType.DC_EMPTY — mirrored for the same reason.
+define GDC_EMPTY: int 4
+
+; Grove — the SGML property set (DSSSL grove): a Node tree built from the
+; opensp Event stream (SPGrove/GroveBuilder), the axes the style primitives
+; navigate, and the class metadata (ComponentName + ClassDef) that
+; node-property answers from. All of the reference's node classes exist here —
+; sgml-document, element, data-char, pi, the two attribute classes, the nine
+; declaration classes and the ENTITY-REFERENCE branch (sdata, external-data,
+; subdocument, non-sgml) — plus `message`, which is metadata only: its sole
+; reference consumer is the Windows-only groveoa component, so no in-scope
+; program can obtain such a node (tests/dazzle/COMPLETENESS.md). Still a later
+; slice: addresses/subgroves.
+
+define GN_DOCUMENT: int 0
+define GN_ELEMENT: int 1
+define GN_DATA: int 2
+define GN_PI: int 3
+; The ATTRIBUTE axis (AttributeAsgnNode / AttributeValueTokenNode). Like data
+; nodes these are VIEWS, not built tree nodes: an assignment is
+; (origin element, attribute index) and a value token adds the token index —
+; exactly the reference's same2 identity — so `chunk` holds the origin, and
+; `char_index` / `element_index` the two indices (see GroveNode.attr_view).
+define GN_ATTR_ASSIGN: int 4
+define GN_ATTR_TOKEN: int 5
+; The DECLARATION node classes — the prolog's own grove, handed out by the
+; named node lists (`entities`, `notations`, `element-types`, `attribute-defs`,
+; `doctypes-and-linktypes`, …) and by the single-node properties around them.
+;
+; None of these is a BUILT node either: like the data and attribute views they
+; are materialized per access over an opensp DECLARATION OBJECT, which the
+; `decl` slot holds and which IS their identity (every same2 in the reference
+; compares the underlying Entity / Notation / ElementType / ModelGroup /
+; AttributeDefinitionList pointer, never the node object). `parent` holds the
+; OWNER node — the chain an attribute-def / external-id / content token climbs to
+; reach the sgml-document node for `grove-root` — while the parent AXIS is null
+; for all of them (Node::getParent's default) and `origin` is answered per class
+; (see Primitive.node_property_value), because the two differ: an ATTRIBUTE-DEF's
+; origin is another attribute-def (AttributeDefNode::getOrigin builds one through
+; makeOriginNode), and a DEFAULTED entity's origin is the grove root rather than
+; its doctype.
+define GN_ENTITY: int 6
+define GN_NOTATION: int 7
+define GN_DOCUMENT_TYPE: int 8
+define GN_DEFAULT_ENTITY: int 9
+define GN_EXTERNAL_ID: int 10
+define GN_ELEMENT_TYPE: int 11
+define GN_ATTRIBUTE_DEF: int 12
+define GN_MODEL_GROUP: int 13
+define GN_ELEMENT_TOKEN: int 14
+define GN_PCDATA_TOKEN: int 15
+define GN_SGML_CONSTANTS: int 16
+
+; The ENTITY-REFERENCE branch — the content nodes an entity reference (or a
+; non-SGML character reference) leaves behind. Like data and pi nodes these are
+; CHUNK nodes: built by the builder, sitting in their element's child list with
+; the ordinary parent / sibling axes; `decl` holds the referenced Entity (the
+; reference's EntityRefChunk::entity, which `entity-name` and `entity` answer
+; from) and `chars` its replacement text where there is one.
+;
+; ★A GN_SDATA node is NOT a data node: the reference keeps SdataNode its own
+; class whose ONE character comes from the SdataMapper (Interpreter::sdataMap),
+; never from the replacement text — `char`, `data` and everything a backend
+; sees go through Primitive.sdata_char.
+define GN_SDATA: int 17
+define GN_EXTERNAL_DATA: int 18
+define GN_SUBDOC: int 19
+; ★NonSgmlNode and MessageNode are the reference's two FIXME classes
+; (grove/Node.cxx:1420/1429): ClassDef::nonSgml and ClassDef::message declare
+; noId as their class name and noProps for BOTH name lists, so `class-name` is
+; the EMPTY symbol and `all-property-names` the empty list — measured, not
+; guessed (tests/dazzle/grove/props5).
+define GN_NONSGML: int 20
+; `message` exists as class METADATA only. The reference builds MessageNodes
+; from GroveImpl's message list, but the only code that reads that list is
+; groveoa (the Windows OLE automation component, out of scope): no DSSSL
+; primitive and no backend reaches getMessages/getSeverity, so no in-scope
+; program can obtain a node of this class — here or in the reference.
+define GN_MESSAGE: int 21
+
+; ★The grove-wide tables that used to live here as `shared` driver cells
+; (GROVE_SUBST / GROVE_DEFAULTED_ENTS / GROVE_ENTITY_DEFAULTED / GROVE_APPINFO,
+; plus the interpreter's grove_dtd / grove_id_index) are now fields of
+; `GroveInfo`, one record per grove, hanging off the sgml-document node — the
+; reference's GroveImpl. A single cell was right only while `sgml-parse` was a
+; stub and exactly one grove could exist; with the GroveManager a run holds any
+; number, and every consumer reaches the right one through Node::getGroveRoot.
+
+; GroveNode.flags — the element chunk's two decided-at-build-time booleans.
+define GN_FLAG_INCLUDED: int 1
+define GN_FLAG_MUST_OMIT_END_TAG: int 2
+
+; --- ComponentName (grove/Node.h ComponentName::Id) -------------------------
+;
+; The grove's NAME metamodel: every component — a property name, a node class
+; name, an enumerated property value — has one id and TWO names, the short RCS
+; name and the long SDQL name (grove/Node.cxx rcsName/sdqlName). Both are
+; installed in the interpreter's node-property table
+; (Interpreter::installNodeProperties), so a stylesheet may address a property
+; by either spelling, and `rcs?: #t` on node-property selects which of the two
+; a component-name VALUE renders as. The ids ARE the enum's order — they index
+; the two name arrays below.
+define CN_ALL_PROPERTY_NAMES: int 0
+define CN_AND: int 1
+define CN_ANY: int 2
+define CN_APPLICATION_INFO: int 3
+define CN_ATTRIBUTE_ASSIGNMENT: int 4
+define CN_ATTRIBUTE_DEF: int 5
+define CN_ATTRIBUTE_DEFS: int 6
+define CN_ATTRIBUTES: int 7
+define CN_ATTRIBUTE_VALUE_TOKEN: int 8
+define CN_CDATA: int 9
+define CN_CHAR: int 10
+define CN_CHILDREN_PROPERTY_NAME: int 11
+define CN_CLASS_NAME: int 12
+define CN_CONNECTOR: int 13
+define CN_CONREF: int 14
+define CN_CONTENT: int 15
+define CN_CONTENT_TOKENS: int 16
+define CN_CONTENT_TYPE: int 17
+define CN_CURRENT: int 18
+define CN_CURRENT_ATTRIBUTE_INDEX: int 19
+define CN_CURRENT_GROUP: int 20
+define CN_DATA_CHAR: int 21
+define CN_DATA_PROPERTY_NAME: int 22
+define CN_DATA_SEP_PROPERTY_NAME: int 23
+define CN_DECL_VALUE_TYPE: int 24
+define CN_DEFAULTED: int 25
+define CN_DEFAULTED_ENTITIES: int 26
+define CN_DEFAULT_ENTITY: int 27
+define CN_DEFAULT_VALUE: int 28
+define CN_DEFAULT_VALUE_TYPE: int 29
+define CN_DOCTYPES_AND_LINKTYPES: int 30
+define CN_DOCUMENT_ELEMENT: int 31
+define CN_DOCUMENT_TYPE: int 32
+define CN_ELEMENT: int 33
+define CN_ELEMENTS: int 34
+define CN_ELEMENT_TOKEN: int 35
+define CN_ELEMENT_TYPE: int 36
+define CN_ELEMENT_TYPES: int 37
+define CN_EMPTY: int 38
+define CN_ENTITIES: int 39
+define CN_ENTITY: int 40
+define CN_ENTITY_NAME: int 41
+define CN_ENTITY_TYPE: int 42
+define CN_EPILOG: int 43
+define CN_EXCLUSIONS: int 44
+define CN_EXTERNAL_DATA: int 45
+define CN_EXTERNAL_ID: int 46
+define CN_FIXED: int 47
+define CN_GENERAL_ENTITIES: int 48
+define CN_GENERATED_SYSTEM_ID: int 49
+define CN_GI: int 50
+define CN_GOVERNING: int 51
+define CN_GOVERNING_DOCTYPE: int 52
+define CN_GROVE_ROOT: int 53
+define CN_ID: int 54
+define CN_IDREF: int 55
+define CN_IDREFS: int 56
+define CN_IMPLIED: int 57
+define CN_INCLUDED: int 58
+define CN_INCLUSIONS: int 59
+define CN_MODEL_GROUP: int 60
+define CN_MUST_OMIT_END_TAG: int 61
+define CN_NAME: int 62
+define CN_NAMES: int 63
+define CN_NDATA: int 64
+define CN_NMTKGRP: int 65
+define CN_NMTOKEN: int 66
+define CN_NMTOKENS: int 67
+define CN_NOTATION: int 68
+define CN_NOTATION_NAME: int 69
+define CN_NOTATIONS: int 70
+define CN_NUMBER: int 71
+define CN_NUMBERS: int 72
+define CN_NUTOKEN: int 73
+define CN_NUTOKENS: int 74
+define CN_OCCURENCE_INDICATOR: int 75
+define CN_OMIT_END_TAG: int 76
+define CN_OMIT_START_TAG: int 77
+define CN_OPT: int 78
+define CN_OR: int 79
+define CN_ORIGIN: int 80
+define CN_ORIGIN_TO_SUBNODE_REL_PROPERTY_NAME: int 81
+define CN_PARAMETER_ENTITIES: int 82
+define CN_PARENT: int 83
+define CN_PCDATA_TOKEN: int 84
+define CN_PI: int 85
+define CN_PLUS: int 86
+define CN_PROLOG: int 87
+define CN_PUBLIC_ID: int 88
+define CN_RCDATA: int 89
+define CN_REFERENT: int 90
+define CN_REP: int 91
+define CN_REQUIRED: int 92
+define CN_SDATA: int 93
+define CN_SEQ: int 94
+define CN_SGML_CONSTANTS: int 95
+define CN_SGML_DOCUMENT: int 96
+define CN_SUBDOCUMENT: int 97
+define CN_SUBNODE_PROPERTY_NAMES: int 98
+define CN_SYSTEM_DATA: int 99
+define CN_SYSTEM_ID: int 100
+define CN_TEXT: int 101
+define CN_TOKEN: int 102
+define CN_TOKENS: int 103
+define CN_TOKEN_SEP: int 104
+define CN_TREE_ROOT: int 105
+define CN_VALUE: int 106
+define CN_N_IDS: int 107
+define CN_NO_ID: int 0 - 1
+
+; 26 letter buckets for the lookup index + one catch-all
+define CN_N_BUCKETS: int 27
+
+; the two name arrays, built once per run (the interpreter owns the instance),
+; plus a first-letter bucket index over both spellings so a lookup compares a
+; handful of names instead of all 214.
+define ComponentName (rcs: ref[Array[StringC]], sdql: ref[Array[StringC]], buckets: ref[Array[ref[Array[int]]?]])
+{
+    function make(host: ref[Page]) @persists true returns ref[ComponentName] linked
+
+    procedure add(host: ref[Page], mutable t: ref[ComponentName], r: Slice[char], s: Slice[char]) linked
+
+    procedure bucket_add(mutable t: ref[ComponentName], b: int, id: int) linked
+
+    ; a name's bucket: its ASCII-lowercased first letter, CN_N_BUCKETS - 1 for
+    ; anything else (no table name starts outside a-z, but a QUERY may).
+    function bucket_of(name: StringC) returns int linked
+
+    function rcs_name(this: ComponentName, id: int) @page true @direct true returns StringC linked
+
+    function sdql_name(this: ComponentName, id: int) @page true @direct true returns StringC linked
+
+    ; the name a component-name VALUE renders as (ELObjPropertyValue::set:
+    ; rcs? picks rcsName, otherwise sdqlName).
+    function name_of(this: ComponentName, id: int, want_rcs: bool) @page true @direct true returns StringC linked
+
+    ; Interpreter::lookupNodeProperty — either spelling to its id, CN_NO_ID if
+    ; unknown. The reference retries an ASCII-lowercased key after the exact
+    ; lookup; every table name is already lowercase, so that is exactly one
+    ; case-insensitive pass. ★The LAST insertion wins (HashTable::insert
+    ; replaces by default); the one duplicate is the RCS name "tokens", shared
+    ; by content-tokens and tokens — which is why the reference has to
+    ; special-case model-group nodes in the node-property primitive.
+    function lookup(this: ComponentName, name: StringC) returns int linked
+
+    ; a table name (already lowercase) against a query whose ASCII letters are
+    ; lowercased on the fly — the reference's lowercase retry.
+    function equals_lower(table: StringC, query: StringC) returns bool linked
+}
+
+
+; --- ClassDef (grove/Node.cxx ClassDef::*) ----------------------------------
+;
+; The per-class metadata: the class name, the ordered property-name lists and
+; the three distinguished property names. Our grove instantiates four of the
+; reference's 21 node classes — sgml-document, element, data-char and pi — and
+; these tables are transcribed from theirs INCLUDING the properties whose
+; accessors are not ported yet: `all-property-names` is a TABLE, not a
+; capability list, and the reference answers it from the same table.
+define GroveClassDef
+{
+    ; ClassDef::className
+    function class_name(node_class: int) returns int linked
+
+    ; ClassDef::childrenPropertyName — only the element class has children
+    ; (which is what makes the CHILDREN AXIS class-specific, see
+    ; GroveNode.has_child_axis).
+    function children_property_name(node_class: int) returns int linked
+
+    ; ClassDef::dataPropertyName
+    function data_property_name(node_class: int) returns int linked
+
+    ; ClassDef::dataSepPropertyName — only attribute-assignment declares one
+    ; (its tokens are separated by the token-sep character).
+    function data_sep_property_name(node_class: int) returns int linked
+
+    ; ClassDef::subnodePropertyNames
+    procedure subnode_property_names(node_class: int, mutable out: ref[Array[int]]) linked
+
+    ; INTRINSIC_PROPS (grove/Node.cxx:1148) — the eleven every class carries.
+    procedure intrinsic_property_names(mutable out: ref[Array[int]]) @page true @direct true linked
+
+    ; ClassDef::allPropertyNames
+    procedure all_property_names(node_class: int, mutable out: ref[Array[int]]) @page true @direct true linked
+}
+
+; A grove node. `children` is null for leaf (data/pi) nodes; element/document
+; nodes carry the ordered child list. `chars` holds a data node's text.
+;
+; DATA NODES — the chunk/view split (spgrove/GroveBuilder.cxx:586-635). The
+; reference stores character data as a `DataChunk` (a run of Chars) and hands
+; out `DataNode`s, which are (chunk, index) VIEWS — one grove node PER
+; CHARACTER, of class `data-char`, without allocating any of them. A GN_DATA
+; node here is that chunk (`flush_pending` = the DataChunk boundary); a VIEW is
+; a GN_DATA node with `chunk` pointing at the chunk and `char_index` its offset.
+; The chunk node itself IS the view at index 0.
+;
+; The TREE stays chunk-level: the builder, ProcessContext's content walk and
+; every FOT backend iterate whole runs (the reference does the same through
+; nextChunkSibling/charChunk). Views are materialized only where the reference's
+; per-character node identity is OBSERVABLE — children/descendants/preced/follow
+; and the node properties — see ELObj.NodeListObj (the prefix index) and DataNode::same2.
+
+; --- the O(1) sibling step (the missing assignNextChunkSibling) -------------
+;
+; The reference steps siblings with `NodePtr::assignNextChunkSibling`, one
+; pointer hop, because a chunk knows its successor. Our nodes carry a parent
+; and the parent an array, so a node's own place in its group is a SCAN — and
+; the primitives that need it (`last-sibling?`, `absolute-last-sibling?`, the
+; `follow` axis) were therefore quadratic over a wide sibling group, which is
+; what tests/dazzle/nsweep measured as cause A.
+;
+; What replaces the missing link is a one-entry memo: styling runs in document
+; order, so the node asked about next is normally the next SLOT, and a scan
+; that starts where the last one stopped finds it in one step. Same idea as
+; NumberCache and the same discipline: the memo is a HINT and nothing more —
+; the answer is still established by comparing the node against the group's
+; members, so a stale or foreign hint costs one wrap around the group and can
+; never produce a wrong index. Nothing here has to be invalidated.
+;
+; ★Identity is POINTER identity, deliberately: it is the identity of every scan
+; this replaces (`s = node` in is_last_sibling and child_number), and a
+; character VIEW is therefore NOT found in a group that holds its chunk — the
+; callers rely on that (`absolute-last-sibling?` of a character node is #t
+; because the scan never meets it).
+;
+; The memo is the Interpreter's (`sib_hint`, one per run, page-hosted on the run
+; arena) and every caller hands it in; a grove node carries no engine state.
+define SiblingHint (parent: ref[GroveNode]?, index: int)
+
+; The parser-side declaration object a grove node stands for. Upstream gives
+; every node class its own typed member (`EntityNode(const Entity *)`,
+; `ElementTypeNode(const ElementType *)`, `DocumentTypeNode(const Dtd *)`,
+; `ModelGroupNode`/`ElementTokenNode` over the content model, the attribute
+; definition list, the GroveInfo of the document node); the port's single
+; GroveNode record (tagged by `node_class`) holds ONE of them behind this
+; pointer alias and reads it back under the class's type
+; (`node.get_decl() as ref[Entity]?`). One declaration per opaque kind
+; (CLAUDE.md, pointer[void]).
+define GroveDecl()
+define GroveDeclRef pointer[GroveDecl]
+
+define GroveNode @resident true (node_class: int, gi: StringC, chars: StringC, attributes: ref[AttributeList]?, parent: ref[GroveNode]?, children: ref[Array[ref[GroveNode]?]]?, element_index: int, char_index: int, chunk: ref[GroveNode]?, views: ref[Array[ref[GroveNode]?]]?, flags: int, decl: GroveDeclRef, loc: Location)
+{
+    function make(host: ref[Page], node_class: int) returns ref[GroveNode] linked
+
+    ; --- the declaration classes --------------------------------------------
+    ;
+    ; A declaration node over one opensp declaration object: `decl` is that
+    ; object (and its identity), `parent` the OWNER node (the grove-root chain),
+    ; `char_index` a within-owner index (an attribute-def's attIndex, a content
+    ; token's member index). Built per access — the reference does the same
+    ; (`new EntityNode(grove, entity)` on every property read).
+    function make_decl(host: ref[Page], node_class: int, decl: GroveDeclRef, owner: ref[GroveNode]?, index: int) returns ref[GroveNode] linked
+
+    function get_decl(this: GroveNode) @direct true returns GroveDeclRef linked
+
+    ; --- the sdata node's mapped character -----------------------------------
+    ;
+    ; SdataNode keeps the character the SdataMapper resolved in the NODE
+    ; (`Char c_`), and hands charChunk a pointer to it. Two reasons it cannot be
+    ; anything shorter-lived here: the FOT SAVE builder RECORDS the character
+    ; pointer without copying (SaveFOTBuilder.record_chars_from_node), so a
+    ; caller-page or stack buffer would dangle; and the mapping cannot be done
+    ; while BUILDING the grove, because the map is the interpreter's and the
+    ; stylesheet has not been read yet. So it is memoized on first use, on the
+    ; grove's OWN page — the `gi` slot, which no class but element /
+    ; element-type / element-token uses (Primitive.node_has_gi is class-gated).
+    function sdata_view(this: GroveNode) @page true @direct true returns StringC linked
+
+    procedure set_sdata_view(mutable this: ref[GroveNode], c: u32) linked
+
+    ; the two classes over an Entity — EntityNode and DefaultEntityNode share
+    ; EntityNodeBase's accessors and differ only in origin, otsrelpn and
+    ; `defaulted?`.
+    function is_entity_class(this: GroveNode) returns bool linked
+
+    ; is this one of the declaration classes? (they share every axis answer:
+    ; no children, no siblings, no parent axis)
+    function is_decl_class(this: GroveNode) returns bool linked
+
+    ; --- data chunks and their per-character views ---------------------------
+
+    ; the DataChunk this node belongs to (itself for a chunk node)
+    function data_chunk(this: ref[GroveNode]) returns ref[GroveNode] linked
+
+    ; this view's character offset inside its chunk (0 for a chunk node)
+    function get_char_index(this: GroveNode) returns int linked
+
+    ; the number of characters in this data node's chunk
+    function chunk_char_count(this: ref[GroveNode]) returns int linked
+
+    ; DataNode(chunk, index) — a per-character view. The index-0 view IS the
+    ; chunk node, so identity stays pointer-comparable for the common case.
+    ;
+    ; MEMOIZED ON THE CHUNK, and deliberately on the chunk's OWN page (the grove
+    ; region, reached with Page.get — grove nodes are page-hosted), never on the
+    ; caller's page: the callers are the axis primitives, whose per-node eval
+    ; brackets release their scratch region, which would dangle every view.
+    ; Building them once per chunk is also what keeps the cost sane — the
+    ; reference pays nothing at all because its DataNodes are transient views,
+    ; and re-materializing per `children` call cost 1.7x wall / 2.6x memory on
+    ; the dsssl.xml fot run before this cache. Sharing the objects is sound
+    ; because identity is (chunk, index) either way (DataNode::same2).
+    procedure chunk_views(mutable chunk: ref[GroveNode]) returns ref[Array[ref[GroveNode]?]] linked
+
+    ; the (chunk, index) view — no caller page is involved (chunk_views
+    ; allocates on the chunk's OWN grove page), so this form is callable from
+    ; ELObj.node_list_node, which materializes views lazily and has no host.
+    procedure char_view(mutable chunk: ref[GroveNode]?, index: int) returns ref[GroveNode]? linked
+
+    ; --- the ATTRIBUTE axis --------------------------------------------------
+    ;
+    ; ElementNode::getAttributes hands out ONE attribute-assignment per DECLARED
+    ; attribute of the element — specified, defaulted or implied alike — in
+    ; declaration order, and AttributeAsgnNode's identity is (origin, attIndex)
+    ; (same2, GroveBuilder.cxx:3785). So these are VIEWS exactly like the data
+    ; nodes: `chunk` is the origin element, `char_index` the attribute index,
+    ; `attributes` the origin's AttributeList (so every property answer is a
+    ; local lookup), and `parent` the element — the assignment's ORIGIN — while
+    ; the parent AXIS stays null (see get_axis_parent).
+    ;
+    ; Memoized on the ELEMENT's `views` slot, on the element's OWN grove page
+    ; (data chunks use theirs for character views; the two never collide because
+    ; a node is either an element or a data chunk). The reason is the same as
+    ; there: the callers are axis primitives whose per-node eval bracket releases
+    ; its scratch region, which would dangle every view built on it.
+    procedure attr_views(mutable elem: ref[GroveNode]) returns ref[Array[ref[GroveNode]?]] linked
+
+    ; the grove-wide tables moved to GroveInfo (see the note at the top of this
+    ; module and `define GroveInfo` below).
+
+    ; TokenizedAttributeValue::token, but copied onto an EXPLICIT page:
+    ; AttributeValue.token's own `substr` allocates through Page.get(<the return
+    ; slot>), which for a field store is a stack temporary — the bogus-page trap.
+    function value_token(host: ref[Page], av: ref[AttributeValue], k: size_t) returns ref[StringC] linked
+
+    ; --- the attribute classes' own properties -------------------------------
+
+    ; AttributeAsgnNode::getName — the DEFINITION's name, i.e. already
+    ; normalized by the parse (upper-cased under NAMECASE GENERAL YES).
+    function assign_name(this: GroveNode) @page true @direct true returns StringC linked
+
+    ; the assignment's AttributeValue, null when the element has none
+    function assign_value(this: GroveNode) @page true @returnpage true returns ref[AttributeValue]? linked
+
+    ; AttributeAsgnNode::getImplied — `value != 0 && value->text() == 0`: the
+    ; #IMPLIED-with-no-value test, so a DEFAULTED attribute is #f. accessNull
+    ; (out_ok false) when there is no value object at all.
+    procedure assign_implied(this: GroveNode, mutable out_ok: ref[bool]) returns bool linked
+
+    ; AttributeAsgnNode::getTokenSep — accessNull unless the VALUE is tokenized
+    ; with MORE THAN ONE token; then the character after token 0, which the
+    ; parse normalized to a space.
+    procedure assign_token_sep(this: GroveNode, mutable out_ok: ref[bool]) returns u32 linked
+
+    ; AttributeAsgnNode::tokens — the WHOLE tokenized value string, separators
+    ; included (accessNull for a CDATA or implied value). This is `nodeData`'s
+    ; second step and the reason `(data <assignment>)` reads "ONE TWO".
+    procedure assign_tokens(this: GroveNode, mutable out_ok: ref[bool]) @page true @direct true returns StringC linked
+
+    ; the attribute-assignment view for (element, attIndex), null out of range
+    procedure attr_view(mutable elem: ref[GroveNode]?, index: int) returns ref[GroveNode]? linked
+
+    ; The VALUE of an assignment — `children` of the assignment node
+    ; (AttributeAsgnNode::getValue is getChildren). Two shapes, decided by the
+    ; attribute value's own kind (makeAttributeValueNodeList): a TOKENIZED value
+    ; becomes one attribute-value-token per token, and everything else (CDATA)
+    ; becomes a DATA CHUNK whose per-character views are the members — the
+    ; reference's CdataAttributeValueNode is of class data-char, so `(node-list-ref
+    ; (node-property 'value a) 0)` reports data-char and `data` gives one
+    ; character. An IMPLIED value has no node at all (accessNull).
+    ; Memoized on the assignment's own `views` slot, same page discipline.
+    procedure attr_value_views(mutable asgn: ref[GroveNode]) returns ref[Array[ref[GroveNode]?]] linked
+
+    ; How many per-character nodes this member of an EXPANDED node-list stands
+    ; for — the weight the node-list's prefix index sums (ELObj.NodeListObj).
+    ; A data CHUNK covers its whole run; everything else (elements, pis, and
+    ; char VIEWS, which already are single characters) counts one.
+    function member_span(node: ref[GroveNode]) returns int linked
+
+    ; the single character this view stands for (0 when out of range) — the
+    ; reference's `char` property / the one-character `data` of a DataNode.
+    function view_char(this: ref[GroveNode]) returns u32 linked
+
+    ; DataNode::same2 — a data node is identified by (chunk, index), never by
+    ; object identity (the reference reuses its DataNode objects); every other
+    ; node class is identified by its single allocation.
+    function node_same(a: ref[GroveNode]?, b: ref[GroveNode]?) returns bool linked
+
+    ; Node::elementIndex — the element's document-order ordinal (0-based,
+    ; assigned by the builder at start-element; -1 on non-elements). The fot
+    ; backend's numeric anchors print it.
+    function get_element_index(this: GroveNode) returns int linked
+
+    ; Node::getId — the element's ID-typed attribute value (empty StringC if
+    ; none); the same AttributeList walk as the element-with-id index.
+    function get_id(this: GroveNode) @page true @direct true returns StringC linked
+
+    function get_class(this: GroveNode) returns int linked
+
+    ; LocNode::getLocation (accessNull -> an empty Location) — the start-tag
+    ; position of an element, inherited by its views.
+    function get_loc(this: GroveNode) @page true @direct true returns Location linked
+
+    function get_gi(this: GroveNode) @page true @direct true returns StringC linked
+
+    function get_chars(this: GroveNode) @page true @direct true returns StringC linked
+
+    function get_attributes(this: GroveNode) returns ref[AttributeList]? linked
+
+    ; get_parent is the STRUCTURAL edge (Node::getOrigin): the node that
+    ; contains this one, the grove root included. Sibling navigation,
+    ; grove-root walks and ProcessingMode::findMatch (which uses getOrigin, not
+    ; getParent) run over this one.
+    function get_parent(this: GroveNode) returns ref[GroveNode]? linked
+
+    ; get_axis_parent is the DSSSL PARENT AXIS — ChunkNode::getParent
+    ; (spgrove/GroveBuilder.cxx:4978), which is deliberately NOT the structural
+    ; edge: the reference returns accessNull for every node whose origin is the
+    ; grove root, with the comment "This is needed because PiNodes in the prolog
+    ; and epilog don't have a parent but do have an origin. Also for the
+    ; document element." The sgml-document node is therefore NEVER reachable
+    ; along the parent axis and every ancestor walk stops at the document
+    ; element. Consumers are classified one by one in COMPLETENESS.md work
+    ; package 1 — ancestor/numbering/pattern walks take the axis, siblings and
+    ; grove-root walks keep get_parent.
+    ; ★An ATTRIBUTE ASSIGNMENT answers the parent axis from `Node::getParent`,
+    ; whose DEFAULT is accessNull (grove/Node.cxx:39) — it does not override it,
+    ; so its parent is null even though its ORIGIN is the element. A VALUE TOKEN
+    ; does override it (AttributeValueTokenNode::getParent,
+    ; GroveBuilder.cxx:4096) and answers with its ASSIGNMENT, which is also its
+    ; origin — measured, so the ordinary structural path below is right for it.
+    function get_axis_parent(this: GroveNode) returns ref[GroveNode]? linked
+
+    ; --- the SIBLING axis (Chunk::getFirstSibling / nextChunkSibling) --------
+    ;
+    ; The sibling axis applies its OWN root rule, independent of the parent
+    ; axis: `Chunk::getFirstSibling` (spgrove/GroveBuilder.cxx:5326) answers
+    ; accessNotInClass when the node's origin is the grove root, so the DOCUMENT
+    ; ELEMENT has no siblings at all — `preced`/`follow` are empty there and
+    ; `first-sibling?`/`absolute-first-sibling?` are #f (their firstSibling call
+    ; fails) while `last-sibling?`/`absolute-last-sibling?` are #t (nothing
+    ; follows). The prolog and epilog PIs OVERRIDE it
+    ; (PrologPiChunk/EpilogPiChunk::getFirstSibling -> root->prolog /
+    ; root->epilog), so each PI group is siblings among itself and never across
+    ; the document element.
+
+    ; the node's own index among its structural parent's children, -1 if none
+    function index_in_parent(this: ref[GroveNode]) returns int linked
+
+    ; the index of the document element among this (grove-root) node's children
+    function document_element_index(this: GroveNode) returns int linked
+
+    ; SgmlDocumentNode::getProlog / getEpilog — the structural children before
+    ; and after the document element. Both are accessOK with an EMPTY list when
+    ; there is nothing there, and only the sgml-document class has them. An
+    ; invalid document without a document element has no epilog (the reference
+    ; never claims one either) and everything it holds is prolog.
+    function prolog_end(this: GroveNode) returns int linked
+
+    function epilog_begin(this: GroveNode) returns int linked
+
+    ; firstSibling succeeds? (false = accessNotInClass: no sibling axis)
+    ; The attribute classes implement firstSibling themselves
+    ; (AttributeAsgnNode / AttributeValueTokenNode: index 0 of their own group),
+    ; so they always have one.
+    function has_siblings(this: GroveNode) returns bool linked
+
+    ; --- the sibling GROUP ---------------------------------------------------
+    ;
+    ; For a tree node the group is its structural parent's child list, addressed
+    ; by the [begin, end) range below. The attribute classes have their OWN
+    ; groups — an assignment's siblings are the origin's other ASSIGNMENTS
+    ; (followSiblingRef walks attIndex, GroveBuilder.cxx:3694) and a value
+    ; token's are the other TOKENS of the same value (it walks tokenIndex) — so
+    ; every sibling walk asks the NODE for its group member rather than reaching
+    ; through the parent's children.
+    procedure sibling_group_at(mutable this: ref[GroveNode], i: int) returns ref[GroveNode]? linked
+
+    ; the half-open [begin, end) index range of this node's sibling group inside
+    ; its structural parent's child list. For the document element the range is
+    ; EMPTY and does not contain the node — which makes both the preced and the
+    ; follow scans yield nothing, exactly as the reference does.
+    function sibling_range_begin(this: ref[GroveNode]) returns int linked
+
+    ; the node's own index inside its sibling group, or -1 when the group does
+    ; not contain it (an empty range, a character view, a node whose group is
+    ; somebody else's). See the note above the concept for why the memo cannot
+    ; make this wrong.
+    procedure group_index(mutable this: ref[GroveNode], mutable hint: ref[SiblingHint]) returns int linked
+
+    procedure sibling_range_end(mutable this: ref[GroveNode]) returns int linked
+
+    function get_children(this: GroveNode) returns ref[Array[ref[GroveNode]?]]? linked
+
+    function child_count(this: GroveNode) returns int linked
+
+    function child_at(this: GroveNode, i: int) returns ref[GroveNode]? linked
+
+    procedure add_child(mutable this: ref[GroveNode], c: ref[GroveNode]) @persists true linked
+
+    ; --- the CHILDREN axis (Node::firstChild) -------------------------------
+    ;
+    ; `Node::firstChild` is accessNotInClass by default and is overridden ONLY
+    ; by ElementNode (grove/Node.cxx:399, spgrove/GroveBuilder.cxx:2965) — the
+    ; attribute-assignment class is the reference's other override and is
+    ; unported. So the SGML-DOCUMENT node has NO children axis: `children`,
+    ; `descendants` and `data` are all empty at the grove root, and
+    ; processChildren falls back to getDocumentElement there. The STRUCTURAL
+    ; child list (child_count/child_at) keeps carrying prolog PIs, document
+    ; element and epilog PIs — that is what the builder, the sibling ranges,
+    ; the prolog/epilog properties and the element-number walk read.
+    function has_child_axis(this: GroveNode) returns bool linked
+
+    procedure axis_child_count(mutable this: ref[GroveNode]) returns int linked
+
+    procedure axis_child_at(mutable this: ref[GroveNode], i: int) returns ref[GroveNode]? linked
+
+    ; --- element flags (the chunk's included / mustOmitEndTag) --------------
+    ;
+    ; `included?` is the start-element event's inclusion flag
+    ; (IncludedElementChunk::included) and `must-omit-end-tag?` is
+    ; ElementChunk::mustOmitEndTag — declared content EMPTY, or a CONREF
+    ; attribute specified WITH a value (AttElementChunk::mustOmitEndTag). Both
+    ; are decided while the event is in hand and stored on the node.
+    function get_included(this: GroveNode) returns bool linked
+
+    function get_must_omit_end_tag(this: GroveNode) returns bool linked
+
+    procedure set_flag(mutable this: ref[GroveNode], f: int) linked
+
+    ; ElementNode::getId — the value of this element's ID-typed attribute, the
+    ; empty string when it has none (an ID value is a name token, so it can
+    ; never legitimately be empty).
+    function id_value(this: GroveNode) @page true @direct true returns StringC linked
+}
+
+; GroveBuilder — walk ps.events into a document node tree. Mirrors
+; SPGrove's event-driven build: start pushes an element under the current
+; node, end pops, data/sdata append a data leaf, pi appends a pi leaf.
+; One entry of the grove ID index: an ID-attribute value and the element it
+; identifies. See GroveBuilder.build_id_index.
+define IdEntry (id: StringC, node: ref[GroveNode]?)
+{
+    ; the element this entry identifies — the sgml-document class's `elements`
+    ; named node list is this table (see Primitive.node_property_value).
+    function get_node(this: IdEntry) returns ref[GroveNode]? linked
+}
+
+; GroveImpl (spgrove/GroveBuilder.cxx:163) — everything a grove owns BESIDE its
+; node tree: the grove index, the governing DTD, the instance syntax's fold
+; table, the defaulted-entity table, the ID table and the APPINFO literal. The
+; record hangs off the sgml-document node's `decl` slot (the only node class
+; that never uses it for a declaration object), so every consumer reaches its
+; own grove's copy through Node::getGroveRoot — which is exactly how the
+; reference spells each of these accesses.
+;
+; `dtd` stays untyped: opensp's Dtd must not enter this module's type graph
+; (the ExternalDataEntity notation-field convention).
+;
+; GroveImpl's `sd_` / `prologSyntax_` / `instanceSyntax_` have NO counterpart
+; here: their only reader is `SgmlDocumentNode::getSd`, whose only caller is the
+; subdoc branch of DssslApp::load — dead in the reference (see the note in
+; GroveManager.load). The instance syntax's contribution that IS live, its
+; general fold table, is `subst`.
+define GroveInfo (grove_index: int, sysid: StringC, subst: Slice[u32], dtd: ref[Dtd]?, defaulted_ents: ref[Array[ref[Entity]?]], entity_defaulted: ref[Array[ref[Entity]?]]?, appinfo: ref[StringC]?, id_index: ref[Array[ref[IdEntry]?]]?, id_table: ref[NamedTable[GroveNode]]?, elem_order: ref[Array[ref[GroveNode]?]]?)
+{
+    function make(host: ref[Page], grove_index: int) returns ref[GroveInfo] linked
+
+    ; The document-order ELEMENT vector — the port's stand-in for the chunk
+    ; chain the reference steps along in `NumberCache::advance`
+    ; (NodePtr::assignNextChunkAfter). Built once per grove, on the first
+    ; `element-number` of the run; null for a grove GroveBuilder never built
+    ; (hand-made unit-test trees), where the caller falls back to the walk.
+    ;
+    ; ★The vector's POSITION is the node's `element_index` — GroveBuilder
+    ; assigns that at every start tag, in document order, and the pre-order
+    ; collection below visits the elements in exactly that order. `advance` is
+    ; an index increment because of it, so the identity is VERIFIED here rather
+    ; than assumed: one mismatch and the grove answers "no vector" for good.
+    procedure elem_order_of(host: ref[Page], mutable node: ref[GroveNode]) @page true @direct true returns ref[Array[ref[GroveNode]?]]? linked
+
+    procedure collect_elements(cur: ref[GroveNode], mutable out: ref[Array[ref[GroveNode]?]]) returns bool linked
+
+    ; Node::getGroveRoot — the STRUCTURAL walk (not the DSSSL parent axis, which
+    ; stops at the document element), then the sgml-document node's info. Null
+    ; for a node that was never built by GroveBuilder (the unit tests' hand-made
+    ; trees), where every accessor below degrades to "no table".
+    function of(node: ref[GroveNode]?) returns ref[GroveInfo]? linked
+
+    ; Node::groveIndex — 0 for the document grove, 1.. for every grove
+    ; sgml-parse loads. `sameGrove` is the comparison of two of these.
+    function index_of(node: ref[GroveNode]?) returns int linked
+
+    ; GroveImpl::generalSubstTable — the instance syntax's 256-entry name-fold
+    ; table the NAMED node lists normalize a query name through. Null = no
+    ; folding.
+    function subst_of(node: ref[GroveNode]?) @page true @direct true returns Slice[u32] linked
+
+    ; GroveImpl::governingDtd
+    function dtd_of(node: ref[GroveNode]?) returns ref[Dtd]? linked
+
+    ; GroveImpl::idTable_ — the elements that have an ID, in document order.
+    ; The Array carries the ORDER (the `elements` named node list walks it); the
+    ; NameTable beside it carries the LOOKUP, which is what the reference's
+    ; PointerTable<...,Hash,...> does. Null table = fall back to the scan (the
+    ; hand-made unit-test groves never install one).
+    function id_index_of(node: ref[GroveNode]?) returns ref[Array[ref[IdEntry]?]]? linked
+
+    function id_table_of(node: ref[GroveNode]?) returns ref[NamedTable[GroveNode]]? linked
+
+    ; GroveImpl::appinfo_ / haveAppinfo_ — the SGML declaration's APPINFO
+    ; literal (accessNull under APPINFO NONE, where no AppinfoEvent fires).
+    function appinfo_of(node: ref[GroveNode]) returns ref[StringC]? linked
+
+    ; GroveImpl::defaultedEntityTable_ — the entities the INSTANCE resolved
+    ; through ParserState's entity lookup (the reference fills this from every
+    ; EntityDefaultedEvent, which fires for far more than actual defaulted
+    ; copies — see ParserState.lookup_entity_pass_aware). Insertion order; the
+    ; reference iterates it as a NamedTable, so the ORDER the
+    ; `defaulted-entities` property hands out is hash-bucket order, re-derived
+    ; at the property (like every other declaration table).
+    function defaulted_ents_of(node: ref[GroveNode]?) returns ref[Array[ref[Entity]?]]? linked
+
+    ; GroveImpl::lookupDefaultedEntity
+    function lookup_defaulted_ent(node: ref[GroveNode]?, nm: StringC) returns ref[Entity]? linked
+
+    ; NamedResourceTable::insert — a same-NAME entry is REPLACED in place, so
+    ; repeated references to one entity leave a single member and the bucket
+    ; sequence follows first-insertion order. Called with the BUILDER's info,
+    ; which is why it takes the record and not a node.
+    procedure add_defaulted_ent(mutable info: ref[GroveInfo], ent: ref[Entity]?) linked
+
+    ; Entity::defaulted() — a side table in this port
+    ; (ParserState.defaulted_entities), threaded in by whoever ran the parse.
+    ; The `defaulted?` property and EntityNode::getOrigin's grove-root special
+    ; case both read it.
+    function entity_is_defaulted(node: ref[GroveNode], ent: ref[Entity]?) returns bool linked
+}
+
+; Incremental grove construction state — the streaming drain (opensp's
+; do_content pump calling back into GroveBuilder.feed) consumes the event
+; queue in chunks, so the builder can no longer be a one-shot walk. The
+; pending-data fields mirror the reference's data COALESCING
+; (GroveBuilder.cxx DataNode::add): consecutive data events whose location
+; is contiguous (same origin, index continues the run) extend ONE data
+; chunk; any other event — or a non-contiguous data event — flushes the
+; pending chunk as a single data node. (The per-event data nodes the old
+; walk produced were a port deviation: 3.4M nodes on a 5 MB parse.)
+;
+; The sim_* fields replicate GroveImpl's CHUNK ALLOCATOR byte-exactly —
+; a data run also breaks where the reference's tryExtend fails (block
+; exhausted), which is OBSERVABLE (one fot <text> per data chunk, chunk-
+; stepped node lists). Geometry: blocks start at 8192 bytes and double
+; every 20 blocks; each block reserves BlockHeader(8) + ForwardingChunk(24);
+; chunk sizes are the reference build's C++ sizeofs (arm64 LP64, Char=4):
+; SgmlDocumentChunk 56, ElementChunk 48, AttElementChunk 56+8*nAtts,
+; LocOriginChunk 24, DataChunk/PiChunk header 32 (+4/char, 8-rounded),
+; SdataChunk 32, ForwardingChunk 24. A LocOriginChunk lands when the event
+; origin changes or 100 allocChunk calls have passed (setLocOrigin);
+; finishProlog/finishDocumentElement add barrier ForwardingChunks.
+define GroveBuildState (info: ref[GroveInfo], host: ref[Page], root: ref[GroveNode], current: ref[GroveNode], pend: ref[Array[u32]]?, pend_org: ref[Origin]?, pend_next: u32, n_elements: int, sim_n_free: size_t, sim_block_size: size_t, sim_blocks_this_size: int, sim_chunks_since_lo: int, sim_cur_lo: ref[Origin]?, sim_block_live: bool, doc_started: bool, prolog_chunk_added: bool, epilog_set: bool, tok_buf: ref[Array[u32]]?, tok_org: ref[Origin]?, tok_start: u32, tok_bound: u32)
+{
+}
+
+; --- GroveImpl allocator simulation (sizes: reference build sizeofs) --------
+define SIM_BLOCK_HEADER: int 8
+define SIM_FORWARDING: int 24
+define SIM_SGML_DOCUMENT: int 56
+define SIM_ELEMENT: int 48
+define SIM_ATT_ELEMENT: int 56
+define SIM_LOC_ORIGIN: int 24
+define SIM_CHARS_HEADER: int 32
+; EntityRefChunk = LocChunk(vptr + origin + Index) + `const Entity *` = 32, and
+; SdataChunk / ExternalDataChunk / SubdocChunk / PiEntityChunk all derive from
+; it without adding a field (SdataNode keeps its mapped Char in the NODE).
+define SIM_SDATA: int 32
+; NonSgmlChunk = LocChunk + Char, which fits the tail padding.
+define SIM_NONSGML: int 24
+define SIM_INITIAL_BLOCK: int 8192
+define SIM_MAX_BLOCKS_PER_SIZE: int 20
+define SIM_MAX_CHUNKS_WITHOUT_LO: int 100
+
+define GroveBuilder
+{
+    function begin(host: ref[Page], grove_index: int) returns ref[GroveBuildState] linked
+
+    ; CharsChunk::allocSize — header + 4 bytes/char, rounded to 8.
+    function sim_chars_alloc_size(n_chars: size_t) returns size_t linked
+
+    ; GroveImpl::allocFinish — possibly double the block size, then open a
+    ; fresh block reserving BlockHeader + a ForwardingChunk slot.
+    procedure sim_alloc_finish(mutable st: ref[GroveBuildState], n: size_t) linked
+
+    ; GroveImpl::allocChunk — bump within the block or finish into a new one.
+    procedure sim_alloc_chunk(mutable st: ref[GroveBuildState], n: size_t) linked
+
+    ; GroveImpl::tryExtend
+    procedure sim_try_extend(mutable st: ref[GroveBuildState], n: size_t) returns bool linked
+
+    ; GroveImpl::setLocOrigin/storeLocOrigin — a LocOriginChunk lands when
+    ; the origin changed or 100 allocChunk calls have passed.
+    procedure sim_set_loc_origin(mutable st: ref[GroveBuildState], org: ref[Origin]?) linked
+
+    ; GroveImpl::addBarrier — a ForwardingChunk written into the block's
+    ; reserved slot; a (nearly) full block dies.
+    procedure sim_add_barrier(mutable st: ref[GroveBuildState]) linked
+
+    ; appendSibling/push bookkeeping shared bits: prolog/epilog tracking for
+    ; the finishProlog/finishDocumentElement barriers.
+    procedure sim_note_append(mutable st: ref[GroveBuildState]) linked
+
+    ; DataNode::add — ONE reference data event (a token): extend the pending
+    ; chunk when the origin is current, the index continues the run AND the
+    ; extension fits the reference's allocation block; else a fresh chunk
+    ; (= a fresh grove data node).
+    procedure data_add(mutable st: ref[GroveBuildState], org: ref[Origin]?, idx: u32, chars: Slice[u32]) linked
+
+    ; The first read-block boundary past `idx` in this origin's fill-bounds
+    ; list (see Origin.set_fill_bounds) — u32 max when none (in-memory
+    ; sources never refill).
+    function next_fill_bound(org: ref[Origin]?, idx: u32) returns u32 linked
+
+    ; Close the open re-grouped token: it becomes one reference data event.
+    ; (The parser port emits content data PER CHARACTER; the reference's
+    ; extendData batches a maximal run of normal chars into ONE
+    ; ImmediateDataEvent, and the chunk-extension quantum is per EVENT —
+    ; observable through where chunks break. Contiguous same-origin 1-char
+    ; data events are regrouped here into that token; RE function-char
+    ; events, origin changes and index gaps close it, as extendData's
+    ; normal-map/buffer boundaries do. Caveat: a record longer than the
+    ; reference's read block would split mid-record there — unmodeled.)
+    procedure close_token(mutable st: ref[GroveBuildState]) linked
+
+    ; flush the pending coalesced data run as ONE data node (the reference's
+    ; DataChunk boundary — GroveImpl::push/appendSibling flush pendingData_).
+    procedure flush_pending(mutable st: ref[GroveBuildState]) linked
+
+    ; consume the queued events [ps.get_drained(), ps.n_events()) — called
+    ; from the streaming drain callback (which then resets the event scratch
+    ; region, so everything kept here is deep-copied; the borrowed
+    ; AttributeList pointers live on the run page and survive).
+    procedure feed(mutable st: ref[GroveBuildState], ps: ref[ParserState]) linked
+
+    procedure finish(mutable st: ref[GroveBuildState]) returns ref[GroveNode] linked
+
+    function build(host: ref[Page], ps: ref[ParserState]) returns ref[GroveNode] linked
+
+    ; build_id_index: walk the grove and collect (id-value -> element node) for
+    ; every element carrying an ID-typed attribute (declared TYPE ID in the DTD;
+    ; opensp flags it via AttributeList.id(i)). Backs element-with-id. Linear
+    ; Array, matching the interpreter's NamedTable shape; lookup is by StringC
+    ; value equality (opensp already normalizes ID/IDREF tokens consistently).
+    ; ElementChunk::mustOmitEndTag (spgrove/GroveBuilder.cxx:3155) plus the
+    ; att-bearing override (:3131): the declared content is EMPTY, or some
+    ; CONREF attribute is specified WITH a value.
+    function must_omit_end_tag(et: ref[ElementType]?, atts: ref[AttributeList]?) returns bool linked
+
+    function build_id_index(host: ref[Page], root: ref[GroveNode]) returns ref[Array[ref[IdEntry]?]] linked
+
+    ; NamedNodeList::namedNode over the sgml-document `elements` list, folded
+    ; through the instance syntax's general subst table — the same normalize
+    ; step Primitive.nnl_normalize does for NNL_ELEMENTS. It lives here, not on
+    ; the Interpreter, because HtmlFOTBuilder's idref link arm needs it and is
+    ; declared long before the Interpreter module.
+    ;
+    ; ★The grove is the QUERIED NODE's, not the run's: `element-with-id` spells
+    ; it `node->getGroveRoot(node) && node->getElements(elements)`, so with a
+    ; second grove loaded the same id can name two different elements.
+    function element_by_id(host: ref[Page], node: ref[GroveNode]?, id: StringC) returns ref[GroveNode]? linked
+
+    ; the hashed companion of the id index: same keys (the entries' own arena
+    ; StringC buffers), same winner on a duplicate id — PointerTable::insert
+    ; defaults to replace=false and returns the EXISTING entry, so the FIRST
+    ; occurrence in document order wins there exactly as it did in the scan.
+    function build_id_table(host: ref[Page], index: ref[Array[ref[IdEntry]?]]?) returns ref[NamedTable[GroveNode]]? linked
+
+    function lookup_element_by_id(host: ref[Page], index: ref[Array[ref[IdEntry]?]]?, tab: Slice[u32], id: StringC, tbl: ref[NamedTable[GroveNode]]?) @page true @direct true returns ref[GroveNode]? linked
+
+    procedure collect_ids(host: ref[Page], node: ref[GroveNode], mutable index: ref[Array[ref[IdEntry]?]]) linked
+
+    ; A small hand-built grove for the node-list unit test:
+    ;   document > para > ["Hello", emph > "world"]
+    function build_test_grove(host: ref[Page]) returns ref[GroveNode] linked
+}

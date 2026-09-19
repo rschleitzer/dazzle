@@ -1,0 +1,262 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.Location.Location
+use opensp.StringC.StringC
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.GlyphSubstTableRec
+; Identifier is reached only through `ic.ident.get_name()` below, and without
+; this line the method did not resolve at all: lookup_concept answers null for
+; an invisible concept, so the hop became an unresolved placeholder and the
+; emitter's lenient extractvalue-at-field-0 recovery read `name` — which is
+; exactly what get_name() returns, so the program was right by accident. Found
+; by the member-not-found trap once the placeholder started recording the
+; UNWRAPPED parent type (see Planner.resolve_member_access#).
+use dazzle.ELObj.Identifier
+use dazzle.ELObj.OutputCharStream
+use dazzle.FrameMark.FrameMark
+use dazzle.Grove.GroveNode
+use dazzle.Insn.Insn
+use dazzle.Interpreter.Interpreter
+use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.Style.StyleStack
+use dazzle.Style.InheritedCInfo
+use dazzle.Style.InheritedC
+use dazzle.Style.VarStyleRec
+use dazzle.Style.Convert
+use dazzle.Style.FotSym
+use dazzle.Style.LengthSpec
+use dazzle.ProcessingMode.ProcessingMode
+
+; VM — the threaded-code virtual machine (Style/VM.cxx). The evaluation loop
+; is `while (insn) insn = insn->execute(this)`; each Insn advances the value
+; stack (sbase/sp) and returns its successor. Frames and closures live on the
+; control stack (csbase/csp). Error is signalled by driving sp negative (the
+; C++ sp==NULL; C# sp==-1). One arena page per run: the stacks grow by
+; allocating a fresh, larger buffer on the host and copying — never freed.
+;
+; Cross-module rule (port history S52): other modules reach VM state ONLY
+; through the accessors below, never by direct field access.
+
+; ControlStackEntry (VM.cs): a saved frame for popFrame to restore.
+define ControlStackEntry
+(
+    closure: pointer[pointer[ELObj]]
+    protect_closure: ref[ELObj]?
+    next: ref[Insn]?
+    frame_size: int
+    closure_loc: Location
+    continuation: ref[ELObj]?
+)
+{
+    init() linked
+}
+
+define VM
+(
+    interp: ref[Interpreter]?
+    host: ref[Page]
+    sbase: pointer[pointer[ELObj]]
+    sp: int
+    slim: int
+    frame_start: int
+    closure: pointer[pointer[ELObj]]
+    protect_closure: ref[ELObj]?
+    closure_loc: Location
+    csbase: pointer[ControlStackEntry]
+    csp: int
+    cslim: int
+    n_actual_args: int
+    ; EvalContext (VM.cxx base) — the node being processed by the enclosing
+    ; construction rule. The `current-node` primitive reads it; ProcessContext
+    ; sets it around each processNode eval (S6a Inc 5).
+    current_node: ref[GroveNode]?
+    ; EvalContext.processingMode — the mode the process-* sosofo primitives
+    ; capture; with-mode pushes/pops it (PushModeInsn/PopModeInsn). This was a
+    ; pointer[void] on the stated ground that naming ProcessingMode here would
+    ; cycle: MEASURED FALSE. A `use` cycle between modules of one package is
+    ; not an error — dazzle already carries 19 mutual pairs, Insn <-> VM among
+    ; them — and only a module-level `define` CONSTANT is order-sensitive.
+    processing_mode: ref[ProcessingMode]?
+    ; grow-only save stack with a cursor (Array cannot shrink) — the open_count
+    ; idiom.
+    mode_stack: ref[Array[ref[ProcessingMode]?]]?
+    mode_sp: size_t
+    ; EvalContext.styleStack/specLevel/actualDependencies — non-null only while
+    ; an inherited-characteristic value is being evaluated (style push,
+    ; inherited-*/actual-*). spec_level -1 = the C++ unsigned(-1) sentinel.
+    style_stack: ref[StyleStack]?
+    spec_level: int
+    actual_deps: ref[Array[int]]?
+    ; EvalContext.currentLanguage — what `with-language` binds and
+    ; `current-language` reads; null means fall back to the interpreter's
+    ; declare-default-language value (which is itself #f by default).
+    current_language: ref[ELObj]?
+    ; the interpreter's frame-mark state block (null: the mark is off), kept
+    ; here because the frame hooks run on the VM's hot path
+    frame_mark: pointer[i64]
+)
+{
+    function make(host: ref[Page], interp: ref[Interpreter]?) returns ref[VM] linked
+
+    function get_style_stack(this: VM) returns ref[StyleStack]? linked
+
+    function get_spec_level(this: VM) returns int linked
+
+    function get_actual_deps(this: VM) returns ref[Array[int]] linked
+
+    ; SetNonInheritedCInsn's per-characteristic dependency reset (the record
+    ; is a sink during the NIC resolve — replaced, never truncated in place).
+    procedure reset_actual_deps(mutable this: ref[VM]) linked
+
+    ; --- EvalContext current node (cross-module accessors) ------------------
+    function get_current_node(this: VM) returns ref[GroveNode]? linked
+
+    function get_current_language(this: VM) returns ref[ELObj]? linked
+
+    procedure set_current_language(mutable this: ref[VM], l: ref[ELObj]?) linked
+
+    procedure set_current_node(mutable this: ref[VM], n: ref[GroveNode]?) linked
+
+    ; --- EvalContext processing mode (with-mode / process-* capture) --------
+    function get_processing_mode(this: VM) returns ref[ProcessingMode]? linked
+
+    procedure set_processing_mode(mutable this: ref[VM], m: ref[ProcessingMode]?) linked
+
+    ; PushModeInsn: save the current mode, switch to `m`.
+    procedure push_mode(mutable this: ref[VM], m: ref[ProcessingMode]?) linked
+
+    ; PopModeInsn: restore the saved mode.
+    procedure pop_mode(mutable this: ref[VM]) linked
+
+    ; --- accessors (cross-module surface) ----------------------------------
+    function get_sp(this: VM) returns int linked
+
+    procedure set_sp(mutable this: ref[VM], n: int) linked
+
+    ; ★★★THE ERROR SIGNAL, and it is the ONLY writer of a negative `sp` in the
+    ; whole engine (`grep -rn "set_sp(0 - 1)\|set this.sp: 0 -"` must find
+    ; nothing outside this file). It answers `null` so that a raising arm reads
+    ; `return vm.fail()` and cannot set the flag without also ending the insn
+    ; chain — which is exactly what lets `VM.eval`'s inner loop drop the
+    ; `sp < 0` test it used to run after EVERY step (22 M times on the
+    ; single-file codegen; the reference has no such test either and reads the
+    ; failure after the loop, `if (sp)` in Insn.cxx:153). One deliberate
+    ; two-hop exception, and only one: `VM.apply_shuffle` returns `false` and
+    ; its single caller `ELObj.apply_call` turns that into `null`. Adding a
+    ; site that raises WITHOUT ending the chain would let the loop run on with
+    ; sp = -1 and store through `sbase - 1`.
+    procedure fail(mutable this: ref[VM]) returns ref[Insn]? linked
+
+    ; ★The UNWRAP is a claim, and the claim is true: `interp` is nullable only
+    ; because `Jit.measure_layout` builds a throwaway VM to find the field
+    ; offsets by sentinel search, and that VM never executes an instruction --
+    ; every VM that runs is made with a real Interpreter. Confining the Option
+    ; to `make` and this one line is deliberate: widening the ACCESSOR instead
+    ; would push it onto 37 call sites, 26 of them in Insn.scaly's dispatch.
+    function get_interp(this: VM) returns ref[Interpreter] linked
+
+    ; value allocations during eval go through here — eval-scratch-aware via
+    ; the Interpreter seam. The VM's OWN stacks keep growing on this.host
+    ; directly (they persist across evals; scratch-hosted stacks would dangle).
+    function get_host(this: VM) returns ref[Page] linked
+
+    function get_frame_start(this: VM) returns int linked
+
+    procedure set_frame_start(mutable this: ref[VM], n: int) linked
+
+    function get_closure(this: VM) returns pointer[pointer[ELObj]] linked
+
+    procedure set_closure(mutable this: ref[VM], d: pointer[pointer[ELObj]]) linked
+
+    procedure set_protect_closure(mutable this: ref[VM], c: ref[ELObj]) linked
+
+    procedure set_closure_loc(mutable this: ref[VM], loc: Location) linked
+
+    function get_n_actual_args(this: VM) returns int linked
+
+    procedure set_n_actual_args(mutable this: ref[VM], n: int) linked
+
+    ; value-stack element access (sbase[i]).
+    function stack_ref(this: VM, i: int) returns ref[ELObj]? linked
+
+    procedure stack_set(mutable this: ref[VM], i: int, v: ref[ELObj]?) linked
+
+    ; a raw pointer into the value stack at index i (arg slices for primitives).
+    function sbase_at(this: VM, i: int) returns pointer[pointer[ELObj]] linked
+
+    ; closure-display element (closure[i]).
+    function closure_ref(this: VM, i: int) returns ref[ELObj] linked
+
+    ; --- stack growth ------------------------------------------------------
+    procedure need_stack(mutable this: ref[VM], n: int) linked
+
+    ; The TEST half of need_stack, on its own. An arm that must stay call-free
+    ; asks this and tail-calls out when it answers true (Insn.execute_grow) —
+    ; calling `need_stack` instead drags the inlined `grow_stack`, and with it
+    ; `Page.allocate`, into the caller, which costs that caller a stack frame.
+    function needs_grow(this: VM, n: int) returns bool linked
+
+    procedure grow_stack(mutable this: ref[VM], n: int) linked
+
+    ; --- control stack -----------------------------------------------------
+    procedure push_frame(mutable this: ref[VM], next: ref[Insn]?, args_pushed: int) linked
+
+    procedure pop_frame(mutable this: ref[VM]) returns ref[Insn]? linked
+
+    ; --- call/cc control-stack helpers -------------------------------------
+    function get_csp(this: VM) returns int linked
+
+    ; VM::setClosureArgToCC — record the continuation (the closure's sole arg,
+    ; now at sp[-1]) in the just-pushed frame and stamp its captured sizes.
+    procedure set_closure_arg_to_cc(mutable this: ref[VM], mutable k: ref[ELObj]) linked
+
+    ; ContinuationObj::call unwind: pop the control stack down to target_csp,
+    ; killing any continuations captured above it.
+    procedure unwind_control_stack(mutable this: ref[VM], target_csp: int) linked
+
+    procedure init_stack(mutable this: ref[VM]) linked
+
+    ; --- eval loop (VM::eval) ----------------------------------------------
+    procedure eval(mutable this: ref[VM], mutable insn_in: ref[Insn]?, display: pointer[pointer[ELObj]], arg: ref[ELObj]?) @page true @direct true returns ref[ELObj]? io reads msg_prog linked
+
+    ; VM::stackTrace — the `called from here` chain over the control stack's
+    ; closure-call locations, newest first. Frame 5 elides the middle when
+    ; more than 7 frames follow (`called from here...(%1 calls omitted)`),
+    ; resuming with the OLDEST 6 frames — byte-exact Insn.cxx arithmetic.
+    ; The currently executing closure (protect_closure) contributes the first
+    ; line; the bottom control-stack entry is skipped when it is the eval
+    ; root (no protecting closure).
+    procedure stack_trace(mutable this: ref[VM]) io reads msg_prog linked
+
+    ; ApplyPrimitiveObj::shuffle — the (apply f a b list) argument reshuffle:
+    ; drop f from under the args, splice the trailing list, push f on top.
+    procedure apply_shuffle(mutable this: ref[VM], loc: Location) returns bool io reads msg_prog linked
+
+    ; --- inherited-characteristics evaluation glue ---------------------------
+    ; Ports InheritedC::value / VarInheritedC::set+value and StyleStack::
+    ; inherited/actual (Style.cxx, InheritedC.cxx). It lives HERE because
+    ; Style.scaly cannot evaluate code (Style importing VM would close the
+    ; VM→Insn→Style cycle). Evaluation always runs in a FRESH VM (the
+    ; reference's StyleStack::inherited does the same; pushEnd's reuse of the
+    ; processing VM is not reentrancy-safe for our eval loop).
+
+    ; InheritedC::value — the ELObj form of a CONSTANT spec's value.
+    procedure ic_value_of(host: ref[Page], mutable interp: ref[Interpreter], ic: ref[InheritedC]) returns ref[ELObj] linked
+
+    ; evaluate a spec's value: VarInheritedC::value (fresh VM, the style's
+    ; display + creation node, spec_level per caller) or the constant form.
+    procedure eval_spec_value(mutable spec: ref[InheritedC], style: ref[VarStyleRec]?, ss: ref[StyleStack]?, spec_level: int, mutable interp: ref[Interpreter], deps: ref[Array[int]]) @page true @returnpage true returns ref[ELObj]? io reads msg_prog linked
+
+    ; StyleStack::inherited — the value of `ic` as seen from a spec at
+    ; `spec_level` (the level below its own specification).
+    procedure stack_inherited(ss: ref[StyleStack], mutable ic: ref[InheritedC], spec_level: int, mutable interp: ref[Interpreter], deps: ref[Array[int]]) @page true @returnpage true returns ref[ELObj]? io reads msg_prog linked
+
+    ; StyleStack::actual — the actual (current-level) value of `ic`, with
+    ; circularity detection over the accumulating dependency list.
+    procedure stack_actual(ss: ref[StyleStack], mutable ic: ref[InheritedC], loc: Location, mutable interp: ref[Interpreter], mutable deps: ref[Array[int]]) @page true @returnpage true returns ref[ELObj]? io reads msg_prog linked
+
+    ; pushEnd's per-spec body (VarInheritedC::set): resolve a pushed spec to
+    ; the CONSTANT characteristic the sink renders — evaluating + caching a
+    ; VarInheritedC's value on first use; null = invalid/error (nothing set).
+    procedure resolve_set(ss: ref[StyleStack]?, mutable info: ref[InheritedCInfo], mutable interp: ref[Interpreter]) returns ref[InheritedC]? io reads msg_prog linked
+}

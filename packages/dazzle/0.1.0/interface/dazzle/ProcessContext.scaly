@@ -1,0 +1,454 @@
+; ProcessContext — drives a grove through a mode's construction rules,
+; emitting a flow-object sequence into a FOTBuilder (Style/ProcessContext.cxx +
+; SosofoObj::process). process(root) walks the tree: each node is matched, its
+; rule evaluated to a sosofo, and the sosofo processed — process-children
+; recurses, literal emits characters, and so on.
+;
+; Inc 5a scope (Konstruktionsregeln-Kern): construction rules driving the real
+; transform FOTBuilder (Inc 5b slice A) with the `make` special form wired in
+; (slice B). Deferred (the print/connection machinery): style stacks,
+; connections/ports, tables, page types, inherited characteristics — Inc 9
+; (print path).
+
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use dazzle.Grove.GroveNode
+use dazzle.Grove.GroveInfo
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.FlowObj
+use dazzle.ELObj.SosofoCtlRec
+use dazzle.ELObj.MacroDef
+use dazzle.Expression.Expression
+use dazzle.VM.VM
+use dazzle.Interpreter.Interpreter
+use dazzle.ProcessingMode.ProcessingMode
+use dazzle.ProcessingMode.Rule
+use dazzle.ProcessingMode.Specificity
+use dazzle.TransformFOTBuilder.TransformFOTBuilder
+use dazzle.SgmlFOTBuilder.SgmlFOTBuilder
+use dazzle.RtfFOTBuilder.RtfFOTBuilder
+use dazzle.TeXFOTBuilder.TeXFOTBuilder
+use dazzle.HtmlFOTBuilder.HtmlFOTBuilder
+use dazzle.MifFOTBuilder.MifFOTBuilder
+use dazzle.Style.PageFloatNIC
+use dazzle.Style.IndexEntryNIC
+use dazzle.Style.LineFieldNIC
+use dazzle.Style.CharacterNIC
+use dazzle.Style.AnchorNIC
+use dazzle.Style.GlyphAnnotationNIC
+use dazzle.Style.EmphasizingMarkNIC
+use dazzle.Style.RadicalNIC
+use dazzle.Style.GridNIC
+use dazzle.Style.GridCellNIC
+use dazzle.Style.EmbeddedTextNIC
+use dazzle.Style.IncludedContainerAreaNIC
+use dazzle.Style.MultiModeRec
+use dazzle.Style.MultiModeNIC
+use dazzle.FotSink.FotSink
+use dazzle.SaveFOTBuilder.SaveFOTBuilder
+use dazzle.ELObj.Identifier
+use dazzle.Style.StyleStack
+use dazzle.Style.InheritedC
+use dazzle.Style.InheritedCInfo
+use dazzle.Style.DisplayNIC
+use dazzle.Style.Convert
+use dazzle.Style.TableNIC
+use dazzle.Style.TableColumnNIC
+use dazzle.Style.TableCellNIC
+use dazzle.Style.RuleNIC
+use dazzle.Style.LinkNIC
+use dazzle.Style.ExternalGraphicNIC
+use dazzle.Style.LeaderNIC
+use dazzle.Style.BoxNIC
+use dazzle.Style.ScoreNIC
+use dazzle.Style.VarStyleRec
+use dazzle.Insn.Insn
+; the sdata character mapping (SdataNode::charChunk through the SdataMapper)
+use dazzle.Primitive.Primitive
+use dazzle.InterpreterMessages.InterpreterMessages
+use opensp.Location.Location
+
+; ProcessContext::Table — the per-table state (row/column styles, the covered
+; rowspan tracker). Lives on the eval region CURRENT AT startTable (the table
+; node's bracket, which outlives all row/cell child brackets); every internal
+; allocation must use `host`, never the (deeper) region current at add time.
+; NOTE (RBMM hazard, documented): a column/row STYLE made by a DESCENDANT
+; node's rule lives on that descendant's bracket and dangles once its bracket
+; pops — the reference-faithful common shape (columns made in the table's own
+; rule, row styles used only while the row processes) is safe.
+define TableRec
+(
+    prev: ref[TableRec]?
+    host: ref[Page]
+    row_style: ref[ELObj]?
+    current_column: int
+    in_row: bool
+    n_columns: int
+    ; the connectable level current when the row started (Table::
+    ; rowConnectableLevel) — endConnection closes a row it opened.
+    row_connectable_level: int
+    covered: ref[Array[int]]
+    column_styles: ref[Array[ref[Array[ref[ELObj]?]]?]]
+)
+{
+    function make(host: ref[Page], prev: ref[TableRec]?) returns ref[TableRec] linked
+}
+
+; ProcessContext::Port — a named connection target of a flow object with
+; non-principal ports (table-part header/footer). `save` is the port's
+; recorded-call queue (the SaveFOTBuilder the owner replays);
+; over-connections while `connected` queue their own recordings, flushed
+; into `save` in order when the count drops to zero. All allocations live on
+; the OWNER's region (`host`, the region current at push_ports — it outlives
+; the deeper node brackets that connect).
+define PortRec
+(
+    labels: ref[Array[ref[ELObj]?]]
+    save: ref[SaveFOTBuilder]?
+    save_queue: ref[Array[ref[SaveFOTBuilder]?]]
+    connected: int
+    host: ref[Page]
+)
+{
+    function make(host: ref[Page], lbl: ref[ELObj]?, save: ref[SaveFOTBuilder]?) returns ref[PortRec] linked
+}
+
+; ProcessContext::Connectable — a flow object that can be connected to
+; (push_ports), or the portless carrier startMapContent synthesizes for
+; principal-port relabeling. Carries a style-stack SNAPSHOT (ported content
+; inherits through the port, not from its lexical position).
+define ConnectableRec
+(
+    prev: ref[ConnectableRec]?
+    ports: ref[Array[ref[PortRec]?]]
+    principal_port_labels: ref[Array[ref[ELObj]?]]
+    style_stack: ref[StyleStack]?
+    flow_obj_level: int
+    host: ref[Page]
+)
+{
+    function make(host: ref[Page], style_stack: ref[StyleStack]?, flow_obj_level: int, prev: ref[ConnectableRec]?) returns ref[ConnectableRec] linked
+}
+
+; ProcessContext::Connection — a label: connection between a flow object and
+; its flow parent. `save` = the recorded-call target (null = the base
+; stream); `style_stack` = the connection's own copy of the connectable's
+; snapshot (null on the base connection = the ProcessContext's stack).
+; n_bad_follow counts startConnection failures so the matching endConnection
+; pops nothing.
+define ConnectionRec
+(
+    prev: ref[ConnectionRec]?
+    save: ref[SaveFOTBuilder]?
+    style_stack: ref[StyleStack]?
+    port: ref[PortRec]?
+    connectable_level: int
+    n_bad_follow: int
+)
+{
+    function make(host: ref[Page], save: ref[SaveFOTBuilder]?, style_stack: ref[StyleStack]?, port: ref[PortRec]?, connectable_level: int, prev: ref[ConnectionRec]?) returns ref[ConnectionRec] linked
+}
+
+; principalPortSaveQueues_ — recordings of principal-restored connections
+; made at a DEEPER flow-obj level than their connectable; flushed (and the
+; record unlinked) when the level unwinds back to `level`. Lives on the
+; connectable's region — flush + unlink always precede that bracket's death.
+define PrincipalQueueRec
+(
+    prev: ref[PrincipalQueueRec]?
+    level: int
+    saves: ref[Array[ref[SaveFOTBuilder]?]]
+    host: ref[Page]
+)
+{
+    function make(host: ref[Page], level: int, prev: ref[PrincipalQueueRec]?) returns ref[PrincipalQueueRec] linked
+}
+
+; ProcessContext::NodeStackEntry (ProcessContext.h) — the loop guard's key.
+; `mode` is compared by POINTER, exactly as the reference does: two different
+; modes may legitimately process the same node.
+define NodeStackEntry (element_index: int, grove_index: int, mode: ref[ProcessingMode]?)
+
+define ProcessContext @resident true (vm: ref[VM], interp: ref[Interpreter], match_spec: Specificity, mode: ref[ProcessingMode]?, sgml_fotb: ref[FotSink]?, style_stack: ref[StyleStack]?, have_page_type: bool, page_type: int, table_stack: ref[TableRec]?, connection_stack: ref[ConnectionRec]?, connectable_stack: ref[ConnectableRec]?, connectable_level: int, flow_obj_level: int, principal_queues: ref[PrincipalQueueRec]?, node_stack: ref[Array[NodeStackEntry]]?, node_stack_depth: int)
+{
+    ; the transform-backend constructor (`-t sgml` / `-t xml`). Since work
+    ; package 23 it is a sink like any other: the reference's
+    ; TransformFOTBuilder is a SerialFOTBuilder, so this context owns a style
+    ; stack, runs the port/connection machinery and takes the same
+    ; flow-object dispatch as the five print backends. Everything the
+    ; transform builder does not implement dead-ends in FotSink, which is what
+    ; the reference's FOTBuilder base class does.
+    function make(host: ref[Page], interp: ref[Interpreter], fotb: ref[TransformFOTBuilder]) returns ref[ProcessContext] linked
+
+    ; the fot-backend constructor: the SgmlFOTBuilder sink + a style stack.
+    function make_fot(host: ref[Page], interp: ref[Interpreter], sgml: ref[SgmlFOTBuilder]) returns ref[ProcessContext] linked
+
+    ; the rtf-backend constructor (same styled seam, the RtfFOTBuilder sink).
+    function make_rtf(host: ref[Page], interp: ref[Interpreter], rtf: ref[RtfFOTBuilder]) returns ref[ProcessContext] linked
+
+    ; the tex-backend constructor (same styled seam, the TeXFOTBuilder sink).
+    function make_tex(host: ref[Page], interp: ref[Interpreter], tex: ref[TeXFOTBuilder]) returns ref[ProcessContext] linked
+
+    ; the html-backend constructor (same styled seam, the HtmlFOTBuilder sink).
+    function make_html(host: ref[Page], interp: ref[Interpreter], html: ref[HtmlFOTBuilder]) returns ref[ProcessContext] linked
+
+    ; the mif-backend constructor (same styled seam, the MifFOTBuilder sink).
+    function make_mif(host: ref[Page], interp: ref[Interpreter], mif: ref[MifFOTBuilder]) returns ref[ProcessContext] linked
+
+    function make_styled(host: ref[Page], interp: ref[Interpreter], sink: ref[FotSink]) returns ref[ProcessContext] linked
+
+    function sgml_sink(this: ProcessContext) returns ref[FotSink]? linked
+
+    ; --- connections & ports (label:/content-map:, ProcessContext.cxx) -------
+
+    ; currentStyleStack — the top connection's stack (its copy of the
+    ; connectable's snapshot), else the base stack.
+    function current_style_stack(this: ref[ProcessContext]) returns ref[StyleStack]? linked
+
+    ; route the fot sink at the top connection's call queue (null = base
+    ; stream).
+    procedure apply_conn_target(mutable this: ref[ProcessContext]) linked
+
+    ; FlowObj::process's flow-object-level bracket.
+    procedure start_flow_obj(mutable this: ref[ProcessContext]) linked
+
+    ; endFlowObj — unwind the level; flush (and unlink) the principal-port
+    ; save queue parked at the new level into the current output.
+    procedure end_flow_obj(mutable this: ref[ProcessContext]) io reads tex_prog linked
+
+    ; pushPorts — a flow object with named ports (table-part header/footer):
+    ; snapshot the current style stack, install the ports, bump the level.
+    procedure push_ports(mutable this: ref[ProcessContext], labels: ref[Array[ref[ELObj]?]], saves: ref[Array[ref[SaveFOTBuilder]?]], host: ref[Page]) linked
+
+    procedure pop_ports(mutable this: ref[ProcessContext]) linked
+
+    ; pushPrincipalPort / popPrincipalPort (ProcessContext.cxx:391) — route the
+    ; output of one directly-processed sosofo into a given queue, with NO
+    ; connectable and NO port: a bare Connection whose builder is that queue
+    ; (emphasizing-mark's `mark:`). Carries no style-stack snapshot, so the
+    ; content inherits from the lexical position, and emits no startNode.
+    procedure push_principal_port(mutable this: ref[ProcessContext], save: ref[SaveFOTBuilder], host: ref[Page]) linked
+
+    procedure pop_principal_port(mutable this: ref[ProcessContext]) linked
+
+    ; startDiscardLabeled / endDiscardLabeled (ProcessContext.cxx:401) — one
+    ; anonymous connectable with a single port carrying the label. ★In the
+    ; reference the port's builder IS the ignore-everything sink; here every
+    ; port records into a SaveFOTBuilder that is replayed only when the port
+    ; is connected, so the discard is achieved by popping the connectable
+    ; WITHOUT replaying — the same nothing, reached from the other side.
+    procedure start_discard_labeled(mutable this: ref[ProcessContext], lbl: ref[ELObj]?) linked
+
+    procedure end_discard_labeled(mutable this: ref[ProcessContext]) io reads tex_prog linked
+
+    ; startConnection — walk the connectable stack for a port (or principal
+    ; label) carrying `label`; no match is a badConnection error and the
+    ; content follows into the current output (nBadFollow).
+    procedure start_connection(mutable this: ref[ProcessContext], lbl: ref[ELObj], loc: Location) io reads msg_prog linked
+
+    ; restoreConnection, port case: first connection records onto the port's
+    ; queue directly; concurrent ones queue their own node-wrapped recording
+    ; (flushed into the port's queue at last end — the reference passes
+    ; currentNode + mode to the over-connection SaveFOTBuilder ctor).
+    procedure restore_connection_port(mutable this: ref[ProcessContext], mutable c: ref[ConnectableRec], mutable port: ref[PortRec], conn_level: int) io reads tex_prog linked
+
+    ; restoreConnection, principal case ((label #f) content-map entries): at
+    ; the connectable's own flow-obj level the content joins the current
+    ; output; from deeper levels it buffers until the level unwinds.
+    procedure restore_connection_principal(mutable this: ref[ProcessContext], mutable c: ref[ConnectableRec], conn_level: int) io reads tex_prog linked
+
+    ; the startNode a restored connection emits (pending-anchor bookkeeping).
+    procedure connection_start_node(mutable this: ref[ProcessContext]) io reads tex_prog linked
+
+    procedure end_connection(mutable this: ref[ProcessContext]) io reads tex_prog linked
+
+    procedure bad_content_map(mutable this: ref[ProcessContext], mutable flagged: ref[bool], loc: Location) io reads msg_prog linked
+
+    ; startMapContent — rebind the port labels of the nearest connectable at
+    ; this flow-obj level (synthesizing a portless one if needed) from a
+    ; ((label port|#f) ...) list; #f targets the principal port.
+    procedure start_map_content(mutable this: ref[ProcessContext], map_in: ref[ELObj]?, loc: Location) io reads msg_prog linked
+
+    procedure end_map_content(mutable this: ref[ProcessContext]) linked
+
+    ; characters dispatch — one sink for every backend since work package 23.
+    procedure emit_characters(mutable this: ref[ProcessContext], s: Slice[u32]) io reads tex_prog linked
+
+    procedure emit_characters_node(mutable this: ref[ProcessContext], node: ref[GroveNode]?, s: Slice[u32]) io reads tex_prog linked
+
+    ; process(root): the entry point (StyleEngine::process). No initial style in
+    ; Inc 5a; go straight to processNode in the initial mode.
+    procedure process(mutable this: ref[ProcessContext], mutable node: ref[GroveNode]) io reads tex_prog linked
+
+    ; processNode: characters flow straight through; element/document nodes are
+    ; matched and their rule evaluated to a sosofo. currentNode + match cursor +
+    ; mode are saved and restored around the (possibly nested) eval.
+    procedure process_node(mutable this: ref[ProcessContext], mutable node: ref[GroveNode]?, mutable mode: ref[ProcessingMode]) io reads tex_prog linked
+
+    ; processChildren: process each child of the current node in `mode`. If the
+    ; current node has no children but is the grove root, descend to the
+    ; document element (mirrors getDocumentElement).
+    procedure process_children(mutable this: ref[ProcessContext], mutable mode: ref[ProcessingMode]?) io reads tex_prog linked
+
+    ; input-whitespace? — the builtin char-property set (charProps.h
+    ; INPUT_WHITESPACE, non-strict mode; user char-property declarations
+    ; are unported, so this is the fixed reference table).
+    function is_input_whitespace(c: u32) returns bool linked
+
+    ; onlyWhiteSpaceFollows: scan the siblings after index i — an element
+    ; blocks, non-whitespace data blocks, PIs are transparent.
+    procedure only_whitespace_follows(this: ref[ProcessContext], mutable parent: ref[GroveNode], i: int) returns bool linked
+
+    ; processChildrenTrim: like processChildren, but data flows through
+    ; directly (no rule matching) with the paragraph's leading and trailing
+    ; input-whitespace trimmed. The trailing trim RETURNS — remaining
+    ; all-whitespace data (and any PIs after it) are skipped, as in the
+    ; reference.
+    procedure process_children_trim(mutable this: ref[ProcessContext], mutable mode: ref[ProcessingMode]) io reads tex_prog linked
+
+    ; nextMatch: resume the current node's rule scan at the next lower rule.
+    procedure next_match(mutable this: ref[ProcessContext]) io reads tex_prog linked
+
+    ; processNodeList: process every node of a node-list value (ProcessNodeList
+    ; SosofoObj::process). currentNode is saved/restored per node by processNode.
+    procedure process_node_list(mutable this: ref[ProcessContext], mutable nl: ref[ELObj]?, mutable mode: ref[ProcessingMode]) io reads tex_prog linked
+
+    ; ProcessContext::processNodeSafe (ProcessContext.cxx:37) — the loop guard
+    ; on the ONE path that can build one: `process-node-list` can hand back a
+    ; node that is already being processed in the same mode, and without this
+    ; the recursion has no bottom. The reference keys on (elementIndex,
+    ; groveIndex, mode) and only guards nodes that HAVE an element index —
+    ; a data or PI node cannot be the head of a loop because nothing can
+    ; select it again from inside itself.
+    ; ★Ported 2026-08-08 with its diagnostic; before that the port called
+    ; process_node directly, so a looping stylesheet ran until the stack gave
+    ; out instead of reporting `node processing loop detected`.
+    procedure process_node_safe(mutable this: ref[ProcessContext], mutable node: ref[GroveNode], mutable mode: ref[ProcessingMode]) io reads tex_prog linked
+
+    ; the mode a process-* sosofo captured at eval time (stashed in the parts
+    ; slot as an opaque pointer — see ELObj); null falls back to the context's
+    ; current mode.
+    function sosofo_mode(this: ref[ProcessContext], sosofo: ref[ELObj]) returns ref[ProcessingMode] linked
+
+    ; SosofoObj::process — the sosofo interpreter. Dispatches on kind.
+    procedure process_sosofo(mutable this: ref[ProcessContext], mutable sosofo: ref[ELObj]?) io reads tex_prog linked
+
+    ; process a flow object's content sosofos (held in the `parts` slot).
+    procedure process_flow_obj_content(mutable this: ref[ProcessContext], mutable sosofo: ref[ELObj]) io reads tex_prog linked
+
+    ; SOSO_FLOWOBJ — FlowObj::process. ONE dispatch for every backend since
+    ; work package 23: the reference has no per-backend flow-object walk at
+    ; all (FlowObj.cxx:32), so the transform run gets the style push, the port
+    ; decomposition and the connection machinery exactly like the print ones,
+    ; and only the leaf calls differ (FotSink).
+    procedure process_flow_obj(mutable this: ref[ProcessContext], mutable sosofo: ref[ELObj]) io reads tex_prog linked
+
+
+    ; --- the fot path (Inc 8) -------------------------------------------------
+    ; FlowObj::process — push the attached style (emitting set_ic for every
+    ; spec pushed at this level), emit the flow object, process content, pop.
+    procedure push_fo_style(mutable this: ref[ProcessContext], fo: ref[FlowObj]) io reads msg_prog linked
+
+    ; StyleStack::push(style, vm, fotb) — the raw style push (borders, table
+    ; column/row styles): push + render this level's specs through set_ic.
+    procedure push_style_obj(mutable this: ref[ProcessContext], style: ref[ELObj]) io reads msg_prog linked
+
+    ; the pushEnd half on its own, so a STYLE RULE run can push several styles
+    ; between one push_start and one push_end (ProcessContext.cxx:85/121: a
+    ; node's matching style rules are pushed one after the other and the level
+    ; is closed once, before the construction rule builds anything).
+    procedure push_style_end(mutable this: ref[ProcessContext]) io reads msg_prog linked
+
+    procedure pop_fo_style(mutable this: ref[ProcessContext], fo: ref[FlowObj]) linked
+
+    ; --- tables (ProcessContext.cxx Table machinery + Table*FlowObj) ---------
+    function in_table(this: ref[ProcessContext]) returns bool linked
+
+    function in_table_row(this: ref[ProcessContext]) returns bool linked
+
+    function current_table_column(this: ref[ProcessContext]) returns int linked
+
+    function table_row_style(this: ref[ProcessContext]) returns ref[ELObj]? linked
+
+    ; ProcessContext::addTableColumn — per-column styles indexed [column][span-1].
+    procedure add_table_column(mutable this: ref[ProcessContext], column_index: int, span: int, style: ref[ELObj]?) linked
+
+    function table_column_style(this: ref[ProcessContext], column_index: int, span: int) returns ref[ELObj]? linked
+
+    ; ProcessContext::noteTableCell — record coverage (rowspan countdown).
+    procedure note_table_cell(mutable this: ref[ProcessContext], column_index: int, colspan: int, rowspan: int) linked
+
+    procedure start_table_row(mutable this: ref[ProcessContext], style: ref[ELObj]?) io reads tex_prog linked
+
+    ; ProcessContext::endTableRow — fill uncovered columns with synthesized
+    ; cells (the trailing one is the "missing" dummy), then count down the
+    ; rowspans.
+    procedure end_table_row(mutable this: ref[ProcessContext]) io reads tex_prog linked
+
+    ; ProcessContext::coverSpannedRows — synthesize empty rows until every
+    ; vertical span is covered (each end_table_row fills + counts down).
+    procedure cover_spanned_rows(mutable this: ref[ProcessContext]) io reads tex_prog linked
+
+    ; the actual value of a border characteristic resolved to the style to
+    ; push (Table*FlowObj::border): #f/#t -> the canned border-present styles,
+    ; a table-border sosofo -> its style, anything else -> null.
+    procedure border_style_actual(mutable this: ref[ProcessContext], mutable name: Slice[char]) @page true @direct true returns ref[ELObj]? io reads msg_prog linked
+
+    ; FractionFlowObj's bar style (FlowObj.cxx:1735) — the actual value of the
+    ; `fraction-bar` characteristic, resolved through SosofoObj::ruleStyle:
+    ; ONLY a rule flow-object sosofo answers with a style. The characteristic's
+    ; INITIAL value is the `rule` class binding itself (a FlowObj prototype,
+    ; which in the reference is a sosofo too) — it has no style, so the
+    ; unstyled default pushes nothing.
+    procedure fraction_bar_style_actual(mutable this: ref[ProcessContext]) @page true @direct true returns ref[ELObj]? io reads msg_prog linked
+
+    ; SosofoObj::characterStyle (ProcessContext.cxx:540 + FlowObj.cxx:1383) —
+    ; the `radical:` value's CharacterNIC and style, WITHOUT processing it.
+    ; Only a `character` flow-object sosofo answers (isCharacter); its deferred
+    ; NIC chain has to run first, exactly as a make of it would.
+    procedure character_style_of(mutable this: ref[ProcessContext], mutable val: ref[ELObj], mutable style_out: ref[ref[ELObj]?]) returns ref[CharacterNIC]? io reads msg_prog linked
+
+    ; TableFlowObj::border — push the NIC style (or the table-border
+    ; fallback), emit the atomic border element, pop.
+    procedure emit_table_border(mutable this: ref[ProcessContext], style_in: ref[ELObj]?, fallback: ref[ELObj]?, which: int) io reads tex_prog linked
+
+    ; TableCellFlowObj::border — always from the cell-*-border actual value.
+    procedure emit_cell_border(mutable this: ref[ProcessContext], which: int) io reads msg_prog linked
+
+    ; SetNonInheritedCsSosofoObj::resolve — evaluate a flow object's lazy NIC
+    ; code against a fresh copy (NIC payloads deep-copied — the chain mutates
+    ; the copy only), the CURRENT style stack at its post-push level
+    ; (inherited-*/actual-* in NIC values read the pushed context) and the
+    ; make-time display vars + current node. Returns null when a value
+    ; expression yields an error (the FO then emits nothing; its style
+    ; push/pop still happened — reference semantics).
+    procedure resolve_nics(mutable this: ref[ProcessContext], mutable fo: ref[FlowObj]) @page true @direct true returns ref[FlowObj]? io reads msg_prog linked
+
+    ; MacroFlowObj::Definition::process — evaluate the macro's body with the
+    ; characteristic values (and the content sosofo) bound, then process the
+    ; sosofo it yields. The CONTEXT's VM is used, not a fresh one: the body
+    ; sees the current node and the current processing mode, exactly like the
+    ; construction rule around it. Only the style stack, the spec level and
+    ; the actual-* dependency record are swapped in and out.
+    procedure process_macro(mutable this: ref[ProcessContext], mutable sosofo: ref[ELObj], mutable fo: ref[FlowObj]) io reads tex_prog linked
+
+    ; TableCellFlowObj::pushStyle + processInner + popStyle — shared by real
+    ; cells (rec/style from the FO) and the synthesized fillers (defaults,
+    ; null style, no content). `fo` non-null = a real cell whose lazy NICs
+    ; (n-rows-spanned) resolve after the style pushes; a failed resolve skips
+    ; the cell's emission but keeps the push/pop bracket.
+    procedure process_table_cell(mutable this: ref[ProcessContext], mutable rec: ref[TableCellNIC], style: ref[ELObj]?, mutable sosofo: ref[ELObj]?, mutable fo: ref[FlowObj]?) io reads tex_prog linked
+
+    ; the flow-object dispatch — every class, every backend (FlowObj::process
+    ; and the *FlowObj::processInner bodies; the reference has no per-backend
+    ; variant). The SGML-transformation classes sit at the far end, next to
+    ; formatting-instruction. Unknown classes (incl. those same transform
+    ; extensions, bound as FOC_UNKNOWN under a print backend) are
+    ; content-transparent.
+    procedure process_flow_obj_fot(mutable this: ref[ProcessContext], mutable sosofo: ref[ELObj], mutable fo: ref[FlowObj], foc: int) io reads tex_prog linked
+
+    ; the element GI: the explicit `gi:` characteristic, else the current node's
+    ; generic identifier (ElementFlowObj's default-to-node behaviour).
+    function element_gi(this: ref[ProcessContext], fo: ref[FlowObj]) @page true @direct true returns StringC linked
+}

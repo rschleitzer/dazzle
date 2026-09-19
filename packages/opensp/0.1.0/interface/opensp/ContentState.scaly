@@ -1,0 +1,137 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.ElementType.ElementType
+use opensp.ElementType.ElementDefinition
+use opensp.ShortReferenceMap.ShortReferenceMap
+use opensp.Dtd.Dtd
+use opensp.OpenElement.OpenElement
+use opensp.ContentToken.ContentToken
+use opensp.ContentToken.CmNode
+use opensp.ContentToken.CompiledModelGroup
+use opensp.ContentToken.Ambiguity
+
+; ContentState — ContentState.cs (216 LOC). The parser's open-element stack and
+; the machinery that tracks, for every dense element-type index, how many
+; instances are currently open / included / excluded — so the content checker
+; can answer elementIsOpen/Included/Excluded in O(1) and drive tag-omission and
+; content-model transitions.
+;
+; MI resolution: C++ `ParserState : ContentState + AttributeContext`, and the C#
+; port linearized it as `ContentState : AttributeContext` so ParserState could
+; single-inherit. Scaly has neither — ContentState is ported as a STANDALONE
+; concept holding the stack + counts; the eventual ParserState will COMPOSE a
+; ContentState and an AttributeContext (their state is disjoint). ContentState is
+; concrete here (C# made it abstract only because ParserState supplied the
+; Messenger — irrelevant to the data structure).
+;
+; PORT SHAPE: page-hosted flat struct. The C++ intrusive `IList<OpenElement>`
+; stack becomes an `Array[pointer[OpenElement]]` + a live `depth` (Array cannot
+; shrink; pop just decrements and reuses slots). The Vector<uint> count arrays
+; are `Array[u32]`, rebuilt by startContent and grown one slot at a time by
+; lookupCreateUndefinedElement (C++ push_back).
+;
+; DEFERRED to the Parser increment (emit diagnostics / need the live parser):
+; getOpenElementInfo (open-element context for messages — needs an OpenElementInfo
+; record + the rniPcdata name, both message-formatting surface).
+
+; Build an Array[u32] of `n` zeros on `host` (Vector<uint>::assign(n, 0)).
+function fill_zeros_u32(host: ref[Page], n: size_t) returns ref[Array[u32]] linked
+
+define ContentState
+(
+    open_elements: ref[Array[ref[OpenElement]?]]
+    depth: size_t
+    open_element_count: ref[Array[u32]]
+    include_count: ref[Array[u32]]
+    exclude_count: ref[Array[u32]]
+    total_exclude_count: u32
+    tag_level: u32
+    net_enabling_count: u32
+    next_index: u64
+    last_ended_type: ref[ElementType]?
+    document_element_container: ref[ElementType]
+    the_empty_map: ref[ShortReferenceMap]
+    ; Popped elements, kept for re-arming — see acquire_element. The reference
+    ; DELETES an element it discards (`delete popSaveElement()`,
+    ; ContentState.cxx:109) and `new`s one per start tag; a region has no
+    ; per-object free, so the discard path hands the object back here instead.
+    ; Without this every start tag left an OpenElement + its MatchState +
+    ; AndState on the run region for the whole parse: measured 112 bytes of
+    ; struct per element, and 114 MB between two 8.4-MB documents of the same
+    ; size but opposite shape (1.05 M tiny elements vs 1048 big text runs).
+    free_elements: ref[Array[ref[OpenElement]?]]
+    ; live entries in free_elements — the same Array-plus-depth shape the open
+    ; element stack uses above, so the list never needs to shrink.
+    free_count: size_t
+)
+{
+    function make(host: ref[Page]) returns ref[ContentState] linked
+
+    ; One OpenElement for a start tag: a recycled one if the discard path has
+    ; handed any back, a fresh one otherwise. This is `new OpenElement(...)` in
+    ; the reference; the recycling is what stands in for its `delete`.
+    ;
+    ; ★Only elements that pop_element DISCARDED are in the list. An element that
+    ; left through pop_save_element belongs to its caller — the OMITTAG undo
+    ; machinery keeps it in `UndoEntry.element` and re-pushes it on rollback —
+    ; and is never recycled, exactly the ownership split the reference draws
+    ; between popSaveElement and popElement.
+    procedure acquire_element(mutable this: ref[ContentState], host: ref[Page], type: ref[ElementType], net: bool, included: bool, map: ref[ShortReferenceMap]?, start_location: Location) returns ref[OpenElement] linked
+
+    ; the discard half of the reference's `delete popSaveElement()`.
+    procedure release_element(mutable this: ref[ContentState], e: ref[OpenElement]) linked
+
+    ; ---- stack primitives (Array + live depth) ---------------------------
+    procedure stack_push(mutable this: ref[ContentState], e: ref[OpenElement]) linked
+
+    ; the element at stack offset `k` from the top (0 = current/head).
+    function at_top(this: ContentState, k: size_t) returns ref[OpenElement]? linked
+
+    ; ContentState::theEmptyMap — the shared sentinel `#EMPTY` map.
+    function get_the_empty_map(this: ContentState) returns ref[ShortReferenceMap] linked
+
+    function current_element(this: ContentState) returns ref[OpenElement]? linked
+
+    ; ---- startContent ----------------------------------------------------
+    ; Build the synthetic document-element container: a SEQ model group of the
+    ; single document element type, compiled to a DFA, and install it as the
+    ; base of the (freshly cleared) open-element stack.
+    procedure start_content(mutable this: ref[ContentState], host: ref[Page], dtd: ref[Dtd], scratch_on: bool) linked
+
+    ; ---- push / pop ------------------------------------------------------
+    procedure push_element(mutable this: ref[ContentState], mutable e: ref[OpenElement]) linked
+
+    procedure pop_save_element(mutable this: ref[ContentState]) returns ref[OpenElement] linked
+
+    ; `delete popSaveElement()` (ContentState.cxx:109) — pop and give the object
+    ; up. Here that means handing it to the free list for the next start tag.
+    procedure pop_element(mutable this: ref[ContentState]) linked
+
+    ; ---- queries ---------------------------------------------------------
+    function tag_level_of(this: ContentState) returns u32 linked
+
+    function element_is_open(this: ContentState, e: ref[ElementType]) returns bool linked
+
+    function element_is_included(this: ContentState, e: ref[ElementType]) returns bool linked
+
+    function element_is_excluded(this: ContentState, e: ref[ElementType]) returns bool linked
+
+    function last_ended_element_type(this: ContentState) returns ref[ElementType] linked
+
+    function after_document_element(this: ContentState) returns bool linked
+
+    function content_mode(this: ContentState) returns int linked
+
+    ; checkImplyLoop — a loop is detected if any of the top `count` open elements
+    ; has the same type AND match state as the current head.
+    function check_imply_loop(this: ContentState, count: u32) returns bool linked
+
+    ; lookupCreateUndefinedElement — a referenced-but-undeclared element: create
+    ; it with an undefined ANY definition, register it in the DTD, hand it the
+    ; implicit attribute def, and grow the count arrays by one slot.
+    procedure lookup_create_undefined_element(mutable this: ref[ContentState], host: ref[Page], mutable name: StringC, mutable loc: Location, mutable dtd: ref[Dtd], allow_immediate_recursion: bool) returns ref[ElementType] linked
+
+    procedure test() returns int linked
+}
