@@ -62,14 +62,14 @@ def main():
     out.write("define %s ()\n" % concept)
     out.write("{\n")
     chunks = [entries[i:i + CHUNK] for i in range(0, len(entries), CHUNK)]
-    out.write("    function install(interp: ref[Interpreter])\n")
+    out.write("    procedure install(interp: ref[Interpreter])\n")
     out.write("    {\n")
     for i in range(len(chunks)):
         out.write("        %s.install_%d(interp)\n" % (concept, i))
     out.write("    }\n")
     for i, chunk in enumerate(chunks):
         out.write("\n")
-        out.write("    function install_%d(interp: ref[Interpreter])\n" % i)
+        out.write("    procedure install_%d(interp: ref[Interpreter])\n" % i)
         out.write("    {\n")
         for code, name in chunk:
             out.write('        interp.%s("%s", 0x%04X)\n' % (call, name, code))
