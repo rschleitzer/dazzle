@@ -189,7 +189,7 @@ synthetic catalogs/entities.
 - **Storage** — `StorageManager`/`StorageObject` (abstract factory + byte
   reader) port to a `Storage` union: `Literal(bytes: StringC-of-u8-ish)` (no
   I/O, from `LiteralStorage.cs`) and `File(base_dir)` (from `PosixStorage.cs`,
-  reads via `scaly.io.File.read_to_string`). `read(spec_id) → byte String`;
+  reads via `scaly.os.File.read_to_string`). `read(spec_id) → byte String`;
   `resolve_relative(base, spec)` via `Path`. Rewind/block-size/search-dirs and
   the Fd/URL/WinInet/Stdio managers are deferred.
 - **ExternalId** (`ExternalId.cs`) — `{ has_public, public_id, has_system,
@@ -221,7 +221,7 @@ synthetic catalogs/entities.
 
 Port order (map's, condensed): Storage → ExternalId → EntityCatalog →
 EntityManager.open → Entity + stacking. File-I/O touches only `Storage.File`
-(→ `scaly.io.File`); everything above reaches bytes only through `Storage.read`.
+(→ `scaly.os.File`); everything above reaches bytes only through `Storage.read`.
 
 ## Stage 3 — declarations: SGML decl, prolog, DTD (in progress)
 
@@ -663,7 +663,7 @@ at the enclosing concept header — keep a braceless body on one line, else use
 All green through the JIT (`tests/opensp/run.sh` → `PASS`):
 
 - **`Storage.scaly`** — `Storage` union `Literal`/`OsFile`; `read`/`exists`/
-  `resolve` (OsFile via `scaly.io.File` + `Path`), `type_name`.
+  `resolve` (OsFile via `scaly.os.File` + `Path`), `type_name`.
 - **`ExternalId.scaly`** — public/system id holder (byte `String` ids).
 - **`EntityCatalog.scaly`** — `CatalogParser` (comment/quote/name tokenizer) for
   PUBLIC/SYSTEM/DOCTYPE/ENTITY/SGMLDECL/OVERRIDE/CATALOG; `EntityCatalog`
@@ -684,6 +684,6 @@ catalog directives + nested-CATALOG following; data-entity events + recursion
 guard. **Corpus-wide entity-graph resolution** (the roadmap exit) needs the
 prolog/DTD parser to drive it and thus couples with Stage 3; Stage 2's gate is
 the machinery + synthetic resolve-and-dump, all deterministic and
-filesystem-free (the `OsFile` live-read path is a thin `scaly.io.File`
+filesystem-free (the `OsFile` live-read path is a thin `scaly.os.File`
 delegation, exercised by the local corpus run once the DTD parser feeds it).
 Emission-neutral (`tools/cycle.sh` IDENTICAL).
