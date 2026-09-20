@@ -45,7 +45,11 @@ def main():
     out = []
     for i in range(0, len(data), 16):
         out.append("".join("%4s" % rep(b) for b in data[i:i + 16]))
-    sys.stdout.write("".join(line + "\n" for line in out))
+    # Through the BINARY stream: a text-mode stdout turns every "\n" into
+    # "\r\n" on Windows, and the whole matrix then differed from the golden
+    # by the line endings alone (measured 2026-09-20 on the Windows box).
+    # Byte for byte the same on POSIX, where text and binary mode agree.
+    sys.stdout.buffer.write("".join(line + "\n" for line in out).encode("latin-1"))
 
 
 if __name__ == "__main__":
