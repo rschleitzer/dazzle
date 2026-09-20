@@ -21,6 +21,8 @@ cd "$ROOT"
 
 # shellcheck disable=SC1091
 source tools/llvm-env.sh >/dev/null 2>&1
+# shellcheck disable=SC1091
+. tests/platform.sh || exit 1
 set -u
 
 TMP="$(mktemp -d)"
@@ -38,8 +40,11 @@ ar rcs "$TMP/libopensp.a" "$TMP/opensp.o"
 
 # --- 2. Ensure the scaly runtime archive the program links against exists --
 # (build.sh / tools/bootstrap.sh / tools/seed.sh all produce /tmp/libscaly.a;
-#  build it here if a bare checkout runs the suite standalone.)
-if [ ! -f /tmp/libscaly.a ]; then
+#  build it here if a bare checkout runs the suite standalone; the Windows
+#  box: libscaly.lib, built as CI's rung 3 builds it)
+if [ "$SCALY_COFF" = 1 ]; then
+  [ -f /tmp/libscaly.lib ] || tools/win-archive.sh "$BIN" > "$TMP/rt.log" 2>&1 || { echo "opensp: FAIL (runtime archive)"; tail -8 "$TMP/rt.log"; exit 1; }
+elif [ ! -f /tmp/libscaly.a ]; then
   "$BIN" -S --no-prelude --no-tests -o /tmp/libscaly.ll packages/scaly/0.1.0/scaly.scaly > "$TMP/rt.log" 2>&1 || { echo "opensp: FAIL (runtime emit)"; tail -8 "$TMP/rt.log"; exit 1; }
   sed 's/^define linkonce_odr /define weak_odr /' /tmp/libscaly.ll > /tmp/libscaly_weak.ll
   "$OPT" -O2 /tmp/libscaly_weak.ll -o /tmp/libscaly_opt.bc >> "$TMP/rt.log" 2>&1 || { echo "opensp: FAIL (runtime opt)"; tail -8 "$TMP/rt.log"; exit 1; }
@@ -52,11 +57,11 @@ if [ ! -f /tmp/libscaly.a ]; then
 fi
 
 # --- 3. Link + run the unit harness ---------------------------------------
-if ! "$BIN" -o "$TMP/unit" "$HERE/unit.scaly" "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
+if ! "$BIN" -o "$TMP/unit$SCALY_EXE" "$HERE/unit.scaly" "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
   echo "opensp: FAIL (link)"; tail -8 "$TMP/link.log"; exit 1
 fi
 
-out="$("$TMP/unit" 2>&1)"
+out="$("$TMP/unit$SCALY_EXE" 2>&1)"
 rc=$?
 if [ "$rc" -eq 0 ] && [ "$out" = "PASS" ]; then
   echo "opensp: PASS"

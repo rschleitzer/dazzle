@@ -44,6 +44,8 @@ BLESS=0
 if [ "${1:-}" = "--bless" ]; then BLESS=1; shift; fi
 BIN="${1:-/tmp/scaly-onsgmls}"
 cd "$ROOT"
+# shellcheck disable=SC1091
+. "$HERE/../../platform.sh" || exit 1
 set -u
 
 WORK="$(mktemp -d)"

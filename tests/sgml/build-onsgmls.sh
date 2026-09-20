@@ -19,7 +19,27 @@ cd "$ROOT"
 
 # shellcheck disable=SC1091
 source tools/llvm-env.sh >/dev/null 2>&1
+# shellcheck disable=SC1091
+. tests/platform.sh || exit 1
 set -u
+
+# The Windows box (tests/platform.sh): the .exe lands at $OUT.exe and $OUT is
+# the two-line front end over tests/win32/lf-wrapper.sh that CI's rung 7 runs
+# the corpus through — the CRT's TEXT-mode stdout and a `C:\…` argv[0] would
+# otherwise fail every ESIS and diagnostic comparison (the wrapper's header
+# has both accounts). Same shape as tests/dazzle/build-cli.sh.
+front_end() {
+  printf '#!/bin/bash\nLFW_BIN=%s LFW_NAME="$0" exec %s "$@"\n' \
+         "$1" "$ROOT/tests/win32/lf-wrapper.sh" > "$OUT" || exit 1
+  chmod +x "$OUT"
+}
+# ★NOT `$OUT.exe`: msys maps a path WITHOUT an extension onto an existing
+# `.exe` of the same stem — for writing too — so `> "$OUT"` overwrote the
+# freshly linked binary with the two-line script, which then exec'd itself
+# without end (measured 2026-09-20: every corpus entry hung). A different stem
+# keeps the two files apart.
+EXE="$OUT"
+[ "$SCALY_COFF" = 1 ] && EXE="$OUT-native.exe"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -55,7 +75,10 @@ fi
 ar rcs "$TMP/libopensp.a" "$TMP/opensp.o"
 
 # --- 2. runtime archive (build if a bare checkout lacks it) ---------------
-if [ ! -f /tmp/libscaly.a ]; then
+# (the Windows box: libscaly.lib, built as CI's rung 3 builds it)
+if [ "$SCALY_COFF" = 1 ]; then
+  [ -f /tmp/libscaly.lib ] || tools/win-archive.sh "$BIN" > "$TMP/rt.log" 2>&1 || { echo "onsgmls: FAIL (runtime archive)"; tail -8 "$TMP/rt.log"; exit 1; }
+elif [ ! -f /tmp/libscaly.a ]; then
   "$BIN" -S --no-prelude --no-tests -o /tmp/libscaly.ll packages/scaly/0.1.0/scaly.scaly > "$TMP/rt.log" 2>&1 || { echo "onsgmls: FAIL (runtime emit)"; tail -8 "$TMP/rt.log"; exit 1; }
   sed 's/^define linkonce_odr /define weak_odr /' /tmp/libscaly.ll > /tmp/libscaly_weak.ll
   "$OPT" -O2 /tmp/libscaly_weak.ll -o /tmp/libscaly_opt.bc >> "$TMP/rt.log" 2>&1 || { echo "onsgmls: FAIL (runtime opt)"; tail -8 "$TMP/rt.log"; exit 1; }
@@ -86,7 +109,7 @@ if [ "${SCALYC_NO_LTO:-0}" != "1" ]; then
 fi
 if [ -n "$RT_LL" ]; then
   if "$BIN" -S -o "$TMP/onsgmls.ll" packages/opensp/0.1.0/onsgmls.scaly > "$TMP/prog.log" 2>&1; then
-    tools/link-lto.sh "$OUT" "$TMP/onsgmls.ll" "$TMP/opensp.ll" "$RT_LL" > "$TMP/lto.log" 2>&1
+    tools/link-lto.sh "$EXE" "$TMP/onsgmls.ll" "$TMP/opensp.ll" "$RT_LL" > "$TMP/lto.log" 2>&1
     rc=$?
     if [ "$rc" = 0 ]; then
       LTO_OK=1
@@ -98,8 +121,9 @@ if [ -n "$RT_LL" ]; then
 fi
 
 if [ "$LTO_OK" = 0 ]; then
-  if ! "$BIN" -o "$OUT" packages/opensp/0.1.0/onsgmls.scaly "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
+  if ! "$BIN" -o "$EXE" packages/opensp/0.1.0/onsgmls.scaly "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
     echo "onsgmls: FAIL (link)"; tail -8 "$TMP/link.log"; exit 1
   fi
-  echo "onsgmls: built $OUT"
+  echo "onsgmls: built $EXE"
 fi
+[ "$EXE" = "$OUT" ] || front_end "$EXE"

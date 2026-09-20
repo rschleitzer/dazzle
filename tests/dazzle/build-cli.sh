@@ -19,7 +19,29 @@ cd "$ROOT"
 
 # shellcheck disable=SC1091
 source tools/llvm-env.sh >/dev/null 2>&1
+# shellcheck disable=SC1091
+. tests/platform.sh || exit 1
 set -u
+
+# What the suites invoke IS $OUT. Where the binary cannot be that file — a
+# prebuilt one somewhere else, or the Windows box, where the CRT's TEXT-mode
+# stdout would fail every byte comparison — $OUT becomes the two-line front
+# end below over tests/win32/lf-wrapper.sh, and the binary lives beside it.
+# `LFW_NAME="$0"` inside the front end matters: the wrapper reports argv[0] as
+# the path IT was invoked as, and tests/dazzle/cli/run.sh normalises stderr by
+# substituting exactly that path.
+front_end() {
+  printf '#!/bin/bash\nLFW_BIN=%s LFW_NAME="$0" exec %s "$@"\n' \
+         "$1" "$ROOT/tests/win32/lf-wrapper.sh" > "$OUT" || exit 1
+  chmod +x "$OUT"
+}
+# The Windows box (tests/platform.sh): the .exe lands beside the front end.
+# ★NOT `$OUT.exe`: msys maps a path WITHOUT an extension onto an existing
+# `.exe` of the same stem — for writing too — so `> "$OUT"` would overwrite
+# the freshly linked binary with the two-line script (measured 2026-09-20 on
+# the onsgmls twin: every corpus entry hung in a wrapper exec'ing itself).
+EXE="$OUT"
+[ "$SCALY_COFF" = 1 ] && EXE="$OUT-native.exe"
 
 # ★A PREBUILT CLI (stage 7, rung 8). On the Windows runner nothing can compile
 # — the objects are cross-emitted on the Linux leg — but the suites are worth
@@ -41,12 +63,7 @@ if [ -n "${DAZZLE_PREBUILT:-}" ]; then
   # A two-line front end rather than three environment variables the caller
   # would have to keep in step: what the suites invoke IS $OUT, so $OUT is the
   # place that knows which binary it stands for.
-  # `exec -a "$0"` inside the front end matters: the wrapper reports argv[0] as
-  # the path IT was invoked as, and tests/dazzle/cli/run.sh normalises stderr by
-  # substituting exactly that path.
-  printf '#!/bin/bash\nLFW_BIN=%s LFW_NAME="$0" exec %s "$@"\n' \
-         "$DAZZLE_PREBUILT" "$ROOT/tests/win32/lf-wrapper.sh" > "$OUT" || exit 1
-  chmod +x "$OUT"
+  front_end "$DAZZLE_PREBUILT"
   echo "dazzle-cli: using prebuilt $DAZZLE_PREBUILT (via lf-wrapper)"
   exit 0
 fi
@@ -95,7 +112,10 @@ for PKG in dazzle opensp; do
 done
 
 # --- 2. runtime archive (build if a bare checkout lacks it) ---------------
-if [ ! -f /tmp/libscaly.a ]; then
+# (the Windows box: libscaly.lib, built as CI's rung 3 builds it)
+if [ "$SCALY_COFF" = 1 ]; then
+  [ -f /tmp/libscaly.lib ] || tools/win-archive.sh "$BIN" > "$TMP/rt.log" 2>&1 || { echo "dazzle-cli: FAIL (runtime archive)"; tail -8 "$TMP/rt.log"; exit 1; }
+elif [ ! -f /tmp/libscaly.a ]; then
   "$BIN" -S --no-prelude --no-tests -o /tmp/libscaly.ll packages/scaly/0.1.0/scaly.scaly > "$TMP/rt.log" 2>&1 || { echo "dazzle-cli: FAIL (runtime emit)"; tail -8 "$TMP/rt.log"; exit 1; }
   sed 's/^define linkonce_odr /define weak_odr /' /tmp/libscaly.ll > /tmp/libscaly_weak.ll
   "$OPT" -O2 /tmp/libscaly_weak.ll -o /tmp/libscaly_opt.bc >> "$TMP/rt.log" 2>&1 || { echo "dazzle-cli: FAIL (runtime opt)"; tail -8 "$TMP/rt.log"; exit 1; }
@@ -127,7 +147,7 @@ if [ "${SCALYC_NO_LTO:-0}" != "1" ]; then
 fi
 if [ -n "$RT_LL" ]; then
   if "$BIN" -S -o "$TMP/dazzle_cli.ll" packages/dazzle/0.1.0/dazzle_cli.scaly > "$TMP/prog.log" 2>&1; then
-    tools/link-lto.sh "$OUT" "$TMP/dazzle_cli.ll" "$TMP/dazzle.ll" "$TMP/opensp.ll" "$RT_LL" > "$TMP/lto.log" 2>&1
+    tools/link-lto.sh "$EXE" "$TMP/dazzle_cli.ll" "$TMP/dazzle.ll" "$TMP/opensp.ll" "$RT_LL" > "$TMP/lto.log" 2>&1
     rc=$?
     if [ "$rc" = 0 ]; then
       LTO_OK=1
@@ -139,8 +159,9 @@ if [ -n "$RT_LL" ]; then
 fi
 
 if [ "$LTO_OK" = 0 ]; then
-  if ! "$BIN" -o "$OUT" packages/dazzle/0.1.0/dazzle_cli.scaly "$TMP/libdazzle.a" "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
+  if ! "$BIN" -o "$EXE" packages/dazzle/0.1.0/dazzle_cli.scaly "$TMP/libdazzle.a" "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
     echo "dazzle-cli: FAIL (link)"; tail -8 "$TMP/link.log"; exit 1
   fi
-  echo "dazzle-cli: built $OUT"
+  echo "dazzle-cli: built $EXE"
 fi
+[ "$EXE" = "$OUT" ] || front_end "$EXE"

@@ -17,6 +17,8 @@ cd "$ROOT"
 
 # shellcheck disable=SC1091
 source tools/llvm-env.sh >/dev/null 2>&1
+# shellcheck disable=SC1091
+. tests/platform.sh || exit 1
 set -u
 
 TMP="$(mktemp -d)"
@@ -35,7 +37,10 @@ for PKG in dazzle opensp; do
 done
 
 # --- 2. Ensure the scaly runtime archive the program links against exists --
-if [ ! -f /tmp/libscaly.a ]; then
+# (the Windows box: libscaly.lib, built as CI's rung 3 builds it)
+if [ "$SCALY_COFF" = 1 ]; then
+  [ -f /tmp/libscaly.lib ] || tools/win-archive.sh "$BIN" > "$TMP/rt.log" 2>&1 || { echo "dazzle: FAIL (runtime archive)"; tail -8 "$TMP/rt.log"; exit 1; }
+elif [ ! -f /tmp/libscaly.a ]; then
   "$BIN" -S --no-prelude --no-tests -o /tmp/libscaly.ll packages/scaly/0.1.0/scaly.scaly > "$TMP/rt.log" 2>&1 || { echo "dazzle: FAIL (runtime emit)"; tail -8 "$TMP/rt.log"; exit 1; }
   sed 's/^define linkonce_odr /define weak_odr /' /tmp/libscaly.ll > /tmp/libscaly_weak.ll
   "$OPT" -O2 /tmp/libscaly_weak.ll -o /tmp/libscaly_opt.bc >> "$TMP/rt.log" 2>&1 || { echo "dazzle: FAIL (runtime opt)"; tail -8 "$TMP/rt.log"; exit 1; }
@@ -48,7 +53,7 @@ if [ ! -f /tmp/libscaly.a ]; then
 fi
 
 # --- 3. Link + run the unit harness ---------------------------------------
-if ! "$BIN" -o "$TMP/unit" "$HERE/unit.scaly" "$TMP/libdazzle.a" "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
+if ! "$BIN" -o "$TMP/unit$SCALY_EXE" "$HERE/unit.scaly" "$TMP/libdazzle.a" "$TMP/libopensp.a" > "$TMP/link.log" 2>&1; then
   echo "dazzle: FAIL (link)"; tail -8 "$TMP/link.log"; exit 1
 fi
 
@@ -58,9 +63,9 @@ fi
 experr="dazzle:E: invalid character after '#'
 dazzle:E: reference to undefined variable \"bogusvar\"
 dazzle:E: 2nd argument for primitive \"string-append\" of wrong type: \"3\" not a string"
-out="$("$TMP/unit" 2>"$TMP/err")"
+out="$("$TMP/unit$SCALY_EXE" 2>"$TMP/err")"
 rc=$?
-err="$(cat "$TMP/err")"
+err="$(scaly_lf < "$TMP/err")"
 if [ "$rc" -ne 0 ] || [ "$out" != "PASS" ] || [ "$err" != "$experr" ]; then
   echo "dazzle: FAIL (rc=$rc) out='$out' err='$err'"
   exit 1
