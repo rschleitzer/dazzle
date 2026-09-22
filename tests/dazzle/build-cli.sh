@@ -99,7 +99,10 @@ for PKG in dazzle opensp; do
   # suspecting LLVM: a call site whose argument count disagrees with the
   # callee's definition is the signature of this class.
   OPTIN="$TMP/${PKG}_weak.ll"
-  if [ -n "${OPT:-}" ]; then
+  # DAZZLE_NO_OPT=1 skips the opt -O2 pipeline (llc still -O2): the acid loop
+  # (packages/scalyc/CLAUDE.md, the opensp/dazzle acid tests) asks a memory
+  # question of the binary, not a speed one, and opt was half of every build.
+  if [ -n "${OPT:-}" ] && [ -z "${DAZZLE_NO_OPT:-}" ]; then
     if ! "$OPT" -O2 "$TMP/${PKG}_weak.ll" -o "$TMP/$PKG.bc" > "$TMP/$PKG-opt.log" 2>&1; then
       echo "dazzle-cli: FAIL ($PKG opt)"; tail -8 "$TMP/$PKG-opt.log"; exit 1
     fi
