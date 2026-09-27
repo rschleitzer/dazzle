@@ -34,12 +34,21 @@ if ! tests/dazzle/build-cli.sh "$DZ" "$BIN" > "$TMP/build.log" 2>&1; then
   echo "framemark: FAIL (build)"; tail -8 "$TMP/build.log"; rm -rf "$TMP"; exit 1
 fi
 
+# The mkp codegen writes its `file` flow objects relative to the WORKING
+# DIRECTORY, so it runs in a scratch directory with the output tree's shape —
+# never in the tree. It used to run in the tree ("byte-identical, nothing to
+# restore"), and in tools/bar.sh this suite runs beside every other lane: the
+# Intel-Mac bar of 2026-09-27 found dazzle-codegen diffing a parser.scaly this
+# suite had just truncated, and anything compiling packages/scalyc meanwhile
+# read the same half-written files. (★NEVER restore with `git checkout -- .`
+# either: an earlier draft did, and reverted every uncommitted change.)
+GEN="$TMP/gen"
+mkdir -p "$GEN/packages/scalyc/0.1.0/scalyc/compiler" "$GEN/packages/scalyls/0.1.0/scalyls" \
+  "$GEN/editors/vscode/syntaxes"
+
 # --- 1. the mark engages BY DEFAULT --------------------------------------
-# ★ NEVER restore with `git checkout -- .` here. An earlier draft did, and it
-# reverted every uncommitted source change in the tree. The codegen regenerates
-# its outputs byte-identically, so there is nothing to restore in the first place.
-"$DZ" --frame-mark-stats \
-  -t sgml -d codegen/scaly.dsl scaly.sgm > /dev/null 2> "$TMP/on"
+( cd "$GEN" && SCALY_HOME="$ROOT" "$DZ" --frame-mark-stats \
+  -t sgml -d "$ROOT/codegen/scaly.dsl" "$ROOT/scaly.sgm" ) > /dev/null 2> "$TMP/on"
 REWOUND="$(sed -n 's/^frame-mark: \([0-9]*\) rewound.*/\1/p' "$TMP/on")"
 if [ -z "$REWOUND" ]; then
   echo "framemark: FAIL (no --frame-mark-stats line)"
@@ -53,11 +62,11 @@ fi
 # --- 2. both escape hatches turn it OFF ----------------------------------
 for way in env cli; do
   if [ "$way" = env ]; then
-    DAZZLE_FRAME_MARK=0 "$DZ" --frame-mark-stats \
-      -t sgml -d codegen/scaly.dsl scaly.sgm > /dev/null 2> "$TMP/off.$way"
+    ( cd "$GEN" && DAZZLE_FRAME_MARK=0 SCALY_HOME="$ROOT" "$DZ" --frame-mark-stats \
+      -t sgml -d "$ROOT/codegen/scaly.dsl" "$ROOT/scaly.sgm" ) > /dev/null 2> "$TMP/off.$way"
   else
-    "$DZ" --frame-mark-stats --no-frame-mark \
-      -t sgml -d codegen/scaly.dsl scaly.sgm > /dev/null 2> "$TMP/off.$way"
+    ( cd "$GEN" && SCALY_HOME="$ROOT" "$DZ" --frame-mark-stats --no-frame-mark \
+      -t sgml -d "$ROOT/codegen/scaly.dsl" "$ROOT/scaly.sgm" ) > /dev/null 2> "$TMP/off.$way"
   fi
   if [ "$(sed -n 's/^frame-mark: \([0-9]*\) rewound.*/\1/p' "$TMP/off.$way")" != 0 ]; then
     echo "framemark: FAIL (the $way escape hatch did not turn the mark off)"
