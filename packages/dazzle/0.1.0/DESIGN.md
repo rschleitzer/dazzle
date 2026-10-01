@@ -463,7 +463,7 @@ follow-up rungs settled:
 - **Generated code calls back through inttoptr CONSTANTS, never by symbol name.**
   The address comes from `&helper` in Scaly. Name resolution was rejected on
   purpose: the shipped binary is linked with whole-program LTO and `hidden`
-  visibility (`tools/link-lto.sh`), so its Scaly symbols are not dynamically
+  visibility (`scaly build --release`), so its Scaly symbols are not dynamically
   resolvable — a name-based seam would work in a debug build and fail in exactly
   the configuration we ship. Every helper is a module-level free function taking
   and returning only pointers and integers, and `Jit.check_helper_abi` calls one
