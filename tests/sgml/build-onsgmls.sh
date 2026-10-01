@@ -44,6 +44,37 @@ EXE="$OUT"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# --- the one tool (ROADMAP-public.md, stage C) ------------------------------
+# On a POSIX host the binary is `scaly build --release`: every package as
+# bitcode out of the build cache, the whole program linked, optimised and
+# emitted as one module in the compiler's own process -- what steps 1 to 3
+# below did with llvm-link, sed, opt, llc and ar through tools/link-lto.sh.
+# Measured 2026-10-01 against that route: tests/dazzle/perf-survey.sh reads the
+# same wall, cpu and peak RSS in every row, the binary is within 1 % of its
+# size, and the build takes less than half the time. What stays of the old
+# route is the ARITY GATE (tools/arity-audit.py over each package's IR), which
+# the compiler does not diagnose yet.
+# SCALYC_NO_LTO=1 and the Windows box (no bitcode route there yet: its
+# whole-program link is tools/win-lto.sh) take the archive steps below.
+if [ "$SCALY_COFF" = 0 ] && [ "${SCALYC_NO_LTO:-0}" != "1" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    for PKG in opensp; do
+      if ! "$BIN" -S --no-prelude -o "$TMP/$PKG.ll" "packages/$PKG/0.1.0/$PKG.scaly" > "$TMP/$PKG-emit.log" 2>&1; then
+        echo "onsgmls: FAIL ($PKG emit)"; tail -8 "$TMP/$PKG-emit.log"; exit 1
+      fi
+      if ! python3 "$ROOT/tools/arity-audit.py" "$TMP/$PKG.ll" > "$TMP/$PKG-arity.log" 2>&1; then
+        echo "onsgmls: FAIL ($PKG arity)"; cat "$TMP/$PKG-arity.log"; exit 1
+      fi
+    done
+  fi
+  RELEASE=--release
+  if ! "$BIN" build packages/opensp/0.1.0/onsgmls.scaly $RELEASE -o "$EXE" > "$TMP/build.log" 2>&1; then
+    echo "onsgmls: FAIL (build)"; tail -8 "$TMP/build.log"; exit 1
+  fi
+  echo "onsgmls: built $OUT (whole-program LTO)"
+  exit 0
+fi
+
 # --- 1. opensp package -> archive -----------------------------------------
 if ! "$BIN" -S --no-prelude -o "$TMP/opensp.ll" packages/opensp/0.1.0/opensp.scaly > "$TMP/emit.log" 2>&1; then
   echo "onsgmls: FAIL (opensp emit)"; tail -8 "$TMP/emit.log"; exit 1
