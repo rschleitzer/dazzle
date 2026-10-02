@@ -15,6 +15,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 OUT="${1:-/tmp/dazzle}"
 BIN="${2:-$ROOT/scalyc/build/scalyc}"
+# the tool beside the compiler: scaly for REPL/run/build/test, scalyc for the flags
+SCALY=$("$ROOT/tools/scaly-of.sh" "$BIN")
 cd "$ROOT"
 
 # shellcheck disable=SC1091
@@ -99,7 +101,7 @@ if [ "$SCALY_COFF" = 0 ] && [ "${SCALYC_NO_LTO:-0}" != "1" ]; then
   # DAZZLE_NO_OPT=1: the acid loop asks a memory question, not a speed one --
   # the packages as cached objects, no whole-program pass
   [ -n "${DAZZLE_NO_OPT:-}" ] && RELEASE=
-  if ! "$BIN" build packages/dazzle/0.1.0/dazzle_cli.scaly $RELEASE -o "$EXE" > "$TMP/build.log" 2>&1; then
+  if ! "$SCALY" build packages/dazzle/0.1.0/dazzle_cli.scaly $RELEASE -o "$EXE" > "$TMP/build.log" 2>&1; then
     echo "dazzle-cli: FAIL (build)"; tail -8 "$TMP/build.log"; exit 1
   fi
   echo "dazzle-cli: built $OUT (whole-program LTO)"

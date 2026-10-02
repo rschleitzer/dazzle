@@ -15,6 +15,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 OUT="${1:-/tmp/scaly-onsgmls}"
 BIN="${2:-$ROOT/scalyc/build/scalyc}"
+# the tool beside the compiler: scaly for REPL/run/build/test, scalyc for the flags
+SCALY=$("$ROOT/tools/scaly-of.sh" "$BIN")
 cd "$ROOT"
 
 # shellcheck disable=SC1091
@@ -69,7 +71,7 @@ if [ "$SCALY_COFF" = 0 ] && [ "${SCALYC_NO_LTO:-0}" != "1" ]; then
     done
   fi
   RELEASE=--release
-  if ! "$BIN" build packages/opensp/0.1.0/onsgmls.scaly $RELEASE -o "$EXE" > "$TMP/build.log" 2>&1; then
+  if ! "$SCALY" build packages/opensp/0.1.0/onsgmls.scaly $RELEASE -o "$EXE" > "$TMP/build.log" 2>&1; then
     echo "onsgmls: FAIL (build)"; tail -8 "$TMP/build.log"; exit 1
   fi
   echo "onsgmls: built $OUT (whole-program LTO)"

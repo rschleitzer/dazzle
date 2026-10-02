@@ -14,6 +14,8 @@
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 BIN="${1:-$ROOT/scalyc/build/scalyc}"
+# the tool beside the compiler: scaly for REPL/run/build/test, scalyc for the flags
+SCALY=$("$ROOT/tools/scaly-of.sh" "$BIN")
 cd "$ROOT"
 
 . tests/platform.sh || exit 1
@@ -22,7 +24,7 @@ if ! scaly_jit_available; then
   exit 0
 fi
 
-out="$("$BIN" test packages/opensp/0.1.0/opensp.scaly 2>&1)"
+out="$("$SCALY" test packages/opensp/0.1.0/opensp.scaly 2>&1)"
 rc=$?
 if [ "$rc" -eq 0 ] && echo "$out" | tail -1 | grep -q ' passed$'; then
   echo "opensp: PASS ($(echo "$out" | tail -1))"

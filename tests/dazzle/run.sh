@@ -13,6 +13,8 @@
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 BIN="${1:-$ROOT/scalyc/build/scalyc}"
+# the tool beside the compiler: scaly for REPL/run/build/test, scalyc for the flags
+SCALY=$("$ROOT/tools/scaly-of.sh" "$BIN")
 cd "$ROOT"
 
 # shellcheck disable=SC1091
@@ -32,7 +34,7 @@ trap 'rm -rf "$TMP"' EXIT
 experr="dazzle:E: invalid character after '#'
 dazzle:E: reference to undefined variable \"bogusvar\"
 dazzle:E: 2nd argument for primitive \"string-append\" of wrong type: \"3\" not a string"
-out="$("$BIN" test packages/dazzle/0.1.0/dazzle.scaly dazzle.test 2>"$TMP/err")"
+out="$("$SCALY" test packages/dazzle/0.1.0/dazzle.scaly dazzle.test 2>"$TMP/err")"
 rc=$?
 err="$(scaly_lf < "$TMP/err")"
 if [ "$rc" -ne 0 ] || [ "$out" != "$(printf 'test dazzle.test ... ok\n1 passed')" ] || [ "$err" != "$experr" ]; then
