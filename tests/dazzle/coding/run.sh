@@ -78,116 +78,22 @@ printf '<!DOCTYPE doc [\n<!ELEMENT doc - - (#PCDATA|em)*>\n<!ELEMENT em - - (#PC
 printf '<!DOCTYPE doc [\n<!ELEMENT doc - - (#PCDATA|em)*>\n<!ELEMENT em - - (#PCDATA)>\n]>\n<doc>ab<em>x</em>c</doc>\n' > "$WORK/plain.sgml"
 cp "$HERE"/*.dsl "$HERE"/*.scm "$WORK/"
 
-# name|environment
-CONFIGS="
-default|
-enc-utf8|SP_ENCODING=UTF-8
-enc-8859-1|SP_ENCODING=ISO-8859-1
-enc-koi8|SP_ENCODING=KOI8-R
-enc-eucjp|SP_ENCODING=EUC-JP
-enc-xml-fixed|SP_CHARSET_FIXED=YES SP_ENCODING=XML
-enc-unknown|SP_ENCODING=NO-SUCH-CS
-enc-ucs2|SP_ENCODING=UCS-2
-bctf-utf8|SP_BCTF=UTF-8
-"
-# label|-b argument
-BEES="
-none|
-b-utf8|-bUTF-8
-b-8859-1|-bISO-8859-1
-b-unicode|-bUNICODE
-b-eucjp|-bEUC-JP
-b-unknown|-bNO-SUCH-CS
-"
-
-# ★A BYTE DUMP THAT EVERY `od` AGREES ON (2026-08-10, stage 7 rung 8). This
-# used to be `od -An -c`, whose COLUMN LAYOUT is implementation-defined: BSD od
-# (the dev box, where the goldens were minted) pads far wider than the GNU od in
-# Git Bash, so on Windows all 228 cells "differed" while every byte was in fact
-# identical — a whole suite red for a formatting convention.
+# The cells -- the configuration and -b tables, the byte dump and the
+# assembly of the matrix -- are tests/dazzle/coding/run.py since 2026-10-03:
+# each of the 228 forked some fifteen processes here, and Git Bash emulates every
+# fork (320 s on the Windows box, the slowest dazzle suite by six). The driver
+# writes the same matrix, byte for byte; the cells run in parallel.
 #
-# ★The obvious repair is wrong and was measured before being discarded:
-# squeezing the spaces out of `-c` output is AMBIGUOUS, because a space BYTE is
-# rendered as spaces too — `a b` and `ab` both collapse to ` a b `, so two
-# different byte streams would compare equal. That is a silent loosening of the
-# very test that exists to catch byte differences. `-tx1` has no such hole:
-# every byte is exactly two hex digits, so squeezing separators cannot conflate
-# anything. Leading and trailing padding go too, since BSD pads the line and GNU
-# does not.
-# ★The blank line goes too: `od` ends with a TOTAL-LENGTH offset line, which
-# `-An` renders as an empty line — and whether a given implementation emits it
-# at all is exactly the kind of thing this helper exists to stop mattering. It
-# carries no information here (sections are delimited by `--- ` markers), and a
-# zero-byte stream still dumps to no lines, which is unambiguous.
-dump() {
-  od -An -tx1 "$@" \
-    | LC_ALL=C tr -s ' ' \
-    | LC_ALL=C sed 's/^ *//; s/ *$//; /^$/d'
-}
-
-cell() { # label, then the dazzle arguments
-  local label="$1"; shift
-  local d="$WORK/run"
-  rm -rf "$d"; mkdir -p "$d"
-  cp "$WORK/d.sgml" "$WORK/plain.sgml" "$WORK"/*.dsl "$WORK"/*.scm "$d/"
-  ( cd "$d" && SCALY_HOME="$ROOT" env -u SP_ENCODING -u SP_BCTF -u SP_CHARSET_FIXED \
-      $CELL_ENV "$DZ" "$@" > cell.out 2> cell.err )
-  local rc=$?
-  {
-    printf '=== %s rc=%d\n' "$label" "$rc"
-    dump "$d/cell.out"
-    printf -- '--- stderr\n'
-    # the argv0 prefix differs per binary; everything else is compared raw
-    LC_ALL=C sed 's|^[^:]*:|PROG:|' "$d/cell.err" | dump
-    # every file the backend wrote itself, in name order
-    local f
-    for f in $(cd "$d" && ls | LC_ALL=C sort); do
-      case "$f" in
-        d.sgml|plain.sgml|*.dsl|*.scm|cell.out|cell.err) continue ;;
-      esac
-      printf -- '--- file %s\n' "$f"
-      dump "$d/$f"
-    done
-  } >> "$MATRIX"
-}
-
+# On Windows the native binary beside the front end is run directly: its CR LF
+# is gone since the standard streams are binary, and the driver passes a
+# program name without a colon (stderr's name is replaced up to the first one).
+DZBIN="$DZ"
+for c in "$DZ-native.exe" "${DAZZLE_PREBUILT:-/nonexistent}-native.exe"; do
+  [ -f "$c" ] && { DZBIN="$c"; break; }
+done
 MATRIX="$WORK/matrix.txt"
-: > "$MATRIX"
-
-while IFS='|' read -r cname cenv; do
-  [ -n "$cname" ] || continue
-  while IFS='|' read -r bname barg; do
-    [ -n "$bname" ] || continue
-    CELL_ENV="$cenv"
-    for t in fot sgml xml html; do
-      if [ -n "$barg" ]; then
-        cell "$cname $bname $t" -t $t -d enc.dsl "$barg" -o "out.$t" d.sgml
-      else
-        cell "$cname $bname $t" -t $t -d enc.dsl -o "out.$t" d.sgml
-      fi
-    done
-  done <<< "$BEES"
-done <<< "$CONFIGS"
-
-# controls: the three BYTE backends must not move when the encoder does
-for t in rtf tex mif; do
-  CELL_ENV=""
-  cell "control none $t" -t $t -d enc.dsl -o "out.$t" d.sgml
-  cell "control b-unicode $t" -t $t -d enc.dsl -bUNICODE -o "out.$t" d.sgml
-  CELL_ENV="SP_ENCODING=KOI8-R"
-  cell "control enc-koi8 $t" -t $t -d enc.dsl -o "out.$t" d.sgml
-done
-
-# the entity flow object's own file: one stream creation per file, so a
-# BOM-writing system stamps it again
-for b in "" "-bUNICODE" "-bEUC-JP"; do
-  CELL_ENV=""
-  if [ -n "$b" ]; then
-    cell "entity ${b:-none} sgml" -t sgml -d ent.dsl "$b" plain.sgml
-  else
-    cell "entity none sgml" -t sgml -d ent.dsl plain.sgml
-  fi
-done
+PY=$(command -v python3 || command -v python) || { echo "dazzle-coding: no python3"; exit 1; }
+"$PY" "$HERE/run.py" "$DZBIN" "$WORK" "$MATRIX" || { echo "dazzle-coding: FAIL (driver)"; exit 1; }
 
 if [ "$BLESS" -eq 1 ]; then
   cp "$MATRIX" "$HERE/expected.txt"
