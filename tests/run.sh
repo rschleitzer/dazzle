@@ -14,7 +14,7 @@
 #   dazzle-build   the engine, ONCE (tests/dazzle/build-cli.sh); every dazzle
 #                  suite gets it as DAZZLE_PREBUILT
 #   dazzle-<d>     the engine's suites, side by side: cli coding engine flowobj
-#                  fot framemark grove html mif prims rtf specarena tex
+#                  fot framemark grove html mif pdf prims rtf specarena tex
 #   dazzle-unit    the engine's self-tests (tests/dazzle/run.sh, `scaly test`)
 #   onsgmls-build  the parser's event dumper (tests/sgml/build-onsgmls.sh)
 #   sgml           the SGML corpus against it (tests/sgml/run.sh)
@@ -61,7 +61,7 @@ step() {
   return 1
 }
 
-DAZZLE_SUITES="cli coding engine flowobj fot framemark grove html mif prims rtf specarena tex"
+DAZZLE_SUITES="cli coding engine flowobj fot framemark grove html mif pdf prims rtf specarena tex"
 
 if step dazzle-build env DAZZLE_PREBUILT= tests/dazzle/build-cli.sh "$LOG/dazzle"; then
   pids=(); names=()

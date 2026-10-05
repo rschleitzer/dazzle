@@ -1,0 +1,2881 @@
+; PdfFOTBuilder — the `-t pdf` backend. It is not in the reference: jade has
+; no PDF backend, and the C# port's one hands the flow object tree to a
+; document library that sets the pages. Here the builder sets them itself and
+; writes the file with the `pdf` package.
+;
+; It is rudimentary, and means to be: simple page sequences with headers and
+; footers, paragraphs, display groups, line fields, leaders, rules, external
+; graphics and tables — enough to set a book with the DocBook print
+; stylesheets, and not more. Text is in the standard fonts (Helvetica, Times,
+; Courier), so a character outside Windows code page 1252 prints as `?`.
+;
+; Shape: the builder does NOT stream. The flow object calls build a TREE of
+; nodes, each with a snapshot of the inherited characteristics it was made
+; under; finish() lays the tree out TWICE — the first pass finds the page every
+; element begins on, the second writes the file with the page numbers of
+; `current-node-page-number` filled in.
+;
+; Layout: blocks flow down the page; a paragraph is broken greedily into
+; lines. Everything placed goes into a flat list of drawing operations of the
+; page being set (`ops`), absolute in thousandths of a point, y downwards. A
+; page is written when it is full. Because the operations are plain numbers,
+; a run of them can still be moved: a table row that does not fit, and a
+; heading that must stay with what follows it, are cut out and put down again
+; on the next page. Inside a table cell no page is ever broken (`nobreak`).
+;
+; Display space collapses as DSSSL has it: between two blocks the larger of
+; the space after the one and the space before the other, and none at the top
+; of a page.
+;
+; The flow-object bracket (start/end/atomic over the characteristics set for
+; the NEXT flow object) is the FOTBuilder base's, as in the other backends.
+;
+; RBMM: nodes, snapshots and buffers live on the builder's page (the run
+; arena).
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String.String
+use scaly.containers.StringBuilder.StringBuilder
+use scaly.os.File.File
+use opensp.StringC.StringC
+use pdf.Font.PdfFont
+use pdf.Font.PDF_HELVETICA
+use pdf.Font.PDF_BOLD
+use pdf.Font.PDF_ITALIC
+use pdf.Document.PdfDocument
+use dazzle.Grove.GroveNode
+use dazzle.ELObj.ELObj
+use dazzle.Style.InheritedC
+use dazzle.Style.LengthSpec
+use dazzle.Style.FotSym
+use dazzle.Style.DisplaySpace
+use dazzle.Style.DisplayNIC
+use dazzle.Style.RuleNIC
+use dazzle.Style.LinkNIC
+use dazzle.Style.ExternalGraphicNIC
+use dazzle.Style.LeaderNIC
+use dazzle.Style.BoxNIC
+use dazzle.Style.ScoreNIC
+use dazzle.Style.LineFieldNIC
+use dazzle.Style.TableNIC
+use dazzle.Style.TableColumnNIC
+use dazzle.Style.TableCellNIC
+use dazzle.Style.PageFloatNIC
+use dazzle.Style.CharacterNIC
+use dazzle.Style.AnchorNIC
+use dazzle.Style.GlyphAnnotationNIC
+use dazzle.Style.EmphasizingMarkNIC
+use dazzle.Style.GridNIC
+use dazzle.Style.GridCellNIC
+use dazzle.Style.EmbeddedTextNIC
+use dazzle.Style.IncludedContainerAreaNIC
+use dazzle.Style.MultiModeRec
+use dazzle.Style.MultiModeNIC
+
+; --- node kinds --------------------------------------------------------------
+; a block container: display-group, scroll, a display box
+define PN_GROUP: int 0
+define PN_PARAGRAPH: int 1
+; an inline container: sequence, link, score, an inline box
+define PN_SEQUENCE: int 2
+define PN_TEXT: int 3
+define PN_PAGE_NUMBER: int 4
+; i0 = the element the page number is asked of
+define PN_NODE_PAGE_NUMBER: int 5
+define PN_LEADER: int 6
+; i0 = orientation is horizontal, i1 = has length, i2 = length
+define PN_RULE: int 7
+; text = the file; i0 = display, i1/i2 = max width (-1 none), i3/i4 = max height
+define PN_GRAPHIC: int 8
+; i0..i3 = thickness of the border before row, after row, before column,
+; after column (-1 none), i4..i7 their colors
+define PN_TABLE: int 9
+; i0 = column, i1 = columns spanned, i2 = has width, i3 = width, i4 = table
+; units in thousandths
+define PN_COLUMN: int 10
+; i0 = 0 body, 1 header, 2 footer
+define PN_ROW: int 11
+; i0 = column, i1 = columns spanned, i2 = rows spanned, i3 = missing,
+; i4..i7 = border thickness as on the table, i8..i11 their colors
+define PN_CELL: int 12
+; i0 = the element that begins here
+define PN_MARK: int 13
+; i0 = the field width
+define PN_FIELD: int 14
+define PN_BREAK: int 15
+define PN_PAGE_SEQUENCE: int 16
+; i0 = the header/footer flags
+define PN_HEADER_FOOTER: int 17
+
+; --- the symbols read here (the FotSym codes of Interpreter's table) ---------
+define PSYM_SEMI_BOLD: int 16
+define PSYM_ULTRA_BOLD: int 19
+define PSYM_OBLIQUE: int 21
+define PSYM_ITALIC: int 23
+define PSYM_START: int 25
+define PSYM_END: int 26
+define PSYM_CENTER: int 27
+define PSYM_JUSTIFY: int 28
+define PSYM_ASIS: int 34
+define PSYM_ASIS_TRUNCATE: int 36
+define PSYM_HORIZONTAL: int 47
+define PSYM_PAGE: int 61
+define PSYM_PRESERVE: int 77
+
+; --- the header/footer flags (FOTBuilder::HF) --------------------------------
+define PHF_FIRST: int 1
+define PHF_FRONT: int 2
+define PHF_HEADER: int 4
+define PHF_CENTER: int 8
+define PHF_RIGHT: int 16
+
+; --- drawing operations: kind, x, y and five operands ------------------------
+define POP_SIZE: int 8
+; font, size, color, text at, text length
+define POP_TEXT: int 0
+; x2, y2, thickness, color
+define POP_LINE: int 1
+; width, height, color
+define POP_RECTANGLE: int 2
+; width, height, image
+define POP_IMAGE: int 3
+; element
+define POP_MARK: int 4
+
+; --- the atoms of a line: kind, characteristics, two operands, width ---------
+define PAT_SIZE: int 5
+; text at, text length
+define PAT_TEXT: int 0
+define PAT_SPACE: int 1
+define PAT_NEWLINE: int 2
+; text at, text length of the pattern; width of one pattern
+define PAT_LEADER: int 3
+; element
+define PAT_MARK: int 4
+; image, height
+define PAT_IMAGE: int 5
+; width = the field width
+define PAT_FIELD_START: int 6
+define PAT_FIELD_END: int 7
+
+; A growing list of numbers that can be cut back — the drawing operations,
+; the atoms, and the scratch space of the layout.
+define PdfInts (var items: ref[Array[int]], var count: int)
+{
+    function make(host: ref[Page]) returns ref[PdfInts]
+    {
+        let l &PdfInts^host(Array[int]^host(), 0)
+        l
+    }
+
+    procedure push(mutable this: ref[PdfInts], v: int)
+    {
+        if (this.count as size_t) < this.items.get_length()
+            this.items.put(this.count as size_t, v)
+        else
+            this.items.add(v)
+        this.count := this.count + 1
+    }
+
+    function at(this: ref[PdfInts], i: int) returns int
+        this.items[i as size_t]
+
+    procedure put(mutable this: ref[PdfInts], i: int, v: int)
+    {
+        this.items.put(i as size_t, v)
+    }
+
+    procedure cut(mutable this: ref[PdfInts], n: int)
+    {
+        this.count := n
+    }
+}
+
+; --- the inherited characteristics a flow object is made under ---------------
+define PdfChars
+(
+    ; its place in the builder's list of snapshots
+    var id: int
+    var font_size: int
+    ; PDF_HELVETICA, PDF_TIMES or PDF_COURIER
+    var family: int
+    var bold: bool
+    var italic: bool
+    var color: int
+    var has_background: bool
+    var background: int
+    var start_indent: int
+    var end_indent: int
+    var first_line_indent: int
+    var line_spacing: int
+    ; a PSYM_ code
+    var quadding: int
+    var display_alignment: int
+    var asis: bool
+    var preserve: bool
+    var shift: int
+    var field_width: int
+    var page_width: int
+    var page_height: int
+    var left_margin: int
+    var right_margin: int
+    var top_margin: int
+    var bottom_margin: int
+    var header_margin: int
+    var footer_margin: int
+    var border_present: bool
+    var line_thickness: int
+    var cell_before_row_margin: int
+    var cell_after_row_margin: int
+    var cell_before_column_margin: int
+    var cell_after_column_margin: int
+    var cell_background: bool
+    var cell_row_alignment: int
+    ; the character of page-number-format: 1 i I a A
+    var number_format: int
+    var number_restart: bool
+)
+{
+    init()
+    {
+        this.id := 0
+        this.font_size := 10 * 1000
+        this.family := PDF_HELVETICA
+        this.bold := false
+        this.italic := false
+        this.color := 0
+        this.has_background := false
+        this.background := 0xFFFFFF
+        this.start_indent := 0
+        this.end_indent := 0
+        this.first_line_indent := 0
+        this.line_spacing := 12 * 1000
+        this.quadding := PSYM_START
+        this.display_alignment := PSYM_START
+        this.asis := false
+        this.preserve := false
+        this.shift := 0
+        this.field_width := 0
+        ; A4, an inch of margin
+        this.page_width := 595276
+        this.page_height := 841890
+        this.left_margin := 72000
+        this.right_margin := 72000
+        this.top_margin := 72000
+        this.bottom_margin := 72000
+        this.header_margin := 0
+        this.footer_margin := 0
+        this.border_present := true
+        this.line_thickness := 1000
+        this.cell_before_row_margin := 0
+        this.cell_after_row_margin := 0
+        this.cell_before_column_margin := 0
+        this.cell_after_column_margin := 0
+        this.cell_background := false
+        this.cell_row_alignment := PSYM_START
+        this.number_format := 0x31
+        this.number_restart := false
+    }
+
+    ; Everything but the id.
+    procedure copy(mutable dst: ref[PdfChars], src: ref[PdfChars])
+    {
+        dst.font_size := src.font_size
+        dst.family := src.family
+        dst.bold := src.bold
+        dst.italic := src.italic
+        dst.color := src.color
+        dst.has_background := src.has_background
+        dst.background := src.background
+        dst.start_indent := src.start_indent
+        dst.end_indent := src.end_indent
+        dst.first_line_indent := src.first_line_indent
+        dst.line_spacing := src.line_spacing
+        dst.quadding := src.quadding
+        dst.display_alignment := src.display_alignment
+        dst.asis := src.asis
+        dst.preserve := src.preserve
+        dst.shift := src.shift
+        dst.field_width := src.field_width
+        dst.page_width := src.page_width
+        dst.page_height := src.page_height
+        dst.left_margin := src.left_margin
+        dst.right_margin := src.right_margin
+        dst.top_margin := src.top_margin
+        dst.bottom_margin := src.bottom_margin
+        dst.header_margin := src.header_margin
+        dst.footer_margin := src.footer_margin
+        dst.border_present := src.border_present
+        dst.line_thickness := src.line_thickness
+        dst.cell_before_row_margin := src.cell_before_row_margin
+        dst.cell_after_row_margin := src.cell_after_row_margin
+        dst.cell_before_column_margin := src.cell_before_column_margin
+        dst.cell_after_column_margin := src.cell_after_column_margin
+        dst.cell_background := src.cell_background
+        dst.cell_row_alignment := src.cell_row_alignment
+        dst.number_format := src.number_format
+        dst.number_restart := src.number_restart
+    }
+
+    function same(a: ref[PdfChars], b: ref[PdfChars]) returns bool
+    {
+        if a.font_size <> b.font_size or a.family <> b.family or a.bold <> b.bold or a.italic <> b.italic
+            return false
+        if a.color <> b.color or a.has_background <> b.has_background or a.background <> b.background
+            return false
+        if a.start_indent <> b.start_indent or a.end_indent <> b.end_indent or a.first_line_indent <> b.first_line_indent
+            return false
+        if a.line_spacing <> b.line_spacing or a.quadding <> b.quadding or a.display_alignment <> b.display_alignment
+            return false
+        if a.asis <> b.asis or a.preserve <> b.preserve or a.shift <> b.shift or a.field_width <> b.field_width
+            return false
+        if a.page_width <> b.page_width or a.page_height <> b.page_height
+            return false
+        if a.left_margin <> b.left_margin or a.right_margin <> b.right_margin or a.top_margin <> b.top_margin or a.bottom_margin <> b.bottom_margin
+            return false
+        if a.header_margin <> b.header_margin or a.footer_margin <> b.footer_margin
+            return false
+        if a.border_present <> b.border_present or a.line_thickness <> b.line_thickness
+            return false
+        if a.cell_before_row_margin <> b.cell_before_row_margin or a.cell_after_row_margin <> b.cell_after_row_margin
+            return false
+        if a.cell_before_column_margin <> b.cell_before_column_margin or a.cell_after_column_margin <> b.cell_after_column_margin
+            return false
+        if a.cell_background <> b.cell_background or a.cell_row_alignment <> b.cell_row_alignment
+            return false
+        if a.number_format <> b.number_format or a.number_restart <> b.number_restart
+            return false
+        true
+    }
+
+    ; The font of the pdf package these characteristics ask for.
+    function font(this: ref[PdfChars]) returns int
+    {
+        var f this.family
+        if this.bold
+            f := f + PDF_BOLD
+        if this.italic
+            f := f + PDF_ITALIC
+        f
+    }
+}
+
+; --- one node of the buffered tree -------------------------------------------
+define PdfNode
+(
+    kind: int
+    var next: ref[PdfNode]?
+    var first: ref[PdfNode]?
+    var last: ref[PdfNode]?
+    var parent: ref[PdfNode]?
+    var chars: ref[PdfChars]
+    ; the node's text in the builder's pool
+    var text_at: int
+    var text_length: int
+    ; the display characteristics of a block
+    var space_before: int
+    var space_after: int
+    var keep_with_next: bool
+    var break_before: bool
+    var break_after: bool
+    ; what the kind says
+    var i0: int
+    var i1: int
+    var i2: int
+    var i3: int
+    var i4: int
+    var i5: int
+    var i6: int
+    var i7: int
+    var i8: int
+    var i9: int
+    var i10: int
+    var i11: int
+)
+{
+    function make(host: ref[Page], kind: int, chars: ref[PdfChars]) returns ref[PdfNode]
+    {
+        let n &PdfNode^host(kind, null, null, null, null, chars, 0, 0, 0, 0, false, false, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        n
+    }
+}
+
+define PdfFOTBuilder
+(
+    var host: ref[Page]
+    var out_name: String
+    ; --- the tree ------------------------------------------------------------
+    var root: ref[PdfNode]
+    ; the container the next node goes into
+    var cur: ref[PdfNode]
+    ; the text of all nodes, as codes of the fonts' encoding; the layout
+    ; appends what it makes up (page numbers, leaders)
+    var pool: ref[Array[u8]]
+    ; --- the flow-object bracket ---------------------------------------------
+    ; the characteristics of the NEXT flow object, the snapshots of the open
+    ; ones, and the snapshot of `next` while it is unchanged
+    var next: PdfChars
+    var stack: ref[Array[ref[PdfChars]?]]
+    var depth: int
+    var snap: ref[PdfChars]?
+    var snaps: ref[Array[ref[PdfChars]?]]
+    ; 0 body, 1 header, 2 footer: where the rows of the open table part go
+    var section: int
+    ; --- the layout ------------------------------------------------------------
+    var doc: ref[PdfDocument]?
+    var ops: ref[PdfInts]
+    var atoms: ref[PdfInts]
+    var scratch: ref[PdfInts]
+    ; elements met where no line is: they go with the next line set
+    var marks: ref[PdfInts]
+    ; per element the page it begins on (from 1; 0 unknown), and per page its
+    ; number as shown and the format of that number
+    var element_page: ref[Array[int]]
+    var page_shown: ref[Array[int]]
+    var page_format: ref[Array[int]]
+    ; the files already read: text at, image (-1: not an image), and its
+    ; width and height in pixels
+    var images: ref[PdfInts]
+    ; the first pass only measures: it reads the size of an image and does
+    ; not take it into its document, which is thrown away
+    var measuring: bool
+    ; where the next block goes, and the space to leave before it
+    var y: int
+    var pending: int
+    var at_top: bool
+    var page_open: bool
+    var page_no: int
+    ; the first page of a page sequence gets a page label
+    var page_labelled: bool
+    ; the area blocks are set into
+    var frame_x: int
+    var frame_width: int
+    var body_top: int
+    var body_bottom: int
+    ; inside a table cell no page is broken
+    var nobreak: int
+    ; where what must stay with the next block begins (-1: nothing)
+    var keep_at: int
+    var keep_y: int
+    ; the paragraph being collected
+    var para_base: int
+    var para_chars: ref[PdfChars]?
+    var para_first: bool
+    var para_keep: bool
+    ; collecting a header or footer: blocks are read as their text
+    var flat: bool
+    ; the page sequence being set
+    var seq: ref[PdfNode]?
+    var seq_chars: ref[PdfChars]
+    var seq_first: bool
+    var seq_base: int
+    ; the ops of the page in front of which nothing is moved (the header)
+    var page_fixed: int
+    ; the height of the table row set last
+    var row_height: int
+)
+{
+    function make(host: ref[Page], out_name: String) returns ref[PdfFOTBuilder]
+    {
+        let f host.allocate(sizeof PdfFOTBuilder, alignof PdfFOTBuilder) as pointer[PdfFOTBuilder]
+        f.host := host
+        f.out_name := out_name
+        f.pool := Array[u8]^host()
+        f.next := PdfChars()
+        f.stack := Array[ref[PdfChars]?]^host()
+        f.depth := 0
+        f.snap := null
+        f.snaps := Array[ref[PdfChars]?]^host()
+        f.section := 0
+        f.doc := null
+        f.ops := PdfInts.make(host)
+        f.atoms := PdfInts.make(host)
+        f.scratch := PdfInts.make(host)
+        f.marks := PdfInts.make(host)
+        f.element_page := Array[int]^host()
+        f.page_shown := Array[int]^host()
+        f.page_format := Array[int]^host()
+        f.images := PdfInts.make(host)
+        f.measuring := false
+        f.y := 0
+        f.pending := 0
+        f.at_top := true
+        f.page_open := false
+        f.page_no := 0
+        f.page_labelled := false
+        f.frame_x := 0
+        f.frame_width := 0
+        f.body_top := 0
+        f.body_bottom := 0
+        f.nobreak := 0
+        f.keep_at := 0 - 1
+        f.keep_y := 0
+        f.para_base := 0
+        f.para_chars := null
+        f.para_first := true
+        f.para_keep := false
+        f.flat := false
+        f.seq := null
+        f.seq_first := false
+        f.seq_base := 0
+        f.page_fixed := 0
+        f.row_height := 0
+        let b f as ref[PdfFOTBuilder]
+        let top b.snapshot()
+        b.seq_chars := top
+        b.root := PdfNode.make(host, PN_GROUP, top)
+        b.cur := b.root
+        ; ctor: one flow-object level
+        b.fo_start()
+        b
+    }
+
+    ; --- the flow-object bracket (FOTBuilder start/end/atomic) ---------------
+
+    ; The snapshot of `next`: the one in hand while nothing was set, the open
+    ; flow object's when `next` came back to it, else a new one.
+    procedure snapshot(mutable this: ref[PdfFOTBuilder]) returns ref[PdfChars]
+    {
+        if this.snap <> null
+            return this.snap as ref[PdfChars]
+        if this.depth > 0
+        {
+            let topp this.stack.get((this.depth - 1) as size_t)
+            let top (*topp) as ref[PdfChars]
+            if PdfChars.same(top, &this.next)
+            {
+                this.snap := top
+                return top
+            }
+        }
+        let host this.host
+        let rec host.allocate(sizeof PdfChars, alignof PdfChars) as pointer[PdfChars]
+        let c rec as ref[PdfChars]
+        PdfChars.copy(c, &this.next)
+        c.id := this.snaps.get_length() as int
+        this.snaps.add(c)
+        this.snap := c
+        c
+    }
+
+    procedure fo_start(mutable this: ref[PdfFOTBuilder])
+    {
+        let c this.snapshot()
+        let d this.depth as size_t
+        if d < this.stack.get_length()
+            this.stack.put(d, c)
+        else
+            this.stack.add(c)
+        this.depth := this.depth + 1
+    }
+
+    procedure fo_end(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.depth <= 1
+            return
+        this.depth := this.depth - 1
+        this.fo_atomic()
+    }
+
+    ; atomic(): the next flow object is made under the open one's again
+    procedure fo_atomic(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.depth <= 0
+            return
+        let topp this.stack.get((this.depth - 1) as size_t)
+        let top (*topp) as ref[PdfChars]
+        PdfChars.copy(&this.next, top)
+        this.snap := top
+    }
+
+    ; --- characteristics -------------------------------------------------------
+    procedure set_ic(mutable this: ref[PdfFOTBuilder], ic: ref[InheritedC])
+    {
+        this.snap := null
+        let ext ic.ext_setter
+        if ext <> 0
+        {
+            ; the RtfFOTBuilder extension table: page-number-format,
+            ; page-number-restart?
+            if ext = 1
+            {
+                this.next.number_format := 0x31
+                if ic.sval.get_size() = 1
+                {
+                    let c ic.sval.get(0)
+                    if c = 0x41 or c = 0x61 or c = 0x49 or c = 0x69
+                        this.next.number_format := c as int
+                }
+            }
+            else if ext = 2
+                this.next.number_restart := ic.bval
+            return
+        }
+        let index ic.get_index()
+        if index = 0
+            this.next.font_size := ic.lval
+        else if index = 1
+            this.next.family := PdfFOTBuilder.family_of(ic.sval)
+        else if index = 2
+        {
+            let c ic.sym.code
+            this.next.bold := c >= PSYM_SEMI_BOLD and c <= PSYM_ULTRA_BOLD
+        }
+        else if index = 3
+        {
+            let c ic.sym.code
+            this.next.italic := c = PSYM_OBLIQUE or c = PSYM_ITALIC
+        }
+        else if index = 4
+            this.next.quadding := ic.sym.code
+        else if index = 5
+            this.next.display_alignment := ic.sym.code
+        else if index = 7
+        {
+            let c ic.sym.code
+            this.next.asis := c >= PSYM_ASIS and c <= PSYM_ASIS_TRUNCATE
+        }
+        else if index = 8
+            this.next.start_indent := ic.ls.length
+        else if index = 9
+            this.next.first_line_indent := ic.ls.length
+        else if index = 10
+            this.next.end_indent := ic.ls.length
+        else if index = 12
+            this.next.line_spacing := ic.ls.length
+        else if index = 13
+            this.next.field_width := ic.ls.length
+        else if index = 14
+            this.next.left_margin := ic.lval
+        else if index = 15
+            this.next.right_margin := ic.lval
+        else if index = 16
+            this.next.top_margin := ic.lval
+        else if index = 17
+            this.next.bottom_margin := ic.lval
+        else if index = 18
+            this.next.header_margin := ic.lval
+        else if index = 19
+            this.next.footer_margin := ic.lval
+        else if index = 20
+            this.next.page_width := ic.lval
+        else if index = 21
+            this.next.page_height := ic.lval
+        else if index = 22
+            this.next.border_present := ic.bval
+        else if index = 23
+            this.next.line_thickness := ic.lval
+        else if index = 24
+            this.next.cell_before_row_margin := ic.lval
+        else if index = 25
+            this.next.cell_after_row_margin := ic.lval
+        else if index = 26
+            this.next.cell_before_column_margin := ic.lval
+        else if index = 27
+            this.next.cell_after_column_margin := ic.lval
+        else if index = 31
+            this.next.shift := ic.ls.length
+        else if index = 51
+            this.next.cell_background := ic.bval
+        else if index = 70
+            this.next.preserve := ic.sym.code = PSYM_PRESERVE
+        else if index = 87
+            this.next.cell_row_alignment := ic.sym.code
+        else if index = 155
+        {
+            if ic.obj <> null
+            {
+                let rgb ic.obj.color_rgb()
+                if rgb >= 0
+                    this.next.color := rgb
+            }
+        }
+        else if index = 156
+        {
+            this.next.has_background := false
+            if ic.obj <> null
+            {
+                let rgb ic.obj.color_rgb()
+                if rgb >= 0
+                {
+                    this.next.has_background := true
+                    this.next.background := rgb
+                }
+            }
+        }
+    }
+
+    ; The font family a font-family-name asks for.
+    function family_of(name: StringC) returns int
+    {
+        var buf u8[64]
+        var n: size_t 0
+        while n < name.get_size() and n < 64
+        {
+            let c name.get(n)
+            if c < 0x80
+                buf[n] := c as u8
+            else
+                buf[n] := 0x3F
+            n := n + 1
+        }
+        PdfFont.select(Slice[u8](n, buf as pointer[u8]), false, false)
+    }
+
+    ; --- the tree --------------------------------------------------------------
+    procedure append(mutable this: ref[PdfFOTBuilder], mutable n: ref[PdfNode])
+    {
+        let owner this.cur
+        n.parent := owner
+        if owner.last = null
+            owner.first := n
+        else
+        {
+            let l owner.last as ref[PdfNode]
+            l.next := n
+        }
+        owner.last := n
+    }
+
+    ; A node under the current container, made under the characteristics
+    ; set for the next flow object.
+    procedure add(mutable this: ref[PdfFOTBuilder], kind: int) returns ref[PdfNode]
+    {
+        let host this.host
+        let n PdfNode.make(host, kind, this.snapshot())
+        this.append(n)
+        n
+    }
+
+    ; The node becomes the container; the flow object is open.
+    procedure open(mutable this: ref[PdfFOTBuilder], n: ref[PdfNode])
+    {
+        this.cur := n
+        this.fo_start()
+    }
+
+    procedure close(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.cur.parent <> null
+            this.cur := this.cur.parent as ref[PdfNode]
+        this.fo_end()
+    }
+
+    procedure display(this: ref[PdfFOTBuilder], mutable n: ref[PdfNode], nic: ref[DisplayNIC]?)
+    {
+        if nic = null
+            return
+        n.space_before := nic.space_before.nominal.length
+        n.space_after := nic.space_after.nominal.length
+        n.keep_with_next := nic.keep_with_next
+        n.break_before := nic.break_before.code = PSYM_PAGE
+        n.break_after := nic.break_after.code = PSYM_PAGE
+    }
+
+    ; --- characters ------------------------------------------------------------
+    ; A run of text. Outside verbatim text every run of white space is one
+    ; space; in it a record end is a line break and spaces are kept.
+    procedure characters(mutable this: ref[PdfFOTBuilder], s: Slice[u32])
+    {
+        let c this.snapshot()
+        let verbatim c.asis or c.preserve
+        let at this.pool.get_length()
+        var i: size_t 0
+        while i < s.length
+        {
+            let ch s[i]
+            i := i + 1
+            if ch = 0x0D
+            {
+                if verbatim
+                {
+                    if i < s.length and s[i] = 0x0A
+                        i := i + 1
+                    this.pool.add(0x0A)
+                }
+                else
+                    this.add_space(at)
+            }
+            else if ch = 0x0A
+            {
+                if verbatim
+                    this.pool.add(0x0A)
+                else
+                    this.add_space(at)
+            }
+            else if ch = 0x20 or ch = 0x09
+            {
+                if verbatim
+                    this.pool.add(0x20)
+                else
+                    this.add_space(at)
+            }
+            ; a soft hyphen and the characters without width are not set
+            else if ch = 0xAD or ch = 0x200B or ch = 0x200C or ch = 0x200D or ch = 0xFEFF
+                continue
+            else if ch >= 0x20
+            {
+                let code PdfFont.encode(ch)
+                if code = 0
+                    this.pool.add(0x3F)
+                else
+                    this.pool.add(code)
+            }
+        }
+        let length this.pool.get_length() - at
+        if length = 0
+            return
+        let n this.add(PN_TEXT)
+        n.text_at := at as int
+        n.text_length := length as int
+    }
+
+    ; One space, unless the run so far ends in one.
+    procedure add_space(mutable this: ref[PdfFOTBuilder], run_at: size_t)
+    {
+        let n this.pool.get_length()
+        if n > run_at and this.pool[n - 1] = 0x20
+            return
+        this.pool.add(0x20)
+    }
+
+    procedure characters_from_node(mutable this: ref[PdfFOTBuilder], node: ref[GroveNode]?, s: Slice[u32])
+    {
+        this.characters(s)
+    }
+
+    procedure character(mutable this: ref[PdfFOTBuilder], nic: ref[CharacterNIC])
+    {
+        if nic.valid
+        {
+            var buf u32[1]
+            *(buf as pointer[u32]) := nic.ch
+            this.characters(Slice[u32](1, buf as pointer[u32]))
+        }
+        this.fo_atomic()
+    }
+
+    ; --- node bracket ----------------------------------------------------------
+    ; An element processed in the default mode begins here: that is the place
+    ; current-node-page-number asks for.
+    procedure start_node(mutable this: ref[PdfFOTBuilder], node: ref[GroveNode]?, mode_name: StringC)
+    {
+        if node = null or mode_name.get_size() <> 0
+            return
+        let ei node.element_index
+        if ei < 0
+            return
+        let n this.add(PN_MARK)
+        n.i0 := ei
+    }
+
+    procedure end_node(mutable this: ref[PdfFOTBuilder])
+    {
+    }
+
+    procedure current_node_page_number(mutable this: ref[PdfFOTBuilder], node: ref[GroveNode]?)
+    {
+        if node <> null
+        {
+            let n this.add(PN_NODE_PAGE_NUMBER)
+            n.i0 := node.element_index
+        }
+        this.fo_atomic()
+    }
+
+    procedure page_number(mutable this: ref[PdfFOTBuilder])
+    {
+        let n this.add(PN_PAGE_NUMBER)
+        this.fo_atomic()
+    }
+
+    ; --- blocks ----------------------------------------------------------------
+    procedure start_paragraph(mutable this: ref[PdfFOTBuilder], nic: ref[DisplayNIC]?)
+    {
+        let n this.add(PN_PARAGRAPH)
+        this.display(n, nic)
+        this.open(n)
+    }
+
+    procedure end_paragraph(mutable this: ref[PdfFOTBuilder])
+        this.close()
+
+    procedure paragraph_break(mutable this: ref[PdfFOTBuilder], nic: ref[DisplayNIC]?)
+    {
+        let n this.add(PN_BREAK)
+        this.fo_atomic()
+    }
+
+    procedure start_display_group(mutable this: ref[PdfFOTBuilder], nic: ref[DisplayNIC]?)
+    {
+        let n this.add(PN_GROUP)
+        this.display(n, nic)
+        this.open(n)
+    }
+
+    procedure end_display_group(mutable this: ref[PdfFOTBuilder])
+        this.close()
+
+    procedure start_scroll(mutable this: ref[PdfFOTBuilder])
+    {
+        let n this.add(PN_GROUP)
+        this.open(n)
+    }
+
+    procedure end_scroll(mutable this: ref[PdfFOTBuilder])
+        this.close()
+
+    procedure start_box(mutable this: ref[PdfFOTBuilder], nic: ref[BoxNIC]?, dnic: ref[DisplayNIC]?)
+    {
+        var kind PN_SEQUENCE
+        if nic <> null and nic.is_display
+            kind := PN_GROUP
+        let n this.add(kind)
+        if kind = PN_GROUP
+            this.display(n, dnic)
+        this.open(n)
+    }
+
+    procedure end_box(mutable this: ref[PdfFOTBuilder])
+        this.close()
+
+    procedure rule(mutable this: ref[PdfFOTBuilder], nic: ref[RuleNIC]?, dnic: ref[DisplayNIC]?)
+    {
+        if nic <> null
+        {
+            let n this.add(PN_RULE)
+            this.display(n, dnic)
+            if nic.orientation.code = PSYM_HORIZONTAL
+                n.i0 := 1
+            if nic.has_length
+            {
+                n.i1 := 1
+                n.i2 := nic.length.length
+            }
+        }
+        this.fo_atomic()
+    }
+
+    procedure external_graphic(mutable this: ref[PdfFOTBuilder], nic: ref[ExternalGraphicNIC]?, dnic: ref[DisplayNIC]?)
+    {
+        if nic <> null
+        {
+            let n this.add(PN_GRAPHIC)
+            this.display(n, dnic)
+            ; the system identifier, one byte per character
+            let name nic.entity_system_id
+            n.text_at := this.pool.get_length() as int
+            var i: size_t 0
+            while i < name.get_size()
+            {
+                this.pool.add(name.get(i) as u8)
+                i := i + 1
+            }
+            n.text_length := name.get_size() as int
+            if nic.is_display
+                n.i0 := 1
+            n.i1 := 0 - 1
+            n.i3 := 0 - 1
+            if nic.has_max_width
+                n.i1 := nic.max_width.length
+            if nic.has_max_height
+                n.i3 := nic.max_height.length
+        }
+        this.fo_atomic()
+    }
+
+    ; --- inline containers -----------------------------------------------------
+    procedure start_sequence(mutable this: ref[PdfFOTBuilder])
+    {
+        ; the sequence the engine wraps a row's cells in is not a node
+        if this.cur.kind = PN_ROW or this.cur.kind = PN_TABLE
+        {
+            this.fo_start()
+            return
+        }
+        let n this.add(PN_SEQUENCE)
+        this.open(n)
+    }
+
+    procedure end_sequence(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.cur.kind = PN_SEQUENCE
+            this.close()
+        else
+            this.fo_end()
+    }
+
+    procedure start_line_field(mutable this: ref[PdfFOTBuilder], nic: ref[LineFieldNIC]?)
+    {
+        let n this.add(PN_FIELD)
+        n.i0 := n.chars.field_width
+        this.open(n)
+    }
+
+    procedure end_line_field(mutable this: ref[PdfFOTBuilder])
+        this.close()
+
+    procedure start_leader(mutable this: ref[PdfFOTBuilder], nic: ref[LeaderNIC]?)
+    {
+        let n this.add(PN_LEADER)
+        this.open(n)
+    }
+
+    procedure end_leader(mutable this: ref[PdfFOTBuilder])
+        this.close()
+
+    ; --- simple page sequence --------------------------------------------------
+    procedure start_simple_page_sequence(mutable this: ref[PdfFOTBuilder])
+    {
+        let n this.add(PN_PAGE_SEQUENCE)
+        this.open(n)
+    }
+
+    procedure start_simple_page_sequence_header_footer(mutable this: ref[PdfFOTBuilder], flags: int)
+    {
+        let n this.add(PN_HEADER_FOOTER)
+        n.i0 := flags
+        this.open(n)
+    }
+
+    procedure end_simple_page_sequence_header_footer(mutable this: ref[PdfFOTBuilder], flags: int)
+        this.close()
+
+    procedure end_all_simple_page_sequence_header_footer(mutable this: ref[PdfFOTBuilder])
+    {
+    }
+
+    procedure end_simple_page_sequence(mutable this: ref[PdfFOTBuilder])
+        this.close()
+
+    ; --- tables ----------------------------------------------------------------
+    procedure start_table(mutable this: ref[PdfFOTBuilder], tnic: ref[TableNIC]?, dnic: ref[DisplayNIC]?)
+    {
+        let n this.add(PN_TABLE)
+        this.display(n, dnic)
+        n.i0 := 0 - 1
+        n.i1 := 0 - 1
+        n.i2 := 0 - 1
+        n.i3 := 0 - 1
+        ; the part the enclosing table was in
+        n.i8 := this.section
+        this.section := 0
+        this.open(n)
+    }
+
+    procedure end_table(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.cur.kind = PN_TABLE
+            this.section := this.cur.i8
+        this.close()
+    }
+
+    procedure start_table_part_serial(mutable this: ref[PdfFOTBuilder], dnic: ref[DisplayNIC]?)
+    {
+        this.section := 0
+        this.fo_start()
+    }
+
+    procedure end_table_part_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_table_part_header(mutable this: ref[PdfFOTBuilder])
+    {
+        this.section := 1
+    }
+
+    procedure end_table_part_header(mutable this: ref[PdfFOTBuilder])
+    {
+        this.section := 0
+    }
+
+    procedure start_table_part_footer(mutable this: ref[PdfFOTBuilder])
+    {
+        this.section := 2
+    }
+
+    procedure end_table_part_footer(mutable this: ref[PdfFOTBuilder])
+    {
+        this.section := 0
+    }
+
+    procedure table_column(mutable this: ref[PdfFOTBuilder], nic: ref[TableColumnNIC]?)
+    {
+        if nic <> null
+        {
+            let n this.add(PN_COLUMN)
+            n.i0 := nic.column_index
+            n.i1 := nic.n_columns_spanned
+            if nic.has_width
+            {
+                n.i2 := 1
+                n.i3 := nic.width.length
+                n.i4 := (nic.width_tfactor * 1000.0) as int
+            }
+        }
+        this.fo_atomic()
+    }
+
+    procedure start_table_row(mutable this: ref[PdfFOTBuilder])
+    {
+        let n this.add(PN_ROW)
+        n.i0 := this.section
+        this.open(n)
+    }
+
+    procedure end_table_row(mutable this: ref[PdfFOTBuilder])
+        this.close()
+
+    procedure start_table_cell(mutable this: ref[PdfFOTBuilder], nic: ref[TableCellNIC])
+    {
+        let n this.add(PN_CELL)
+        n.i0 := nic.column_index
+        n.i1 := nic.n_columns_spanned
+        n.i2 := nic.n_rows_spanned
+        if nic.missing
+            n.i3 := 1
+        n.i4 := 0 - 1
+        n.i5 := 0 - 1
+        n.i6 := 0 - 1
+        n.i7 := 0 - 1
+        this.open(n)
+    }
+
+    procedure end_table_cell(mutable this: ref[PdfFOTBuilder])
+        this.close()
+
+    ; A border: the characteristics set for it say whether it is there, how
+    ; thick and of what color. Answers the thickness, -1 for none.
+    function border_thickness(this: ref[PdfFOTBuilder]) returns int
+    {
+        if this.next.border_present
+            return this.next.line_thickness
+        0 - 1
+    }
+
+    procedure table_before_row_border(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.cur.kind = PN_TABLE
+        {
+            this.cur.i0 := this.border_thickness()
+            this.cur.i4 := this.next.color
+        }
+        this.fo_atomic()
+    }
+
+    procedure table_after_row_border(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.cur.kind = PN_TABLE
+        {
+            this.cur.i1 := this.border_thickness()
+            this.cur.i5 := this.next.color
+        }
+        this.fo_atomic()
+    }
+
+    procedure table_before_column_border(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.cur.kind = PN_TABLE
+        {
+            this.cur.i2 := this.border_thickness()
+            this.cur.i6 := this.next.color
+        }
+        this.fo_atomic()
+    }
+
+    procedure table_after_column_border(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.cur.kind = PN_TABLE
+        {
+            this.cur.i3 := this.border_thickness()
+            this.cur.i7 := this.next.color
+        }
+        this.fo_atomic()
+    }
+
+    procedure table_cell_before_row_border(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.cur.kind = PN_CELL
+        {
+            this.cur.i4 := this.border_thickness()
+            this.cur.i8 := this.next.color
+        }
+        this.fo_atomic()
+    }
+
+    procedure table_cell_after_row_border(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.cur.kind = PN_CELL
+        {
+            this.cur.i5 := this.border_thickness()
+            this.cur.i9 := this.next.color
+        }
+        this.fo_atomic()
+    }
+
+    procedure table_cell_before_column_border(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.cur.kind = PN_CELL
+        {
+            this.cur.i6 := this.border_thickness()
+            this.cur.i10 := this.next.color
+        }
+        this.fo_atomic()
+    }
+
+    procedure table_cell_after_column_border(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.cur.kind = PN_CELL
+        {
+            this.cur.i7 := this.border_thickness()
+            this.cur.i11 := this.next.color
+        }
+        this.fo_atomic()
+    }
+
+    ; =========================================================================
+    ; The layout
+    ; =========================================================================
+
+    ; Lay the tree out twice and write the file. False when the file cannot
+    ; be written.
+    procedure finish(mutable this: ref[PdfFOTBuilder]) returns bool
+    {
+        let host this.host
+        let first &PdfDocument^host()
+        this.measuring := true
+        this.layout(first)
+        let second &PdfDocument^host()
+        this.measuring := false
+        this.layout(second)
+        second.write(this.out_name)
+    }
+
+    procedure layout(mutable this: ref[PdfFOTBuilder], doc: ref[PdfDocument])
+    {
+        this.doc := doc
+        this.ops.cut(0)
+        this.atoms.cut(0)
+        this.scratch.cut(0)
+        this.marks.cut(0)
+        this.images.cut(0)
+        this.page_open := false
+        this.page_no := 0
+        this.pending := 0
+        this.nobreak := 0
+        this.keep_at := 0 - 1
+        this.flat := false
+        this.seq := null
+        this.seq_chars := this.root.chars
+        this.seq_first := true
+        this.seq_base := 0
+        this.set_frame()
+        this.flow_children(this.root, null, false)
+        if this.page_open
+            this.emit_page()
+    }
+
+    ; The body area of the page sequence being set.
+    procedure set_frame(mutable this: ref[PdfFOTBuilder])
+    {
+        let c this.seq_chars
+        this.frame_x := c.left_margin
+        this.frame_width := c.page_width - c.left_margin - c.right_margin
+        this.body_top := c.top_margin
+        this.body_bottom := c.page_height - c.bottom_margin
+    }
+
+    ; --- pages -----------------------------------------------------------------
+    procedure open_page(mutable this: ref[PdfFOTBuilder])
+    {
+        this.page_no := this.page_no + 1
+        this.page_open := true
+        this.at_top := true
+        this.pending := 0
+        this.y := this.body_top
+        this.page_labelled := this.seq_first
+        ; kept from the first pass for the second, which asks for the number
+        ; of a page before it has set it
+        if this.page_no <= (this.page_shown.get_length() as int)
+        {
+            this.page_shown.put((this.page_no - 1) as size_t, this.page_no - this.seq_base)
+            this.page_format.put((this.page_no - 1) as size_t, this.seq_chars.number_format)
+        }
+        else
+        {
+            this.page_shown.add(this.page_no - this.seq_base)
+            this.page_format.add(this.seq_chars.number_format)
+        }
+        this.set_headers()
+        this.seq_first := false
+        this.page_fixed := this.ops.count
+    }
+
+    ; Write the page being set.
+    procedure emit_page(mutable this: ref[PdfFOTBuilder])
+    {
+        let doc this.doc as ref[PdfDocument]
+        let c this.seq_chars
+        doc.begin_page(c.page_width, c.page_height)
+        if this.page_labelled
+        {
+            var style: u8 0x44
+            let format c.number_format
+            if format = 0x69
+                style := 0x72
+            else if format = 0x49
+                style := 0x52
+            else if format = 0x61 or format = 0x41
+                style := format as u8
+            doc.add_page_label(this.page_no - 1, style, this.page_no - this.seq_base)
+        }
+        var i 0
+        while i < this.ops.count
+        {
+            let kind this.ops.at(i)
+            let x this.ops.at(i + 1)
+            let y this.ops.at(i + 2)
+            let a this.ops.at(i + 3)
+            let b this.ops.at(i + 4)
+            let cc this.ops.at(i + 5)
+            let d this.ops.at(i + 6)
+            let e this.ops.at(i + 7)
+            if kind = POP_TEXT
+            {
+                doc.set_color((cc >> 16) & 255, (cc >> 8) & 255, cc & 255)
+                doc.text(a, b, x, y, this.pool.as_slice().subslice(d as size_t, (d + e) as size_t))
+            }
+            else if kind = POP_LINE
+            {
+                doc.set_color((d >> 16) & 255, (d >> 8) & 255, d & 255)
+                doc.line(x, y, a, b, cc)
+            }
+            else if kind = POP_RECTANGLE
+                doc.fill_rectangle(x, y, a, b, (cc >> 16) & 255, (cc >> 8) & 255, cc & 255)
+            else if kind = POP_IMAGE
+                doc.image(cc, x, y, a, b)
+            else if kind = POP_MARK
+                this.note_element(a)
+            i := i + POP_SIZE
+        }
+        doc.end_page()
+        this.ops.cut(0)
+        this.page_open := false
+        this.keep_at := 0 - 1
+    }
+
+    ; An element begins on the page being written.
+    procedure note_element(mutable this: ref[PdfFOTBuilder], element: int)
+    {
+        while (this.element_page.get_length() as int) <= element
+            this.element_page.add(0)
+        this.element_page.put(element as size_t, this.page_no)
+    }
+
+    ; The page is full: write it and go on on a new one. What must stay with
+    ; the block being set goes along, unless that is half a page.
+    procedure new_page(mutable this: ref[PdfFOTBuilder])
+    {
+        let base this.scratch.count
+        let from this.keep_at
+        let from_y this.keep_y
+        let old_y this.y
+        var moved false
+        if from >= this.page_fixed and from_y > this.body_top and (old_y - from_y) * 2 < this.body_bottom - this.body_top
+        {
+            moved := true
+            var i from
+            while i < this.ops.count
+            {
+                this.scratch.push(this.ops.at(i))
+                i := i + 1
+            }
+            this.ops.cut(from)
+        }
+        this.emit_page()
+        this.open_page()
+        if moved
+        {
+            this.keep_at := this.ops.count
+            this.keep_y := this.body_top
+            this.put_back(base, this.body_top - from_y)
+            this.y := this.body_top + (old_y - from_y)
+            this.at_top := false
+        }
+    }
+
+    ; Operations saved in the scratch space from `base` on come back, moved
+    ; down by dy.
+    procedure put_back(mutable this: ref[PdfFOTBuilder], base: int, dy: int)
+    {
+        var i base
+        while i < this.scratch.count
+        {
+            let kind this.scratch.at(i)
+            this.ops.push(kind)
+            this.ops.push(this.scratch.at(i + 1))
+            this.ops.push(this.scratch.at(i + 2) + dy)
+            this.ops.push(this.scratch.at(i + 3))
+            if kind = POP_LINE
+                this.ops.push(this.scratch.at(i + 4) + dy)
+            else
+                this.ops.push(this.scratch.at(i + 4))
+            this.ops.push(this.scratch.at(i + 5))
+            this.ops.push(this.scratch.at(i + 6))
+            this.ops.push(this.scratch.at(i + 7))
+            i := i + POP_SIZE
+        }
+        this.scratch.cut(base)
+    }
+
+    ; Move the operations from `from` on down by dy, where they are.
+    procedure shift_ops(mutable this: ref[PdfFOTBuilder], from: int, dy: int)
+    {
+        var i from
+        while i < this.ops.count
+        {
+            this.ops.put(i + 2, this.ops.at(i + 2) + dy)
+            if this.ops.at(i) = POP_LINE
+                this.ops.put(i + 4, this.ops.at(i + 4) + dy)
+            i := i + POP_SIZE
+        }
+    }
+
+    procedure op(mutable this: ref[PdfFOTBuilder], kind: int, x: int, y: int, a: int, b: int, c: int, d: int, e: int)
+    {
+        this.ops.push(kind)
+        this.ops.push(x)
+        this.ops.push(y)
+        this.ops.push(a)
+        this.ops.push(b)
+        this.ops.push(c)
+        this.ops.push(d)
+        this.ops.push(e)
+    }
+
+    ; Make room for something `height` high: a page is opened if none is,
+    ; and broken if it does not fit. Then the pending space is put in, and
+    ; the elements waiting for a line are marked here.
+    procedure make_room(mutable this: ref[PdfFOTBuilder], height: int, keep: bool)
+    {
+        if this.page_open = false
+            this.open_page()
+        if this.at_top
+            this.pending := 0
+        if this.nobreak = 0 and this.at_top = false and this.y + this.pending + height > this.body_bottom
+        {
+            this.new_page()
+            if this.at_top
+                this.pending := 0
+        }
+        this.y := this.y + this.pending
+        this.pending := 0
+        if keep
+        {
+            if this.keep_at < 0
+            {
+                this.keep_at := this.ops.count
+                this.keep_y := this.y
+            }
+        }
+        else
+            this.keep_at := 0 - 1
+        var i 0
+        while i < this.marks.count
+        {
+            this.op(POP_MARK, this.frame_x, this.y, this.marks.at(i), 0, 0, 0, 0)
+            i := i + 1
+        }
+        this.marks.cut(0)
+        this.at_top := false
+    }
+
+    ; A block begins: its break, and its space before against the space
+    ; after the block before it.
+    procedure block_start(mutable this: ref[PdfFOTBuilder], n: ref[PdfNode])
+    {
+        if n.break_before and this.page_open and this.at_top = false and this.nobreak = 0
+            this.emit_page()
+        if n.space_before > this.pending
+            this.pending := n.space_before
+    }
+
+    procedure block_end(mutable this: ref[PdfFOTBuilder], n: ref[PdfNode])
+    {
+        if n.space_after > this.pending
+            this.pending := n.space_after
+        if n.break_after and this.page_open and this.nobreak = 0
+            this.emit_page()
+    }
+
+    ; --- the flow --------------------------------------------------------------
+
+    ; Set the children of a container: what is inline is collected into
+    ; lines under the paragraph's characteristics (those of the first text
+    ; where there is no paragraph), a block ends the lines before it.
+    procedure flow_children(mutable this: ref[PdfFOTBuilder], parent: ref[PdfNode], p: ref[PdfChars]?, keep: bool)
+    {
+        let old_base this.para_base
+        let old_chars this.para_chars
+        let old_first this.para_first
+        let old_keep this.para_keep
+        this.para_base := this.atoms.count
+        this.para_chars := p
+        this.para_first := true
+        this.para_keep := keep
+        var c: ref[PdfNode]? parent.first
+        while c <> null
+        {
+            let n c as ref[PdfNode]
+            this.flow_node(n)
+            c := n.next
+        }
+        this.flush_lines()
+        this.para_base := old_base
+        this.para_chars := old_chars
+        this.para_first := old_first
+        this.para_keep := old_keep
+    }
+
+    procedure flow_inside(mutable this: ref[PdfFOTBuilder], parent: ref[PdfNode])
+    {
+        var c: ref[PdfNode]? parent.first
+        while c <> null
+        {
+            let n c as ref[PdfNode]
+            this.flow_node(n)
+            c := n.next
+        }
+    }
+
+    procedure atom(mutable this: ref[PdfFOTBuilder], kind: int, chars: ref[PdfChars], a: int, b: int, width: int)
+    {
+        this.atoms.push(kind)
+        this.atoms.push(chars.id)
+        this.atoms.push(a)
+        this.atoms.push(b)
+        this.atoms.push(width)
+    }
+
+    procedure flow_node(mutable this: ref[PdfFOTBuilder], n: ref[PdfNode])
+    {
+        let kind n.kind
+        if kind = PN_TEXT
+            this.text_atoms(n.chars, n.text_at, n.text_length)
+        else if kind = PN_SEQUENCE
+            this.flow_inside(n)
+        else if kind = PN_MARK
+            this.atom(PAT_MARK, n.chars, n.i0, 0, 0)
+        else if kind = PN_FIELD
+        {
+            this.atom(PAT_FIELD_START, n.chars, 0, 0, n.i0)
+            this.flow_inside(n)
+            this.atom(PAT_FIELD_END, n.chars, 0, 0, 0)
+        }
+        else if kind = PN_PAGE_NUMBER
+        {
+            var page this.page_no
+            if this.page_open = false
+                page := page + 1
+            let at this.pool.get_length() as int
+            this.number_text(page - this.seq_base, this.seq_chars.number_format)
+            this.text_atoms(n.chars, at, (this.pool.get_length() as int) - at)
+        }
+        else if kind = PN_NODE_PAGE_NUMBER
+        {
+            let at this.pool.get_length() as int
+            var page 0
+            if n.i0 >= 0 and n.i0 < (this.element_page.get_length() as int)
+                page := this.element_page[n.i0 as size_t]
+            if page > 0 and page <= (this.page_shown.get_length() as int)
+                this.number_text(this.page_shown[(page - 1) as size_t], this.page_format[(page - 1) as size_t])
+            else if page > 0
+                this.number_text(page, 0x31)
+            else
+            {
+                ; not known yet: the room of a number
+                this.pool.add(0x30)
+                this.pool.add(0x30)
+            }
+            this.text_atoms(n.chars, at, (this.pool.get_length() as int) - at)
+        }
+        else if kind = PN_LEADER
+            this.leader_atom(n)
+        else if kind = PN_GRAPHIC and (n.i0 = 0 or this.flat)
+            this.image_atom(n)
+        else if kind = PN_BREAK
+        {
+            if this.flat = false
+            {
+                this.flush_lines()
+                this.para_first := true
+            }
+        }
+        else if kind = PN_HEADER_FOOTER or kind = PN_COLUMN
+            return
+        else if this.flat
+        {
+            ; in a header or footer a block is its text
+            if kind = PN_PARAGRAPH or kind = PN_GROUP
+                this.flow_inside(n)
+        }
+        else
+        {
+            this.flush_lines()
+            this.flow_block(n)
+        }
+    }
+
+    procedure flow_block(mutable this: ref[PdfFOTBuilder], n: ref[PdfNode])
+    {
+        let kind n.kind
+        if kind = PN_PAGE_SEQUENCE
+        {
+            this.flow_sequence(n)
+            return
+        }
+        this.block_start(n)
+        if kind = PN_PARAGRAPH
+            this.flow_children(n, n.chars, n.keep_with_next)
+        else if kind = PN_GROUP
+            this.flow_children(n, null, n.keep_with_next)
+        else if kind = PN_RULE
+            this.flow_rule(n)
+        else if kind = PN_GRAPHIC
+            this.flow_graphic(n)
+        else if kind = PN_TABLE
+            this.flow_table(n)
+        this.block_end(n)
+    }
+
+    procedure flow_sequence(mutable this: ref[PdfFOTBuilder], n: ref[PdfNode])
+    {
+        if this.page_open
+            this.emit_page()
+        let old_seq this.seq
+        let old_chars this.seq_chars
+        let old_first this.seq_first
+        let old_base this.seq_base
+        this.seq := n
+        this.seq_chars := n.chars
+        this.seq_first := true
+        if n.chars.number_restart
+            this.seq_base := this.page_no
+        this.pending := 0
+        this.set_frame()
+        this.flow_children(n, null, false)
+        if this.page_open
+            this.emit_page()
+        this.seq := old_seq
+        this.seq_chars := old_chars
+        this.seq_first := old_first
+        this.seq_base := old_base
+        this.pending := 0
+        this.set_frame()
+    }
+
+    ; A horizontal rule across the area, or of its length.
+    procedure flow_rule(mutable this: ref[PdfFOTBuilder], n: ref[PdfNode])
+    {
+        if n.i0 = 0
+            return
+        let c n.chars
+        let thickness c.line_thickness
+        this.make_room(thickness, n.keep_with_next)
+        let x this.frame_x + c.start_indent
+        var length this.frame_width - c.start_indent - c.end_indent
+        if n.i1 <> 0
+            length := n.i2
+        let at this.y + thickness / 2
+        this.op(POP_LINE, x, at, x + length, at, thickness, c.color, 0)
+        this.y := this.y + thickness
+    }
+
+    procedure flow_graphic(mutable this: ref[PdfFOTBuilder], n: ref[PdfNode])
+    {
+        let image this.image_of(n)
+        if image < 0
+            return
+        let c n.chars
+        let available this.frame_width - c.start_indent - c.end_indent
+        var width 0
+        var height 0
+        this.image_size(n, image, available, &width, &height)
+        this.make_room(height, n.keep_with_next)
+        var x this.frame_x + c.start_indent
+        if c.display_alignment = PSYM_CENTER
+            x := x + (available - width) / 2
+        else if c.display_alignment = PSYM_END
+            x := x + available - width
+        this.op(POP_IMAGE, x, this.y, width, height, this.images.at(image + 1), 0, 0)
+        this.y := this.y + height
+    }
+
+    ; --- images ----------------------------------------------------------------
+
+    ; The image of a graphic's file in the document being written, -1 when
+    ; the file cannot be read or is neither JPEG nor PNG. Answers the place
+    ; of its entry in `images`, where its size is.
+    procedure image_of(mutable this: ref[PdfFOTBuilder], n: ref[PdfNode]) returns int
+    {
+        var i 0
+        while i < this.images.count
+        {
+            if this.images.at(i) = n.text_at
+            {
+                if this.images.at(i + 1) < 0
+                    return 0 - 1
+                return i
+            }
+            i := i + 4
+        }
+        let doc this.doc as ref[PdfDocument]
+        var sb StringBuilder()
+        var from n.text_at
+        let end n.text_at + n.text_length
+        ; a file URL is its path
+        if n.text_length > 7 and this.pool[from as size_t] = 0x66 and this.pool[(from + 4) as size_t] = 0x3A and this.pool[(from + 5) as size_t] = 0x2F and this.pool[(from + 6) as size_t] = 0x2F
+            from := from + 7
+        while from < end
+        {
+            sb.append(this.pool[from as size_t] as char)
+            from := from + 1
+        }
+        let data File.read_to_string(sb.to_string())
+        var image 0 - 1
+        var width 0
+        var height 0
+        if data.get_length() > 0 and PdfDocument.probe(data.as_slice(), &width, &height)
+        {
+            image := 0
+            if this.measuring = false
+            {
+                image := doc.add_jpeg(data.as_slice())
+                if image < 0
+                    image := doc.add_png(data.as_slice())
+            }
+        }
+        let entry this.images.count
+        this.images.push(n.text_at)
+        this.images.push(image)
+        this.images.push(width)
+        this.images.push(height)
+        if image < 0
+            return 0 - 1
+        entry
+    }
+
+    ; The size an image is set at: its own at 96 pixels to the inch, made
+    ; smaller to fit the widths and heights that limit it.
+    procedure image_size(this: ref[PdfFOTBuilder], n: ref[PdfNode], entry: int, available: int, mutable width: ref[int], mutable height: ref[int])
+    {
+        var w this.images.at(entry + 2) * 750
+        var h this.images.at(entry + 3) * 750
+        var limit available
+        if n.i1 >= 0 and n.i1 < limit
+            limit := n.i1
+        if limit > 0 and w > limit
+        {
+            h := h * limit / w
+            w := limit
+        }
+        if n.i3 >= 0 and h > n.i3 and h > 0
+        {
+            w := w * n.i3 / h
+            h := n.i3
+        }
+        width := w
+        height := h
+    }
+
+    procedure image_atom(mutable this: ref[PdfFOTBuilder], n: ref[PdfNode])
+    {
+        let image this.image_of(n)
+        if image < 0
+            return
+        var width 0
+        var height 0
+        this.image_size(n, image, this.frame_width, &width, &height)
+        this.atom(PAT_IMAGE, n.chars, this.images.at(image + 1), height, width)
+    }
+
+    ; --- atoms -----------------------------------------------------------------
+
+    ; The atoms of a run of text: words and the spaces between them, in
+    ; verbatim text lines and the breaks between them.
+    procedure text_atoms(mutable this: ref[PdfFOTBuilder], c: ref[PdfChars], at: int, length: int)
+    {
+        let font c.font()
+        let verbatim c.asis or c.preserve
+        var stop: u8 0x20
+        if verbatim
+            stop := 0x0A
+        let end at + length
+        var i at
+        var word at
+        while i <= end
+        {
+            if i = end or this.pool[i as size_t] = stop
+            {
+                if i > word
+                {
+                    let width PdfFont.text_width(font, c.font_size, this.pool.as_slice().subslice(word as size_t, i as size_t))
+                    this.atom(PAT_TEXT, c, word, i - word, width)
+                }
+                if i < end
+                {
+                    if verbatim
+                        this.atom(PAT_NEWLINE, c, 0, 0, 0)
+                    else
+                        this.atom(PAT_SPACE, c, 0, 0, PdfFont.width(font, 0x20) * c.font_size / 1000)
+                }
+                word := i + 1
+            }
+            i := i + 1
+        }
+    }
+
+    ; A leader: its pattern is the text in it, a dot where there is none.
+    procedure leader_atom(mutable this: ref[PdfFOTBuilder], n: ref[PdfNode])
+    {
+        var c n.chars
+        var at 0 - 1
+        var length 0
+        var child: ref[PdfNode]? n.first
+        while child <> null
+        {
+            let t child as ref[PdfNode]
+            if t.kind = PN_TEXT and at < 0
+            {
+                c := t.chars
+                at := t.text_at
+                length := t.text_length
+            }
+            child := t.next
+        }
+        if at < 0
+        {
+            at := this.pool.get_length() as int
+            this.pool.add(0x2E)
+            length := 1
+        }
+        let width PdfFont.text_width(c.font(), c.font_size, this.pool.as_slice().subslice(at as size_t, (at + length) as size_t))
+        this.atom(PAT_LEADER, c, at, length, width)
+    }
+
+    ; A page number in a format (the character of page-number-format),
+    ; appended to the pool.
+    procedure number_text(mutable this: ref[PdfFOTBuilder], number: int, format: int)
+    {
+        var n number
+        if n <= 0 or format = 0x31
+        {
+            var digits u8[20]
+            var at: size_t 20
+            if n < 0
+            {
+                this.pool.add(0x2D)
+                n := 0 - n
+            }
+            repeat
+            {
+                at := at - 1
+                digits[at] := ((n % 10) as u8) + 0x30
+                n := n / 10
+                if n = 0
+                    break
+            }
+            while at < 20
+            {
+                this.pool.add(digits[at])
+                at := at + 1
+            }
+            return
+        }
+        if format = 0x61 or format = 0x41
+        {
+            ; a..z, aa..az, ...
+            var letters u8[16]
+            var at: size_t 16
+            while n > 0 and at > 0
+            {
+                n := n - 1
+                at := at - 1
+                letters[at] := ((n % 26) as u8) + (format as u8)
+                n := n / 26
+            }
+            while at < 16
+            {
+                this.pool.add(letters[at])
+                at := at + 1
+            }
+            return
+        }
+        var lower: u8 0
+        if format = 0x69
+            lower := 0x20
+        while n >= 1000
+        {
+            this.pool.add(0x4D + lower)
+            n := n - 1000
+        }
+        this.roman_digit(n / 100, 0x43, 0x44, 0x4D, lower)
+        this.roman_digit((n / 10) % 10, 0x58, 0x4C, 0x43, lower)
+        this.roman_digit(n % 10, 0x49, 0x56, 0x58, lower)
+    }
+
+    procedure roman_digit(mutable this: ref[PdfFOTBuilder], digit: int, one: u8, five: u8, ten: u8, lower: u8)
+    {
+        var d digit
+        if d = 9
+        {
+            this.pool.add(one + lower)
+            this.pool.add(ten + lower)
+            return
+        }
+        if d = 4
+        {
+            this.pool.add(one + lower)
+            this.pool.add(five + lower)
+            return
+        }
+        if d >= 5
+        {
+            this.pool.add(five + lower)
+            d := d - 5
+        }
+        while d > 0
+        {
+            this.pool.add(one + lower)
+            d := d - 1
+        }
+    }
+
+    ; --- lines -----------------------------------------------------------------
+
+    function atom_chars(this: ref[PdfFOTBuilder], i: int) returns ref[PdfChars]
+    {
+        let p this.snaps.get(this.atoms.at(i + 1) as size_t)
+        (*p) as ref[PdfChars]
+    }
+
+    ; The width of the atoms from..to set side by side; a leader counts as
+    ; one pattern, a line field as at least its width.
+    function line_width(this: ref[PdfFOTBuilder], from: int, to: int) returns int
+    {
+        var x 0
+        var field_x 0
+        var field_width 0
+        var i from
+        while i < to
+        {
+            let kind this.atoms.at(i)
+            if kind = PAT_FIELD_START
+            {
+                field_x := x
+                field_width := this.atoms.at(i + 4)
+            }
+            else if kind = PAT_FIELD_END
+            {
+                if x < field_x + field_width
+                    x := field_x + field_width
+            }
+            else if kind <> PAT_MARK and kind <> PAT_NEWLINE
+                x := x + this.atoms.at(i + 4)
+            i := i + PAT_SIZE
+        }
+        x
+    }
+
+    ; The atoms collected since the paragraph began become lines.
+    procedure flush_lines(mutable this: ref[PdfFOTBuilder])
+    {
+        let base this.para_base
+        let end this.atoms.count
+        if end = base
+            return
+        ; the characteristics of the lines: the paragraph's, else the first
+        ; text's; with no text at all there is no line, only elements to mark
+        var pc this.para_chars
+        var visible false
+        var i base
+        while i < end
+        {
+            let kind this.atoms.at(i)
+            if kind = PAT_TEXT or kind = PAT_IMAGE or kind = PAT_LEADER or kind = PAT_NEWLINE
+            {
+                if pc = null
+                    pc := this.atom_chars(i)
+                visible := true
+                break
+            }
+            i := i + PAT_SIZE
+        }
+        if visible = false or pc = null
+        {
+            i := base
+            while i < end
+            {
+                if this.atoms.at(i) = PAT_MARK
+                    this.marks.push(this.atoms.at(i + 2))
+                i := i + PAT_SIZE
+            }
+            this.atoms.cut(base)
+            return
+        }
+        let p pc as ref[PdfChars]
+        let verbatim p.asis or p.preserve
+        var from base
+        while from < end
+        {
+            var indent p.start_indent
+            if this.para_first
+                indent := indent + p.first_line_indent
+            let available this.frame_width - indent - p.end_indent
+            ; a line does not begin with a space
+            if verbatim = false
+            {
+                while from < end and this.atoms.at(from) = PAT_SPACE
+                    from := from + PAT_SIZE
+                if from >= end
+                    break
+            }
+            ; as many atoms as fit, broken at a space
+            var to from
+            var break_at 0 - 1
+            var ended false
+            while to < end
+            {
+                let kind this.atoms.at(to)
+                if kind = PAT_NEWLINE
+                {
+                    ended := true
+                    break
+                }
+                if kind = PAT_SPACE and verbatim = false
+                {
+                    break_at := to
+                }
+                else if verbatim = false and to > from and this.line_width(from, to + PAT_SIZE) > available
+                {
+                    if break_at > from
+                        to := break_at
+                    break
+                }
+                to := to + PAT_SIZE
+            }
+            let last to >= end or ended
+            this.set_line(p, from, to, indent, available, last)
+            this.para_first := false
+            from := to
+            if ended
+                from := to + PAT_SIZE
+        }
+        this.atoms.cut(base)
+    }
+
+    ; Set one line of a paragraph at the place of the next block.
+    procedure set_line(mutable this: ref[PdfFOTBuilder], p: ref[PdfChars], from: int, to: int, indent: int, available: int, last: bool)
+    {
+        ; the height: the paragraph's line spacing, more for larger text
+        var size 0
+        var tall 0
+        var spaces 0
+        var leaders 0
+        var i from
+        while i < to
+        {
+            let kind this.atoms.at(i)
+            if kind = PAT_TEXT or kind = PAT_LEADER
+            {
+                let c this.atom_chars(i)
+                if c.font_size > size
+                    size := c.font_size
+            }
+            else if kind = PAT_IMAGE
+            {
+                if this.atoms.at(i + 3) > tall
+                    tall := this.atoms.at(i + 3)
+            }
+            else if kind = PAT_SPACE
+                spaces := spaces + 1
+            if kind = PAT_LEADER
+                leaders := leaders + 1
+            i := i + PAT_SIZE
+        }
+        if size = 0
+            size := p.font_size
+        var height p.line_spacing
+        if height < size * 12 / 10
+            height := size * 12 / 10
+        if tall > height
+            height := tall
+        this.make_room(height, this.para_keep)
+        let natural this.line_width(from, to)
+        var x this.frame_x + indent
+        var extra 0
+        var fill 0
+        if leaders > 0
+        {
+            if available > natural
+                fill := (available - natural) / leaders
+        }
+        else if p.quadding = PSYM_END
+            x := x + available - natural
+        else if p.quadding = PSYM_CENTER
+            x := x + (available - natural) / 2
+        else if p.quadding = PSYM_JUSTIFY and last = false and spaces > 0 and available > natural
+            extra := (available - natural) / spaces
+        this.set_atoms(from, to, x, this.y + height / 2 + size / 4, this.y, extra, fill)
+        this.y := this.y + height
+    }
+
+    ; Put the atoms from..to side by side with their baseline at `baseline`.
+    ; Every space gets `extra` more, every leader `fill` more than one
+    ; pattern.
+    procedure set_atoms(mutable this: ref[PdfFOTBuilder], from: int, to: int, start: int, baseline: int, top: int, extra: int, fill: int)
+    {
+        var x start
+        var field_x 0
+        var field_width 0
+        var i from
+        while i < to
+        {
+            let kind this.atoms.at(i)
+            let a this.atoms.at(i + 2)
+            let b this.atoms.at(i + 3)
+            let width this.atoms.at(i + 4)
+            if kind = PAT_TEXT
+            {
+                let c this.atom_chars(i)
+                this.op(POP_TEXT, x, baseline - c.shift, c.font(), c.font_size, c.color, a, b)
+                x := x + width
+            }
+            else if kind = PAT_SPACE
+                x := x + width + extra
+            else if kind = PAT_LEADER
+            {
+                ; as many patterns as fit, flush with the end of the room
+                let c this.atom_chars(i)
+                let room width + fill
+                var count 0
+                if width > 0
+                    count := room / width
+                let at this.pool.get_length() as int
+                var k 0
+                while k < count
+                {
+                    var j 0
+                    while j < b
+                    {
+                        this.pool.add(this.pool[(a + j) as size_t])
+                        j := j + 1
+                    }
+                    k := k + 1
+                }
+                this.op(POP_TEXT, x + room - count * width, baseline, c.font(), c.font_size, c.color, at, count * b)
+                x := x + room
+            }
+            else if kind = PAT_IMAGE
+            {
+                this.op(POP_IMAGE, x, baseline - b, width, b, a, 0, 0)
+                x := x + width
+            }
+            else if kind = PAT_MARK
+                this.op(POP_MARK, x, top, a, 0, 0, 0, 0)
+            else if kind = PAT_FIELD_START
+            {
+                field_x := x
+                field_width := width
+            }
+            else if kind = PAT_FIELD_END
+            {
+                if x < field_x + field_width
+                    x := field_x + field_width
+            }
+            i := i + PAT_SIZE
+        }
+    }
+
+    ; --- headers and footers ---------------------------------------------------
+
+    ; The headers and footers of the page just opened: of the six parts each
+    ; is one line, at the left, in the middle and at the right.
+    procedure set_headers(mutable this: ref[PdfFOTBuilder])
+    {
+        if this.seq = null
+            return
+        let seq this.seq as ref[PdfNode]
+        let c this.seq_chars
+        var flags 0
+        if this.seq_first
+            flags := flags | PHF_FIRST
+        if ((this.page_no - this.seq_base) & 1) = 1
+            flags := flags | PHF_FRONT
+        var child: ref[PdfNode]? seq.first
+        while child <> null
+        {
+            let part child as ref[PdfNode]
+            if part.kind = PN_HEADER_FOOTER and (part.i0 & 3) = flags and part.first <> null
+                this.set_header_part(part, c)
+            child := part.next
+        }
+    }
+
+    procedure set_header_part(mutable this: ref[PdfFOTBuilder], part: ref[PdfNode], c: ref[PdfChars])
+    {
+        let base this.atoms.count
+        let was_flat this.flat
+        this.flat := true
+        this.flow_inside(part)
+        this.flat := was_flat
+        let end this.atoms.count
+        ; the size of its largest text
+        var size 0
+        var i base
+        while i < end
+        {
+            if this.atoms.at(i) = PAT_TEXT
+            {
+                let ac this.atom_chars(i)
+                if ac.font_size > size
+                    size := ac.font_size
+            }
+            i := i + PAT_SIZE
+        }
+        if size = 0
+            size := part.chars.font_size
+        let width this.line_width(base, end)
+        let body c.page_width - c.left_margin - c.right_margin
+        var x c.left_margin
+        if (part.i0 & PHF_CENTER) <> 0
+            x := x + (body - width) / 2
+        else if (part.i0 & PHF_RIGHT) <> 0
+            x := x + body - width
+        ; the header's line below the header margin, the footer's above the
+        ; footer margin; without a margin, in the middle of the page margin
+        var baseline 0
+        if (part.i0 & PHF_HEADER) <> 0
+        {
+            if c.header_margin > 0
+                baseline := c.header_margin + size
+            else
+                baseline := c.top_margin / 2 + size / 2
+        }
+        else
+        {
+            if c.footer_margin > 0
+                baseline := c.page_height - c.footer_margin
+            else
+                baseline := c.page_height - c.bottom_margin / 2 + size / 2
+        }
+        this.set_atoms(base, end, x, baseline, baseline - size, 0, 0)
+        this.atoms.cut(base)
+    }
+
+    ; --- tables ----------------------------------------------------------------
+
+    ; A table: the widths of its columns, then its rows one below the other,
+    ; the header rows first and again at the top of every further page.
+    procedure flow_table(mutable this: ref[PdfFOTBuilder], table: ref[PdfNode])
+    {
+        let c table.chars
+        let x this.frame_x + c.start_indent
+        let available this.frame_width - c.start_indent - c.end_indent
+        ; the number of columns: what the columns say, and what the rows hold
+        var columns 0
+        var child: ref[PdfNode]? table.first
+        while child <> null
+        {
+            let n child as ref[PdfNode]
+            if n.kind = PN_COLUMN
+            {
+                if n.i0 + n.i1 > columns
+                    columns := n.i0 + n.i1
+            }
+            else if n.kind = PN_ROW
+            {
+                var in_row 0
+                var cell: ref[PdfNode]? n.first
+                while cell <> null
+                {
+                    let cn cell as ref[PdfNode]
+                    if cn.kind = PN_CELL and cn.i3 = 0
+                        in_row := in_row + cn.i1
+                    cell := cn.next
+                }
+                if in_row > columns
+                    columns := in_row
+            }
+            child := n.next
+        }
+        if columns = 0
+            return
+        ; the widths, in the scratch space: a length is taken as it is, what
+        ; is left over is shared by the table units; a column that says
+        ; nothing has one unit
+        let widths this.scratch.count
+        var k 0
+        while k < columns
+        {
+            this.scratch.push(0)
+            this.scratch.push(1000)
+            k := k + 1
+        }
+        child := table.first
+        while child <> null
+        {
+            let n child as ref[PdfNode]
+            if n.kind = PN_COLUMN and n.i1 = 1 and n.i0 >= 0 and n.i0 < columns and n.i2 <> 0
+            {
+                this.scratch.put(widths + n.i0 * 2, n.i3)
+                this.scratch.put(widths + n.i0 * 2 + 1, n.i4)
+            }
+            child := n.next
+        }
+        var fixed 0
+        var units 0
+        k := 0
+        while k < columns
+        {
+            fixed := fixed + this.scratch.at(widths + k * 2)
+            units := units + this.scratch.at(widths + k * 2 + 1)
+            k := k + 1
+        }
+        var left available - fixed
+        if left < 0
+            left := 0
+        k := 0
+        while k < columns
+        {
+            var w this.scratch.at(widths + k * 2)
+            if units > 0
+                w := w + left * this.scratch.at(widths + k * 2 + 1) / units
+            this.scratch.put(widths + k * 2, w)
+            k := k + 1
+        }
+        var total 0
+        k := 0
+        while k < columns
+        {
+            total := total + this.scratch.at(widths + k * 2)
+            k := k + 1
+        }
+        ; the rows: header, body, footer
+        var first true
+        var last_bottom 0
+        var section 1
+        repeat
+        {
+            child := table.first
+            while child <> null
+            {
+                let row child as ref[PdfNode]
+                if row.kind = PN_ROW and row.i0 = section
+                {
+                    this.flow_row(table, row, x, widths, columns, section = 0)
+                    if first and table.i0 >= 0
+                    {
+                        ; the border before the first row
+                        let top this.y - this.row_height
+                        this.op(POP_LINE, x, top, x + total, top, table.i0, table.i4, 0)
+                    }
+                    first := false
+                    ; the borders before the first and after the last column
+                    let row_top this.y - this.row_height
+                    if table.i2 >= 0
+                        this.op(POP_LINE, x, row_top, x, this.y, table.i2, table.i6, 0)
+                    if table.i3 >= 0
+                        this.op(POP_LINE, x + total, row_top, x + total, this.y, table.i3, table.i7, 0)
+                }
+                child := row.next
+            }
+            if section = 1
+                section := 0
+            else if section = 0
+                section := 2
+            else
+                break
+        }
+        if first = false and table.i1 >= 0
+            this.op(POP_LINE, x, this.y, x + total, this.y, table.i1, table.i5, 0)
+        this.scratch.cut(widths)
+    }
+
+    ; One row at the place of the next block: its cells side by side, each
+    ; set into its columns; the row is as high as its highest cell. A row
+    ; that does not fit on the page moves to the next one as a whole.
+    procedure flow_row(mutable this: ref[PdfFOTBuilder], table: ref[PdfNode], row: ref[PdfNode], x: int, widths: int, columns: int, body: bool)
+    {
+        this.make_room(0, false)
+        let was_top this.y <= this.body_top
+        let row_ops this.ops.count
+        let row_top this.y
+        ; per cell, in the scratch space: where its background is, where its
+        ; content begins, and how high it is
+        let cells this.scratch.count
+        var height 0
+        var column 0
+        var child: ref[PdfNode]? row.first
+        while child <> null
+        {
+            let cell child as ref[PdfNode]
+            child := cell.next
+            if cell.kind <> PN_CELL or cell.i3 <> 0
+                continue
+            if cell.i0 >= 0 and cell.i0 < columns
+                column := cell.i0
+            if column >= columns
+                continue
+            let c cell.chars
+            var cell_x x
+            var k 0
+            while k < column
+            {
+                cell_x := cell_x + this.scratch.at(widths + k * 2)
+                k := k + 1
+            }
+            var cell_width 0
+            k := 0
+            while k < cell.i1 and column + k < columns
+            {
+                cell_width := cell_width + this.scratch.at(widths + (column + k) * 2)
+                k := k + 1
+            }
+            column := column + cell.i1
+            var background 0 - 1
+            if c.cell_background and c.has_background
+            {
+                background := this.ops.count
+                this.op(POP_RECTANGLE, cell_x, row_top, cell_width, 0, c.background, 0, 0)
+            }
+            let content this.ops.count
+            ; the cell is an area of its own, in which no page is broken
+            let old_x this.frame_x
+            let old_width this.frame_width
+            let old_pending this.pending
+            let old_keep this.keep_at
+            this.nobreak := this.nobreak + 1
+            this.frame_x := cell_x + c.cell_before_column_margin
+            this.frame_width := cell_width - c.cell_before_column_margin - c.cell_after_column_margin
+            this.y := row_top + c.cell_before_row_margin
+            this.pending := 0
+            this.at_top := true
+            this.flow_children(cell, null, false)
+            let cell_height this.y - row_top + c.cell_after_row_margin
+            this.nobreak := this.nobreak - 1
+            this.frame_x := old_x
+            this.frame_width := old_width
+            this.pending := old_pending
+            this.keep_at := old_keep
+            this.at_top := false
+            if cell_height > height
+                height := cell_height
+            this.scratch.push(background)
+            this.scratch.push(content)
+            this.scratch.push(cell_height)
+            this.scratch.push(cell_x)
+            this.scratch.push(cell_width)
+        }
+        ; now the height is known: backgrounds, alignment, borders
+        var at cells
+        child := row.first
+        while child <> null
+        {
+            let cell child as ref[PdfNode]
+            child := cell.next
+            if cell.kind <> PN_CELL or cell.i3 <> 0 or at >= this.scratch.count
+                continue
+            let c cell.chars
+            let background this.scratch.at(at)
+            let content this.scratch.at(at + 1)
+            let cell_height this.scratch.at(at + 2)
+            let cell_x this.scratch.at(at + 3)
+            let cell_width this.scratch.at(at + 4)
+            at := at + 5
+            if background >= 0
+                this.ops.put(background + 4, height)
+            ; the operations of this cell end where the next cell's begin
+            var content_end this.ops.count
+            if at < this.scratch.count
+            {
+                content_end := this.scratch.at(at + 1)
+                if this.scratch.at(at) >= 0
+                    content_end := this.scratch.at(at)
+            }
+            var down 0
+            if c.cell_row_alignment = PSYM_CENTER
+                down := (height - cell_height) / 2
+            else if c.cell_row_alignment = PSYM_END
+                down := height - cell_height
+            if down > 0
+            {
+                var i content
+                while i < content_end
+                {
+                    this.ops.put(i + 2, this.ops.at(i + 2) + down)
+                    if this.ops.at(i) = POP_LINE
+                        this.ops.put(i + 4, this.ops.at(i + 4) + down)
+                    i := i + POP_SIZE
+                }
+            }
+        }
+        at := cells
+        child := row.first
+        while child <> null
+        {
+            let cell child as ref[PdfNode]
+            child := cell.next
+            if cell.kind <> PN_CELL or cell.i3 <> 0 or at >= this.scratch.count
+                continue
+            let cell_x this.scratch.at(at + 3)
+            let cell_width this.scratch.at(at + 4)
+            at := at + 5
+            if cell.i4 >= 0
+                this.op(POP_LINE, cell_x, row_top, cell_x + cell_width, row_top, cell.i4, cell.i8, 0)
+            if cell.i5 >= 0
+                this.op(POP_LINE, cell_x, row_top + height, cell_x + cell_width, row_top + height, cell.i5, cell.i9, 0)
+            if cell.i6 >= 0
+                this.op(POP_LINE, cell_x, row_top, cell_x, row_top + height, cell.i6, cell.i10, 0)
+            if cell.i7 >= 0
+                this.op(POP_LINE, cell_x + cell_width, row_top, cell_x + cell_width, row_top + height, cell.i7, cell.i11, 0)
+        }
+        this.scratch.cut(cells)
+        this.y := row_top + height
+        this.row_height := height
+        ; a row over the end of the page goes to the next page
+        if this.nobreak = 0 and was_top = false and this.y > this.body_bottom
+        {
+            let saved this.scratch.count
+            var i row_ops
+            while i < this.ops.count
+            {
+                this.scratch.push(this.ops.at(i))
+                i := i + 1
+            }
+            this.ops.cut(row_ops)
+            this.keep_at := 0 - 1
+            this.emit_page()
+            this.open_page()
+            this.at_top := false
+            if body
+            {
+                ; the header rows again; the scratch space above `saved`
+                ; is theirs meanwhile
+                var head: ref[PdfNode]? table.first
+                while head <> null
+                {
+                    let h head as ref[PdfNode]
+                    if h.kind = PN_ROW and h.i0 = 1
+                        this.flow_row(table, h, x, widths, columns, false)
+                    head := h.next
+                }
+            }
+            this.put_back(saved, this.y - row_top)
+            this.y := this.y + height
+            this.row_height := height
+        }
+    }
+
+    ; =========================================================================
+    ; The flow objects this backend does nothing of its own with: the
+    ; FOTBuilder base, a bracket around their content, which is set where it
+    ; stands.
+    ; =========================================================================
+
+    procedure start_link(mutable this: ref[PdfFOTBuilder], nic: ref[LinkNIC])
+        this.fo_start()
+
+    procedure end_link(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_score(mutable this: ref[PdfFOTBuilder], nic: ref[ScoreNIC]?)
+        this.fo_start()
+
+    procedure end_score(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_page_float(mutable this: ref[PdfFOTBuilder], nic: ref[PageFloatNIC]?)
+        this.fo_start()
+
+    procedure end_page_float(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_page_footnote(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_page_footnote(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure alignment_point(mutable this: ref[PdfFOTBuilder])
+        this.fo_atomic()
+
+    procedure start_sideline(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_sideline(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure anchor(mutable this: ref[PdfFOTBuilder], nic: ref[AnchorNIC]?)
+        this.fo_atomic()
+
+    procedure start_glyph_annotation(mutable this: ref[PdfFOTBuilder], nic: ref[GlyphAnnotationNIC]?)
+        this.fo_start()
+
+    procedure end_glyph_annotation(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_emphasizing_mark_serial(mutable this: ref[PdfFOTBuilder], nic: ref[EmphasizingMarkNIC]?)
+        this.fo_start()
+
+    procedure end_emphasizing_mark_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_emphasizing_mark_mark(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_emphasizing_mark_mark(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure end_all_emphasizing_mark_mark(mutable this: ref[PdfFOTBuilder])
+    {
+    }
+
+    procedure start_math_sequence(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_math_sequence(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_fraction_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_fraction_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure fraction_bar(mutable this: ref[PdfFOTBuilder])
+        this.fo_atomic()
+
+    procedure start_fraction_numerator(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_fraction_numerator(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_fraction_denominator(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_fraction_denominator(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_unmath(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_unmath(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_superscript(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_superscript(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_subscript(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_subscript(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_script_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_script_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_script_pre_sup(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_script_pre_sup(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_script_pre_sub(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_script_pre_sub(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_script_post_sup(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_script_post_sup(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_script_post_sub(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_script_post_sub(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_script_mid_sup(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_script_mid_sup(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_script_mid_sub(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_script_mid_sub(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_mark_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_mark_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_mark_over(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_mark_over(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_mark_under(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_mark_under(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_fence_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_fence_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_fence_open(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_fence_open(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_fence_close(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_fence_close(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_radical_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_radical_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure radical_radical(mutable this: ref[PdfFOTBuilder], nic: ref[CharacterNIC])
+        this.fo_atomic()
+
+    procedure radical_radical_defaulted(mutable this: ref[PdfFOTBuilder])
+        this.fo_atomic()
+
+    procedure start_radical_degree(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_radical_degree(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_math_operator_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_math_operator_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_math_operator_operator(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_math_operator_operator(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_math_operator_lower_limit(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_math_operator_lower_limit(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_math_operator_upper_limit(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_math_operator_upper_limit(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_grid(mutable this: ref[PdfFOTBuilder], nic: ref[GridNIC]?)
+        this.fo_start()
+
+    procedure end_grid(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_grid_cell(mutable this: ref[PdfFOTBuilder], nic: ref[GridCellNIC]?)
+        this.fo_start()
+
+    procedure end_grid_cell(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_embedded_text(mutable this: ref[PdfFOTBuilder], nic: ref[EmbeddedTextNIC]?)
+        this.fo_start()
+
+    procedure end_embedded_text(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_included_container_area(mutable this: ref[PdfFOTBuilder], nic: ref[IncludedContainerAreaNIC]?, dnic: ref[DisplayNIC]?)
+        this.fo_start()
+
+    procedure end_included_container_area(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_side_by_side(mutable this: ref[PdfFOTBuilder], dnic: ref[DisplayNIC]?)
+        this.fo_start()
+
+    procedure end_side_by_side(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_side_by_side_item(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_side_by_side_item(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_aligned_column(mutable this: ref[PdfFOTBuilder], dnic: ref[DisplayNIC]?)
+        this.fo_start()
+
+    procedure end_aligned_column(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_marginalia(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_marginalia(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_multi_mode_serial(mutable this: ref[PdfFOTBuilder], mode: ref[MultiModeRec]?)
+        this.fo_start()
+
+    procedure end_multi_mode_serial(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_multi_mode_mode(mutable this: ref[PdfFOTBuilder], mode: ref[MultiModeRec]?)
+        this.fo_start()
+
+    procedure end_multi_mode_mode(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_page_sequence(mutable this: ref[PdfFOTBuilder])
+        this.fo_start()
+
+    procedure end_page_sequence(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+
+    procedure start_column_set_sequence(mutable this: ref[PdfFOTBuilder], dnic: ref[DisplayNIC]?)
+        this.fo_start()
+
+    procedure end_column_set_sequence(mutable this: ref[PdfFOTBuilder])
+        this.fo_end()
+}

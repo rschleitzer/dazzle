@@ -26,6 +26,19 @@ virtual dispatch.
 SGML/XML transformation, RTF, TeX, MIF and HTML, as in the original, and the
 flow object tree (`-t fot`).
 
+One backend the original does not have, in the Scaly engine only: PDF
+(`-t pdf`). It sets the pages itself and writes them with the
+[pdf](https://github.com/rschleitzer/pdf) package. It is rudimentary: simple
+page sequences with headers and footers, paragraphs, display groups, line
+fields, leaders, rules, external graphics (JPEG, PNG) and tables, in the
+standard fonts Helvetica, Times and Courier — enough to set a book with the
+DocBook print stylesheets, and not more. A character outside Windows code
+page 1252 prints as `?`.
+
+```sh
+SCALY_HOME=$PWD ./dazzle -t pdf -o book.pdf -d stylesheet.dsl document.xml
+```
+
 One addition to DSSSL, in both the C++ and the Scaly engine: the `directory`
 flow object class. The transformation backend writes files through `entity`;
 `directory` creates a directory and makes the entities inside it relative to
@@ -43,14 +56,21 @@ it, so a stylesheet can lay out a whole tree of generated files.
 ## Build
 
 Install Scaly (`curl -fsSL https://scaly.io/install.sh | sh`, or see
-[scaly.io/download](https://scaly.io/download/)), then from this directory:
+[scaly.io/download](https://scaly.io/download/)) and check out the pdf package
+beside this repository — `packages/pdf` here is a link into it:
+
+```sh
+git clone https://github.com/rschleitzer/pdf ../pdf
+```
+
+Then from this directory:
 
 ```sh
 scaly build packages/dazzle/0.1.0/dazzle_cli.scaly --release -o dazzle
 scaly build packages/opensp/0.1.0/onsgmls.scaly --release -o onsgmls
 ```
 
-The compiler finds the two packages in `packages/` here and the standard
+The compiler finds the packages in `packages/` here and the standard
 library in the installation. Compiling the engine needs a 64 MB stack
 (`ulimit -s 65520`).
 
@@ -71,7 +91,8 @@ tests/run.sh
 ```
 
 builds both programs once and runs every suite: the engine's suites compare
-its output, backend by backend, with files the C++ reference produced; the
+its output, backend by backend, with files the C++ reference produced (the
+PDF backend's with files of its own, looked at when they were frozen); the
 SGML corpus (380 documents) compares the parser's ESIS output with the
 reference's; `tests/opensp` runs the parser's unit tests.
 
