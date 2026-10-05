@@ -10,8 +10,8 @@
 ;   EMPTYNL    - the step BEFORE this one already answered an empty node-list
 ;
 ; TWO documented deviations are pinned with OUR value, not the reference's,
-; because the reference misbehaves (see props3.expected's header and
-; tests/dazzle/COMPLETENESS.md):
+; because the reference misbehaves (see props3.expected's
+; header):
 ;   - ad.figform / ad.gifscheme `tokens`: AttributeDefNode::getTokens builds its
 ;     GroveStrings out of a LOCAL AttributeDefinitionDesc, so the reference
 ;     prints freed memory (unstable garbage).

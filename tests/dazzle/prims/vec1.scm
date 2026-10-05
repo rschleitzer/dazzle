@@ -5,7 +5,7 @@
 ;
 ; *NOT probed: the reference's readOnly diagnostic on vector-set! /
 ; vector-fill!. readOnly is a COLLECTOR bit (Collector.h:20) set by
-; makePermanent, and this port has no collector - see COMPLETENESS.md.
+; makePermanent, and this port has no collector.
 ;
 ; ASCII ONLY, and MARKUP-FREE (see num1.scm).
 

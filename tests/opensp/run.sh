@@ -5,7 +5,7 @@
 #
 #   tests/opensp/run.sh [scalyc-binary]   (default: scalyc/build/scalyc)
 #
-# HISTORY (memory opensp-harness-falsepass): the first harness ran `scalyc
+# HISTORY: the first harness ran `scalyc
 # --jit unit.scaly`, a PROGRAM that uses opensp -- the package bodies were
 # undefined externals the ORC JIT filled with 0-returning stubs, so every test
 # "passed" and nothing ran. `scaly test` compiles the package as the ROOT, so

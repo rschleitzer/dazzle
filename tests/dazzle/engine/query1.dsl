@@ -26,7 +26,7 @@
 ; A MARKED SECTION, not a SYSTEM .scm entity (see key1.dsl), and pure ASCII:
 ; this port reads its .dsl as UTF-8 while the reference reads it 8-bit, so a
 ; non-ASCII byte in a comment is a non-SGML character to onsgmls and not to
-; us (the documented input-decoder deviation, COMPLETENESS.md dimension 6).
+; us (the documented input-decoder deviation).
 
 (declare-flow-object-class fi
   "UNREGISTERED::James Clark//Flow Object Class::formatting-instruction")

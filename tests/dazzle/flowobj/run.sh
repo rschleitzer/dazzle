@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tests/dazzle/flowobj/run.sh — the FLOW-OBJECT-CLASS suite: one fixture family
-# per class bundle of COMPLETENESS.md gap (1), differentially against the
+# per class bundle, differentially against the
 # reference C++ dazzle where it can run at all.
 #
 #   tests/dazzle/flowobj/run.sh [scalyc-binary]
@@ -54,7 +54,7 @@
 # why the transform backend's whole output for this family is document text.
 # inline5 stays inside the 8-bit range on purpose: above it the reference's
 # output encoder falls back to numeric character references (the still-open
-# OutputEncoder item of COMPLETENESS.md (5), unrelated to this family).
+# OutputEncoder item, unrelated to this family).
 #
 # --- the math bundle: math-sequence, fraction, unmath, superscript,
 #     subscript, script, mark, fence, radical, math-operator, grid, grid-cell
@@ -190,7 +190,7 @@
 # port, a table-part header), so `column-set-sequence`'s display NIC has to
 # survive the queue and `page-sequence` records a payload-less bracket.
 #
-# --- the address family (COMPLETENESS.md gap (3), the addresses cluster) ---
+# --- the address family (the addresses cluster) ---
 #
 # addr1 (-t fot, addrdoc.sgml): the VALUE side — the seven producers, what
 # address? says about each, and how address-local? and address-visited?
@@ -361,7 +361,7 @@ run_case addr3t tex "" addr3 addrdoc.sgml
 run_case addr3r rtf "" addr3 addrdoc.sgml
 run_case addr3m mif "" addr3m addrdoc.sgml
 
-# the EXTENSION CHARACTERISTICS (COMPLETENESS.md gap (7)): all sixteen names
+# the EXTENSION CHARACTERISTICS: all sixteen names
 # of the four backend tables, declared in one stylesheet and set on both a
 # page sequence and a paragraph, then rendered on three backends. The three
 # that appear in no other fixture are here: `preserve-sdata?` and the two

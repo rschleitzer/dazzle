@@ -10,7 +10,7 @@
 ;
 ; NOT probed here, deliberately: an exact-integer or length argv[0], where
 ; the same line leaves the double uninitialized and the reference powers
-; stack garbage. That divergence is documented in COMPLETENESS.md.
+; stack garbage.
 ;
 ; ASCII ONLY, and MARKUP-FREE (see num1.scm).
 

@@ -13,7 +13,7 @@
 ; NOT covered on purpose: `preced` OF a char node - the reference ABORTS there
 ; (CANNOT_HAPPEN in SiblingNodeListObj::nodeListChunkRest,
 ; style/primitive.cxx:5695, because nextChunkSibling fails mid-chunk). We answer
-; the consistent count instead; see COMPLETENESS.md.
+; the consistent count instead.
 
 (declare-flow-object-class fi
   "UNREGISTERED::James Clark//Flow Object Class::formatting-instruction")

@@ -50,8 +50,8 @@
   ; locale that calls setlocale + wcscoll + towupper around every single
   ; comparison. This port answers #f, which is what the reference itself
   ; answers on a build without those two macros. Porting it would put
-  ; process-global setlocale state under every collation; it is named in
-  ; COMPLETENESS.md as an open remainder, not silently skipped. Nothing
+  ; process-global setlocale state under every collation; it is
+  ; an open remainder, not silently skipped. Nothing
   ; else in the language cluster depends on it - define-language is the
   ; LangObj branch, and that IS ported (everything below).
   (p "have-xlang"  (procedure? xlang))

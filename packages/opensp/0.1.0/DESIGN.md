@@ -1,6 +1,6 @@
 # opensp — design notes
 
-Per-stage design notes for the OpenSP port (ROADMAP-dazzle.md Part I). Each
+Per-stage design notes for the OpenSP port (Part I of the dazzle epic). Each
 stage records its RBMM residency mapping and any multiple-inheritance
 resolution before the code lands.
 
@@ -134,8 +134,7 @@ All four exit criteria green through the JIT (`tests/opensp/run.sh` → `PASS`;
   Streaming `fill()`/mutable cursor + the rest of the Origin hierarchy: Stage 2+.
   (Both landed since: the Origin hierarchy is folded into the one record, and
   `InputSource` grew the `ExternalInputSource` half — a decoding window plus
-  `SourceFill`, 2026-08-04. See `tests/dazzle/PERFORMANCE.md`, „Der
-  Eingabe-Layer streamt".)
+  `SourceFill`, 2026-08-04.)
 
 Deferred within Stage 1 by scope (not blockers): the full `Tokens` constant
 table (lands with the lexer, Stage 3), OutputByteStream/OutputCharStream sinks

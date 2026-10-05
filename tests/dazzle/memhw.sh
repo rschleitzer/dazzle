@@ -6,7 +6,7 @@
 # Measures peak resident set size of the dazzle CLI over the in-repo mkp DSSSL
 # codegen corpus (the same five `openjade -G -t sgml -d <spec> <doc>` runs
 # tests/dazzle/codegen/run.sh proves byte-identical), alongside openjade on the
-# same inputs as the GC baseline. Answers risk-register item 1 (ROADMAP-dazzle):
+# same inputs as the GC baseline. Answers risk-register item 1:
 # does the arena-per-run model retain enough style-eval garbage to need the
 # scratch-region or Collector rung? Records numbers, restores the regenerated
 # goldens, and leaves the tree clean. Output is RSS figures only — no corpus

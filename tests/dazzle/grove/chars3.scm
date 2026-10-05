@@ -16,7 +16,7 @@
 ; U+FFFD) report their data LENGTH instead of their characters, deliberately:
 ; the reference's sgml backend escapes a character its output coding system
 ; cannot represent as a numeric reference while this port writes UTF-8
-; unconditionally - the open OutputEncoder item of COMPLETENESS.md gap (6),
+; unconditionally - the open OutputEncoder item,
 ; which has nothing to do with these node classes.
 
 (declare-flow-object-class fi

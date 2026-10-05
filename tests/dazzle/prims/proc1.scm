@@ -91,7 +91,7 @@
 ; capture seam in this port, so a connected port's content leaks into the
 ; output stream instead of being buffered. That is a pre-existing gap in the
 ; connection machinery (it equally affects label: and content-map: on that
-; backend), named in COMPLETENESS.md, not something these primitives decide.
+; backend), not something these primitives decide.
 (element o (empty-sosofo))
 ; a label the discard does not name still follows on
 (element q (sosofo-discard-labeled

@@ -46,7 +46,7 @@ EXE="$OUT"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# --- the one tool (ROADMAP-public.md, stage C) ------------------------------
+# --- the one tool -----------------------------------------------------------
 # On a POSIX host the binary is `scaly build --release`: every package as
 # bitcode out of the build cache, the whole program linked, optimised and
 # emitted as one module in the compiler's own process -- what steps 1 to 3

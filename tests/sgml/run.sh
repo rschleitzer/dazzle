@@ -24,7 +24,7 @@
 # ★The count is GATED (see the discovery gate at the bottom): the number of
 # models found must equal `expected-models` — the public tier's is committed, the
 # private tier's is written by fetch/freeze. A number nobody checks is a number
-# that drifts: "469/469" was quoted in PERFORMANCE.md at nine places while the
+# that drifts: "469/469" was quoted at nine places while the
 # suite was reporting 462, and the reverse failure (a tier that silently stops
 # being discovered, so M shrinks and N/M still reads "all green") had nothing
 # watching it at all. Both directions fail here.
@@ -49,8 +49,8 @@
 # point, same arguments, same output, same exit codes (plus --jobs <n>). The
 # shell loop forked ~10 processes per model, and on Windows every fork is
 # emulated -- 4 min 50 s for the 380 public models there, against 1.7 s for the
-# driver starting the native binary itself, in parallel
-# (tests/win32/WINDOWS-BOX.md §8). The discovery gate, the stdin check and the
+# driver starting the native binary itself, in parallel.
+# The discovery gate, the stdin check and the
 # stderr normalisation are the driver's; their accounts stay in its comments.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

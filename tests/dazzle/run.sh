@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # dazzle unit suite — the style-engine layer self-tests for the dazzle port
-# (Stage 6a, ROADMAP-dazzle.md).
+# (Stage 6a).
 #
 #   tests/dazzle/run.sh [scalyc-binary]   (default: scalyc/build/scalyc)
 #

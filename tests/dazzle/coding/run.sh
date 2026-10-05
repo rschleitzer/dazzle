@@ -43,7 +43,7 @@
 # input decoder and output encoder agree with the reference cell for cell there;
 # that CmdLineApp string plumbing we deliberately do NOT reproduce (Ralf,
 # 2026-08-01: no dependency on a bug). Pinned in tests/sgml/coding/deviation.sh
-# with OUR behaviour as the golden; rationale in COMPLETENESS.md.
+# with OUR behaviour as the golden.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"

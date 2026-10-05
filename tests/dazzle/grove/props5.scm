@@ -28,7 +28,7 @@
 ; defaultChar fallback is pinned by COMPARING characters instead of printing
 ; one: the reference's sgml backend escapes a character its output coding
 ; system cannot represent as a numeric reference while this port writes UTF-8
-; unconditionally, which is COMPLETENESS.md gap (6)'s open OutputEncoder item
+; unconditionally, which is the open OutputEncoder item
 ; and has nothing to do with these node classes.
 
 (declare-flow-object-class fi

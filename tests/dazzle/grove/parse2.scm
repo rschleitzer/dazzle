@@ -14,7 +14,7 @@
 ;   * active: + architecture: -> the architecture silently takes the ACTIVE
 ;     names and the parse succeeds.
 ; NOT pinned: active: + parent:, which writes past `lists` and SEGFAULTS the
-; reference (rc 139, measured) - see COMPLETENESS.md.
+; reference (rc 139, measured).
 
 (declare-flow-object-class fi
   "UNREGISTERED::James Clark//Flow Object Class::formatting-instruction")

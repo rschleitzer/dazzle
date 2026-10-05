@@ -4,7 +4,7 @@
 #
 #   tests/dazzle/grove/run.sh [scalyc-binary]
 #
-# Home of the COMPLETENESS.md work-package-1 fixtures (the grove property axis).
+# Home of the work-package-1 fixtures (the grove property axis).
 # Every golden here is minted from /usr/local/bin/dazzle — these cases cover
 # grove semantics that no corpus document exercises, so the reference binary is
 # the only oracle.
@@ -130,8 +130,8 @@ run_case() { # name expected [expected_err] [document]
 # is the doctype; the entity-origin attribute assignments of an NDATA entity;
 # and node identity (same2 over the underlying declaration object) across
 # separate accesses.
-# ★TWO DEVIATIONS are pinned with OUR value, both measured, both in
-# COMPLETENESS.md: `tokens` of a NOTATION / name-token-group attribute-def (the
+# ★TWO DEVIATIONS are pinned with OUR value, both measured:
+# `tokens` of a NOTATION / name-token-group attribute-def (the
 # reference builds its GroveStrings from a LOCAL AttributeDefinitionDesc and
 # prints freed memory), and `current-group`, which null-derefs in the reference
 # for any DTD with an element type that has no attribute definition list — the

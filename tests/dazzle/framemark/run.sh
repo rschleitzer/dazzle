@@ -17,10 +17,6 @@
 #      FrameMark.scaly), so the way out has to work on the day it is needed;
 #   3. the OFF path still produces the goldens. That path is now the unusual
 #      one, and an unusual path with no gate rots.
-#
-# Numbers and the reasoning behind the six conditions are in
-# tests/dazzle/PERFORMANCE.md ("Die Marke GEBAUT", "Die Marke IN PRODUKTION",
-# "Die Marke als VORGABE").
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"

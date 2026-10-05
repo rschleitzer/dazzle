@@ -18,7 +18,7 @@
 ; existing symbol stays a string. Measured, and identical on both sides.
 
 (element a
-  ; the two repros that MEASURED the gap (COMPLETENESS.md gap 12): a symbol
+  ; the two repros that MEASURED the gap: a symbol
   ; through an enum NIC, an integer through a priority NIC, plus the rest of
   ; the layout-composite record - lengths, a boolean and the scale enum
   (make sequence

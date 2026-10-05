@@ -5,7 +5,7 @@
 #
 #   tests/dazzle/prims/run.sh [scalyc-binary]
 #
-# Home of the COMPLETENESS.md work-package-7 fixtures (primitive completeness).
+# Home of the work-package-7 fixtures (primitive completeness).
 # Every golden here is minted from /usr/local/bin/dazzle: these primitives are
 # reached by no corpus document, so the reference binary is the only oracle.
 #
@@ -102,8 +102,7 @@
 # the attribute is absent. ★proc2 is separate because the discard needs a
 # backend with a CAPTURE SEAM: the `-t sgml` transform builder has none in
 # this port, so connected content leaks there — a pre-existing gap of the
-# connection machinery (label: and content-map: share it), named in
-# COMPLETENESS.md.
+# connection machinery (label: and content-map: share it).
 # lang1 + lang2 (langdoc.sgml): the LANGUAGE / COLLATION cluster, with and
 # without a declared default language. Both are MARKED SECTIONS inside the
 # .dsl rather than a SYSTEM .scm entity, because `char<?` cannot survive SGML
@@ -125,7 +124,7 @@
 # is built with SP_HAVE_LOCALE + SP_HAVE_WCHAR and returns a RefLangObj — a
 # live C locale calling setlocale + wcscoll + towupper around every
 # comparison; we return #f, which is what the reference returns without those
-# macros. See COMPLETENESS.md.
+# macros.
 # time1 + time2 (langdoc.sgml): the TIME family — time, time->string and the
 # four comparisons over timeConv, the last primitives of primitive.h that
 # needed a C shim (packages/scaly/0.1.0/scaly/time/ctime.c: struct tm plus
@@ -147,9 +146,9 @@
 # external-procedure reaches and the identifier does not. ★Its golden records
 # a MEASURED reference defect as contract: primitive.cxx:5042 reads the second
 # quantity from argv[0], so `(xexpt 2.0 3.0)` is 4 and `(xexpt 2.0 "x")` is 4
-# with no diagnostic at all. See COMPLETENESS.md for the half that is NOT
-# reproduced (an exact-integer base, where the reference powers uninitialized
-# stack).
+# with no diagnostic at all. The half that is NOT
+# reproduced: an exact-integer base, where the reference powers uninitialized
+# stack.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"

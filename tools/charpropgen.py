@@ -18,7 +18,7 @@ quads), so the Scaly side walks them with a fixed stride and no parsing.
 The array literal MUST stay on one line — an LF inside the brackets ends the
 construct. The script NAMES are printed as a trailing comment block and are
 transcribed by hand into CharProps.append_script_name (a function may not
-return a `pointer[const_char]` literal; see CLAUDE.md).
+return a `pointer[const_char]` literal).
 
 Usage:  tools/charpropgen.py > /tmp/cp.scaly
         then splice the tables into

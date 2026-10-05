@@ -1,6 +1,6 @@
 # tests/sgml — the dazzle/OpenSP corpus oracle
 
-The survival gate for the OpenSP port (ROADMAP-dazzle.md, Part I). Replays a
+The survival gate for the OpenSP port. Replays a
 frozen corpus of SGML/XML documents against a configurable onsgmls-compatible
 binary and diffs ESIS output + exit code against golden snapshots taken from
 the reference `onsgmls`. `run.sh` prints the running counter
@@ -55,7 +55,7 @@ ESIS-identical` says nothing about `M`. A renamed directory, a manifest that los
 its `DOC`, an unfetched private tier — and the run prints `366 of 366` with exit 0
 while a hundred models have silently stopped running. The counterpart failure is
 just as quiet: on 2026-08-05 the port broke seven models and the number 469/469
-kept being quoted from memory in `PERFORMANCE.md` (nine places) while the suite
+kept being quoted from memory (nine places) while the suite
 was reporting 462 and exiting 1. Whoever cites a corpus run as a gate cites the
 number the run PRINTED.
 

@@ -7,8 +7,8 @@ Writes the matrix BYTE-IDENTICAL to the shell loop it replaces: per cell
 `=== <label> rc=<n>`, the dazzle stdout as `od -An -tx1 | tr -s ' ' | sed`
 printed it (16 bytes a line, a run of identical lines as one `*`), `--- stderr`
 with each line's program name replaced by PROG, and every file the cell wrote,
-by name in C order. A driver and not the loop since 2026-10-03
-(tests/win32/WINDOWS-BOX.md §8): each of the 228 cells forked some fifteen
+by name in C order. A driver and not the loop since 2026-10-03:
+each of the 228 cells forked some fifteen
 processes around its one dazzle run, and Git Bash emulates every fork -- the
 suite was 320 s on the Windows box, the slowest of the bar's dazzle lane by six.
 The cells now run in parallel, each in a directory of its own.

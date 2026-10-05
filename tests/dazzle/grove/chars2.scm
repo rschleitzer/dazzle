@@ -18,7 +18,7 @@
 ;
 ; NOT covered on purpose: `preced` OF a char node - the reference ABORTS there
 ; (CANNOT_HAPPEN in SiblingNodeListObj::nodeListChunkRest,
-; style/primitive.cxx:5695). See COMPLETENESS.md.
+; style/primitive.cxx:5695).
 
 (declare-flow-object-class fi
   "UNREGISTERED::James Clark//Flow Object Class::formatting-instruction")

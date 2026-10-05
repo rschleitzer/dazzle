@@ -35,8 +35,7 @@
 # MESSAGE TABLE through it (the getMessageText override — `%1` is never
 # substituted) and encodes STDERR through it (makeStdErr). We do NOT reproduce
 # that (Ralf, 2026-08-01: no dependency on a bug). Pinned separately in
-# ./deviation.sh, whose golden is OUR behaviour; rationale + measurements in
-# COMPLETENESS.md, coding-system dimension.
+# ./deviation.sh, whose golden is OUR behaviour.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"

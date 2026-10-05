@@ -135,8 +135,8 @@ if command -v onsgmls >/dev/null 2>&1; then
   run_matrix onsgmls "$WORK/ref.txt"
   if diff -q "$WORK/ours.txt" "$WORK/ref.txt" > /dev/null; then
     echo "deviation: NOTE — the reference now AGREES with us in every cell."
-    echo "  The deviation documented in this script no longer exists; revisit"
-    echo "  COMPLETENESS.md gap (6) and consider deleting this suite."
+    echo "  The deviation documented in this script no longer exists; consider"
+    echo "  deleting this suite."
   else
     echo "deviation: confirmed — the reference still differs ($(diff "$WORK/ours.txt" "$WORK/ref.txt" | grep -c '^<') golden lines)"
   fi

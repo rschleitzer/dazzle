@@ -9,7 +9,7 @@ the goldens. Prints the counter
 
     N of M models ESIS-identical
 
-A driver and not a shell loop since 2026-10-03 (tests/win32/WINDOWS-BOX.md §8):
+A driver and not a shell loop since 2026-10-03:
 the loop forked ~10 processes per model -- basename, a subshell, sed, three
 diffs, cats -- and on Windows every fork is emulated by the MSYS runtime
 (~59 ms measured, against ~8 ms for a CreateProcess from here), so the corpus

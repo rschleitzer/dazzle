@@ -5,7 +5,7 @@
 #
 #   tests/dazzle/engine/run.sh [scalyc-binary]
 #
-# Home of the COMPLETENESS.md dimension-(5) fixtures. Every golden here is
+# Home of the dimension-(5) fixtures. Every golden here is
 # minted from /usr/local/bin/dazzle: these forms are reached by no corpus
 # stylesheet, so the reference binary is the only oracle.
 #
@@ -149,7 +149,7 @@
 
 # conv1 / conv1b / conv2 / conv2b (keydoc.sgml, -t fot): the `-2` STRING
 # LENIENCY of the characteristic converters (Interpreter::convertFromString,
-# Interpreter.cxx:1095) - COMPLETENESS.md gap (12). Under -2 every
+# Interpreter.cxx:1095). Under -2 every
 # characteristic value goes through it before its converter, so a STRING may
 # stand in for the number, symbol or boolean that converter wants; without
 # the flag the function is a no-op, which is why each stylesheet runs twice

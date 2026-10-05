@@ -10,7 +10,7 @@
 ;
 ; The characters stay inside the 8-bit range on purpose: above it the
 ; reference's output encoder falls back to numeric character references,
-; which is the still-open OutputEncoder item of COMPLETENESS.md (5) and has
+; which is the still-open OutputEncoder item and has
 ; nothing to do with this family.
 
 (root (make sequence (process-children)))

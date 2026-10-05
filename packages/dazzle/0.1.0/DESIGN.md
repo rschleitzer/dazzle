@@ -1,6 +1,6 @@
 # dazzle package — Stage 6a design note
 
-Stage 6a of [ROADMAP-dazzle.md](../../../ROADMAP-dazzle.md): faithful port of
+Stage 6a of the dazzle epic: faithful port of
 the openjade style engine, interpreter included; the JIT (6b) comes later
 behind the same `Expression` seam, with this interpreter as its differential
 oracle. Port sources: `~/repos/openjade-net/src/OpenJade/{Grove,SPGrove,Style,Jade}`
@@ -146,7 +146,7 @@ emission-neutral — `cycle.sh` IDENTICAL)
 - No JIT — that is 6b, behind the `Expression` seam established here.
 - `LangObj`/`MacroFlowObj` etc. ported only if the demand list pulls them in.
 - ~~No print path (`InheritedC`, RTF/TeX/MIF/HTML backends) — Stage 9.~~
-  SUPERSEDED by the widened 6a exit (REPRODUCTION.md step 2, started
+  SUPERSEDED by the widened 6a exit (started
   2026-07-27): the `-t fot` backend + the inherited-characteristics
   foundation land in 6a; see Inc 8 below.
 
@@ -435,8 +435,7 @@ Decisions:
 `dazzle/Jit.scaly` lowers the `Insn` graph to LLVM IR and executes it through the
 ORC JIT; `dazzle/Llvm.scaly` holds the package's own LLVM-C/ORC bindings. It
 landed opt-in and became the DEFAULT the same day, once the two measured rungs
-were worked off (`--interp` opts out); the numbers are in "Die zwei Sprossen
-GELANDET" and "Die dritte und vierte Sprosse" in `tests/dazzle/PERFORMANCE.md`.
+were worked off (`--interp` opts out).
 What belongs in a design note is the decisions — the four the generator was
 built on, the two that made it worth defaulting to, and the three the two
 follow-up rungs settled:
@@ -447,7 +446,7 @@ follow-up rungs settled:
   instead would mean a second implementation of `Expression.compile`'s semantics
   (varargs entry points, keyword arguments, letrec boxing, the 800-line
   `make`/`style` lowering) and would put port bugs and lowering bugs in the same
-  debugging session — the sequencing mistake ROADMAP-dazzle.md warns about twice.
+  debugging session — a sequencing mistake.
 - **The return protocol carries everything.** A region is
   `i64 region(ptr vm, ptr insn)` and answers the NEXT INSN, exactly as
   `Insn.execute` does. An arm the generator
