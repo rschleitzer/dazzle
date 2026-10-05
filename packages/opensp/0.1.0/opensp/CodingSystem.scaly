@@ -1,0 +1,817 @@
+use scaly.memory.Page
+
+; Coding systems — the INPUT half of the byte->Char layer: every concrete
+; decoder of the reference kit (IdentityCodingSystem, UTF8CodingSystem,
+; Fixed2/Fixed4, UTF16, Unicode, EUCJP, SJIS, Big5, TranslateCodingSystem and
+; the XML autodetector). The OUTPUT half (encoders, the -b option) lives in
+; CodingSystemKit.scaly; the NAME tables and the TranslateCodingSystem maps
+; that select any of these live there too.
+;
+; The C++ runtime hierarchy (InputCodingSystem + Decoder abstracts + concretes)
+; has no Scaly vtable equivalent, so it ports the same way the output half does:
+; a flat RECORD carrying the kind plus the parameters a decoder needs (byte/word
+; order, the translate map and its sub-BCTF), dispatched on `kind`.
+;
+; STATELESSNESS. The reference's Decoder is a streaming object: it is handed one
+; read block at a time, keeps partial sequences across the boundary, and reports
+; the unconsumed tail through `rest`. Our readers decode a whole entity at once,
+; so `decode_one` answers the one question the fused decode/record-normalize
+; loop in Parser asks — "what is the char at byte i and how many bytes is it?" —
+; and a truncated sequence at the very END of the buffer is dropped, which is
+; what the reference's fill loop does with a tail that never completes.
+; The two genuinely STATEFUL systems (XML autodetect, Unicode BOM sniffing) are
+; resolved BEFORE the loop by CodingSystemKit.resolve_input, which turns them
+; into a byte offset to skip plus the decoder(s) to run.
+
+define OSP_EOF: i32 -1
+; charMax (opensp/include/constant.h): Char is restricted to the UTF-16 range.
+define OSP_CHAR_MAX: u32 0x10FFFF
+define OSP_REPLACEMENT_CHAR: u32 0xFFFD
+
+; decoder kinds (CodingSystemKitImpl::CodingSystemId, input side)
+define IENC_IDENTITY: int 0
+define IENC_UTF8: int 1
+define IENC_XML: int 2
+define IENC_FIXED2: int 3
+define IENC_FIXED4: int 4
+define IENC_UTF16: int 5
+define IENC_UNICODE: int 6
+define IENC_EUC: int 7
+define IENC_SJIS: int 8
+define IENC_BIG5: int 9
+define IENC_TRANSLATE: int 10
+
+; decode_one's "consumed bytes but produced NO char" answer — the SJIS decoder
+; has three such byte classes (128, 160, 240..255 and the two out-of-range
+; second bytes). Not a possible Char: charMax is 0x10FFFF.
+define IENC_NO_CHAR: u32 0xFFFFFFFF
+
+define CodingSystem (var kind: int, var sub: int, var lsb_first: bool, var lsw_first: bool, var map: Slice[u32])
+{
+    ; the identity system — the reference's default for every app whose
+    ; environment selects nothing (CmdLineApp::initCodingSystem's last resort).
+    init()
+    {
+        kind := IENC_IDENTITY
+        sub := IENC_IDENTITY
+        lsb_first := false
+        lsw_first := false
+        map.data := null
+        map.length := 0
+    }
+
+    function identity() returns CodingSystem
+        CodingSystem()
+
+    ; a parameterless kind (identity, utf8, xml, euc, sjis, big5, unicode)
+    function simple(k: int) returns CodingSystem
+    {
+        var cs CodingSystem()
+        cs.kind := k
+        cs
+    }
+
+    function fixed2(lsb: bool) returns CodingSystem
+    {
+        var cs CodingSystem()
+        cs.kind := IENC_FIXED2
+        cs.lsb_first := lsb
+        cs
+    }
+
+    function fixed4(lsb: bool, lsw: bool) returns CodingSystem
+    {
+        var cs CodingSystem()
+        cs.kind := IENC_FIXED4
+        cs.lsb_first := lsb
+        cs.lsw_first := lsw
+        cs
+    }
+
+    function utf16(lsb: bool) returns CodingSystem
+    {
+        var cs CodingSystem()
+        cs.kind := IENC_UTF16
+        cs.lsb_first := lsb
+        cs
+    }
+
+    ; TranslateCodingSystem: the sub-BCTF's code, then the decode map
+    ; (CodingSystemKit.make_decode_map) from that code to a Char.
+    function translate(sub_kind: int, m: Slice[u32]) returns CodingSystem
+    {
+        var cs CodingSystem()
+        cs.kind := IENC_TRANSLATE
+        cs.sub := sub_kind
+        cs.map := m
+        cs
+    }
+
+    function get_kind(this: CodingSystem) returns int
+        kind
+
+    ; Copy this record into a caller-owned one. `set *out: <returned record>`
+    ; trips the escape checker — the value is built on the callee's frame page
+    ; and the store would outlive it — so the factories write FIELDS, exactly as
+    ; the output side's CodingSystemKit.make_encoder does.
+    procedure store(this: CodingSystem, mutable out: ref[CodingSystem])
+    {
+        out.kind := kind
+        out.sub := sub
+        out.lsb_first := lsb_first
+        out.lsw_first := lsw_first
+        out.map := map
+    }
+
+    ; CodingSystem::fixedBytesPerChar — 0 for everything variable-width. It is
+    ; load-bearing exactly once: CmdLineApp::initCodingSystem REJECTS a system
+    ; coding system with more than one byte per char (without SP_WIDE_SYSTEM)
+    ; and falls back to identity, so `SP_ENCODING=UCS-2` reads 8-bit.
+    function fixed_bytes_per_char(this: CodingSystem) returns int
+    {
+        if kind = IENC_FIXED2
+            return 2
+        if kind = IENC_FIXED4
+            return 4
+        0
+    }
+
+    ; A leading UTF-8 byte-order mark is skipped by UTF8Decoder itself (and by
+    ; nothing else — under the identity system its three bytes are DATA). The
+    ; XML and Unicode systems handle their own marks in resolve_input.
+    function bom_skip(this: CodingSystem, input: Slice[u8]) returns size_t
+    {
+        if kind <> IENC_UTF8
+            return 0 as size_t
+        if input.length < 3
+            return 0 as size_t
+        if input[0] <> 0xEF
+            return 0 as size_t
+        if input[1] <> 0xBB
+            return 0 as size_t
+        if input[2] <> 0xBF
+            return 0 as size_t
+        3 as size_t
+    }
+
+    ; --- one char at byte offset i -----------------------------------------
+    ; Returns the number of bytes consumed, 0 for "the sequence is truncated at
+    ; the end of the buffer" (the caller stops). `*out_ch` is the Char, or
+    ; IENC_NO_CHAR when the bytes carry no character at all.
+    procedure decode_one(this: CodingSystem, input: Slice[u8], i: size_t, mutable out_ch: ref[u32]) returns size_t
+    {
+        if kind = IENC_TRANSLATE
+        {
+            ; TranslateDecoder::decode — the sub-BCTF's code mapped through the
+            ; decode map (unmapped codes land on the replacement char).
+            var code: u32 0
+            let sub_cs CodingSystem.simple(sub)
+            let used sub_cs.decode_one(input, i, &code)
+            if used = 0
+                return 0 as size_t
+            if code = IENC_NO_CHAR
+            {
+                out_ch := IENC_NO_CHAR
+                return used
+            }
+            if code > 0xFFFF
+                out_ch := OSP_REPLACEMENT_CHAR
+            else
+                out_ch := map[code as size_t]
+            return used
+        }
+        if kind = IENC_UTF8
+            return CodingSystem.decode_one_utf8(input, i, out_ch)
+        if kind = IENC_EUC
+            return CodingSystem.decode_one_euc(input, i, out_ch)
+        if kind = IENC_SJIS
+            return CodingSystem.decode_one_sjis(input, i, out_ch)
+        if kind = IENC_BIG5
+            return CodingSystem.decode_one_big5(input, i, out_ch)
+        if kind = IENC_FIXED2
+        {
+            ; Fixed2Decoder — two bytes, no range check (the value IS the Char).
+            if (i + 2) > input.length
+                return 0 as size_t
+            let b0 (input[i]) as u32
+            let b1 (input[i + 1]) as u32
+            if lsb_first
+                out_ch := (b1 << (8 as u32)) + b0
+            else
+                out_ch := (b0 << (8 as u32)) + b1
+            return 2 as size_t
+        }
+        if kind = IENC_FIXED4
+        {
+            ; Fixed4Decoder — the four byte orders 0123/2301/1032/3210, and a
+            ; value beyond charMax is the replacement char.
+            if (i + 4) > input.length
+                return 0 as size_t
+            var s0: u32 16
+            var s1: u32 24
+            var s2: u32 0
+            var s3: u32 8
+            if lsb_first
+            {
+                if lsw_first
+                {
+                    s0 := 0
+                    s1 := 8
+                    s2 := 16
+                    s3 := 24
+                }
+                else
+                {
+                    s0 := 16
+                    s1 := 24
+                    s2 := 0
+                    s3 := 8
+                }
+            }
+            else
+            {
+                if lsw_first
+                {
+                    s0 := 8
+                    s1 := 0
+                    s2 := 24
+                    s3 := 16
+                }
+                else
+                {
+                    s0 := 24
+                    s1 := 16
+                    s2 := 8
+                    s3 := 0
+                }
+            }
+            let c ((input[i]) as u32 << s0) + ((input[i + 1]) as u32 << s1) + ((input[i + 2]) as u32 << s2) + ((input[i + 3]) as u32 << s3)
+            if c > OSP_CHAR_MAX
+                out_ch := OSP_REPLACEMENT_CHAR
+            else
+                out_ch := c
+            return 4 as size_t
+        }
+        if kind = IENC_UTF16
+            return CodingSystem.decode_one_utf16(input, i, lsb_first, out_ch)
+        ; IENC_IDENTITY (and IENC_XML/IENC_UNICODE, which resolve_input has
+        ; already replaced by the time a loop runs)
+        out_ch := (input[i]) as u32
+        1 as size_t
+    }
+
+    ; UTF8Decoder::decode. Faithful to the reference's table, INCLUDING the
+    ; three places it is not modern UTF-8:
+    ;   * the 5- and 6-byte forms exist;
+    ;   * every sequence of FOUR OR MORE bytes decodes to the replacement char,
+    ;     because the guards `charMax < min5 - 1` / `< min6` / `< max6` all hold
+    ;     with charMax = 0x10FFFF — so an astral character is U+FFFD, not itself
+    ;     (measured against onsgmls: U+1F600 comes back as U+FFFD);
+    ;   * an overlong sequence is decoded and THEN replaced (so its bytes are
+    ;     consumed), while a bad LEAD byte consumes itself plus every following
+    ;     continuation byte and yields ONE replacement char.
+    procedure decode_one_utf8(input: Slice[u8], i: size_t, mutable out_ch: ref[u32]) returns size_t
+    {
+        let c0 (input[i]) as u32
+        if (c0 & 0x80) = 0
+        {
+            out_ch := c0
+            return 1 as size_t
+        }
+        var need: size_t 0
+        var acc: u32 0
+        var minv: u32 0
+        var over4 false
+        if (c0 & 0xE0) = 0xC0
+        {
+            need := 1
+            acc := c0 & 0x1F
+            minv := 0x80
+        }
+        else if (c0 & 0xF0) = 0xE0
+        {
+            need := 2
+            acc := c0 & 0x0F
+            minv := 0x800
+        }
+        else if (c0 & 0xF8) = 0xF0
+        {
+            need := 3
+            over4 := true
+        }
+        else if (c0 & 0xFC) = 0xF8
+        {
+            need := 4
+            over4 := true
+        }
+        else if (c0 & 0xFE) = 0xFC
+        {
+            need := 5
+            over4 := true
+        }
+        if need > 0
+        {
+            if (i + need + 1) > input.length
+                return 0 as size_t
+            var bad false
+            var k: size_t 1
+            while k <= need
+            {
+                let cx ((input[i + k]) as u32) xor 0x80
+                if (cx & 0xC0) <> 0
+                    bad := true
+                else
+                    acc := (acc << (6 as u32)) | cx
+                k := k + 1
+            }
+            if bad = false
+            {
+                if over4
+                    out_ch := OSP_REPLACEMENT_CHAR
+                else if acc < minv
+                    out_ch := OSP_REPLACEMENT_CHAR
+                else
+                    out_ch := acc
+                return need + 1
+            }
+        }
+        ; the `error:`/`recover:` path — one replacement char for the bad lead
+        ; byte, then every following continuation byte is swallowed silently.
+        out_ch := OSP_REPLACEMENT_CHAR
+        var used: size_t 1
+        var go true
+        while go
+        {
+            if (i + used) >= input.length
+                go := false
+            else if ((input[i + used]) & 0xC0) <> 0x80
+                go := false
+            else
+                used := used + 1
+        }
+        used
+    }
+
+    ; UTF16Decoder::decode. A high surrogate followed by a non-surrogate yields
+    ; the replacement char for the surrogate alone (its partner is then decoded
+    ; on the next step, which is exactly the reference's two-char output), and a
+    ; low surrogate on its own is the replacement char.
+    procedure decode_one_utf16(input: Slice[u8], i: size_t, lsb: bool, mutable out_ch: ref[u32]) returns size_t
+    {
+        if (i + 2) > input.length
+            return 0 as size_t
+        let b0 (input[i]) as u32
+        let b1 (input[i + 1]) as u32
+        var x b0
+        if lsb
+            x := (b1 << (8 as u32)) + b0
+        else
+            x := (b0 << (8 as u32)) + b1
+        if x < 0xD800
+        {
+            out_ch := x
+            return 2 as size_t
+        }
+        if x > 0xDFFF
+        {
+            out_ch := x
+            return 2 as size_t
+        }
+        if x > 0xDBFF
+        {
+            ; an unpaired low surrogate
+            out_ch := OSP_REPLACEMENT_CHAR
+            return 2 as size_t
+        }
+        if (i + 4) > input.length
+            return 0 as size_t
+        let b2 (input[i + 2]) as u32
+        let b3 (input[i + 3]) as u32
+        var y b2
+        if lsb
+            y := (b3 << (8 as u32)) + b2
+        else
+            y := (b2 << (8 as u32)) + b3
+        if y < 0xDC00
+        {
+            out_ch := OSP_REPLACEMENT_CHAR
+            return 2 as size_t
+        }
+        if y > 0xDFFF
+        {
+            out_ch := OSP_REPLACEMENT_CHAR
+            return 2 as size_t
+        }
+        out_ch := ((x - 0xD800) * 0x400 + (y - 0xDC00)) + 0x10000
+        4 as size_t
+    }
+
+    ; EUCJPDecoder::decode — G0 direct, SS2 (0x8E) sets the high bit of one
+    ; byte, SS3 (0x8F) builds a two-byte code with the SECOND byte's high bit
+    ; CLEARED, G1 sets the high bit of the second byte.
+    procedure decode_one_euc(input: Slice[u8], i: size_t, mutable out_ch: ref[u32]) returns size_t
+    {
+        let b0 (input[i]) as u32
+        if (b0 & 0x80) = 0
+        {
+            out_ch := b0
+            return 1 as size_t
+        }
+        if b0 = 0x8E
+        {
+            if (i + 2) > input.length
+                return 0 as size_t
+            out_ch := ((input[i + 1]) as u32) | 0x80
+            return 2 as size_t
+        }
+        if b0 = 0x8F
+        {
+            if (i + 3) > input.length
+                return 0 as size_t
+            let c1 (((input[i + 1]) as u32) | 0x80) << (8 as u32)
+            let c2 ((input[i + 2]) as u32) & 0x7F
+            out_ch := c1 | c2
+            return 3 as size_t
+        }
+        if (i + 2) > input.length
+            return 0 as size_t
+        let d1 b0 << (8 as u32)
+        let d2 ((input[i + 1]) as u32) | 0x80
+        out_ch := d1 | d2
+        2 as size_t
+    }
+
+    ; SJISDecoder::decode — the two lead-byte ranges fold into a JIS0208 code
+    ; with the 0x8080 bits set; 161..223 is single-byte JIS0201; 128, 160 and
+    ; 240..255 (and an out-of-range second byte) produce NO character at all.
+    procedure decode_one_sjis(input: Slice[u8], i: size_t, mutable out_ch: ref[u32]) returns size_t
+    {
+        let c (input[i]) as u32
+        if (c & 0x80) = 0
+        {
+            out_ch := c
+            return 1 as size_t
+        }
+        var lead: u32 0
+        if c >= 129
+        {
+            if c <= 159
+                lead := 112
+        }
+        if c >= 224
+        {
+            if c <= 239
+                lead := 176
+        }
+        if lead <> 0
+        {
+            if (i + 2) > input.length
+                return 0 as size_t
+            let c2 (input[i + 1]) as u32
+            var v ((c - lead) << (9 as u32)) | c2
+            var ok true
+            if c2 >= 64
+            {
+                if c2 <= 127
+                    ; The casts are load-bearing here: the right operand is a
+                    ; parenthesised SUB-EXPRESSION, and the literal retype only
+                    ; reaches a bare literal -- without them `v` (u32) widens to
+                    ; i64 for the subtraction and is truncated back on the store.
+                    v := v - (31 + (256 as u32))
+                else if c2 <= 158
+                    v := v - (32 + (256 as u32))
+                else if c2 <= 252
+                    v := v - 126
+                else
+                    ok := false
+            }
+            else
+                ok := false
+            if ok = false
+            {
+                out_ch := IENC_NO_CHAR
+                return 2 as size_t
+            }
+            out_ch := (v & 0xFFFF) | 0x8080
+            return 2 as size_t
+        }
+        if c >= 161
+        {
+            if c <= 223
+            {
+                out_ch := c
+                return 1 as size_t
+            }
+        }
+        ; 128, 160, 240..255
+        out_ch := IENC_NO_CHAR
+        1 as size_t
+    }
+
+    ; Big5Decoder::decode — a high-bit byte always starts a two-byte code.
+    procedure decode_one_big5(input: Slice[u8], i: size_t, mutable out_ch: ref[u32]) returns size_t
+    {
+        let b0 (input[i]) as u32
+        if (b0 & 0x80) = 0
+        {
+            out_ch := b0
+            return 1 as size_t
+        }
+        if (i + 2) > input.length
+            return 0 as size_t
+        out_ch := (b0 << (8 as u32)) | ((input[i + 1]) as u32)
+        2 as size_t
+    }
+
+    ; --- whole-buffer decode (EntityManager's in-memory sources) -----------
+    ; `result` needs room for one Char per input byte; every system produces at
+    ; most that. XML/Unicode must be resolved by the caller (resolve_input) —
+    ; here they decode as their unresolved default, UTF-8 and UTF-16BE.
+    procedure decode(this: CodingSystem, input: Slice[u8], mutable result: Slice[u32]) returns size_t
+    {
+        ; XML/Unicode are resolved by CodingSystemKit.resolve_input; reached
+        ; here unresolved they decode as their own defaults (UTF-8, UTF-16BE).
+        var eff_kind kind
+        if kind = IENC_XML
+            eff_kind := IENC_UTF8
+        else if kind = IENC_UNICODE
+            eff_kind := IENC_UTF16
+        ; ★ A REBIND of a var reference, not a store THROUGH it. `store(&eff)`
+        ; copied the replacement's fields into whatever `&eff` addresses, and
+        ; `eff` is an ALIAS -- its slot holds a pointer -- so that wrote the
+        ; five fields over the pointer itself and the `bom_skip` below loaded a
+        ; wild one. It never fired: the branch is unreachable while the caller
+        ; resolves XML/Unicode, which is also why no suite could see it.
+        var eff: ref[CodingSystem] this
+        if eff_kind <> kind
+        {
+            let repl CodingSystem.simple(eff_kind)
+            eff := &repl
+        }
+        var out: size_t 0
+        var i eff.bom_skip(input)
+        while i < input.length
+        {
+            var ch: u32 0
+            let used eff.decode_one(input, i, &ch)
+            if used = 0
+                break
+            if ch <> IENC_NO_CHAR
+            {
+                result.put(out, ch)
+                out := out + 1
+            }
+            i := i + used
+        }
+        out
+    }
+
+    ; --- encode (the small half kept here) ---------------------------------
+    ; The real output side is CodingSystemKit's encoder set (the -b option, with
+    ; escaping and the translate maps). This is the plain Char->byte writer the
+    ; dazzle backends use to serialize their own char streams: identity drops a
+    ; Char above 255 (IdentityEncoder has no unencodable handler here) and UTF-8
+    ; encodes the whole range. Any other kind writes UTF-8 — a decoder-only
+    ; system never reaches this path.
+    ; the UTF-8 writer as a STATIC — the dazzle backends' serialization path.
+    ; ★Deliberately not `CodingSystem.simple(IENC_UTF8).encode(…)`: holding the
+    ; returned record in a local of a function that then constructs its own
+    ; return VALUE crashed the fot backend (a String came back with data = 0x1),
+    ; the small-struct-return hazard. No record, no hazard.
+    procedure encode_utf8_bytes(chars: Slice[u32], mutable out: Slice[u8]) returns size_t
+    {
+        var n: size_t 0
+        var i: size_t 0
+        while i < chars.length
+        {
+            let c chars[i]
+            if c < 0x80
+            {
+                if (n + 1) > out.length
+                    break
+                out.put(n, c as u8)
+                n := n + 1
+            }
+            else if c < 0x800
+            {
+                if (n + 2) > out.length
+                    break
+                out.put(n, ((c >> (6 as u32)) | 0xC0) as u8)
+                out.put(n + 1, ((c & 0x3F) | 0x80) as u8)
+                n := n + 2
+            }
+            else if c < 0x10000
+            {
+                if (n + 3) > out.length
+                    break
+                out.put(n, ((c >> (12 as u32)) | 0xE0) as u8)
+                out.put(n + 1, (((c >> (6 as u32)) & 0x3F) | 0x80) as u8)
+                out.put(n + 2, ((c & 0x3F) | 0x80) as u8)
+                n := n + 3
+            }
+            else
+            {
+                if (n + 4) > out.length
+                    break
+                out.put(n, ((c >> (18 as u32)) | 0xF0) as u8)
+                out.put(n + 1, (((c >> (12 as u32)) & 0x3F) | 0x80) as u8)
+                out.put(n + 2, (((c >> (6 as u32)) & 0x3F) | 0x80) as u8)
+                out.put(n + 3, ((c & 0x3F) | 0x80) as u8)
+                n := n + 4
+            }
+            i := i + 1
+        }
+        n
+    }
+
+    procedure encode(this: CodingSystem, chars: Slice[u32], mutable out: Slice[u8]) returns size_t
+    {
+        var n: size_t 0
+        var i: size_t 0
+        while i < chars.length
+        {
+            let c chars[i]
+            if kind = IENC_IDENTITY
+            {
+                if n >= out.length
+                    break
+                if c <= 255
+                {
+                    out.put(n, c as u8)
+                    n := n + 1
+                }
+            }
+            else if c < 0x80
+            {
+                if (n + 1) > out.length
+                    break
+                out.put(n, c as u8)
+                n := n + 1
+            }
+            else if c < 0x800
+            {
+                if (n + 2) > out.length
+                    break
+                out.put(n, ((c >> (6 as u32)) | 0xC0) as u8)
+                out.put(n + 1, ((c & 0x3F) | 0x80) as u8)
+                n := n + 2
+            }
+            else if c < 0x10000
+            {
+                if (n + 3) > out.length
+                    break
+                out.put(n, ((c >> (12 as u32)) | 0xE0) as u8)
+                out.put(n + 1, (((c >> (6 as u32)) & 0x3F) | 0x80) as u8)
+                out.put(n + 2, ((c & 0x3F) | 0x80) as u8)
+                n := n + 3
+            }
+            else
+            {
+                if (n + 4) > out.length
+                    break
+                out.put(n, ((c >> (18 as u32)) | 0xF0) as u8)
+                out.put(n + 1, (((c >> (12 as u32)) & 0x3F) | 0x80) as u8)
+                out.put(n + 2, (((c >> (6 as u32)) & 0x3F) | 0x80) as u8)
+                out.put(n + 3, ((c & 0x3F) | 0x80) as u8)
+                n := n + 4
+            }
+            i := i + 1
+        }
+        n
+    }
+
+    function test() returns int
+    {
+        ; --- identity: every byte is its own Char --------------------------
+        var bytes u8[8]
+        let bp bytes as pointer[u8]
+        bytes[0] := 0x41
+        bytes[1] := 0xC3
+        bytes[2] := 0xBC
+        var chars u32[8]
+        let cp chars as pointer[u32]
+        let bs Slice[u8](8, bp)
+        let cs Slice[u32](8, cp)
+        let idc CodingSystem.identity()
+        if idc.decode(bs.slice_to(3), cs) <> 3
+            return -1
+        if chars[1] <> 0xC3
+            return -2
+
+        ; --- UTF-8: the same bytes are ONE char, and a BOM is skipped ------
+        let u8c CodingSystem.simple(IENC_UTF8)
+        if u8c.decode(bs.slice_to(3), cs) <> 2
+            return -3
+        if chars[1] <> 0xFC
+            return -4
+        bytes[0] := 0xEF
+        bytes[1] := 0xBB
+        bytes[2] := 0xBF
+        bytes[3] := 0x41
+        if u8c.decode(bs.slice_to(4), cs) <> 1
+            return -5
+        if *cp <> 0x41
+            return -6
+        ; ...but under identity the mark is three data chars
+        if idc.decode(bs.slice_to(4), cs) <> 4
+            return -7
+
+        ; --- UTF-8: a FOUR-byte sequence is the replacement char (charMax) --
+        bytes[0] := 0xF0
+        bytes[1] := 0x9F
+        bytes[2] := 0x98
+        bytes[3] := 0x80
+        if u8c.decode(bs.slice_to(4), cs) <> 1
+            return -8
+        if *cp <> OSP_REPLACEMENT_CHAR
+            return -9
+
+        ; --- UTF-8: a bad lead byte swallows its continuations -------------
+        bytes[0] := 0x80
+        bytes[1] := 0x80
+        bytes[2] := 0x41
+        if u8c.decode(bs.slice_to(3), cs) <> 2
+            return -10
+        if *cp <> OSP_REPLACEMENT_CHAR
+            return -11
+        if chars[1] <> 0x41
+            return -12
+
+        ; --- UTF-16BE / LE, and a surrogate pair --------------------------
+        bytes[0] := 0xD8
+        bytes[1] := 0x3D
+        bytes[2] := 0xDE
+        bytes[3] := 0x00
+        let u16be CodingSystem.utf16(false)
+        if u16be.decode(bs.slice_to(4), cs) <> 1
+            return -13
+        if *cp <> 0x1F600
+            return -14
+        bytes[0] := 0x41
+        bytes[1] := 0x00
+        let u16le CodingSystem.utf16(true)
+        if u16le.decode(bs.slice_to(2), cs) <> 1
+            return -15
+        if *cp <> 0x41
+            return -16
+
+        ; --- Fixed2 / Fixed4 ----------------------------------------------
+        let f2 CodingSystem.fixed2(false)
+        bytes[0] := 0x00
+        bytes[1] := 0x41
+        if f2.decode(bs.slice_to(2), cs) <> 1
+            return -17
+        if *cp <> 0x41
+            return -18
+        let f4 CodingSystem.fixed4(false, false)
+        bytes[0] := 0x00
+        bytes[1] := 0x01
+        bytes[2] := 0xF6
+        bytes[3] := 0x00
+        if f4.decode(bs.slice_to(4), cs) <> 1
+            return -19
+        if *cp <> 0x1F600
+            return -20
+        ; beyond charMax -> replacement
+        bytes[0] := 0x00
+        bytes[1] := 0x20
+        bytes[2] := 0x00
+        bytes[3] := 0x00
+        if f4.decode(bs.slice_to(4), cs) <> 1
+            return -21
+        if *cp <> OSP_REPLACEMENT_CHAR
+            return -22
+
+        ; --- EUC: SS2 + byte -> the byte with its high bit set ------------
+        let euc CodingSystem.simple(IENC_EUC)
+        bytes[0] := 0x8E
+        bytes[1] := 0x69
+        if euc.decode(bs.slice_to(2), cs) <> 1
+            return -23
+        if *cp <> 0xE9
+            return -24
+
+        ; --- SJIS: 0xA1 is single-byte JIS0201, 0x80 is NO char -----------
+        let sjis CodingSystem.simple(IENC_SJIS)
+        bytes[0] := 0xA1
+        bytes[1] := 0x80
+        bytes[2] := 0x41
+        if sjis.decode(bs.slice_to(3), cs) <> 2
+            return -25
+        if *cp <> 0xA1
+            return -26
+        if chars[1] <> 0x41
+            return -27
+
+        ; --- Big5: a high-bit byte always starts a two-byte code ----------
+        let big5 CodingSystem.simple(IENC_BIG5)
+        bytes[0] := 0xA4
+        bytes[1] := 0x40
+        if big5.decode(bs.slice_to(2), cs) <> 1
+            return -28
+        if *cp <> 0xA440
+            return -29
+
+        0
+    }
+}

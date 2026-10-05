@@ -1,0 +1,2331 @@
+; SgmlFOTBuilder — the `-t fot` backend: the flow object tree dumped as SGML
+; (Stage 6a Inc 8, slice 1). Ported from ~/repos/dazzle/jade/SgmlFOTBuilder.cxx
+; (C++ oracle; C# mirror openjade-net/src/OpenJade/Jade/SgmlFOTBuilder.cs).
+;
+; Structure mirror: the reference's ~147 characteristic setters each render
+; ` name="value"` into the `ics_` string stream, flushed by the next flow
+; object's start into its start tag; here one set_ic renders a Style.InheritedC
+; by kind (the fot backend is a pure printer — the semantic setters return
+; with the RTF port). Flow objects of this slice: sequence, paragraph,
+; paragraph-break, display-group, line-field, plus text/characters and the
+; pending-anchor machinery (<a name=.../> for source elements). Units print in
+; the reference's millipoint format (72000 units/inch, "%03d" + point-insert —
+; quirks preserved: 500 -> ".5pt"); the LengthSpec display-size factor is NEVER
+; printed (dead sprintf in the reference operator<<).
+;
+; Output frame: `<?xml version="1.0"?>` RE `<fot>` RE ... `</fot>` RE, RE =
+; 0x0D rendered as the output newline by the record encoder at flush (the
+; RecordOutputCharStream seam, same as the transform sink).
+;
+; RBMM: both buffers (out, ics) live on the sink's own page; ics is reused
+; via a length cursor (the open_elements pattern), never reallocated per FO.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String.String
+use opensp.StringC.StringC
+use opensp.CodingSystem.CodingSystem
+use opensp.CodingSystemKit.CodingSystemKit
+use opensp.CodingSystem.IENC_UTF8
+use dazzle.Grove.GroveNode
+use dazzle.Grove.GroveInfo
+use dazzle.ELObj.Identifier
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.GlyphSubstTableRec
+use dazzle.ELObj.OutputCharStream
+use dazzle.Style.InheritedC
+use dazzle.Style.RuleNIC
+use dazzle.Style.LinkNIC
+use dazzle.Style.ExternalGraphicNIC
+use dazzle.Style.LeaderNIC
+use dazzle.Style.BoxNIC
+use dazzle.Style.ScoreNIC
+use dazzle.Style.LengthSpec
+use dazzle.Style.DisplaySpace
+use dazzle.Style.InlineSpace
+use dazzle.Style.FotSym
+use dazzle.Style.DisplayNIC
+use dazzle.Style.TableNIC
+use dazzle.Style.TableColumnNIC
+use dazzle.Style.TableCellNIC
+use dazzle.Style.CharacterNIC
+use dazzle.Style.AnchorNIC
+use dazzle.Style.GlyphAnnotationNIC
+use dazzle.Style.EmphasizingMarkNIC
+use dazzle.Style.GridNIC
+use dazzle.Style.GridCellNIC
+use dazzle.Style.EmbeddedTextNIC
+use dazzle.Style.IncludedContainerAreaNIC
+use dazzle.Style.MultiModeRec
+use dazzle.Style.MultiModeNIC
+
+define SgmlFOTBuilder
+(
+    var out: ref[Array[u32]]
+    var ics: ref[Array[u32]]
+    var ics_len: size_t
+    var in_ics: bool
+    ; the header/footer capture (curOs_ = &hfs_ between startSimplePageSequence
+    ; and endAllSimplePageSequenceHeaderFooter); hf holds the 24 extracted
+    ; part strings (StringC hf_[nHF]).
+    var hfs: ref[Array[u32]]
+    var hfs_len: size_t
+    var in_hfs: bool
+    var hf: ref[Array[StringC]]?
+    ; em[0] — the emphasizing-mark's captured mark content (same buffer as the
+    ; header/footer parts, exactly as in the reference).
+    var em: StringC
+    var pending_elements: ref[Array[ref[GroveNode]?]]
+    var pending_levels: ref[Array[int]]
+    var pending_count: size_t
+    var n_pending_non_empty: int
+    var node_level: int
+    var suppress_anchors: bool
+    ; (the label:/content-map: port capture moved UP to the FotSink seam —
+    ; recorded calls, SaveFOTBuilder.scaly; this sink only ever renders the
+    ; live stream.)
+    ; glyphSubstTableDefined_ — which gst<n> tables the dump has defined.
+    var gst_defined: ref[Array[bool]]
+    ; multiModeHasPrincipalMode_ — one flag per open multi-mode: whether its
+    ; principal `<multi-mode.mode>` is still open (the first named mode closes
+    ; it, and so does the serial end if there is no named mode at all).
+    var mm_principal: ref[Array[bool]]
+    var mm_depth: size_t
+    var host: ref[Page]
+)
+{
+    function make(host: ref[Page]) returns ref[SgmlFOTBuilder]
+    {
+        let f host.allocate(sizeof SgmlFOTBuilder, alignof SgmlFOTBuilder) as pointer[SgmlFOTBuilder]
+        f.out := Array[u32]^host()
+        f.ics := Array[u32]^host()
+        f.ics_len := 0
+        f.in_ics := false
+        f.hfs := Array[u32]^host()
+        f.hfs_len := 0
+        f.in_hfs := false
+        let hf Array[StringC]^host()
+        var k 0
+        while k < 24
+        {
+            hf.add(StringC())
+            k := k + 1
+        }
+        f.hf := hf
+        f.em := StringC()
+        f.pending_elements := Array[ref[GroveNode]?]^host()
+        f.pending_levels := Array[int]^host()
+        f.pending_count := 0
+        f.n_pending_non_empty := 0
+        f.node_level := 0
+        f.suppress_anchors := false
+        f.gst_defined := Array[bool]^host()
+        f.mm_principal := Array[bool]^host()
+        f.mm_depth := 0
+        f.host := host
+        f.raw("<?xml version=\"1.0\"?>")
+        f.re()
+        f.raw("<fot>")
+        f.re()
+        f
+    }
+
+    ; the destructor's closing tag — the CLI calls this before flushing.
+    procedure finish(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.raw("</fot>")
+        this.re()
+    }
+
+    ; --- low-level output ----------------------------------------------------
+    ; one char into the current stream (out, or ics while a set_ic renders).
+    procedure put(mutable this: ref[SgmlFOTBuilder], c: u32)
+    {
+        if this.in_ics
+        {
+            if this.ics_len < this.ics.get_length()
+                this.ics.put(this.ics_len, c)
+            else
+                this.ics.add(c)
+            this.ics_len := this.ics_len + 1
+            return
+        }
+        this.out_put(c)
+    }
+
+    ; the curOs_ seam: the main tree, or the header/footer capture while a
+    ; simple-page-sequence's parts render.
+    procedure out_put(mutable this: ref[SgmlFOTBuilder], c: u32)
+    {
+        if this.in_hfs
+        {
+            if this.hfs_len < this.hfs.get_length()
+                this.hfs.put(this.hfs_len, c)
+            else
+                this.hfs.add(c)
+            this.hfs_len := this.hfs_len + 1
+            return
+        }
+        this.out.add(c)
+    }
+
+    procedure raw(mutable this: ref[SgmlFOTBuilder], s: Slice[char])
+    {
+        var i: size_t 0
+        while i < s.length
+        {
+            this.put(s[i] as u32)
+            i := i + 1
+        }
+    }
+
+    procedure re(mutable this: ref[SgmlFOTBuilder])
+        this.put(0x0D)
+
+    procedure raw_stringc(mutable this: ref[SgmlFOTBuilder], s: StringC)
+    {
+        let n s.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            this.put(s.get(i))
+            i := i + 1
+        }
+    }
+
+    ; unsigned decimal.
+    procedure raw_uint(mutable this: ref[SgmlFOTBuilder], n_in: int)
+    {
+        var n n_in
+        if n = 0
+        {
+            this.put(0x30)
+            return
+        }
+        var digits u8[24]
+        var k 0
+        while n > 0
+        {
+            digits[k] := ((n % 10) + 0x30) as u8
+            n := n / 10
+            k := k + 1
+        }
+        while k > 0
+        {
+            k := k - 1
+            this.put((digits[k]) as u32)
+        }
+    }
+
+    ; signed long per the reference operator<< (sign, then magnitude).
+    procedure raw_int(mutable this: ref[SgmlFOTBuilder], n: int)
+    {
+        if n < 0
+        {
+            this.put(0x2D)
+            this.raw_uint(0 - n)
+        }
+        else
+            this.raw_uint(n)
+    }
+
+    ; Data escaping (operator<<(Data)): &amp; &lt; &gt; &quot;, raw ASCII,
+    ; numeric char refs at and above 0x80.
+    procedure data_escaped(mutable this: ref[SgmlFOTBuilder], s: Slice[u32])
+    {
+        var i: size_t 0
+        while i < s.length
+        {
+            let c s[i]
+            if c = 0x26
+                this.raw("&amp;")
+            else if c = 0x3C
+                this.raw("&lt;")
+            else if c = 0x3E
+                this.raw("&gt;")
+            else if c = 0x22
+                this.raw("&quot;")
+            else if c < 0x80
+                this.put(c)
+            else
+            {
+                this.raw("&#")
+                this.raw_uint(c as int)
+                this.put(0x3B)
+            }
+            i := i + 1
+        }
+    }
+
+    ; Units — the reference "%03d" + point-insertion algorithm, quirks intact
+    ; (500 -> ".5pt", -500 -> "-.5pt", 0 -> "0pt", 12000 -> "12pt").
+    procedure units(mutable this: ref[SgmlFOTBuilder], n_in: int)
+    {
+        var buf u8[32]
+        var len 0
+        var n n_in
+        if n < 0
+        {
+            *((buf as pointer[u8])) := 0x2D
+            len := 1
+            n := 0 - n
+        }
+        var tmp u8[24]
+        var k 0
+        while n > 0
+        {
+            tmp[k] := ((n % 10) + 0x30) as u8
+            n := n / 10
+            k := k + 1
+        }
+        while k < 3
+        {
+            tmp[k] := 0x30
+            k := k + 1
+        }
+        while k > 0
+        {
+            k := k - 1
+            buf[len] := tmp[k]
+            len := len + 1
+        }
+        ; count up to three trailing zeros
+        var i 0
+        while i < 3
+        {
+            if buf[(len - i - 1)] <> 0x30
+                break
+            i := i + 1
+        }
+        if i = 3
+        {
+            ; whole points: drop the three zeros
+            i := len - 3
+            if i = 0
+            {
+                *((buf as pointer[u8])) := 0x30
+                i := 1
+            }
+        }
+        else
+        {
+            ; shift the last digits right and insert the point (sprintf-quirk
+            ; faithful: ".5pt", "-.5pt", "1.005pt")
+            let j len + 1 - i
+            while i < 3
+            {
+                buf[(len - i)] := buf[(len - i - 1)]
+                i := i + 1
+            }
+            buf[(len - 3)] := 0x2E
+            i := j
+        }
+        var m 0
+        while m < i
+        {
+            this.put((buf[m]) as u32)
+            m := m + 1
+        }
+        this.raw("pt")
+    }
+
+    ; operator<<(LengthSpec) — factor-bearing specs print ONLY the length part
+    ; (the reference never streams the sprintf'd percentage; dead code kept
+    ; faithfully).
+    procedure length_spec(mutable this: ref[SgmlFOTBuilder], ls: LengthSpec)
+    {
+        if ls.factor <> 0.0
+        {
+            if ls.length <> 0
+            {
+                this.units(ls.length)
+                if ls.factor >= 0.0
+                    this.put(0x2B)
+            }
+            return
+        }
+        this.units(ls.length)
+    }
+
+    ; "%.2f" — two decimals, round half away from zero (printf shape for the
+    ; factor magnitudes the corpus produces).
+    procedure raw_fixed2(mutable this: ref[SgmlFOTBuilder], d_in: double)
+    {
+        var d d_in
+        if d < 0.0
+        {
+            this.put(0x2D)
+            d := 0.0 - d
+        }
+        let cents ((d * 100.0) + 0.5) as int
+        this.raw_uint(cents / 100)
+        this.put(0x2E)
+        let frac cents % 100
+        this.put(((frac / 10) + 0x30) as u32)
+        this.put(((frac % 10) + 0x30) as u32)
+    }
+
+    ; operator<<(TableLengthSpec) — unlike the plain LengthSpec operator this
+    ; one really prints the factors: "%.2f%%" for display-size, "%.2f*" for
+    ; table-unit, '+'-joined after a leading length.
+    procedure table_length_spec(mutable this: ref[SgmlFOTBuilder], ls: LengthSpec, tfactor: double)
+    {
+        if (ls.factor <> 0.0) or (tfactor <> 0.0)
+        {
+            var need_sign false
+            if ls.length <> 0
+            {
+                this.units(ls.length)
+                need_sign := true
+            }
+            if ls.factor <> 0.0
+            {
+                if need_sign and (ls.factor >= 0.0)
+                    this.put(0x2B)
+                this.raw_fixed2(ls.factor * 100.0)
+                this.put(0x25)
+                need_sign := true
+            }
+            if tfactor <> 0.0
+            {
+                if need_sign and (tfactor >= 0.0)
+                    this.put(0x2B)
+                this.raw_fixed2(tfactor)
+                this.put(0x2A)
+            }
+            return
+        }
+        this.units(ls.length)
+    }
+
+    ; hex2 — two uppercase hex digits.
+    procedure hex2(mutable this: ref[SgmlFOTBuilder], c: int)
+    {
+        let digits "0123456789ABCDEF"
+        this.put((*((digits as pointer[u8]) + ((c >> 4) & 0xF))) as u32)
+        this.put((*((digits as pointer[u8]) + (c & 0xF))) as u32)
+    }
+
+    ; operator<<(DeviceRGBColor) — '#RRGGBB'.
+    procedure color_out(mutable this: ref[SgmlFOTBuilder], rgb: int)
+    {
+        this.put(0x23)
+        this.hex2((rgb >> 16) & 0xFF)
+        this.hex2((rgb >> 8) & 0xFF)
+        this.hex2(rgb & 0xFF)
+    }
+
+    ; inlineSpaceC — reference quirks kept faithfully: nothing at all when
+    ; nominal, min and max are all zero; and the value is NEVER closed (the
+    ; reference forgets the trailing quote).
+    procedure inline_space_c(mutable this: ref[SgmlFOTBuilder], name: StringC, sp: ref[InlineSpace])
+    {
+        var any sp.nominal.is_set()
+        if sp.min.is_set()
+            any := true
+        if sp.max.is_set()
+            any := true
+        if any = false
+            return
+        this.put(0x20)
+        this.raw_stringc(name)
+        this.put(0x3D)
+        this.put(0x22)
+        this.length_spec(sp.nominal)
+        var diff sp.min.differs(sp.nominal)
+        if sp.max.differs(sp.nominal)
+            diff := true
+        if diff
+        {
+            this.put(0x2C)
+            this.length_spec(sp.min)
+            this.put(0x2C)
+            this.length_spec(sp.max)
+        }
+    }
+
+    procedure sym_out(mutable this: ref[SgmlFOTBuilder], s: FotSym)
+    {
+        if s.code = SYM_FALSE
+        {
+            this.raw("false")
+            return
+        }
+        if s.code = SYM_TRUE
+        {
+            this.raw("true")
+            return
+        }
+        this.raw_stringc(s.name)
+    }
+
+    ; the two scale symbols printed from their CODE. Every other FotSym this
+    ; backend renders arrived through a symbol conversion and carries its own
+    ; name, but included-container-area's scaleType DEFAULTS to symbolMaxUniform
+    ; without ever being converted — and the reference prints symbolName(sym)
+    ; there, not a captured string.
+    procedure scale_sym_out(mutable this: ref[SgmlFOTBuilder], s: FotSym)
+    {
+        if s.code = SYM_MAX_UNIFORM
+        {
+            this.raw("max-uniform")
+            return
+        }
+        if s.code = SYM_MAX_SCALE
+        {
+            this.raw("max")
+            return
+        }
+        this.sym_out(s)
+    }
+
+    ; --- characteristic rendering (the set* family) --------------------------
+    procedure set_ic(mutable this: ref[SgmlFOTBuilder], ic: ref[InheritedC])
+    {
+        let kind ic.get_kind()
+        ; IgnoredC::set is a no-op — nothing rendered (BorderC and RuleC
+        ; included).
+        if kind = IC_IGNORED
+            return
+        if kind = IC_BORDER
+            return
+        if kind = IC_RULE
+            return
+        if kind = IC_GST
+        {
+            this.gst_out(ic.gst)
+            return
+        }
+        ; setInlineSpaceSpace is not overridden in the reference SgmlFOTBuilder
+        ; — an inline-space-space set renders nothing.
+        if kind = IC_OPT_INLINE_SPACE
+            return
+        if kind = IC_INLINE_SPACE
+        {
+            ; inlineSpaceC writes its own frame (no closing quote — quirk).
+            this.in_ics := true
+            if ic.obj <> null
+                this.inline_space_c(ic.print_name, ic.obj.as_inline_space() as ref[InlineSpace])
+            this.in_ics := false
+            return
+        }
+        if kind = IC_OPT_LENGTH_SPEC
+        {
+            if ic.bval
+            {
+                ; optLengthSpecC's #f arm omits the '=' (reference quirk).
+                this.in_ics := true
+                this.put(0x20)
+                this.raw_stringc(ic.print_name)
+                this.put(0x22)
+                this.raw("false")
+                this.put(0x22)
+                this.in_ics := false
+                return
+            }
+        }
+        this.in_ics := true
+        this.put(0x20)
+        this.raw_stringc(ic.print_name)
+        this.put(0x3D)
+        this.put(0x22)
+        if kind = IC_BOOL
+        {
+            if ic.bval
+                this.raw("true")
+            else
+                this.raw("false")
+        }
+        else if kind = IC_LENGTH
+            this.units(ic.lval)
+        else if kind = IC_LENGTH_SPEC
+            this.length_spec(ic.ls)
+        else if kind = IC_SYMBOL
+            this.sym_out(ic.sym)
+        else if kind = IC_STRING
+            this.raw_stringc(ic.sval)
+        else if kind = IC_INT
+            this.raw_int(ic.lval)
+        else if kind = IC_MAYBE_INT
+            ; GenericMaybeIntegerInheritedC::set calls the integer setter
+            ; unconditionally (#f arrives as 0).
+            this.raw_int(ic.lval)
+        else if kind = IC_PUBLIC_ID
+        {
+            ; publicIdC: an unset/empty id prints "false"
+            if ic.bval or (ic.sval.get_size() = 0)
+                this.raw("false")
+            else
+                this.raw_stringc(ic.sval)
+        }
+        else if kind = IC_LETTER2
+        {
+            if ic.bval or (ic.sval.get_size() = 0)
+                this.raw("false")
+            else
+                this.raw_stringc(ic.sval)
+        }
+        else if kind = IC_OPT_LENGTH_SPEC
+            ; the has-length arm (the #f arm returned above).
+            this.length_spec(ic.ls)
+        else if kind = IC_COLOR
+        {
+            if ic.obj <> null
+                this.color_out(ic.obj.color_rgb())
+        }
+        else if kind = IC_OPT_COLOR
+        {
+            ; setBackgroundColor() (no arg, #f) prints "false".
+            if ic.obj = null
+                this.raw("false")
+            else
+                this.color_out(ic.obj.color_rgb())
+        }
+        this.put(0x22)
+        this.in_ics := false
+    }
+
+    ; a GlyphId attribute value: the public id (raw), "::<suffix>" when the
+    ; suffix is set; an id-less glyph id prints "false".
+    procedure glyph_id_out(mutable this: ref[SgmlFOTBuilder], gid: ref[ELObj])
+    {
+        let pubid gid.glyph_pubid()
+        if pubid.get_size() = 0
+        {
+            this.raw("false")
+            return
+        }
+        this.raw_stringc(pubid)
+        let suffix gid.glyph_suffix()
+        if suffix <> 0
+        {
+            this.raw("::")
+            this.raw_int(suffix)
+        }
+    }
+
+    ; setGlyphSubstTable — the reference dump: first use of a table writes a
+    ; <define-glyph-subst-table id="gst<n>"> block to the MAIN stream (before
+    ; the element's open tag — set* runs at style push); the characteristic
+    ; itself renders the space-separated id list into the ics buffer.
+    procedure gst_out(mutable this: ref[SgmlFOTBuilder], tabs: ref[Array[ref[GlyphSubstTableRec]?]]?)
+    {
+        this.in_ics := true
+        this.raw(" glyph-subst-table=")
+        this.put(0x22)
+        var n: size_t 0
+        if tabs <> null
+            n := tabs.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let tp tabs.get(i)
+            if tp <> null
+            {
+                let t *tp
+                let uid t.get_unique_id()
+                while this.gst_defined.get_length() <= (uid as size_t)
+                    this.gst_defined.add(false)
+                var need true
+                let dp this.gst_defined.get(uid as size_t)
+                if dp <> null
+                {
+                    if *dp
+                        need := false
+                }
+                if need
+                {
+                    this.gst_defined.put(uid as size_t, true)
+                    this.in_ics := false
+                    this.raw("<define-glyph-subst-table id=")
+                    this.put(0x22)
+                    this.raw("gst")
+                    this.raw_int(uid)
+                    this.put(0x22)
+                    this.put(0x3E)
+                    this.re()
+                    let pairs t.get_pairs()
+                    let np pairs.get_length()
+                    var j: size_t 0
+                    while j < np
+                    {
+                        let op pairs.get(j)
+                        let vp pairs.get(j + 1)
+                        if op <> null
+                        {
+                            if vp <> null
+                            {
+                                this.raw("<glyph-subst old=")
+                                this.put(0x22)
+                                this.glyph_id_out((*op) as ref[ELObj])
+                                this.put(0x22)
+                                this.raw(" new=")
+                                this.put(0x22)
+                                this.glyph_id_out((*vp) as ref[ELObj])
+                                this.put(0x22)
+                                this.raw("/>")
+                                this.re()
+                            }
+                        }
+                        j := j + 2
+                    }
+                    ; the reference emits NO record end after the closing tag.
+                    this.raw("</define-glyph-subst-table>")
+                    this.in_ics := true
+                }
+                if i > 0
+                    this.put(0x20)
+                this.raw("gst")
+                this.raw_int(uid)
+            }
+            i := i + 1
+        }
+        this.put(0x22)
+        this.in_ics := false
+    }
+
+    procedure output_ics(mutable this: ref[SgmlFOTBuilder])
+    {
+        let n this.ics_len
+        let b this.ics.as_slice()
+        var i: size_t 0
+        while i < n
+        {
+            this.out_put(b[i])
+            i := i + 1
+        }
+        this.ics_len := 0
+    }
+
+    ; --- NIC rendering --------------------------------------------------------
+    procedure display_space_nic(mutable this: ref[SgmlFOTBuilder], name: Slice[char], ds: DisplaySpace)
+    {
+        var any ds.nominal.is_set()
+        if ds.min.is_set()
+            any := true
+        if ds.max.is_set()
+            any := true
+        if any
+        {
+            this.put(0x20)
+            this.raw(name)
+            this.put(0x3D)
+            this.put(0x22)
+            this.length_spec(ds.nominal)
+            var diff ds.min.differs(ds.nominal)
+            if ds.max.differs(ds.nominal)
+                diff := true
+            if diff
+            {
+                this.put(0x2C)
+                this.length_spec(ds.min)
+                this.put(0x2C)
+                this.length_spec(ds.max)
+            }
+            this.put(0x22)
+        }
+        if ds.force
+        {
+            this.put(0x20)
+            this.raw(name)
+            this.raw("-priority=\"force\"")
+        }
+        else if ds.priority <> 0
+        {
+            this.put(0x20)
+            this.raw(name)
+            this.raw("-priority=")
+            this.put(0x22)
+            this.raw_int(ds.priority)
+            this.put(0x22)
+        }
+        if ds.conditional = false
+        {
+            this.put(0x20)
+            this.raw(name)
+            this.raw("-conditional=\"false\"")
+        }
+    }
+
+    procedure display_nic(mutable this: ref[SgmlFOTBuilder], nic: ref[DisplayNIC])
+    {
+        if nic.keep_with_previous
+            this.raw(" keep-with-previous=\"true\"")
+        if nic.keep_with_next
+            this.raw(" keep-with-next=\"true\"")
+        if nic.may_violate_keep_before
+            this.raw(" may-violate-keep-before=\"true\"")
+        if nic.may_violate_keep_after
+            this.raw(" may-violate-keep-after=\"true\"")
+        if nic.position_preference.code <> SYM_FALSE
+        {
+            this.raw(" position-preference=\"")
+            this.sym_out(nic.position_preference)
+            this.put(0x22)
+        }
+        if nic.keep.code <> SYM_FALSE
+        {
+            this.raw(" keep=\"")
+            this.sym_out(nic.keep)
+            this.put(0x22)
+        }
+        if nic.break_before.code <> SYM_FALSE
+        {
+            this.raw(" break-before=\"")
+            this.sym_out(nic.break_before)
+            this.put(0x22)
+        }
+        if nic.break_after.code <> SYM_FALSE
+        {
+            this.raw(" break-after=\"")
+            this.sym_out(nic.break_after)
+            this.put(0x22)
+        }
+        this.display_space_nic("space-before", nic.space_before)
+        this.display_space_nic("space-after", nic.space_after)
+    }
+
+    ; --- pending element anchors ----------------------------------------------
+    procedure start_node(mutable this: ref[SgmlFOTBuilder], node: ref[GroveNode], mode_name: StringC)
+    {
+        this.node_level := this.node_level + 1
+        if mode_name.get_size() <> 0
+            return
+        if node.get_class() <> GN_ELEMENT
+            return
+        var i: size_t 0
+        while i < this.pending_count
+        {
+            let pp this.pending_elements.get(i)
+            if pp <> null
+            {
+                if *pp = node
+                    return
+            }
+            i := i + 1
+        }
+        if this.pending_count < this.pending_elements.get_length()
+        {
+            this.pending_elements.put(this.pending_count, node)
+            this.pending_levels.put(this.pending_count, this.node_level)
+        }
+        else
+        {
+            this.pending_elements.add(node)
+            this.pending_levels.add(this.node_level)
+        }
+        this.pending_count := this.pending_count + 1
+    }
+
+    procedure end_node(mutable this: ref[SgmlFOTBuilder])
+    {
+        if this.pending_count > 0
+        {
+            let lp this.pending_levels.get(this.pending_count - 1)
+            if lp <> null
+            {
+                if (*lp = this.node_level) and (this.n_pending_non_empty < (this.pending_count as int))
+                    this.pending_count := this.pending_count - 1
+            }
+        }
+        this.node_level := this.node_level - 1
+    }
+
+    ; outputElementName(groveIndex, idData, idSize) — a NON-document grove
+    ; prefixes its index and a dot; grove 0 writes the bare name.
+    procedure output_element_name_g(mutable this: ref[SgmlFOTBuilder], g: int, id_chars: Slice[u32])
+    {
+        if g <> 0
+        {
+            this.raw_uint(g)
+            this.put(0x2E)
+        }
+        this.data_escaped(id_chars)
+    }
+
+    procedure output_element_name(mutable this: ref[SgmlFOTBuilder], node: ref[GroveNode])
+    {
+        let g GroveInfo.index_of(node)
+        let id node.get_id()
+        if id.get_size() > 0
+        {
+            this.output_element_name_g(g, id.as_slice())
+            return
+        }
+        if g <> 0
+        {
+            this.raw_uint(g)
+            this.put(0x2E)
+        }
+        let ei node.get_element_index()
+        if ei >= 0
+            this.raw_uint(ei)
+    }
+
+    procedure flush_pending_elements(mutable this: ref[SgmlFOTBuilder])
+    {
+        if this.suppress_anchors
+            return
+        var i: size_t 0
+        while i < this.pending_count
+        {
+            let pp this.pending_elements.get(i)
+            if pp <> null
+            {
+                this.raw("<a name=\"")
+                this.output_element_name((*pp) as ref[GroveNode])
+                this.raw("\"/>")
+                this.re()
+            }
+            i := i + 1
+        }
+        this.n_pending_non_empty := 0
+        this.pending_count := 0
+    }
+
+    ; --- text ------------------------------------------------------------------
+    procedure characters(mutable this: ref[SgmlFOTBuilder], s: Slice[u32])
+    {
+        if s.length = 0
+            return
+        this.flush_pending_elements()
+        this.raw("<text>")
+        this.data_escaped(s)
+        this.raw("</text>")
+        this.re()
+    }
+
+    ; SDATA substitution is deferred grove-wide (see the transform sink); the
+    ; plain character path matches.
+    procedure characters_from_node(mutable this: ref[SgmlFOTBuilder], node: ref[GroveNode]?, s: Slice[u32])
+        this.characters(s)
+
+    ; --- flow objects ------------------------------------------------------------
+    procedure start_simple_flow_obj(mutable this: ref[SgmlFOTBuilder], name: Slice[char])
+    {
+        this.put(0x3C)
+        this.raw(name)
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    procedure end_flow(mutable this: ref[SgmlFOTBuilder], name: Slice[char])
+    {
+        this.raw("</")
+        this.raw(name)
+        this.raw(">")
+        this.re()
+    }
+
+    procedure start_sequence(mutable this: ref[SgmlFOTBuilder])
+        this.start_simple_flow_obj("sequence")
+
+    ; ScrollFlowObj — SgmlFOTBuilder::startScroll/endScroll
+    procedure start_scroll(mutable this: ref[SgmlFOTBuilder])
+        this.start_simple_flow_obj("scroll")
+
+    procedure end_scroll(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("scroll")
+
+    procedure end_sequence(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("sequence")
+
+    procedure start_paragraph(mutable this: ref[SgmlFOTBuilder], nic: ref[DisplayNIC]?)
+    {
+        this.raw("<paragraph")
+        this.display_nic(nic as ref[DisplayNIC])
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    procedure end_paragraph(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("paragraph")
+
+    procedure paragraph_break(mutable this: ref[SgmlFOTBuilder], nic: ref[DisplayNIC]?)
+    {
+        this.raw("<paragraph-break")
+        this.display_nic(nic as ref[DisplayNIC])
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    ; InlineNIC dump — the break priorities (only when nonzero).
+    procedure inline_nic(mutable this: ref[SgmlFOTBuilder], break_before_priority: int, break_after_priority: int)
+    {
+        if break_before_priority <> 0
+        {
+            this.raw(" break-before-priority=\"")
+            this.raw_int(break_before_priority)
+            this.put(0x22)
+        }
+        if break_after_priority <> 0
+        {
+            this.raw(" break-after-priority=\"")
+            this.raw_int(break_after_priority)
+            this.put(0x22)
+        }
+    }
+
+    ; SgmlFOTBuilder::rule — display NICs for the display orientations
+    ; (horizontal/vertical), inline NICs otherwise; length only when set.
+    procedure rule(mutable this: ref[SgmlFOTBuilder], nic: ref[RuleNIC], dnic: ref[DisplayNIC]?)
+    {
+        this.flush_pending_elements()
+        var orientation FotSym()
+        var has_length false
+        var length LengthSpec()
+        var bbp 0
+        var bap 0
+        orientation := nic.orientation
+        has_length := nic.has_length
+        length := nic.length
+        bbp := nic.break_before_priority
+        bap := nic.break_after_priority
+        ; symbolName guard — a nameless orientation renders nothing.
+        if orientation.name.get_size() = 0
+            return
+        this.raw("<rule orientation=")
+        this.put(0x22)
+        this.raw_stringc(orientation.name)
+        this.put(0x22)
+        if (orientation.code = SYM_HORIZONTAL) or (orientation.code = SYM_VERTICAL)
+            this.display_nic(dnic as ref[DisplayNIC])
+        else
+            this.inline_nic(bbp, bap)
+        if has_length
+        {
+            this.raw(" length=")
+            this.put(0x22)
+            this.length_spec(length)
+            this.put(0x22)
+        }
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    ; C's %g (the reference's operator<<(OutputCharStream&, double)).
+    procedure raw_double(mutable this: ref[SgmlFOTBuilder], x: double)
+    {
+        let host this.host
+        let os OutputCharStream.make(host)
+        ELObj.print_double(os, x)
+        this.raw_stringc(os.to_string_c(host))
+    }
+
+    ; SgmlFOTBuilder::startLink — ics BEFORE the destination (reference
+    ; order); a resolved-node destination prints only for elements.
+    procedure start_link(mutable this: ref[SgmlFOTBuilder], nic: ref[LinkNIC])
+    {
+        this.raw("<link")
+        this.output_ics()
+        var addr_type ADDR_NONE
+        var node: ref[GroveNode]? null
+        addr_type := nic.addr_type
+        node := nic.node
+        if addr_type = ADDR_RESOLVED_NODE
+        {
+            if node <> null
+            {
+                if node.get_class() = GN_ELEMENT
+                {
+                    this.raw(" destination=")
+                    this.put(0x22)
+                    this.output_element_name(node)
+                    this.put(0x22)
+                }
+            }
+        }
+        else if addr_type = ADDR_IDREF
+        {
+            ; the (groveIndex, idData, idSize) overload — the WHOLE param
+            ; string, spaces and all; this backend does not cut at the first
+            ; IDREF the way rtf/html/mif do.
+            this.raw(" destination=")
+            this.put(0x22)
+            this.output_element_name_g(GroveInfo.index_of(node), nic.p0.as_slice())
+            this.put(0x22)
+        }
+        ; sgmlDocument and entity are bare `// FIXME` breaks in the reference
+        ; (SgmlFOTBuilder.cxx:1801/1816) — the link element is written with no
+        ; destination at all; so is every other type via `default`.
+        this.raw(">")
+        this.re()
+    }
+
+    procedure end_link(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("link")
+
+    ; SgmlFOTBuilder::externalGraphic.
+    procedure external_graphic(mutable this: ref[SgmlFOTBuilder], nic: ref[ExternalGraphicNIC]?, dnic: ref[DisplayNIC]?)
+    {
+        this.flush_pending_elements()
+        var r: ref[ExternalGraphicNIC]? nic
+        if r = null
+            r := ExternalGraphicNIC.make(this.host)
+        this.raw("<external-graphic entity-system-id=")
+        this.put(0x22)
+        this.data_escaped( Slice[u32](r.entity_system_id.get_size(), r.entity_system_id.data_ptr()))
+        this.put(0x22)
+        this.raw(" notation-system-id=")
+        this.put(0x22)
+        this.data_escaped( Slice[u32](r.notation_system_id.get_size(), r.notation_system_id.data_ptr()))
+        this.put(0x22)
+        if r.scale_type.code <> SYM_FALSE
+        {
+            this.raw(" scale=")
+            this.put(0x22)
+            this.raw_stringc(r.scale_type.name)
+            this.put(0x22)
+        }
+        else
+        {
+            this.raw(" scale-x=")
+            this.put(0x22)
+            this.raw_double(r.scale_x)
+            this.put(0x22)
+            this.raw(" scale-y=")
+            this.put(0x22)
+            this.raw_double(r.scale_y)
+            this.put(0x22)
+        }
+        if r.has_max_width
+        {
+            this.raw(" max-width=")
+            this.put(0x22)
+            this.length_spec(r.max_width)
+            this.put(0x22)
+        }
+        if r.has_max_height
+        {
+            this.raw(" max-height=")
+            this.put(0x22)
+            this.length_spec(r.max_height)
+            this.put(0x22)
+        }
+        if r.is_display
+        {
+            this.raw(" display=\"true\"")
+            this.display_nic(dnic as ref[DisplayNIC])
+        }
+        else
+        {
+            if r.escapement_direction.code <> SYM_FALSE
+            {
+                this.raw(" escapement-direction=")
+                this.put(0x22)
+                this.raw_stringc(r.escapement_direction.name)
+                this.put(0x22)
+            }
+            ; positionPointX/Y print on LengthSpec truthiness (non-zero).
+            let ppx r.position_point_x
+            if ppx.is_set()
+            {
+                this.raw(" position-point-x=")
+                this.put(0x22)
+                this.length_spec(ppx)
+                this.put(0x22)
+            }
+            let ppy r.position_point_y
+            if ppy.is_set()
+            {
+                this.raw(" position-point-y=")
+                this.put(0x22)
+                this.length_spec(ppy)
+                this.put(0x22)
+            }
+            this.inline_nic(r.break_before_priority, r.break_after_priority)
+        }
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    ; SgmlFOTBuilder::startLeader — the length prints UNQUOTED (reference
+    ; quirk: `os() << " length=" << nic.length`).
+    procedure start_leader(mutable this: ref[SgmlFOTBuilder], nic: ref[LeaderNIC])
+    {
+        this.flush_pending_elements()
+        this.raw("<leader")
+        if nic.has_length
+        {
+            this.raw(" length=")
+            this.length_spec(nic.length)
+        }
+        this.inline_nic(nic.break_before_priority, nic.break_after_priority)
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    procedure end_leader(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("leader")
+
+    ; SgmlFOTBuilder::startBox.
+    procedure start_box(mutable this: ref[SgmlFOTBuilder], nic: ref[BoxNIC], dnic: ref[DisplayNIC]?)
+    {
+        this.flush_pending_elements()
+        this.raw("<box")
+        var is_display false
+        var bbp 0
+        var bap 0
+        is_display := nic.is_display
+        bbp := nic.break_before_priority
+        bap := nic.break_after_priority
+        if is_display
+        {
+            this.raw(" display=\"true\"")
+            this.display_nic(dnic as ref[DisplayNIC])
+        }
+        else
+            this.inline_nic(bbp, bap)
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    procedure end_box(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("box")
+
+    ; SgmlFOTBuilder::startScore (the three typed variants; symbolName guard
+    ; on the symbol form).
+    procedure start_score(mutable this: ref[SgmlFOTBuilder], nic: ref[ScoreNIC])
+    {
+        if nic.kind = SCORE_SYMBOL
+        {
+            if nic.sym.name.get_size() = 0
+                return
+            this.raw("<score type=")
+            this.put(0x22)
+            this.raw_stringc(nic.sym.name)
+            this.put(0x22)
+        }
+        else if nic.kind = SCORE_LENGTH
+        {
+            this.raw("<score type=")
+            this.put(0x22)
+            this.length_spec(nic.length)
+            this.put(0x22)
+        }
+        else
+        {
+            this.raw("<score type=\"char\" char=")
+            this.put(0x22)
+            this.put(nic.ch)
+            this.put(0x22)
+        }
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    procedure end_score(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("score")
+
+    procedure start_display_group(mutable this: ref[SgmlFOTBuilder], nic: ref[DisplayNIC])
+    {
+        this.raw("<display-group")
+        if nic.has_coalesce_id
+        {
+            this.raw(" coalesce-id=\"")
+            this.data_escaped( Slice[u32](nic.coalesce_id.get_size(), nic.coalesce_id.data_ptr()))
+            this.put(0x22)
+        }
+        this.display_nic(nic)
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    procedure end_display_group(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("display-group")
+
+    procedure start_line_field(mutable this: ref[SgmlFOTBuilder])
+    {
+        ; LineFieldNIC (inline priorities) is not printed by the reference.
+        this.flush_pending_elements()
+        this.start_simple_flow_obj("line-field")
+    }
+
+    procedure end_line_field(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("line-field")
+
+    ; --- the INLINE/MARK family -------------------------------------------------
+    ; SgmlFOTBuilder::characterNIC — one attribute per SPECIFIED field, in this
+    ; exact order; `stretch-factor` has no specified bit and renders whenever it
+    ; differs from 1.0.
+    procedure character_nic(mutable this: ref[SgmlFOTBuilder], nic: ref[CharacterNIC])
+    {
+        if nic.specified <> 0
+        {
+            if nic.is_specified(CNIC_CHAR)
+            {
+                this.raw(" char=\"&#")
+                this.raw_uint(nic.ch as int)
+                this.raw(";\"")
+            }
+            if nic.is_specified(CNIC_GLYPH_ID)
+            {
+                this.raw(" glyph-id=\"")
+                if nic.glyph_id = null
+                    this.raw("false")
+                else
+                    this.glyph_id_out(nic.glyph_id)
+                this.put(0x22)
+            }
+            if nic.is_specified(CNIC_IS_DROP_AFTER_LINE_BREAK)
+                this.bool_attr("drop-after-line-break", nic.is_drop_after_line_break)
+            if nic.is_specified(CNIC_IS_DROP_UNLESS_BEFORE_LINE_BREAK)
+                this.bool_attr("drop-unless-before-line-break", nic.is_drop_unless_before_line_break)
+            if nic.is_specified(CNIC_IS_PUNCT)
+                this.bool_attr("punct", nic.is_punct)
+            if nic.is_specified(CNIC_IS_INPUT_WHITESPACE)
+                this.bool_attr("input-whitespace", nic.is_input_whitespace)
+            if nic.is_specified(CNIC_IS_INPUT_TAB)
+                this.bool_attr("input-tab", nic.is_input_tab)
+            if nic.is_specified(CNIC_IS_RECORD_END)
+                this.bool_attr("record-end", nic.is_record_end)
+            if nic.is_specified(CNIC_IS_SPACE)
+                this.bool_attr("space", nic.is_space)
+            if nic.is_specified(CNIC_SCRIPT)
+            {
+                ; a null PublicId prints "false" (the reference's `if
+                ; (nic.script)`); here an EMPTY public id is that null.
+                this.raw(" script=\"")
+                if nic.script.get_size() = 0
+                    this.raw("false")
+                else
+                    this.raw_stringc(nic.script)
+                this.put(0x22)
+            }
+            if nic.is_specified(CNIC_MATH_CLASS)
+            {
+                this.raw(" math-class=\"")
+                this.sym_out(nic.math_class)
+                this.put(0x22)
+            }
+            if nic.is_specified(CNIC_MATH_FONT_POSTURE)
+            {
+                this.raw(" math-font-posture=\"")
+                this.sym_out(nic.math_font_posture)
+                this.put(0x22)
+            }
+            if nic.is_specified(CNIC_BREAK_BEFORE_PRIORITY)
+            {
+                this.raw(" break-before-priority=\"")
+                this.raw_int(nic.break_before_priority)
+                this.put(0x22)
+            }
+            if nic.is_specified(CNIC_BREAK_AFTER_PRIORITY)
+            {
+                this.raw(" break-after-priority=\"")
+                this.raw_int(nic.break_after_priority)
+                this.put(0x22)
+            }
+        }
+        if nic.stretch_factor <> 1.0
+        {
+            this.raw(" stretch-factor=\"")
+            this.raw_double(nic.stretch_factor)
+            this.put(0x22)
+        }
+    }
+
+    procedure bool_attr(mutable this: ref[SgmlFOTBuilder], name: Slice[char], b: bool)
+    {
+        this.put(0x20)
+        this.raw(name)
+        this.raw("=\"")
+        if b
+            this.raw("true")
+        else
+            this.raw("false")
+        this.put(0x22)
+    }
+
+    ; ★the record ends `RE` then `/>` — the reference writes
+    ; `os() << RE << "/>"` (SgmlFOTBuilder.cxx:698), so the empty-element tag of
+    ; a character is split across the line break. Reproduced verbatim.
+    procedure character(mutable this: ref[SgmlFOTBuilder], nic: ref[CharacterNIC])
+    {
+        this.flush_pending_elements()
+        this.raw("<character")
+        this.character_nic(nic)
+        this.output_ics()
+        this.re()
+        this.raw("/>")
+    }
+
+    procedure alignment_point(mutable this: ref[SgmlFOTBuilder])
+        this.simple_flow_obj("alignment-point")
+
+    procedure start_sideline(mutable this: ref[SgmlFOTBuilder])
+        this.start_simple_flow_obj("sideline")
+
+    procedure end_sideline(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("sideline")
+
+    ; SgmlFOTBuilder::anchor — ★no flushPendingElements (the reference's call is
+    ; commented out), so a pending anchor stays pending across this flow object.
+    procedure anchor(mutable this: ref[SgmlFOTBuilder], nic: ref[AnchorNIC])
+    {
+        this.raw("<anchor")
+        if nic.is_display
+            this.raw(" display=\"true\"")
+        this.inline_nic(nic.break_before_priority, nic.break_after_priority)
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    ; ★glyph-annotation and emphasizing-mark open with a SELF-CLOSING tag and
+    ; are then closed by endFlow — the reference's own asymmetry
+    ; (SgmlFOTBuilder.cxx:2126/2140), reproduced.
+    procedure start_glyph_annotation(mutable this: ref[SgmlFOTBuilder], nic: ref[GlyphAnnotationNIC])
+    {
+        this.raw("<glyph-annotation")
+        this.inline_nic(nic.break_before_priority, nic.break_after_priority)
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    procedure end_glyph_annotation(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("glyph-annotation")
+
+    ; the emphasizing-mark bracket: the start tag, then anchors off and the
+    ; output redirected into the SAME capture buffer the header/footer parts use
+    ; (the reference shares curOs_ = &hfs_ between both, aliasing and all).
+    procedure start_emphasizing_mark_serial(mutable this: ref[SgmlFOTBuilder], nic: ref[EmphasizingMarkNIC])
+    {
+        this.raw("<emphasizing-mark")
+        this.inline_nic(nic.break_before_priority, nic.break_after_priority)
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+        this.suppress_anchors := true
+        this.in_hfs := true
+    }
+
+    function start_emphasizing_mark_mark(this: ref[SgmlFOTBuilder])
+    {
+    }
+
+    procedure end_emphasizing_mark_mark(mutable this: ref[SgmlFOTBuilder])
+    {
+        let host this.host
+        this.em := StringC^host(this.hfs.get_buffer(), this.hfs_len)
+        this.hfs_len := 0
+    }
+
+    procedure end_all_emphasizing_mark_mark(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.in_hfs := false
+        this.suppress_anchors := false
+        if this.em.get_size() <> 0
+        {
+            this.start_simple_flow_obj("emphasizing-mark.mark")
+            this.raw_stringc(this.em)
+            this.end_flow("emphasizing-mark.mark")
+        }
+    }
+
+    procedure end_emphasizing_mark_serial(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("emphasizing-mark")
+
+    ; --- the MATH family ---------------------------------------------------------
+    ; SgmlFOTBuilder implements every one of the twelve. ★A PORT element opens
+    ; with startPortFlow (`<name>` + RE, NO inherited characteristics) while the
+    ; class's own element opens with startSimpleFlowObj (ics flushed into the
+    ; tag) — the ics belong to the flow object, not to its ports.
+    ; ★And the four classes with a principal port (script, mark, fence,
+    ; math-operator) plus radical open `<x.principal>` as part of the SERIAL
+    ; open and close it in their FIRST port bracket, so the principal content is
+    ; wrapped without any callback of its own. `fraction` has no principal port
+    ; and so no such element.
+    procedure start_port_flow(mutable this: ref[SgmlFOTBuilder], name: Slice[char])
+    {
+        this.raw("<")
+        this.raw(name)
+        this.raw(">")
+        this.re()
+    }
+
+    procedure start_math_sequence(mutable this: ref[SgmlFOTBuilder])
+        this.start_simple_flow_obj("math-sequence")
+
+    procedure end_math_sequence(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("math-sequence")
+
+    procedure start_fraction_serial(mutable this: ref[SgmlFOTBuilder])
+        this.start_simple_flow_obj("fraction")
+
+    procedure end_fraction_serial(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("fraction")
+
+    procedure fraction_bar(mutable this: ref[SgmlFOTBuilder])
+        this.simple_flow_obj("fraction.fraction-bar")
+
+    procedure start_fraction_numerator(mutable this: ref[SgmlFOTBuilder])
+        this.start_port_flow("fraction.numerator")
+
+    procedure end_fraction_numerator(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("fraction.numerator")
+
+    procedure start_fraction_denominator(mutable this: ref[SgmlFOTBuilder])
+        this.start_port_flow("fraction.denominator")
+
+    procedure end_fraction_denominator(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("fraction.denominator")
+
+    procedure start_unmath(mutable this: ref[SgmlFOTBuilder])
+        this.start_simple_flow_obj("unmath")
+
+    procedure end_unmath(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("unmath")
+
+    procedure start_superscript(mutable this: ref[SgmlFOTBuilder])
+        this.start_simple_flow_obj("superscript")
+
+    procedure end_superscript(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("superscript")
+
+    procedure start_subscript(mutable this: ref[SgmlFOTBuilder])
+        this.start_simple_flow_obj("subscript")
+
+    procedure end_subscript(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("subscript")
+
+    procedure start_script_serial(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.start_simple_flow_obj("script")
+        this.start_port_flow("script.principal")
+    }
+
+    procedure end_script_serial(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("script")
+
+    procedure start_script_pre_sup(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.end_flow("script.principal")
+        this.start_port_flow("script.pre-sup")
+    }
+
+    procedure end_script_pre_sup(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("script.pre-sup")
+
+    procedure start_script_pre_sub(mutable this: ref[SgmlFOTBuilder])
+        this.start_port_flow("script.pre-sub")
+
+    procedure end_script_pre_sub(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("script.pre-sub")
+
+    procedure start_script_post_sup(mutable this: ref[SgmlFOTBuilder])
+        this.start_port_flow("script.post-sup")
+
+    procedure end_script_post_sup(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("script.post-sup")
+
+    procedure start_script_post_sub(mutable this: ref[SgmlFOTBuilder])
+        this.start_port_flow("script.post-sub")
+
+    procedure end_script_post_sub(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("script.post-sub")
+
+    procedure start_script_mid_sup(mutable this: ref[SgmlFOTBuilder])
+        this.start_port_flow("script.mid-sup")
+
+    procedure end_script_mid_sup(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("script.mid-sup")
+
+    procedure start_script_mid_sub(mutable this: ref[SgmlFOTBuilder])
+        this.start_port_flow("script.mid-sub")
+
+    procedure end_script_mid_sub(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("script.mid-sub")
+
+    procedure start_mark_serial(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.start_simple_flow_obj("mark")
+        this.start_port_flow("mark.principal")
+    }
+
+    procedure end_mark_serial(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("mark")
+
+    procedure start_mark_over(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.end_flow("mark.principal")
+        this.start_port_flow("mark.over-mark")
+    }
+
+    procedure end_mark_over(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("mark.over-mark")
+
+    procedure start_mark_under(mutable this: ref[SgmlFOTBuilder])
+        this.start_port_flow("mark.under-mark")
+
+    procedure end_mark_under(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("mark.under-mark")
+
+    procedure start_fence_serial(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.start_simple_flow_obj("fence")
+        this.start_port_flow("fence.principal")
+    }
+
+    procedure end_fence_serial(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("fence")
+
+    procedure start_fence_open(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.end_flow("fence.principal")
+        this.start_port_flow("fence.open")
+    }
+
+    procedure end_fence_open(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("fence.open")
+
+    procedure start_fence_close(mutable this: ref[SgmlFOTBuilder])
+        this.start_port_flow("fence.close")
+
+    procedure end_fence_close(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("fence.close")
+
+    procedure start_radical_serial(mutable this: ref[SgmlFOTBuilder])
+        this.start_simple_flow_obj("radical")
+
+    procedure end_radical_serial(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("radical")
+
+    ; ★Both radical-radical forms OPEN `<radical.principal>` — the radical
+    ; element itself is what start_radical_serial wrote, and the principal port
+    ; only begins once the radical glyph (or its absence) is settled.
+    procedure radical_radical(mutable this: ref[SgmlFOTBuilder], nic: ref[CharacterNIC])
+    {
+        this.raw("<radical.radical")
+        this.character_nic(nic)
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+        this.start_port_flow("radical.principal")
+    }
+
+    procedure radical_radical_defaulted(mutable this: ref[SgmlFOTBuilder])
+        this.start_port_flow("radical.principal")
+
+    procedure start_radical_degree(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.end_flow("radical.principal")
+        this.start_port_flow("radical.degree")
+    }
+
+    procedure end_radical_degree(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("radical.degree")
+
+    procedure start_math_operator_serial(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.start_simple_flow_obj("math-operator")
+        this.start_port_flow("math-operator.principal")
+    }
+
+    procedure end_math_operator_serial(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("math-operator")
+
+    procedure start_math_operator_operator(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.end_flow("math-operator.principal")
+        this.start_port_flow("math-operator.operator")
+    }
+
+    procedure end_math_operator_operator(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("math-operator.operator")
+
+    procedure start_math_operator_lower_limit(mutable this: ref[SgmlFOTBuilder])
+        this.start_port_flow("math-operator.lower-limit")
+
+    procedure end_math_operator_lower_limit(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("math-operator.lower-limit")
+
+    procedure start_math_operator_upper_limit(mutable this: ref[SgmlFOTBuilder])
+        this.start_port_flow("math-operator.upper-limit")
+
+    procedure end_math_operator_upper_limit(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("math-operator.upper-limit")
+
+    ; grid / grid-cell — their own start tags (a zero count prints nothing).
+    procedure start_grid(mutable this: ref[SgmlFOTBuilder], nic: ref[GridNIC])
+    {
+        this.raw("<grid")
+        if nic.n_columns <> 0
+        {
+            this.raw(" grid-n-columns=\"")
+            this.raw_uint(nic.n_columns)
+            this.put(0x22)
+        }
+        if nic.n_rows <> 0
+        {
+            this.raw(" grid-n-rows=\"")
+            this.raw_uint(nic.n_rows)
+            this.put(0x22)
+        }
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    procedure end_grid(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("grid")
+
+    procedure start_grid_cell(mutable this: ref[SgmlFOTBuilder], nic: ref[GridCellNIC])
+    {
+        this.raw("<grid-cell")
+        if nic.column_number <> 0
+        {
+            this.raw(" column-number=\"")
+            this.raw_uint(nic.column_number)
+            this.put(0x22)
+        }
+        if nic.row_number <> 0
+        {
+            this.raw(" row-number=\"")
+            this.raw_uint(nic.row_number)
+            this.put(0x22)
+        }
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    procedure end_grid_cell(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("grid-cell")
+
+    ; --- the LAYOUT-COMPOSITE family ------------------------------------------
+    ; SgmlFOTBuilder is the ONLY backend that overrides any of the five. All
+    ; five opens are SELF-CLOSING (`… />` RE) and are then closed by a real
+    ; `</…>` — the same asymmetry glyph-annotation and the math classes have.
+    procedure start_embedded_text(mutable this: ref[SgmlFOTBuilder], nic: ref[EmbeddedTextNIC])
+    {
+        this.raw("<embedded-text")
+        if nic.direction.code <> SYM_FALSE
+        {
+            this.raw(" direction=")
+            this.put(0x22)
+            this.sym_out(nic.direction)
+            this.put(0x22)
+        }
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    procedure end_embedded_text(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("embedded-text")
+
+    ; SgmlFOTBuilder::includedContainerAreaNIC — the class's own ten fields in
+    ; the reference's order, then the display half (whose printer is byte-for-
+    ; byte the tail of this function in the reference).
+    ; ★`scale` prints for ANY non-false scaleType, and the initial one is
+    ; symbolMaxUniform — an untouched included-container-area therefore carries
+    ; scale="max-uniform". The name comes from the CODE (the reference prints
+    ; symbolName(sym)); a defaulted symbol never went through a conversion and
+    ; so carries no name string of its own.
+    procedure start_included_container_area(mutable this: ref[SgmlFOTBuilder], nic: ref[IncludedContainerAreaNIC], dnic: ref[DisplayNIC]?)
+    {
+        this.raw("<included-container-area")
+        if nic.escapement_direction.code <> SYM_FALSE
+        {
+            this.raw(" escapement-direction=")
+            this.put(0x22)
+            this.sym_out(nic.escapement_direction)
+            this.put(0x22)
+        }
+        if nic.is_display
+            this.raw(" display=\"true\"")
+        if nic.scale_type.code <> SYM_FALSE
+        {
+            this.raw(" scale=")
+            this.put(0x22)
+            this.scale_sym_out(nic.scale_type)
+            this.put(0x22)
+        }
+        else
+        {
+            this.raw(" scale-x=")
+            this.put(0x22)
+            this.raw_double(nic.scale_x)
+            this.put(0x22)
+            this.raw(" scale-y=")
+            this.put(0x22)
+            this.raw_double(nic.scale_y)
+            this.put(0x22)
+        }
+        if nic.width_type = ICA_WIDTH_EXPLICIT
+        {
+            this.raw(" width=")
+            this.put(0x22)
+            this.length_spec(nic.width)
+            this.put(0x22)
+        }
+        else if nic.width_type = ICA_WIDTH_MINIMUM
+            this.raw(" minimum-width=\"true\"")
+        if nic.height_type = ICA_HEIGHT_EXPLICIT
+        {
+            this.raw(" height=")
+            this.put(0x22)
+            this.length_spec(nic.height)
+            this.put(0x22)
+        }
+        else if nic.height_type = ICA_HEIGHT_MINIMUM
+            this.raw(" minimum-height=\"true\"")
+        if nic.contents_rotation <> 0
+        {
+            this.raw(" contents-rotation=")
+            this.put(0x22)
+            this.raw_int(nic.contents_rotation)
+            this.put(0x22)
+        }
+        let ppx nic.position_point_x
+        if ppx.is_set()
+        {
+            this.raw(" position-point-x=")
+            this.put(0x22)
+            this.length_spec(ppx)
+            this.put(0x22)
+        }
+        let ppy nic.position_point_y
+        if ppy.is_set()
+        {
+            this.raw(" position-point-y=")
+            this.put(0x22)
+            this.length_spec(ppy)
+            this.put(0x22)
+        }
+        this.inline_nic(nic.break_before_priority, nic.break_after_priority)
+        this.display_nic(dnic as ref[DisplayNIC])
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    procedure end_included_container_area(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("included-container-area")
+
+    procedure start_aligned_column(mutable this: ref[SgmlFOTBuilder], dnic: ref[DisplayNIC]?)
+    {
+        this.raw("<aligned-column")
+        this.display_nic(dnic as ref[DisplayNIC])
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    procedure end_aligned_column(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("aligned-column")
+
+    procedure start_side_by_side(mutable this: ref[SgmlFOTBuilder], dnic: ref[DisplayNIC]?)
+    {
+        this.raw("<side-by-side")
+        this.display_nic(dnic as ref[DisplayNIC])
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    procedure end_side_by_side(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("side-by-side")
+
+    procedure start_side_by_side_item(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.raw("<side-by-side-item")
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    procedure end_side_by_side_item(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("side-by-side-item")
+
+    ; --- the ONLINE family ----------------------------------------------------
+    procedure start_marginalia(mutable this: ref[SgmlFOTBuilder])
+        this.start_simple_flow_obj("marginalia")
+
+    procedure end_marginalia(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("marginalia")
+
+    ; SgmlFOTBuilder::startMultiModeSerial — the class element, then the
+    ; PRINCIPAL mode's element if the characteristic asked for one. Its flag is
+    ; stacked, because a multi-mode can sit inside a multi-mode.
+    procedure start_multi_mode_serial(mutable this: ref[SgmlFOTBuilder], mode: ref[MultiModeRec]?)
+    {
+        this.start_simple_flow_obj("multi-mode")
+        if mode <> null
+        {
+            this.raw("<multi-mode.mode")
+            if mode.has_desc
+            {
+                this.raw(" desc=")
+                this.put(0x22)
+                this.data_escaped( Slice[u32](mode.desc.get_size(), mode.desc.data_ptr()))
+                this.put(0x22)
+            }
+            this.raw(">")
+            this.re()
+        }
+        while this.mm_principal.get_length() <= this.mm_depth
+            this.mm_principal.add(false)
+        this.mm_principal.put(this.mm_depth, mode <> null)
+        this.mm_depth := this.mm_depth + 1
+    }
+
+    procedure end_multi_mode_serial(mutable this: ref[SgmlFOTBuilder])
+    {
+        if this.mm_depth > 0
+        {
+            this.mm_depth := this.mm_depth - 1
+            let fp this.mm_principal.get(this.mm_depth)
+            if fp <> null
+            {
+                if *fp
+                    this.end_flow("multi-mode.mode")
+            }
+        }
+        this.end_flow("multi-mode")
+    }
+
+    ; SgmlFOTBuilder::startMultiModeMode — the FIRST named mode closes the
+    ; principal mode's element (the reference clears the flag as it does).
+    procedure start_multi_mode_mode(mutable this: ref[SgmlFOTBuilder], mode: ref[MultiModeRec]?)
+    {
+        if this.mm_depth > 0
+        {
+            let top this.mm_depth - 1
+            let fp this.mm_principal.get(top)
+            if fp <> null
+            {
+                if *fp
+                {
+                    this.end_flow("multi-mode.mode")
+                    this.mm_principal.put(top, false)
+                }
+            }
+        }
+        this.raw("<multi-mode.mode name=")
+        this.put(0x22)
+        if mode <> null
+            this.data_escaped( Slice[u32](mode.name.get_size(), mode.name.data_ptr()))
+        this.put(0x22)
+        if mode <> null
+        {
+            if mode.has_desc
+            {
+                this.raw(" desc=")
+                this.put(0x22)
+                this.data_escaped( Slice[u32](mode.desc.get_size(), mode.desc.data_ptr()))
+                this.put(0x22)
+            }
+        }
+        this.raw(">")
+        this.re()
+    }
+
+    procedure end_multi_mode_mode(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("multi-mode.mode")
+
+    ; --- the PAGE/COLUMN MODEL ------------------------------------------------
+    ; SgmlFOTBuilder::startPageSequenceSerial (2113) and
+    ; startColumnSetSequenceSerial (1973). Both opens are SELF-CLOSING and are
+    ; then closed by a real `</…>`, the asymmetry this backend has for every
+    ; class it decomposes. `page-sequence` prints NOTHING but its ics — its six
+    ; characteristics are inherited ones, so they arrive through outputIcs.
+    procedure start_page_sequence(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.raw("<page-sequence")
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    procedure end_page_sequence(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("page-sequence")
+
+    procedure start_column_set_sequence(mutable this: ref[SgmlFOTBuilder], dnic: ref[DisplayNIC]?)
+    {
+        this.raw("<column-set-sequence")
+        this.display_nic(dnic as ref[DisplayNIC])
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    procedure end_column_set_sequence(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("column-set-sequence")
+
+    ; --- simple-page-sequence -------------------------------------------------
+    ; startSimplePageSequenceSerial: the start tag (ics flushed into it), then
+    ; anchors off and output redirected into the header/footer capture until
+    ; end_all_simple_page_sequence_header_footer.
+    procedure start_simple_page_sequence(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.start_simple_flow_obj("simple-page-sequence")
+        this.suppress_anchors := true
+        this.in_hfs := true
+    }
+
+    ; endSimplePageSequenceHeaderFooter(flags): hfs_.extractString(hf_[flags]).
+    procedure end_simple_page_sequence_header_footer(mutable this: ref[SgmlFOTBuilder], flags: int)
+    {
+        let host this.host
+        let s StringC^host(this.hfs.get_buffer(), this.hfs_len)
+        this.hf.put(flags as size_t, s)
+        this.hfs_len := 0
+    }
+
+    ; endAllSimplePageSequenceHeaderFooter: restore the main stream, then the
+    ; six part groups, each deduplicated across the four page types — front=
+    ; only when front/back differ, first= only when first/other differ.
+    procedure end_all_simple_page_sequence_header_footer(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.in_hfs := false
+        this.suppress_anchors := false
+        var i 0
+        while i < 24
+        {
+            let s3 this.hf_at(i + 3)
+            let s2 this.hf_at(i + 2)
+            let s1 this.hf_at(i + 1)
+            let s0 this.hf_at(i + 0)
+            var front 0
+            if (s3.equals(s1) = false) or (s2.equals(s0) = false)
+                front := 2
+            var first 0
+            if (s3.equals(s2) = false) or (s1.equals(s0) = false)
+                first := 1
+            var j 0
+            while j <= front
+            {
+                var k 0
+                while k <= first
+                {
+                    let str this.hf_at(i + j + k)
+                    if str.get_size() <> 0
+                    {
+                        var side: Slice[char] "left"
+                        if (i & 8) <> 0
+                            side := "center"
+                        else if (i & 16) <> 0
+                            side := "right"
+                        var hf_name: Slice[char] "footer"
+                        if (i & 4) <> 0
+                            hf_name := "header"
+                        this.raw("<simple-page-sequence.")
+                        this.raw(side)
+                        this.put(0x2D)
+                        this.raw(hf_name)
+                        if front <> 0
+                        {
+                            this.raw(" front=\"")
+                            if j <> 0
+                                this.raw("true")
+                            else
+                                this.raw("false")
+                            this.put(0x22)
+                        }
+                        if first <> 0
+                        {
+                            this.raw(" first=\"")
+                            if k <> 0
+                                this.raw("true")
+                            else
+                                this.raw("false")
+                            this.put(0x22)
+                        }
+                        this.raw(">")
+                        this.re()
+                        this.raw_stringc(str)
+                        this.raw("</simple-page-sequence.")
+                        this.raw(side)
+                        this.put(0x2D)
+                        this.raw(hf_name)
+                        this.raw(">")
+                        this.re()
+                    }
+                    k := k + 1
+                }
+                j := j + 2
+            }
+            i := i + 4
+        }
+    }
+
+    procedure end_simple_page_sequence(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("simple-page-sequence")
+
+    function hf_at(this: ref[SgmlFOTBuilder], k: int) returns StringC
+    {
+        let pp this.hf.get(k as size_t)
+        if pp = null
+            return StringC()
+        *pp
+    }
+
+    ; --- tables -----------------------------------------------------------------
+    ; simpleFlowObj: an atomic element, ics flushed into the tag.
+    procedure simple_flow_obj(mutable this: ref[SgmlFOTBuilder], name: Slice[char])
+    {
+        this.put(0x3C)
+        this.raw(name)
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    procedure start_table(mutable this: ref[SgmlFOTBuilder], tnic: ref[TableNIC], dnic: ref[DisplayNIC]?)
+    {
+        this.flush_pending_elements()
+        this.raw("<table")
+        if tnic.width_type = TABLE_WIDTH_EXPLICIT
+        {
+            this.raw(" width=\"")
+            this.length_spec(tnic.width)
+            this.put(0x22)
+        }
+        if tnic.width_type = TABLE_WIDTH_MINIMUM
+            this.raw(" minimum-width=\"true\"")
+        this.display_nic(dnic as ref[DisplayNIC])
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    procedure end_table(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("table")
+
+    procedure table_before_row_border(mutable this: ref[SgmlFOTBuilder])
+        this.simple_flow_obj("table.before-row-border")
+
+    procedure table_after_row_border(mutable this: ref[SgmlFOTBuilder])
+        this.simple_flow_obj("table.after-row-border")
+
+    procedure table_before_column_border(mutable this: ref[SgmlFOTBuilder])
+        this.simple_flow_obj("table.before-column-border")
+
+    procedure table_after_column_border(mutable this: ref[SgmlFOTBuilder])
+        this.simple_flow_obj("table.after-column-border")
+
+    procedure table_column(mutable this: ref[SgmlFOTBuilder], nic: ref[TableColumnNIC])
+    {
+        this.raw("<table-column column-number=\"")
+        this.raw_uint(nic.column_index + 1)
+        this.put(0x22)
+        if nic.n_columns_spanned <> 1
+        {
+            this.raw(" n-columns-spanned=\"")
+            this.raw_uint(nic.n_columns_spanned)
+            this.put(0x22)
+        }
+        if nic.has_width
+        {
+            this.raw(" width=\"")
+            this.table_length_spec(nic.width, nic.width_tfactor)
+            this.put(0x22)
+        }
+        this.output_ics()
+        this.raw("/>")
+        this.re()
+    }
+
+    procedure start_table_part_serial(mutable this: ref[SgmlFOTBuilder], dnic: ref[DisplayNIC]?)
+    {
+        this.raw("<table-part")
+        this.display_nic(dnic as ref[DisplayNIC])
+        this.output_ics()
+        this.raw(">")
+        this.re()
+        this.raw("<table-part.principal>")
+        this.re()
+    }
+
+    procedure end_table_part_serial(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("table-part")
+
+    procedure start_table_part_header(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.end_flow("table-part.principal")
+        this.raw("<table-part.header>")
+        this.re()
+    }
+
+    procedure end_table_part_header(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("table-part.header")
+
+    procedure start_table_part_footer(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.raw("<table-part.footer>")
+        this.re()
+    }
+
+    procedure end_table_part_footer(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("table-part.footer")
+
+    procedure start_table_row(mutable this: ref[SgmlFOTBuilder])
+        this.start_simple_flow_obj("table-row")
+
+    procedure end_table_row(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("table-row")
+
+    procedure start_table_cell(mutable this: ref[SgmlFOTBuilder], nic: ref[TableCellNIC])
+    {
+        if nic.missing
+            this.raw("<table-cell column-number=\"0\"")
+        else
+        {
+            this.raw("<table-cell column-number=\"")
+            this.raw_uint(nic.column_index + 1)
+            this.put(0x22)
+            if nic.n_columns_spanned <> 1
+            {
+                this.raw(" n-columns-spanned=\"")
+                this.raw_uint(nic.n_columns_spanned)
+                this.put(0x22)
+            }
+            if nic.n_rows_spanned <> 1
+            {
+                this.raw(" n-rows-spanned=\"")
+                this.raw_uint(nic.n_rows_spanned)
+                this.put(0x22)
+            }
+        }
+        this.output_ics()
+        this.raw(">")
+        this.re()
+    }
+
+    procedure end_table_cell(mutable this: ref[SgmlFOTBuilder])
+        this.end_flow("table-cell")
+
+    procedure table_cell_before_row_border(mutable this: ref[SgmlFOTBuilder])
+        this.simple_flow_obj("table-cell.before-row-border")
+
+    procedure table_cell_after_row_border(mutable this: ref[SgmlFOTBuilder])
+        this.simple_flow_obj("table-cell.after-row-border")
+
+    procedure table_cell_before_column_border(mutable this: ref[SgmlFOTBuilder])
+        this.simple_flow_obj("table-cell.before-column-border")
+
+    procedure table_cell_after_column_border(mutable this: ref[SgmlFOTBuilder])
+        this.simple_flow_obj("table-cell.after-column-border")
+
+    ; --- page-number references -------------------------------------------------
+    procedure page_number(mutable this: ref[SgmlFOTBuilder])
+    {
+        this.raw("<page-number/>")
+        this.re()
+    }
+
+    procedure current_node_page_number(mutable this: ref[SgmlFOTBuilder], node: ref[GroveNode])
+    {
+        if node.get_class() <> GN_ELEMENT
+            return
+        this.raw("<page-number ref=\"")
+        this.output_element_name(node)
+        this.raw("\"/>")
+        this.re()
+    }
+
+    ; --- flush ---------------------------------------------------------------
+    ; the whole tree, record-encoded (RE -> NL, RS dropped) and then run
+    ; through the app's OUTPUT coding system — the
+    ; RecordOutputCharStream(EncodeOutputCharStream(&outputFile_,
+    ; outputCodingSystem_)) seam of jade.cxx:175. The stream carries
+    ; outputNumericCharRef as its escaper (SgmlFOTBuilder.cxx:615), so a char
+    ; the coding system cannot express leaves as `&#<decimal>;`; the BOM
+    ; belongs to stream creation, i.e. to this one file.
+    procedure to_utf8(mutable this: ref[SgmlFOTBuilder]) returns String
+    {
+        let host this.host
+        let n this.out.get_length()
+        let cap n * 4 + 1
+        let src allocate_slice[u32](host, n + 1)
+        var m: size_t 0
+        var i: size_t 0
+        while i < n
+        {
+            let c this.out[i]
+            if c = 0x0D
+            {
+                src.put(m, 0x0A)
+                m := m + 1
+            }
+            else if c = 0x0A
+                0
+            else
+            {
+                src.put(m, c)
+                m := m + 1
+            }
+            i := i + 1
+        }
+        let bytes allocate_slice[u8](host, cap)
+        let blen CodingSystem.encode_utf8_bytes(src.subslice(0, m), bytes)
+        let obytes CodingSystemKit.encode_output_charref(host, bytes.slice_to(blen), true)
+        String(obytes.data as pointer[const_char], obytes.length)
+    }
+
+    ; the raw tree as a StringC — the unit-test observation point.
+    function to_stringc(this: ref[SgmlFOTBuilder], host: ref[Page]) returns StringC
+        StringC^host(this.out.as_slice())
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+
+        ; 1. Units quirks (millipoints; reference "%03d" + point-insert)
+        let f SgmlFOTBuilder.make(host)
+        f.units(12000)
+        f.units(500)
+        f.units(0 - 500)
+        f.units(0)
+        f.units(1005)
+        f.units(5)
+        let got f.to_stringc(host)
+        if got.equals(StringC("<?xml version=\"1.0\"?>\r<fot>\r12pt.5pt-.5pt0pt1.005pt.005pt")) = false
+            return 0 - 1
+
+        ; 2. text escaping incl. numeric char refs >= 0x80
+        let f2 SgmlFOTBuilder.make(host)
+        let chars Array[u32]^host()
+        chars.add(0x61)
+        chars.add(0x26)
+        chars.add(0x3C)
+        chars.add(0xFC)
+        f2.characters( Slice[u32](chars.get_length(), chars.get_buffer()))
+        f2.finish()
+        let got2 f2.to_stringc(host)
+        if got2.equals(StringC("<?xml version=\"1.0\"?>\r<fot>\r<text>a&amp;&lt;&#252;</text>\r</fot>\r")) = false
+            return 0 - 2
+
+        ; 3. ics buffer: a length IC flushed into a paragraph start tag
+        let f3 SgmlFOTBuilder.make(host)
+        let ident3 Identifier.make(host, StringC("font-size"))
+        let ic3 InheritedC.make(host, IC_LENGTH, ident3, 0, StringC("font-size"))
+        ic3.lval := 18000
+        f3.set_ic(ic3)
+        ; A NIC is never absent in the reference (a by-value member, default
+        ; constructed with the flow object), so the default-constructed record
+        ; is what "no NIC" means -- the same thing ProcessContext now supplies.
+        ; A default DisplayNIC has every field at its zero, so display_nic
+        ; emits nothing and the expected string below is unchanged.
+        f3.start_paragraph(DisplayNIC.make(host))
+        f3.end_paragraph()
+        let got3 f3.to_stringc(host)
+        if got3.equals(StringC("<?xml version=\"1.0\"?>\r<fot>\r<paragraph font-size=\"18pt\">\r</paragraph>\r")) = false
+            return 0 - 3
+
+        0
+    }
+}

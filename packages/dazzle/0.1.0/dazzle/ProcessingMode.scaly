@@ -1,0 +1,846 @@
+; ProcessingMode — the construction/style rule set of one mode (Style/
+; ProcessingMode.{h,cxx}). Rules match grove nodes; findMatch returns the
+; most-specific matching rule, resumably (next-match continues from the last
+; match via the Specificity cursor).
+;
+; Inc 5a scope: construction rules only (styleRule needs InheritedC/StyleStack
+; = the print path, deferred). Faithful simplification of the two-ruletype /
+; initial-mode-chaining machinery: a single initial mode.
+;
+; Element rules are kept in ONE list sorted by specificity (build_sorted) and,
+; on top of it, in the reference's per-grove / per-GI index (GroveRules +
+; ElementRules, ProcessingMode.cxx:36): a node is matched only against the
+; rules that can possibly match it — those whose pattern pins its GI plus the
+; ones that pin no GI at all. Without the index every node was tried against
+; EVERY rule, which measured 14.17 million pattern attempts for 12 929 element
+; nodes on the DocBook print stylesheets (~1 096 per node).
+;
+; ★The buckets are FILTERED OUT OF the flat sorted list, not sorted per bucket
+; the way the reference builds them (bucket rules first, then all GI-less ones
+; appended, then qsort). Same set, same specificity order — but ties keep the
+; order the flat scan gave them, so which rule of an equal-specificity run
+; fires does not change with this index. (The reference's own tie order is
+; qsort's, i.e. undefined; only the ambiguity diagnostic is a contract.)
+
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.Location.Location
+use dazzle.NameTable.NamedTable
+use dazzle.Grove.GroveNode
+use dazzle.Grove.GroveInfo
+use dazzle.ELObj.ELObj
+use dazzle.Expression.Expression
+use dazzle.Expression.Environment
+use dazzle.Insn.Insn
+use dazzle.Pattern.Pattern
+use dazzle.Interpreter.Interpreter
+use dazzle.InterpreterMessages.InterpreterMessages
+
+; One precomputed comparison key per element rule, as build_sorted lays them
+; out: [part_index, has_pattern, s0 … s8]. The tail is Pattern.N_SPECIFICITY
+; wide — the two are read together in compare_keys, where a divergence would be
+; a loud out-of-range read of the row rather than a silent wrong order.
+define KEY_STRIDE: int 11
+
+; ProcessingMode::RuleType. ★The ORDER is the semantics, not a label: a node
+; is matched against the STYLE rules first and against the construction rules
+; afterwards, so every style rule that applies has been pushed onto the style
+; stack before the one construction rule that builds the flow objects runs.
+define RT_STYLE: int 0
+define RT_CONSTRUCTION: int 1
+
+; The match cursor (ProcessingMode::Specificity). next_rule_index resumes a
+; scan for next-match; found records whether the last findMatch succeeded.
+; rule_type is the half of the cursor that walks the two rule sets in turn.
+define Specificity (var next_rule_index: int, var to_initial: bool, var rule_type: int)
+{
+    init()
+    {
+        this.rule_type := RT_STYLE
+        this.next_rule_index := 0
+        ; 1 once the match fell through from a named processing mode to the
+        ; initial mode (reference Specificity::toInitial_) — next-match
+        ; resumes on the right side of the fallback boundary.
+        this.to_initial := false
+    }
+
+    ; Specificity::isStyle — which set the LAST match came from. The caller
+    ; needs it because a style match is pushed and the loop continues, while a
+    ; construction match ends the loop.
+    function is_style(this: Specificity) returns bool
+        rule_type = RT_STYLE
+}
+
+; ProcessingMode::Action — a rule body: the compiled Insn (evaluated to a
+; sosofo at process time) + its source part/location.
+define Action (expr: ref[Expression]?, var insn: ref[Insn]?, part_index: u32, def_loc: Location)
+{
+    function make(host: ref[Page], part_index: u32, expr: ref[Expression]?, loc: Location) returns ref[Action]
+    {
+        let a &Action^host(expr, null, part_index, loc)
+        a
+    }
+
+    ; ProcessingMode::Action::compile (ProcessingMode.cxx:114). ★The rule type
+    ; decides what the body must EVALUATE TO: a construction rule's value is a
+    ; sosofo and is guarded by a CheckSosofoInsn (so `(element p 42)` reports
+    ; `this context requires a sosofo` instead of silently building nothing),
+    ; a style rule's value is a StyleObj and must NOT be.
+    procedure compile(mutable this: ref[Action], mutable interp: ref[Interpreter], rule_type: int)
+    {
+        if this.insn <> null
+            return
+        let host interp.get_host()
+        let env Environment.make(host)
+        var check: ref[Insn]? null
+        if rule_type = RT_CONSTRUCTION
+            check := Insn.make_check_sosofo(host, this.def_loc, null)
+        this.insn := Expression.optimize_compile(this.expr, interp, env, 0, check)
+    }
+
+    function get_insn(this: Action) returns ref[Insn]?
+        insn
+
+    function location(this: Action) returns Location
+        def_loc
+}
+
+; A rule = an action + (for element rules) a matching pattern. Root rules have
+; a null pattern (root nodes match by position, not by pattern).
+define Rule (action: ref[Action], pattern: ref[Pattern]?)
+{
+    function make(host: ref[Page], action: ref[Action], pattern: ref[Pattern]?) returns ref[Rule]
+    {
+        let r &Rule^host(action, pattern)
+        r
+    }
+
+    ; cross-module accessors (fields aren't reachable across modules — S52).
+    function get_action(this: ref[Rule]) returns ref[Action]
+        this.action
+
+    function get_rule_insn(this: ref[Rule]) returns ref[Insn]?
+        this.action.get_insn()
+
+    ; compareSpecificity: part index first (Rule::compareSpecificity), then
+    ; pattern specificity (ElementRule::compareSpecificity). -1 => `this` sorts
+    ; earlier (more specific / higher priority).
+    function compare_specificity(this: Rule, other: ref[Rule]) returns int
+    {
+        let i1 this.action.part_index
+        let i2 other.action.part_index
+        if i1 <> i2
+        {
+            if i1 < i2
+                return 0 - 1
+            return 1
+        }
+        if (this.pattern = null) or (other.pattern = null)
+            return 0
+        Pattern.compare_specificity(this.pattern as ref[Pattern], other.pattern as ref[Pattern])
+    }
+}
+
+; ProcessingMode::ElementRules — one GI's scan vector: the rules whose pattern
+; must have that GI, merged with the GI-less ones, in flat sorted order.
+define ElementRules (gi: ref[StringC], rules: ref[Array[ref[Rule]?]])
+{
+    function make(host: ref[Page], gi: ref[StringC]) returns ref[ElementRules]
+    {
+        let e &ElementRules^host(gi, Array[ref[Rule]?]^host())
+        e
+    }
+}
+
+; ProcessingMode::GroveRules — the GI index of ONE grove. Per grove because
+; the key is the pattern's GI folded through THAT grove's general substitution
+; table (the reference normalizes with Interpreter::normalizeGeneralName(node)
+; while building, and looks up with the node's stored GI, which the parse
+; already normalized).
+define GroveRules (element_table: ref[NamedTable[ElementRules]], buckets: ref[Array[ref[ElementRules]?]], other_rules: ref[Array[ref[Rule]?]])
+{
+    ; One pass over the sorted rules. A GI-less rule joins other_rules AND
+    ; every bucket opened so far; a new bucket starts as a copy of the GI-less
+    ; rules seen up to that point. That is what keeps each bucket a
+    ; SUBSEQUENCE of the flat scan order (see the module header).
+    procedure build(host: ref[Page], mutable node: ref[GroveNode], sorted: ref[Array[ref[Rule]?]]) returns ref[GroveRules]
+    {
+        let g &GroveRules^host(&NamedTable[ElementRules]^host(256), Array[ref[ElementRules]?]^host(), Array[ref[Rule]?]^host())
+        let n sorted.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let r sorted[i]
+            var raw StringC()
+            var has_gi false
+            if r.pattern <> null
+                has_gi := r.pattern.must_have_gi(&raw)
+            if has_gi
+            {
+                let key Pattern.normalize_general(host, node, raw)
+                var er g.element_table.lookup(key)
+                if er = null
+                {
+                    er := ElementRules.make(host, key)
+                    g.element_table.insert(host, key, er as ref[ElementRules])
+                    g.buckets.add(er)
+                    ; seed the fresh bucket with the GI-less rules that sort
+                    ; ahead of this one
+                    let o g.other_rules
+                    let on o.get_length()
+                    var k: size_t 0
+                    while k < on
+                    {
+                        er.rules.add(o[k])
+                        k := k + 1
+                    }
+                }
+                er.rules.add(r)
+            }
+            else
+            {
+                g.other_rules.add(r)
+                let bl g.buckets
+                let bn bl.get_length()
+                var k: size_t 0
+                while k < bn
+                {
+                    let er bl[k]
+                    er.rules.add(r)
+                    k := k + 1
+                }
+            }
+            i := i + 1
+        }
+        g
+    }
+
+    ; the scan vector for a node: its GI's bucket, or the GI-less rules when no
+    ; rule in this mode pins that GI.
+    function rules_for(this: ref[GroveRules], node: ref[GroveNode]) returns ref[Array[ref[Rule]?]]
+    {
+        let gi node.get_gi()
+        let er this.element_table.lookup(gi)
+        if er = null
+            return this.other_rules
+        er.rules
+    }
+}
+
+; ★The style side is a SECOND, parallel set of the same four structures rather
+; than a second dimension inside each: a stylesheet without style rules leaves
+; every `style_*` field null, so the construction path is bit-for-bit the one
+; that ran before this landed and pays one null test per node for the style
+; pass. The reference indexes by RuleType instead (`rules[nRuleType]`); the
+; observable order is identical because the cursor walks style-then-construction
+; either way.
+define ProcessingMode (name: StringC, initial: ref[ProcessingMode]?, var defined_flag: bool, var root_rules: ref[Array[ref[Rule]?]]?, var element_rules: ref[Array[ref[Rule]?]]?, var sorted_elements: ref[Array[ref[Rule]?]]?, var sorted_built: bool, var grove_rules: ref[Array[ref[GroveRules]?]]?, var style_root_rules: ref[Array[ref[Rule]?]]?, var style_element_rules: ref[Array[ref[Rule]?]]?, var style_sorted: ref[Array[ref[Rule]?]]?, var style_sorted_built: bool, var style_grove_rules: ref[Array[ref[GroveRules]?]]?)
+{
+    function make(host: ref[Page], name: StringC, initial: ref[ProcessingMode]?) returns ref[ProcessingMode]
+    {
+        ; rule lists are allocated lazily (in add_rule) — an interpreter with no
+        ; stylesheet (every eval-only run) never grabs their exclusive pages.
+        let m &ProcessingMode^host(name, initial, false, null, null, null, false, null, null, null, null, false, null)
+        m
+    }
+
+    function get_name(this: ProcessingMode) returns StringC
+        name
+
+    function defined(this: ProcessingMode) returns bool
+        defined_flag
+
+    procedure set_defined(mutable this: ref[ProcessingMode])
+        this.defined_flag := true
+
+    ; addRule: one Action shared by all patterns; each pattern -> an ElementRule;
+    ; a root rule -> a pattern-less Rule inserted into root_rules by specificity.
+    procedure add_rule(mutable this: ref[ProcessingMode], root: bool, patterns: ref[Array[ref[Pattern]?]]?, expr: ref[Expression]?, loc: Location, mutable interp: ref[Interpreter], rule_type: int)
+    {
+        let host interp.get_host()
+        if rule_type = RT_STYLE
+        {
+            if this.style_element_rules = null
+                this.style_element_rules := Array[ref[Rule]?]^host()
+            if this.style_root_rules = null
+                this.style_root_rules := Array[ref[Rule]?]^host()
+        }
+        if this.element_rules = null
+            this.element_rules := Array[ref[Rule]?]^host()
+        if this.root_rules = null
+            this.root_rules := Array[ref[Rule]?]^host()
+        let action Action.make(host, interp.current_part_index(), expr, loc)
+        if patterns <> null
+        {
+            let n patterns.get_length()
+            var i: size_t 0
+            while i < n
+            {
+                let pat patterns[i]
+                let r Rule.make(host, action, pat)
+                if rule_type = RT_STYLE
+                    this.style_element_rules.add(r)
+                else
+                    this.element_rules.add(r)
+                i := i + 1
+            }
+        }
+        this.sorted_built := false
+        this.style_sorted_built := false
+        this.style_grove_rules := null
+        ; a rule added after a grove was indexed invalidates the index too
+        ; (rules only ever arrive at stylesheet-read time, before the first
+        ; match — this is belt and braces).
+        this.grove_rules := null
+        if root = false
+            return
+        let r Rule.make(host, action, null)
+        var rr this.root_rules
+        if rule_type = RT_STYLE
+            rr := this.style_root_rules
+        rr.add(r)
+        ; keep the root rules sorted (bubble the new rule up while more specific).
+        var k (rr.get_length() as int) - 1
+        while k > 0
+        {
+            let prev rr[(k - 1)]
+            let curr rr[k]
+            let cmp prev.compare_specificity(curr as ref[Rule])
+            if cmp <= 0
+            {
+                ; duplicateRootRule (ProcessingMode.cxx:165) — a second root
+                ; rule of the SAME importance in the same part, reported with
+                ; the first one as the auxiliary line. ★The reference gates it
+                ; on `ruleType == constructionRule`, and since the style rules
+                ; landed that gate is real: two root STYLE rules of equal
+                ; specificity are legal and both apply.
+                if (cmp = 0) and (rule_type = RT_CONSTRUCTION)
+                {
+                    interp.set_next_location(loc)
+                    interp.message0(InterpreterMessages.duplicateRootRule())
+                    interp.emit_aux(InterpreterMessages.duplicateRootRule_aux(), prev.get_action().location())
+                }
+                break
+            }
+            rr.put(((k - 1) as size_t), curr)
+            rr.put((k as size_t), prev)
+            k := k - 1
+        }
+    }
+
+    ; build the element-rule scan order once (selection sort by specificity;
+    ; rule counts per stylesheet are small).
+    ; the style side of build_sorted. ★It shares `sort_rules` with the
+    ; construction side, so a style rule set is ordered by exactly the same
+    ; stable merge on exactly the same keys — the two sets differ in WHEN they
+    ; are scanned, never in HOW they are ordered.
+    ; the sort of build_sorted, factored out so the STYLE rule set is ordered
+    ; by exactly the same stable merge on exactly the same keys.
+    procedure sort_rules(host: ref[Page], mutable sorted: ref[Array[ref[Rule]?]], src: ref[Array[ref[Rule]?]])
+    {
+        let n src.get_length()
+        let ni n as int
+        if ni > 0
+        {
+            ; ★The specificity KEY of every rule, computed ONCE — and this is a
+            ; pure memoisation, so it is ORDER-PRESERVING by construction: the
+            ; comparison sees the same numbers in the same sequence and answers
+            ; the same, so which rule of an equal-specificity run ends up first
+            ; cannot change (which is exactly what a different SORT ALGORITHM
+            ; would change, and why the O(n²) below stays for now).
+            ;
+            ; The compared value never depended on the sort at all: `compare_
+            ; specificity` recomputed `Pattern::compute_specificity` — a walk of
+            ; the pattern's ancestors and of each ancestor's qualifiers — TWICE
+            ; per comparison, i.e. n² times for n rules, where n is ~2000 for the
+            ; DocBook print stylesheets. Measured 2026-08-07 as 24.3 % of a
+            ; startup run, the biggest single line of it.
+            ; The reference recomputes it too, but it qsorts
+            ; per GI bucket, so it pays n log n small buckets instead of n² flat.
+            ;
+            ; Row layout, KEY_STRIDE ints per rule: [part_index, has_pattern,
+            ; s0 … s8]. Both halves of Rule.compare_specificity are in there —
+            ; the part index first, then the pattern vector, and `has_pattern`
+            ; carries the "either side has no pattern ⇒ equal" case.
+            let keys allocate_slice[int](host, n * (KEY_STRIDE as size_t))
+            let ord allocate_slice[int](host, n)
+            var k 0
+            while k < ni
+            {
+                let r sorted[k]
+                let row keys.slice_from((k * KEY_STRIDE) as size_t)
+                row.put(0, r.action.part_index as int)
+                if r.pattern = null
+                    row.put(1, 0)
+                else
+                {
+                    row.put(1, 1)
+                    r.pattern.compute_specificity(row.slice_from(2))
+                }
+                ord.put(k, k)
+                k := k + 1
+            }
+            ; ★A STABLE bottom-up merge sort over `ord` (the rule indices), so
+            ; the comparison count is n log n instead of n²: ~22 K instead of
+            ; 2 M for the ~2000 rules of the DocBook print sheet. The whole
+            ; sort was measured at 3.1 % of a startup run by building a probe
+            ; that simply skips it, so that is this rung's ceiling.
+            ;
+            ; Why changing the algorithm is ALLOWED here, which the earlier
+            ; note doubted: the order WITHIN a run of equally specific rules is
+            ; not a contract — the reference qsorts (unstable) per GI bucket,
+            ; and the selection sort standing here swapped, so it was not
+            ; stable either. It is only OBSERVABLE when two equally specific
+            ; rules match the SAME node, and that case is exactly what
+            ; `element_rule_advance` reports as ambiguousMatch. That makes the
+            ; diagnostic a COMPLETE detector for the order-relevant case, and
+            ; it is silent over the whole corpus: 0 of 48 real-world codegen
+            ; goldens, 0 of 469 ESIS models, 0 in all three DocBook backends —
+            ; while `tests/dazzle/engine/pat4` still fires it, so the detector
+            ; is live rather than merely quiet. A future tie announces itself.
+            ;
+            ; Merge sort rather than the reference's qsort because STABLE means
+            ; the result no longer depends on the algorithm's tie handling at
+            ; all: equal rules keep their declaration order, which is a
+            ; stronger guarantee than the reference gives.
+            ;
+            ; ★The reference reaches n log n differently — GroveRules::build
+            ; buckets per GI FIRST and qsorts each small bucket. This port
+            ; sorts once globally and distributes the sorted list into the same
+            ; buckets (grove_rules_for), so the buckets come out sorted either
+            ; way; only the sort's cost differs.
+            let scratch allocate_slice[int](host, n)
+            var run 1
+            var from ord
+            var into scratch
+            while run < ni
+            {
+                var lo 0
+                while lo < ni
+                {
+                    var mid lo + run
+                    if mid > ni
+                        mid := ni
+                    var hi mid + run
+                    if hi > ni
+                        hi := ni
+                    var li lo
+                    var ri mid
+                    var oi lo
+                    while oi < hi
+                    {
+                        var take_left false
+                        if li < mid
+                        {
+                            if ri >= hi
+                                take_left := true
+                            else
+                            {
+                                let kl keys.slice_from((from[li] * KEY_STRIDE) as size_t)
+                                let kr keys.slice_from((from[ri] * KEY_STRIDE) as size_t)
+                                ; `<= 0` is what makes the merge STABLE
+                                if ProcessingMode.compare_keys(kl, kr) <= 0
+                                    take_left := true
+                            }
+                        }
+                        if take_left
+                        {
+                            into.put(oi, from[li])
+                            li := li + 1
+                        }
+                        else
+                        {
+                            into.put(oi, from[ri])
+                            ri := ri + 1
+                        }
+                        oi := oi + 1
+                    }
+                    lo := hi
+                }
+                let swap from
+                from := into
+                into := swap
+                run := run + run
+            }
+            ; `from` holds the sorted rule indices; `sorted` was filled from
+            ; `src` in order, so the source of index i is src[i].
+            var w 0
+            while w < ni
+            {
+                let si from[w]
+                sorted.put(w, src[si])
+                w := w + 1
+            }
+        }
+    }
+
+    procedure build_sorted_style(mutable this: ref[ProcessingMode], host: ref[Page])
+    {
+        if this.style_sorted_built
+            return
+        if this.style_element_rules = null
+        {
+            this.style_sorted := Array[ref[Rule]?]^host()
+            this.style_sorted_built := true
+            return
+        }
+        let src this.style_element_rules
+        let n src.get_length()
+        ; ★★★REVERSE declaration order, and this is a CONTRACT here where it is
+        ; not one for construction rules. The reference keeps element rules in
+        ; an IList whose `insert` PREPENDS, so an equal-specificity run is in
+        ; reverse declaration order; its per-bucket qsort then leaves that run
+        ; as it found it. For CONSTRUCTION rules that is invisible — exactly
+        ; one rule of the run fires, which is what `ambiguousMatch` reports —
+        ; but every matching STYLE rule is applied, so the order decides which
+        ; specification of a characteristic wins and in which order the
+        ; characteristics reach the backend. Measured against the reference:
+        ; four equally specific style rules come out last-declared-first.
+        ; Our sort is STABLE, so filling in reverse is the whole fix.
+        ; ★TWO arrays: `sort_rules` writes the ordered result into its first
+        ; argument while READING the second, so source and target must not be
+        ; the same array.
+        let rev Array[ref[Rule]?]^host()
+        var i n
+        while i > 0
+        {
+            i := i - 1
+            rev.add(src[i])
+        }
+        let sorted Array[ref[Rule]?]^host()
+        var j: size_t 0
+        while j < n
+        {
+            sorted.add(rev[j])
+            j := j + 1
+        }
+        ProcessingMode.sort_rules(host, sorted, rev)
+        this.style_sorted := sorted
+        this.style_sorted_built := true
+    }
+
+    procedure build_sorted(mutable this: ref[ProcessingMode], host: ref[Page])
+    {
+        if this.sorted_built
+            return
+        if this.element_rules = null
+        {
+            this.sorted_elements := Array[ref[Rule]?]^host()
+            this.sorted_built := true
+            return
+        }
+        let src this.element_rules
+        let n src.get_length()
+        let sorted Array[ref[Rule]?]^host()
+        var i: size_t 0
+        while i < n
+        {
+            sorted.add(src[i])
+            i := i + 1
+        }
+        ProcessingMode.sort_rules(host, sorted, src as ref[Array[Option[ref[Rule]]]])
+        this.sorted_elements := sorted
+        this.sorted_built := true
+    }
+
+    ; Rule.compare_specificity over two precomputed key rows — the same two
+    ; tests in the same order (part index, then the specificity vector), so the
+    ; answer is identical for every pair.
+    function compare_keys(k1: Slice[int], k2: Slice[int]) returns int
+    {
+        let i1 k1[0]
+        let i2 k2[0]
+        if i1 <> i2
+        {
+            if i1 < i2
+                return 0 - 1
+            return 1
+        }
+        if (k1[1] = 0) or (k2[1] = 0)
+            return 0
+        var i 0
+        while i < N_SPECIFICITY
+        {
+            let x k1[2 + i]
+            let y k2[2 + i]
+            if x <> y
+            {
+                if x > y
+                    return 0 - 1
+                return 1
+            }
+            i := i + 1
+        }
+        0
+    }
+
+    ; findMatch: element node -> element rules; root node (no parent) -> root
+    ; rules. Advances `spec` so a subsequent next-match resumes.
+    procedure find_match(mutable this: ref[ProcessingMode], mutable node: ref[GroveNode]?, host: ref[Page], mutable interp: ref[Interpreter], mutable spec: ref[Specificity]) returns ref[Rule]?
+    {
+        if node = null
+            return null
+        if node.get_class() = GN_ELEMENT
+            return this.find_element_match(node, host, interp, spec)
+        ; STRUCTURAL: ProcessingMode::findMatch tests `getOrigin`, NOT getParent
+        ; — with the parent axis a prolog/epilog PI (axis parent null) would be
+        ; misrouted to the root rules.
+        if node.get_parent() = null
+            return this.find_root_match(host, spec)
+        null
+    }
+
+    ; ProcessingMode::groveRules — the node's grove index into the per-grove
+    ; index, built on first use. ★On the PERMANENT arena, never on
+    ; interp.get_host(): during processing that is the per-node eval scratch
+    ; region, and an index built there would dangle after the bracket (the
+    ; same reason build_sorted runs from Interpreter.compile).
+    procedure grove_rules_for(mutable this: ref[ProcessingMode], mutable node: ref[GroveNode], mutable interp: ref[Interpreter], rule_type: int) returns ref[GroveRules]
+    {
+        let host interp.get_perm_host()
+        if rule_type = RT_STYLE
+        {
+            this.build_sorted_style(host)
+            if this.style_grove_rules = null
+                this.style_grove_rules := Array[ref[GroveRules]?]^host()
+        }
+        else
+            this.build_sorted(host)
+        if this.grove_rules = null
+            this.grove_rules := Array[ref[GroveRules]?]^host()
+        var table this.grove_rules
+        if rule_type = RT_STYLE
+            table := this.style_grove_rules
+        let idx GroveInfo.index_of(node) as size_t
+        while table.get_length() <= idx
+            table.add(null)
+        ; The slot holds a nullable ref: read it in the two-step form (a null
+        ; test on the borrowed cell itself never loads it).
+        var gr: ref[GroveRules]? table.at(idx)
+        if gr = null
+        {
+            var src this.sorted_elements
+            if rule_type = RT_STYLE
+                src := this.style_sorted
+            gr := GroveRules.build(host, node, src as ref[Array[Option[ref[Rule]]]])
+            table.put(idx, gr)
+        }
+        gr as ref[GroveRules]
+    }
+
+    ; one scan pass over THIS mode's element rules for the node's GI, from the
+    ; spec cursor.
+    procedure scan_element_rules(mutable this: ref[ProcessingMode], mutable node: ref[GroveNode], host: ref[Page], mutable interp: ref[Interpreter], mutable spec: ref[Specificity]) returns ref[Rule]?
+    {
+        ; ★the early out that keeps a stylesheet WITHOUT style rules on exactly
+        ; the path it had before: no index is built, nothing is scanned.
+        if spec.rule_type = RT_STYLE
+        {
+            if this.style_element_rules = null
+                return null
+        }
+        let gr this.grove_rules_for(node, interp, spec.rule_type)
+        let sorted gr.rules_for(node)
+        let n sorted.get_length() as int
+        var i spec.next_rule_index
+        while i < n
+        {
+            let rule sorted[i]
+            if rule.pattern.matches(host, interp, node)
+            {
+                spec.next_rule_index := ProcessingMode.element_rule_advance(host, interp, node, sorted, i, spec.rule_type)
+                return rule
+            }
+            i := i + 1
+        }
+        spec.next_rule_index := i
+        null
+    }
+
+    ; ProcessingMode::elementRuleAdvance (ProcessingMode.cxx:284) — where the
+    ; cursor lands after a hit, and the home of the ambiguity diagnostic.
+    ; ★It does NOT stop right after the hit: it walks the whole run of rules
+    ; with EQUAL specificity, so next-match resumes at the first rule of a
+    ; DIFFERENT specificity either way. If any rule in that run matches too
+    ; (or is trivial, which matches by construction), the node is reported as
+    ; matching more than one pattern with the same specificity and the rest of
+    ; the run is skipped in one go.
+    ; ★Which rule of an equal-specificity run FIRES is not defined by the
+    ; reference: it sorts with qsort, which is not stable, so two tied rules
+    ; may land in either order. Only the diagnostic is a contract.
+    ; ★For a STYLE rule the reference simply steps to the next index
+    ; (ProcessingMode.cxx:290: `if (ruleType_ != constructionRule) { ++i; return; }`)
+    ; — SEVERAL style rules are MEANT to apply to one node, one per
+    ; characteristic, so the ambiguity diagnostic would be nonsense there. It
+    ; is a construction-rule concept: exactly one rule may build the node.
+    procedure element_rule_advance(host: ref[Page], mutable interp: ref[Interpreter], mutable node: ref[GroveNode], sorted: ref[Array[ref[Rule]?]], hit: int, rule_type: int) returns int
+    {
+        if rule_type = RT_STYLE
+            return hit + 1
+        let n sorted.get_length() as int
+        let r sorted[hit]
+        var i hit + 1
+        var ambiguous false
+        while i < n
+        {
+            let other sorted[i]
+            if r.compare_specificity(other as ref[Rule]) <> 0
+                return i
+            ; ★the reference's test is `trivial() || matches()`, but its `vec`
+            ; is the per-GI bucket of GroveRules::build, where a TRIVIAL
+            ; pattern matches every member by construction. This port keeps one
+            ; flat, specificity-sorted list (see the header note), so the
+            ; shortcut would fire for a trivial rule of an unrelated GI — the
+            ; match test is the whole test here.
+            if other.pattern.matches(host, interp, node)
+            {
+                ambiguous := true
+                break
+            }
+            i := i + 1
+        }
+        if ambiguous = false
+            return i
+        interp.set_next_location(node.get_loc())
+        interp.message0(InterpreterMessages.ambiguousMatch())
+        i := i + 1
+        while i < n
+        {
+            let other sorted[i]
+            if r.compare_specificity(other as ref[Rule]) <> 0
+                return i
+            i := i + 1
+        }
+        i
+    }
+
+    ; A named mode's scan FALLS THROUGH to the initial mode's rules when it
+    ; is exhausted (reference findElementMatch: specificity.toInitial_ — the
+    ; cursor persists across the boundary so next-match resumes correctly).
+    ; findElementMatch's OUTER loop (ProcessingMode.cxx:212): exhaust the
+    ; current rule type — this mode, then the initial mode — and only then
+    ; advance style → construction, resetting the cursor for the new set.
+    procedure find_element_match(mutable this: ref[ProcessingMode], mutable node: ref[GroveNode], host: ref[Page], mutable interp: ref[Interpreter], mutable spec: ref[Specificity]) returns ref[Rule]?
+    {
+        repeat
+        {
+            let r this.find_element_match_one(node, host, interp, spec)
+            if r <> null
+                return r
+            if spec.rule_type = RT_CONSTRUCTION
+                break
+            spec.rule_type := RT_CONSTRUCTION
+            spec.next_rule_index := 0
+            spec.to_initial := false
+        }
+        null
+    }
+
+    procedure find_element_match_one(mutable this: ref[ProcessingMode], mutable node: ref[GroveNode], host: ref[Page], mutable interp: ref[Interpreter], mutable spec: ref[Specificity]) returns ref[Rule]?
+    {
+        if spec.to_initial = false
+        {
+            let r this.scan_element_rules(node, host, interp, spec)
+            if r <> null
+                return r
+            if this.initial = null
+                return null
+            spec.to_initial := true
+            spec.next_rule_index := 0
+        }
+        let m this.initial
+        if m = null
+            return null
+        m.scan_element_rules(node, host, interp, spec)
+    }
+
+    procedure scan_root_rules(this: ref[ProcessingMode], mutable spec: ref[Specificity]) returns ref[Rule]?
+    {
+        var rr this.root_rules
+        if spec.rule_type = RT_STYLE
+            rr := this.style_root_rules
+        if rr = null
+            return null
+        let n rr.get_length() as int
+        let i spec.next_rule_index
+        if i < n
+        {
+            spec.next_rule_index := i + 1
+            return rr[i]
+        }
+        spec.next_rule_index := n
+        null
+    }
+
+    procedure find_root_match(this: ref[ProcessingMode], host: ref[Page], mutable spec: ref[Specificity]) returns ref[Rule]?
+    {
+        repeat
+        {
+            let r this.find_root_match_one(host, spec)
+            if r <> null
+                return r
+            if spec.rule_type = RT_CONSTRUCTION
+                break
+            spec.rule_type := RT_CONSTRUCTION
+            spec.next_rule_index := 0
+            spec.to_initial := false
+        }
+        null
+    }
+
+    procedure find_root_match_one(this: ref[ProcessingMode], host: ref[Page], mutable spec: ref[Specificity]) returns ref[Rule]?
+    {
+        if spec.to_initial = false
+        {
+            let r this.scan_root_rules(spec)
+            if r <> null
+                return r
+            if this.initial = null
+                return null
+            spec.to_initial := true
+            spec.next_rule_index := 0
+        }
+        let m this.initial
+        if m = null
+            return null
+        m.scan_root_rules(spec)
+    }
+
+    ; compile every rule's action.
+    procedure compile(mutable this: ref[ProcessingMode], mutable interp: ref[Interpreter])
+    {
+        ProcessingMode.compile_set(interp, this.style_root_rules, this.style_element_rules, RT_STYLE)
+        ProcessingMode.compile_set(interp, this.root_rules, this.element_rules, RT_CONSTRUCTION)
+    }
+
+    procedure compile_set(mutable interp: ref[Interpreter], mutable root_set: ref[Array[ref[Rule]?]]?, mutable elem_set: ref[Array[ref[Rule]?]]?, rule_type: int)
+    {
+        if root_set <> null
+        {
+            let rr root_set
+            var i: size_t 0
+            while i < rr.get_length()
+            {
+                let r rr[i]
+                r.action.compile(interp, rule_type)
+                i := i + 1
+            }
+        }
+        if elem_set <> null
+        {
+            ; the reference elementRules_ is an IList whose insert PREPENDS —
+            ; forward iteration there compiles rules in REVERSE file order
+            ; (observable through compile-time diagnostics: constant NIC
+            ; conversions, unknown make keywords).
+            let er elem_set
+            var j er.get_length() as int
+            while j > 0
+            {
+                j := j - 1
+                let r er[j]
+                r.action.compile(interp, rule_type)
+            }
+        }
+    }
+}

@@ -1,0 +1,483 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use dazzle.TestScratch.TestScratch
+use opensp.Location.Location
+use opensp.Location.InputSource
+use opensp.Location.Origin
+use opensp.Location.TextChunk
+use opensp.ParserState.ParserState
+use opensp.Parser.Parser
+use opensp.Event.Event
+use opensp.ElementType.ElementType
+use opensp.AttributeList.AttributeList
+use opensp.Attribute.Attribute
+use opensp.Attribute.AttributeValue
+use opensp.Attribute.AttributeSemantics
+use opensp.Attribute.Text
+use opensp.Entity.Entity
+use opensp.Entity.InternalEntity
+use opensp.Notation.Notation
+use opensp.ExternalId.ExternalId
+use opensp.Dtd.Dtd
+use opensp.ArcEngine.ArcEngine
+use dazzle.Interpreter.Interpreter
+use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.OutputCharStream
+use dazzle.SchemeParser.SchemeParser
+use scaly.os.File
+
+; DssslSpecEventHandler — assembles a DSSSL style specification from a parsed
+; `.dsl` document (style/DssslSpecEventHandler.cxx / .cs). A `.dsl` is an SGML
+; document conforming to the DSSSL style-sheet DTD; parsing it produces the
+; STYLE-SHEET / STYLE-SPECIFICATION / STYLE-SPECIFICATION-BODY element events
+; with the Scheme source arriving as character data (external `.scm` text
+; entities + CDATA marked sections are expanded inline by the parser into DATA
+; events). This handler walks those events, assembles the Part/Doc structure,
+; extracts each part's body text, and resolves the USE closure — the ordered
+; list of parts the interpreter then reads with the SchemeParser.
+;
+; SEAM (the ArcEngine/Rast precedent): a POST-PARSE pass over `ps.events`
+; (opensp.Parser.parse_simple produced them), not a live EventHandler. The C++
+; loadDoc routes the parse through ArcEngine to SELECT the DSSSL architecture
+; (arcEventHandler matches the arch's notation public id); the C# mirror
+; DIVERGES and parses directly ("ArcEngine architecture processing is
+; incomplete").
+;
+; ★Since 2026-08-09 the port does route it (route_through_arch): the walk below
+; consumes the DSSSL architecture's GENERATED stream, which is loadDoc's
+; `ArcEngine::parseAll`. Two halves make that possible, and both are in opensp:
+; the validating half of the engine (ArcEngine.scaly's STATUS note) and
+; mungeMetaDtd, without which the arch stream carries no ENTITY semantics — and
+; `document`/`content` below are exactly ENTITY-declared attributes, so a
+; routing without it would have cut the 37-document chain of a DocBook style
+; sheet off in silence.
+;
+; The architecture GATE stays where it was and keeps its own job:
+; check_dsssl_arch asks opensp whether the spec declares the DSSSL architecture
+; as a BASE architecture (`IS10744 ArcBase` PI + a notation with the arch public
+; id, the conjunction that sets the reference's gotArc_) and reports specNotArc
+; when it does not, processing on with no rules. It must run BEFORE the routing,
+; because it reads the PI that the routing replaces.
+;
+; Inc-2 scope: single-document assembly with USE-within-document part chaining
+; and inline/gathered bodies (ImmediateBodyElement). The cross-file
+; EXTERNAL-SPECIFICATION path (a `document` entity referencing another `.dsl`,
+; resolved by a NESTED parse) is ported structurally; its resolve re-parses
+; through parse_simple when a system id is present.
+
+function getenv(name: pointer[const_char]) returns pointer[const_char] extern
+procedure scaly_eputs(s: pointer[const_char]) extern
+procedure scaly_eputi(value: i64) extern
+procedure scaly_eputnl() extern
+
+; --- the per-document parse ARENA ------------------------------------------
+;
+; A style sheet is not one SGML document but 38 (`docbook.dsl` declares 37
+; <external-specification>, each loaded by its own parse), and every one of
+; those parses used to live to program end on the run region — 234 of 270 MB
+; requested, measured by tests/dazzle/startbytes. What survives a spec parse is
+; the assembled Part/Doc structure and, per body element, the gathered text plus
+; its chunk table; all of that is on the handler's own host, and since the
+; pinning step (Origin.pin, StringC copies in declaration_start) NOTHING in it
+; points into the parse any more. So each document's parse gets an exclusive
+; page chain that falls when its walk is done.
+;
+; ★The escape hatch is not comfort. Condition (b) below is an audit of the
+; structures the walk keeps, and an audit is exactly the kind of claim that is
+; invisible when it is wrong (the frame mark's store sweep, 2026-08-06) —
+; `DZ_SPEC_ARENA=0` restores the old lifetime, and tests/dazzle/specarena
+; checks BOTH paths.
+;
+; NOT freed, two conditions:
+;   (a) DZ_SPEC_ARENA=0.
+;   (b) the document produced a BodyElement.Entity (a CONTENT= entity body).
+;       That arm keeps a pointer[Entity] INTO the parse, and make_input_source
+;       dereferences it after every parse is over. Pinning it would mean a deep
+;       copy of an Entity, and no corpus style sheet uses the form — an
+;       untested pin is worse than a held arena, and the hold costs nothing
+;       measurable because it never fires.
+
+; DssslSpecEventHandler::DeclarationType
+define DECL_FEATURES: int 0
+define DECL_BASESET_ENCODING: int 1
+define DECL_LITERAL_DESCRIBED_CHAR: int 2
+define DECL_ADD_NAME_CHARS: int 3
+define DECL_ADD_SEPARATOR_CHARS: int 4
+define DECL_STANDARD_CHARS: int 5
+define DECL_OTHER_CHARS: int 6
+define DECL_COMBINE_CHAR: int 7
+define DECL_MAP_SDATA_ENTITY: int 8
+define DECL_CHAR_REPERTOIRE: int 9
+define DECL_SGML_GROVE_PLAN: int 10
+
+; opensp Event.event_type discriminants (module-level consts in opensp.Event
+; are not cross-package-visible; mirrored here — the values are the stable
+; Event ABI: EVK_START=0, EVK_END=1, EVK_DATA=2).
+define EVK_START: int 0
+define EVK_END: int 1
+define EVK_DATA: int 2
+define EVK_END_PROLOG: int 8
+
+; --- the assembled structures (Link subclasses in the reference) -----------
+
+; A DSSSL declaration element's gathered content (features, char-repertoire,
+; standard-chars, …). name/text/modadd/desc are the attribute-sourced fields.
+; ★`chunks` is the declaration's own location table, kept for the same
+; reason `ImmediateBody` keeps one: the four declaration parsers DO
+; report (badDeclaration, badCharName, duplicateCharName), and without
+; the table a diagnostic in an entity-expanded declaration anchors
+; nowhere. StyleEngine.cxx builds the same thing —
+; `TextInputSourceOrigin(content_)`.
+define DeclarationElement (decl_type: int, var content: StringC, var chunks: ref[Array[TextChunk]]?, var name: StringC, var text: StringC, var modadd: StringC, var desc: StringC)
+{
+    function make(host: ref[Page], decl_type: int) @ret_explicit_0 true @deep true returns ref[DeclarationElement] linked
+
+    function get_type(this: DeclarationElement) @ret_param_0 true @deep true returns int linked
+
+    function get_content(this: DeclarationElement) @page true @direct true @ret_param_0 true @deep true returns StringC linked
+
+    function get_name(this: DeclarationElement) @page true @direct true @ret_param_0 true @deep true returns StringC linked
+
+    function get_text(this: DeclarationElement) @page true @direct true @ret_param_0 true @deep true returns StringC linked
+}
+
+; A body element: either immediate gathered text or an entity reference
+; (STYLE-SPECIFICATION-BODY with a CONTENT= entity attribute). The immediate
+; arm carries the per-chunk source-location table (the reference Text object)
+; so a diagnostic in the gathered Scheme resolves to the original source —
+; a chunk gathered from an expanded `&file.scm;` reference resolves INTO that
+; file (TextInputSourceOrigin::defLocation → Text::charLocation).
+define ImmediateBody (text: StringC, chunks: ref[Array[TextChunk]]?)
+define EntityBody (entity: ref[Entity]?)
+
+define BodyElement union
+(
+    Immediate: ImmediateBody
+    Entity: EntityBody
+)
+{
+    function make_immediate(host: ref[Page], text: StringC, chunks: ref[Array[TextChunk]]) @ret_explicit_0 true @deep true returns ref[BodyElement] linked
+
+    function make_entity(host: ref[Page], entity: ref[Entity]) @ret_explicit_0 true @deep true returns ref[BodyElement] linked
+}
+
+; A concrete specification part: its declarations, body elements, and the
+; headers of the parts it USEs.
+define Part
+(
+    declarations: ref[Array[ref[DeclarationElement]?]]
+    body_elements: ref[Array[ref[BodyElement]?]]
+    use_headers: ref[Array[ref[PartHeader]?]]
+    var mark: bool
+    doc: ref[Doc]?
+)
+{
+    function make(host: ref[Page], doc: ref[Doc]?) @ret_explicit_0 true @deep true returns ref[Part] linked
+
+    procedure add_use(mutable this: ref[Part], header: ref[PartHeader]) @persists true @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    procedure append_body(mutable this: ref[Part], b: ref[BodyElement]) @persists true @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    procedure append_decl(mutable this: ref[Part], d: ref[DeclarationElement]?) @persists true @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    function get_body_elements(this: Part) @ret_param_0 true @deep true returns ref[Array[ref[BodyElement]?]] linked
+
+    ; the document this part came from — StyleEngine::parseSpec reads its
+    ; declarations before the part's own.
+    function get_doc(this: Part) @ret_param_0 true @deep true returns ref[Doc]? linked
+
+    ; StyleEngine::parseSpec walks the DOC's declarations and then the PART's
+    ; (the `local` do-while), so both lists need an accessor.
+    function get_declarations(this: Part) @ret_param_0 true @deep true returns ref[Array[ref[DeclarationElement]?]] linked
+
+    function get_use_headers(this: Part) @ret_param_0 true @deep true returns ref[Array[ref[PartHeader]?]] linked
+
+    ; setMark(b): return the previous mark, set the new one (use-loop guard).
+    procedure set_mark(mutable this: ref[Part], b: bool) @ret_param_0 true @deep true returns bool linked
+}
+
+; SpecPart — how a PartHeader resolves to a concrete Part.
+define ExternalPartRef (header: ref[PartHeader])
+define ExternalFirstPartRef (doc: ref[Doc])
+define ConcretePartRef (part: ref[Part])
+
+define SpecPart union
+(
+    External: ExternalPartRef
+    ExternalFirst: ExternalFirstPartRef
+    Concrete: ConcretePartRef
+)
+
+; A reference to a specification part by ID within a document.
+define PartHeader
+(
+    doc: ref[Doc]
+    id: StringC
+    var ref_loc: Location
+    var spec_part: ref[SpecPart]?
+)
+{
+    function make(host: ref[Page], doc: ref[Doc], id: StringC) @ret_explicit_0 true @deep true returns ref[PartHeader] linked
+
+    function get_id(this: PartHeader) @page true @direct true @ret_param_0 true @deep true returns StringC linked
+
+    ; setRefLoc — first reference wins (the reference guards on a null origin).
+    ; The location is PINNED (Origin.pin): a header outlives the parse of the
+    ; document that referenced it, and missingPart renders this anchor later,
+    ; from resolve_parts.
+    procedure set_ref_loc(mutable this: ref[PartHeader], host: ref[Page], mutable loc: Location) @deep true linked
+
+    procedure set_concrete(mutable this: ref[PartHeader], host: ref[Page], part: ref[Part]) @deep true @deep_this_4 true @deep_whole_4 true linked
+
+    procedure set_external(mutable this: ref[PartHeader], host: ref[Page], header: ref[PartHeader]) @deep true @deep_this_4 true @deep_whole_4 true linked
+
+    procedure set_external_first(mutable this: ref[PartHeader], host: ref[Page], doc: ref[Doc]) @deep true @deep_this_4 true @deep_whole_4 true linked
+
+    ; PartHeader::resolve — force the owning doc loaded, then resolve the part.
+    procedure resolve(mutable this: ref[PartHeader], mutable eh: ref[DssslSpecEventHandler]) @deep true returns ref[Part]? io reads msg_prog linked
+}
+
+; A source document (the main `.dsl` or a referenced external spec file).
+define Doc
+(
+    var loaded: bool
+    sysid: StringC
+    declarations: ref[Array[ref[DeclarationElement]?]]
+    headers: ref[Array[ref[PartHeader]?]]
+    var loc: Location
+)
+{
+    function make(host: ref[Page], sysid: StringC) @ret_explicit_0 true @deep true returns ref[Doc] linked
+
+    function get_declarations(this: Doc) @ret_param_0 true @deep true returns ref[Array[ref[DeclarationElement]?]] linked
+
+    function get_sysid(this: Doc) @page true @direct true @ret_param_0 true @deep true returns StringC linked
+
+    ; refPart(id): find or create the header for a part ID in this doc.
+    procedure ref_part(mutable this: ref[Doc], host: ref[Page], id: StringC) @ret_args_3 true @deep true returns ref[PartHeader] linked
+
+    procedure append_decl(mutable this: ref[Doc], d: ref[DeclarationElement]?) @persists true @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    ; the doc's own location (its end-prolog event; anchors noParts) — PINNED
+    ; for the same reason as PartHeader.ref_loc: resolve_first_part renders it
+    ; after the walk that produced it.
+    procedure set_location(mutable this: ref[Doc], host: ref[Page], mutable loc: Location) @deep true linked
+
+    ; resolveFirstPart: the FIRST-created header's part — the reference walks
+    ; its headers_ IList to the last iteration position, and IList::insert
+    ; PREPENDS, so that is the EARLIEST refPart (the document's first
+    ; style-specification in practice; a USE ref can create headers later).
+    procedure resolve_first_part(mutable this: ref[Doc], mutable eh: ref[DssslSpecEventHandler]) @deep true returns ref[Part]? io reads msg_prog linked
+
+    ; Doc::load — parse the referenced spec file (sysid) and assemble it.
+    ; The main doc (empty sysid) is already assembled by the driver's walk;
+    ; this fires only for an external-spec document with its own file.
+    procedure load(mutable this: ref[Doc], mutable eh: ref[DssslSpecEventHandler]) @deep true io reads APP_INPUT_CS linked
+}
+
+; --- the handler -----------------------------------------------------------
+define DssslSpecEventHandler
+(
+    host: ref[Page]
+    interp: ref[Interpreter]
+    var got_arc: bool
+    var gathering_body: bool
+    var current_part: ref[Part]?
+    current_body: ref[Array[u32]]
+    ; the gathered text's per-chunk source locations (the reference gathers
+    ; into a Text, which records a chunk per addChars) — cleared with
+    ; current_body, snapshotted into the ImmediateBody.
+    current_chunks: ref[Array[TextChunk]]
+    var current_doc: ref[Doc]?
+    var current_decl: ref[DeclarationElement]?
+    ; condition (b) of the per-document arena: this document's walk kept a
+    ; pointer INTO its parse. Saved/restored around every walk like current_doc,
+    ; and read directly by load_stylesheet after load() returns — the accessor
+    ; that used to sit beside it was SHADOWED by this field at every call site
+    ; (a field wins over a same-named method, silently), so it was never the
+    ; thing that ran.
+    var keeps_parse: bool
+    docs: ref[Array[ref[Doc]?]]
+    ; parse parameters for loading EXTERNAL-SPECIFICATION documents (the
+    ; reference derives a child SgmlParser from the main parser's params;
+    ; we re-parse with the same program name and DSSSL catalog).
+    prog_name: String
+    catalog_path: String
+    ; chunk-table coalescing (Text::addChars, see the walk's data arm): the
+    ; chunks kept and the characters gathered over this handler's walks. The
+    ; mechanism is INVISIBLE in the output — one chunk per character resolves
+    ; every offset to the same location — so the self-test reads the ratio.
+    var chunks_kept: i64
+    var chunk_chars: i64
+    ; the per-document arenas this handler released and held (condition (b)) —
+    ; what `--spec-arena-stats` prints, the gate's proof that the arena engages
+    var arenas_released: i64
+    var arenas_held: i64
+)
+{
+    function make(host: ref[Page], interp: ref[Interpreter], prog_name: String, catalog_path: String) @ret_explicit_0 true @deep true returns ref[DssslSpecEventHandler] linked
+
+    ; DZ_SPEC_ARENA — see the arena comment at the top of this file.
+    ; read per spec DOCUMENT — a style sheet has a few dozen — so there is no
+    ; state worth caching
+    procedure spec_arena_on() @ret_nonlocal true @deep true returns bool io linked
+
+    ; the parse host for ONE spec document: an exclusive page chain off `host`
+    ; when the arena is on, otherwise `host` itself (the historical lifetime).
+    procedure spec_arena(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[Page] io linked
+
+    ; …and its release. `keep` is condition (b), decided by the walk.
+    procedure release_spec_arena(mutable this: ref[DssslSpecEventHandler], host: ref[Page], arena: ref[Page], keep: bool) @deep true @deep_beyond_4 true @deep_whole_4 true linked
+
+    ; `--spec-arena-stats`: the gate's proof that the arena and the chunk
+    ; coalescing engaged — both are invisible in the output
+    procedure report_spec_arena(this: ref[DssslSpecEventHandler]) @ret_nonlocal true @deep true linked
+
+    ; findDoc(sysid): the doc registry (one Doc per system id; empty = main).
+    procedure find_doc(mutable this: ref[DssslSpecEventHandler], sysid: StringC) @ret_param_0 true @deep true returns ref[Doc] linked
+
+    ; SpecPart::resolve dispatch.
+    procedure resolve_spec_part(mutable sp: ref[SpecPart]?, mutable eh: ref[DssslSpecEventHandler]) @deep true returns ref[Part]? io reads msg_prog linked
+
+    ; check_dsssl_arch — loadDoc's gotArc_ gate: the document must declare the
+    ; DSSSL architecture as a BASE architecture, i.e. carry an `IS10744 ArcBase`
+    ; PI naming an architecture whose notation in the DTD has the DSSSL arch
+    ; public id. That conjunction (ArcBase PI + lookupNotation + the director's
+    ; pubid test) lives in opensp, where the ArcEngine already parses the PI form.
+    ;
+    ; ★It used to test the NOTATION alone, which is strictly weaker: a spec whose
+    ; internal subset declares the DSSSL notation but no ArcBase PI passed here
+    ; while both reference binaries report specNotArc and then process with NO
+    ; rules (tests/dazzle/cli/notarc.dsl pins the difference).
+    procedure check_dsssl_arch(mutable this: ref[DssslSpecEventHandler], ps: ref[ParserState]) @ret_nonlocal true @deep true returns bool linked
+
+    ; --- attribute helpers -------------------------------------------------
+    function attribute_string(ev: ref[Event], name: Slice[char]) @page true @direct true @ret_param_0 true @deep true returns StringC linked
+
+    ; attributeText — the attribute's value Text (per-char source locations).
+    function attribute_text(ev: ref[Event], name: Slice[char]) @page true @direct true @ret_param_0 true @deep true returns ref[Text]? linked
+
+    ; Text::charLocation(i) — the recorded per-char location (one past the
+    ; last for i == size, like the reference).
+    function text_char_loc(t: ref[Text], i: size_t) @page true @direct true @deep true returns Location linked
+
+    function attribute_entity(ev: ref[Event], name: Slice[char]) @page true @direct true @deep true returns ref[Entity]? linked
+
+    ; --- element handlers (the mapping table's targets) --------------------
+    procedure external_specification_start(mutable this: ref[DssslSpecEventHandler], mutable ev: ref[Event]) @deep true linked
+
+    procedure style_specification_start(mutable this: ref[DssslSpecEventHandler], mutable ev: ref[Event]?) @deep true linked
+
+    procedure style_specification_end(mutable this: ref[DssslSpecEventHandler]) @deep true linked
+
+    procedure style_specification_body_start(mutable this: ref[DssslSpecEventHandler], ev: ref[Event]?) @deep true linked
+
+    procedure style_specification_body_end(mutable this: ref[DssslSpecEventHandler]) @deep true linked
+
+    procedure declaration_start(mutable this: ref[DssslSpecEventHandler], ev: ref[Event]?, decl_type: int) @deep true linked
+
+    procedure declaration_end(mutable this: ref[DssslSpecEventHandler]) @deep true linked
+
+    ; the decl-type of a declaration GI (the reference's declarationStart switch).
+    function decl_type_of(gi: StringC) @deep true returns int linked
+
+    function is_declaration_gi(gi: StringC) @ret_nonlocal true @deep true returns bool linked
+
+    ; --- the event walk (mapping-table dispatch) ---------------------------
+    procedure walk(mutable this: ref[DssslSpecEventHandler], mutable ps: ref[ParserState]) @deep true linked
+
+    ; load an external spec document by re-parsing its file, then walk it
+    ; (reference Doc::load → loadDoc: a child SgmlParser over the sysid, the
+    ; DSSSL-architecture gate per document, currentDoc_ rebound for the walk).
+    procedure load_external_doc(mutable this: ref[DssslSpecEventHandler], doc: ref[Doc]) @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true io reads APP_INPUT_CS linked
+
+    ; loadDoc's `ArcEngine::parseAll` (DssslSpecEventHandler.cxx:88): replace the
+    ; base event stream with the DSSSL architecture's generated one, so the walk
+    ; below sees the ARCHITECTURAL forms. Called only once the gate has already
+    ; said the architecture is declared — the gate reads the ArcBase PI out of
+    ; the base events, which this call removes, so the ORDER is load-bearing.
+    ;
+    ; The host is the PARSE's own region, not the handler's: the generated stream
+    ; and the meta-DTD must live exactly as long as the base parse they came from
+    ; (the reference allocates them in the ArcEngineImpl's Allocator, same
+    ; lifetime), and that is also what makes the per-document arena above still
+    ; correct — condition (b) holds the arena for a CONTENT= entity, and under
+    ; routing that entity is the meta-DTD's COPY, which sits on the same arena.
+    procedure route_through_arch(mutable ps: ref[ParserState]) @ret_nonlocal true @deep true io reads STDERR_ENC linked
+
+    ; --- top-level entry ---------------------------------------------------
+    ; load(): assemble the parts of the main document from ps.events. Returns
+    ; the ordered part list (the resolved part + its USE closure).
+    ;
+    ; A document that does not declare the DSSSL architecture as a base
+    ; architecture is NOT fatal: loadDoc reports specNotArc and RETURNS, and
+    ; load() then runs its normal tail over a doc that was never walked — so the
+    ; part list comes back EMPTY and the engine processes with no construction
+    ; rules (default processing). Nothing is skipped besides the walk: an
+    ; explicit `-d sysid#ID` still creates its header and still reports the
+    ; missing-ID error, exactly like the reference. resolve_first_part stays
+    ; silent because the doc's location is only set by the (never delivered)
+    ; end-prolog event.
+    procedure load(mutable this: ref[DssslSpecEventHandler], mutable ps: ref[ParserState], mutable id: StringC) @page true @direct true @deep true returns ref[Array[ref[Part]?]]? io reads msg_prog linked
+
+    ; resolveParts: collect the part and, transitively, its USE closure
+    ; (mark guards the use-loop).
+    procedure resolve_parts(mutable this: ref[DssslSpecEventHandler], mutable part: ref[Part]?, mutable parts: ref[Array[ref[Part]?]]) @page true @direct true @deep true @deep_into_2_2 true io reads msg_prog linked
+
+    ; makeInputSource (BodyElement::makeInputSource): ONE InputSource per body
+    ; element, each read by its own SchemeParser (StyleEngine::parseSpec). An
+    ; immediate body reads the gathered text through a text origin whose chunk
+    ; table resolves a diagnostic back into the original source — a chunk
+    ; gathered from an expanded `&file.scm;` reference anchors INSIDE that
+    ; file. A CONTENT= internal entity reads its replacement text under an
+    ; entity origin with no reference location (EntityOrigin::make(entity,
+    ; Location()) — renders "(invalid location)", like the reference). The
+    ; CONTENT= EXTERNAL entity fresh-open (entityManager().open) is not
+    ; wired yet — no corpus stylesheet uses it; returns null (skipped).
+    ; DeclarationElement::makeInputSource (DssslSpecEventHandler.cxx:523) —
+    ; a TextInputSourceOrigin over the gathered content, i.e. exactly the
+    ; Immediate body arm below with the declaration's own chunk table.
+    ; StyleEngine::parseSpec's DECLARATION phase (StyleEngine.cxx:40-80) — the
+    ; part of the spec that runs BEFORE any Scheme body, and which this port
+    ; gathered but never executed until 2026-08-08 (found by the dazzle-side
+    ; message audit: `Interpreter.set_char_repertoire` and the four
+    ; `SchemeParser.parse_*` declaration readers were fully ported and had ZERO
+    ; callers).
+    ;
+    ; Three shapes of the reference are load-bearing here:
+    ;
+    ;  * TWO PHASES over the whole part list. `char-repertoire` and
+    ;    `standard-chars` run in phase 0, everything else in phase 1 — a
+    ;    `map-sdata-entity` in the FIRST part may name a character that the LAST
+    ;    part's `standard-chars` defines, so the character tables must be complete
+    ;    before anything reads them.
+    ;  * per part, the DOC's declarations first, then the PART's own (the
+    ;    reference's `local` do-while).
+    ;  * `dEndPart` after each part, in BOTH phases — the declaration phase has
+    ;    its own part counter, and it is what decides whether a redefinition
+    ;    overwrites, is ignored, or is a duplicate diagnostic.
+    procedure parse_declarations(host: ref[Page], mutable interp: ref[Interpreter], parts: ref[Array[ref[Part]?]]) @deep true io reads msg_prog linked
+
+    ; the switch of StyleEngine::parseSpec. ★Every arm gets its OWN SchemeParser
+    ; over the declaration's own input source, exactly as the reference does —
+    ; the reader state (token, current entity) must not leak between declarations.
+    procedure run_declaration(host: ref[Page], mutable interp: ref[Interpreter], mutable d: ref[DeclarationElement], ty: int) @deep true io reads msg_prog linked
+
+    function make_decl_input_source(host: ref[Page], d: ref[DeclarationElement]) @ret_explicit_0 true @deep true returns ref[InputSource]? linked
+
+    function make_input_source(host: ref[Page], be: ref[BodyElement]?) @ret_explicit_0 true @deep true returns ref[InputSource]? linked
+
+    ; body_text(part): concatenate the part's immediate body elements into one
+    ; StringC — the Scheme source the SchemeParser reads. (Entity body elements
+    ; are resolved by the interpreter at read time; Inc 2 gathers immediate.)
+    function body_text(host: ref[Page], part: ref[Part]) @page true @direct true @ret_explicit_0 true @deep true returns StringC linked
+
+    ; --- self-test ---------------------------------------------------------
+    ; Parse a self-contained `.dsl` (inline DTD subset declaring the style-sheet
+    ; forms + the DSSSL arch notation for the gate), assemble the part, extract
+    ; the body, and dump its datums through the SchemeParser — the Inc-2 seam
+    ; end to end: opensp parse → part assembly → Scheme reader.
+    procedure test() @ret_nonlocal true @deep true returns int io reads APP_INPUT_CS linked
+}

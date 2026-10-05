@@ -1,0 +1,1481 @@
+use scaly.memory.Page
+use scaly.memory.root_pages.getenv
+use scaly.containers.Array
+use scaly.containers.Vector
+use opensp.ElementType.ElementType
+use opensp.StringC.StringC
+use opensp.Attribute.Text
+
+; Content models compiled to a DFA — ContentToken.cs (the strongest
+; self-contained non-trivial island of Stage 3; C++ ContentToken.cxx family).
+;
+; A content model `(a, b?, (c | d)+)` parses to a tree of ModelGroups
+; (AND/OR/SEQ connectors) over Leaf tokens (element / #PCDATA / the initial
+; pseudo-token). `CompiledModelGroup.compile` runs Clark's position-automaton
+; construction: `analyze` computes each node's FIRST/LAST sets and threads
+; follow transitions between adjacent positions (`addTransitions`), then
+; `finish` dedups/compacts each leaf's follow list into the deterministic
+; element->transition table, flagging AND-depth bookkeeping and content-model
+; ambiguities. `MatchState` then drives the automaton at parse time
+; (`tryTransition`), tracking AND-group completion via `AndState`.
+;
+; PORT SHAPE — the C++ class hierarchy (ContentToken -> ModelGroup ->
+; And/Or/Seq; ContentToken -> LeafContentToken -> Pcdata/Initial/Element) is
+; FLATTENED into one page-hosted `CmNode` struct tagged by `kind`/`connector`:
+; the algorithm mutates a shared node graph in place (leaf_index, follow sets,
+; final flags, AND-info) and cross-links nodes by pointer, which a Scaly union
+; models awkwardly; the tag replaces C++ virtual dispatch. One-region-per-run:
+; every CmNode and its follow/member arrays live on the compile page (`host`),
+; Owner<T> -> plain pointer field, shared refs borrowed. DataTagGroup is a
+; SeqModelGroup (make_group CONN_SEQ); DataTagElementToken is a leaf carrying
+; the data-tag templates (make_data_tag_element) — see the dt_* fields.
+
+; --- occurrence indicators (ContentToken::OccurrenceIndicator) ---
+define OI_NONE: int 0
+define OI_OPT: int 1
+define OI_PLUS: int 2
+define OI_REP: int 3
+
+; --- connectors (ModelGroup::Connector) ---
+define CONN_AND: int 0
+define CONN_OR: int 1
+define CONN_SEQ: int 2
+
+; --- node kinds ---
+define NK_LEAF: int 0
+define NK_GROUP: int 1
+
+; Transition::invalidIndex sentinel, and the "no value" marker for the u32
+; scratch tables (C++ size_t(-1) / uint(-1)).
+define INVALID_U32: u32 0xFFFFFFFF
+
+; --- the compile-time SCRATCH arena ---------------------------------------
+; Everything the position-automaton construction BUILDS is dead the moment
+; `compile` returns: the FIRST/LAST sets and their arrays, the per-member
+; temporaries of or_/seq_/and_analyze1, GroupInfo and its next_type_index
+; table, and the min_buf/elem_buf tables `finish` scribbles on. What SURVIVES
+; is the CmNode graph, each leaf's `follow`/`ai_follow` arrays, and the
+; CompiledModelGroup — and none of those is affected by which page the
+; analysis runs on, because a follow array grows through
+; `Page.get(the Array)`, i.e. the CmNode's OWN page, not the caller's.
+;
+; The reference gets this for free: its FirstSet/LastSet are stack locals and
+; its `Vector<unsigned> minAndDepth(...)` is freed at the end of compile. On a
+; bump region the same objects live as long as the DTD does — measured on the
+; 198-KB DocBook DTD (tests/dazzle/sizeprof): 3.3 MB of a 30.8 MB parse, and
+; content-model compilation is HALF that parse.
+;
+; Escape hatch: SP_CM_SCRATCH=0 puts the scratch back on `host`, i.e. restores
+; the historical lifetime exactly (ParserOptions.cm_scratch).
+
+; A follow transition annotated for AND-group tracking (struct Transition).
+define Transition
+(
+    clear_and_state_start_index: u32
+    and_depth: u32
+    isolated: bool
+    require_clear: u32
+    to_set: u32
+)
+{
+    init(clear_and_state_start_index: u32, and_depth: u32, isolated: bool, require_clear: u32, to_set: u32)
+    {
+        this.clear_and_state_start_index := clear_and_state_start_index
+        this.and_depth := and_depth
+        this.isolated := isolated
+        this.require_clear := require_clear
+        this.to_set := to_set
+    }
+}
+
+; A detected content-model ambiguity (struct ContentModelAmbiguity).
+define Ambiguity
+(
+    from: ref[CmNode]
+    to1: ref[CmNode]
+    to2: ref[CmNode]
+    and_depth: u32
+)
+{
+    init(from: ref[CmNode], to1: ref[CmNode], to2: ref[CmNode], and_depth: u32)
+    {
+        this.from := from
+        this.to1 := to1
+        this.to2 := to2
+        this.and_depth := and_depth
+    }
+}
+
+; The flattened content-token node. Group fields are meaningful when
+; kind = NK_GROUP; leaf fields when kind = NK_LEAF. AND-group state
+; (g_*) is meaningful only for connector = CONN_AND groups; AND-info
+; (ai_*) only for leaves inside an AND group.
+define CmNode
+(
+    kind: int
+    occurrence: int
+    var inherently_optional: bool
+
+    ; --- group ---
+    connector: int
+    members: ref[Array[ref[CmNode]?]]?
+    var g_and_depth: u32
+    var g_and_index: u32
+    var g_and_group_index: u32
+    var g_and_ancestor: ref[CmNode]?
+
+    ; --- leaf ---
+    element: ref[ElementType]?
+    var leaf_index: u32
+    var type_index: u32
+    follow: ref[Array[ref[CmNode]?]]?
+    ai_follow: ref[Array[Transition]]?
+    var n_follow: u32
+    var is_final: bool
+    var or_group_member: bool
+    var pcdata_transition_type: int
+    var simple_pcdata_transition: ref[CmNode]?
+    var has_required: bool
+    var required_index: u32
+    var has_and_info: bool
+    var ai_ancestor: ref[CmNode]?
+    var ai_group_index: u32
+    is_initial: bool
+    is_pcdata: bool
+
+    ; --- data tag (DataTagElementToken) ---
+    ; A data-tag element token is an ElementToken carrying the parsed data-tag
+    ; templates_ and (optionally) paddingTemplate_ (ContentToken.cxx:156). The
+    ; reference stores them but never consumes them — the DATATAG runtime is
+    ; itself unimplemented (datatagNotImplemented). Ported faithfully so the
+    ; storage matches; in the compiled model a DataTagElementToken behaves
+    ; exactly as ElementToken(element, none).
+    var is_data_tag: bool
+    var dt_templates: ref[Array[Text]]?
+    var dt_have_padding: bool
+    var dt_padding: ref[Text]?
+)
+
+; Model-group analysis scratch (struct GroupInfo).
+define GroupInfo
+(
+    var next_leaf_index: u32
+    var contains_pcdata: bool
+    var and_state_size: u32
+    next_type_index: Slice[u32]
+    n_type: size_t
+)
+
+; FIRST set with the contextually-required-token marker (class FirstSet).
+define FirstSet
+(
+    v: ref[Array[ref[CmNode]?]]
+    var has_required: bool
+    var required_index: u32
+)
+
+; LAST set (class LastSet).
+define LastSet
+(
+    var v: ref[Array[ref[CmNode]?]]
+)
+
+; AndState: which AND-group members have been matched (class AndState).
+define AndState
+(
+    var clear_from: u32
+    v: Slice[u8]
+    n: u32
+)
+
+; The compiled model + entry pseudo-token (class CompiledModelGroup).
+define CompiledModelGroup
+(
+    model_group: ref[CmNode]?
+    initial: ref[CmNode]
+    and_state_size: u32
+    contains_pcdata: bool
+)
+
+; Automaton cursor over a compiled model (class MatchState).
+define MatchState
+(
+    var pos: ref[CmNode]?
+    var and_state: ref[AndState]
+    var min_and_depth: u32
+)
+
+define ContentToken
+{
+    ; ---- occurrence-indicator bit helpers (opt bit = &01, plus bit = &02) ----
+    function is_opt(oi: int) returns bool
+        (oi = OI_OPT) || (oi = OI_REP)
+
+    function is_plus(oi: int) returns bool
+        (oi = OI_PLUS) || (oi = OI_REP)
+
+    ; ---- constructors ----
+    function make_leaf(host: ref[Page], element: ref[ElementType]?, oi: int, is_pcdata: bool, is_initial: bool) returns ref[CmNode]
+    {
+        let p &CmNode^host(NK_LEAF, oi, false, CONN_SEQ, null, 0, 0, 0, null, element, 0, 0, Array[ref[CmNode]?]^host(), Array[Transition]^host(), 0, false, false, 0, null, false, 0, false, null, 0, is_initial, is_pcdata, false, null, false, null)
+        p
+    }
+
+    ; DataTagElementToken(element, templates[, paddingTemplate]) — an
+    ; ElementToken(element, none) that additionally carries the data-tag
+    ; templates (ContentToken.cxx:156/166). have_padding selects the two-arg
+    ; vs three-arg reference constructor.
+    procedure make_data_tag_element(host: ref[Page], mutable element: ref[ElementType]?, templates: ref[Array[Text]]?, have_padding: bool, padding: ref[Text]?) returns ref[CmNode]
+    {
+        let p ContentToken.make_leaf(host, element, OI_NONE, false, false)
+        p.is_data_tag := true
+        p.dt_templates := templates
+        p.dt_have_padding := have_padding
+        p.dt_padding := padding
+        p
+    }
+
+    procedure make_group(host: ref[Page], connector: int, mutable members: ref[Array[ref[CmNode]?]], oi: int) returns ref[CmNode]
+    {
+        let p &CmNode^host(NK_GROUP, oi, false, connector, members, 0, 0, 0, null, null, 0, 0, null, null, 0, false, false, 0, null, false, 0, false, null, 0, false, false, false, null, false, null)
+
+        ; OrModelGroup ctor calls setOrGroup(): flag each DIRECT leaf member.
+        if connector = CONN_OR
+        {
+            var i: size_t 0
+            let n members.get_length()
+            while i < n
+            {
+                let m members[i]
+                if m.kind = NK_LEAF
+                    m.or_group_member := true
+                i := i + 1
+            }
+        }
+        p
+    }
+
+    function n_members(g: ref[CmNode]) returns u32
+        g.members.get_length() as u32
+
+    ; ContentToken::grpgtcnt / ModelGroup::grpgtcnt (ContentToken.cxx:65) —
+    ; the grand total of content tokens: 1 per node, groups add their members.
+    function grpgtcnt_of(g: ref[CmNode]) returns u64
+    {
+        var cnt: u64 1
+        if g.kind = NK_GROUP
+        {
+            var i: size_t 0
+            let n g.members.get_length()
+            while i < n
+            {
+                let m g.members[i] as ref[CmNode]
+                cnt := cnt + grpgtcnt_of(m)
+                i := i + 1
+            }
+        }
+        cnt
+    }
+
+    function member(g: ref[CmNode], i: u32) returns ref[CmNode]
+        g.members[(i as size_t)] as ref[CmNode]
+
+    ; static ContentToken::andDepth / andIndex
+    function and_depth_of(anc: ref[CmNode]?) returns u32
+    {
+        if anc = null
+            return 0 as u32
+
+        anc.g_and_depth + 1
+    }
+
+    function and_index_of(anc: ref[CmNode]?) returns u32
+    {
+        if anc = null
+            return 0 as u32
+
+        anc.g_and_index + n_members(anc as ref[CmNode])
+    }
+
+    ; ---- FirstSet / LastSet helpers ----
+    function make_first(host: ref[Page]) returns ref[FirstSet]
+    {
+        let f &FirstSet^host(Array[ref[CmNode]?]^host(), false, 0)
+        f
+    }
+
+    function make_last(host: ref[Page]) returns ref[LastSet]
+    {
+        let l &LastSet^host(Array[ref[CmNode]?]^host())
+        l
+    }
+
+    ; FirstSet::init(LeafContentToken *)
+    procedure first_init_leaf(mutable f: ref[FirstSet], p: ref[CmNode])
+    {
+        f.v.add(p)
+        f.required_index := 0
+        f.has_required := true
+    }
+
+    ; FirstSet::append
+    procedure first_append(mutable f: ref[FirstSet], other: ref[FirstSet])
+    {
+        if other.has_required
+        {
+            f.required_index := other.required_index + (f.v.get_length() as u32)
+            f.has_required := true
+        }
+        var i: size_t 0
+        let n other.v.get_length()
+        let buf other.v.as_slice()
+        while i < n
+        {
+            f.v.add(buf[i])
+            i := i + 1
+        }
+    }
+
+    procedure first_set_not_required(mutable f: ref[FirstSet])
+        f.has_required := false
+
+    ; LastSet::append
+    procedure last_append(mutable l: ref[LastSet], other: ref[LastSet])
+    {
+        var i: size_t 0
+        let n other.v.get_length()
+        let buf other.v.as_slice()
+        while i < n
+        {
+            l.v.add(buf[i])
+            i := i + 1
+        }
+    }
+
+    ; tempLast.swap(last): move other's contents into l (other is discarded).
+    procedure last_move(mutable l: ref[LastSet], other: ref[LastSet])
+        l.v := other.v
+
+    ; ---- analyze (ContentToken::analyze) ----
+    procedure analyze(host: ref[Page], mutable p: ref[CmNode], mutable info: ref[GroupInfo], and_ancestor: ref[CmNode]?, and_group_index: u32, mutable first: ref[FirstSet], mutable last: ref[LastSet])
+    {
+        analyze1(host, p, info, and_ancestor, and_group_index, first, last)
+        if is_opt(p.occurrence)
+            p.inherently_optional := true
+        if p.inherently_optional
+            first_set_not_required(first)
+        if is_plus(p.occurrence)
+            add_transitions(last, first, false, and_index_of(and_ancestor), and_depth_of(and_ancestor), false, INVALID_U32, INVALID_U32)
+    }
+
+    procedure analyze1(host: ref[Page], mutable p: ref[CmNode], mutable info: ref[GroupInfo], and_ancestor: ref[CmNode]?, and_group_index: u32, mutable first: ref[FirstSet], mutable last: ref[LastSet])
+    {
+        if p.kind = NK_LEAF
+        {
+            leaf_analyze1(host, p, info, and_ancestor, and_group_index, first, last)
+            return
+        }
+        if p.connector = CONN_AND
+        {
+            and_analyze1(host, p, info, and_ancestor, and_group_index, first, last)
+            return
+        }
+        if p.connector = CONN_OR
+        {
+            or_analyze1(host, p, info, and_ancestor, and_group_index, first, last)
+            return
+        }
+        seq_analyze1(host, p, info, and_ancestor, and_group_index, first, last)
+    }
+
+    ; LeafContentToken::analyze1 (+ PcdataToken override)
+    procedure leaf_analyze1(host: ref[Page], mutable p: ref[CmNode], mutable info: ref[GroupInfo], and_ancestor: ref[CmNode]?, and_group_index: u32, mutable first: ref[FirstSet], mutable last: ref[LastSet])
+    {
+        p.leaf_index := info.next_leaf_index
+        info.next_leaf_index := info.next_leaf_index + 1
+        var ei: size_t 0
+        if p.element <> null
+            ei := p.element.get_index()
+        p.type_index := info.next_type_index[ei]
+        info.next_type_index.put(ei, info.next_type_index[ei] + 1)
+        if and_ancestor <> null
+        {
+            p.has_and_info := true
+            p.ai_ancestor := and_ancestor
+            p.ai_group_index := and_group_index
+        }
+        if p.is_pcdata
+            info.contains_pcdata := true
+        first_init_leaf(first, p)
+        last.v.add(p)
+        p.inherently_optional := false
+    }
+
+    ; OrModelGroup::analyze1
+    procedure or_analyze1(host: ref[Page], mutable p: ref[CmNode], mutable info: ref[GroupInfo], and_ancestor: ref[CmNode]?, and_group_index: u32, mutable first: ref[FirstSet], mutable last: ref[LastSet])
+    {
+        analyze(host, member(p, 0), info, and_ancestor, and_group_index, first, last)
+        first_set_not_required(first)
+        p.inherently_optional := member(p, 0).inherently_optional
+        var i: u32 1
+        let n n_members(p)
+        while i < n
+        {
+            let temp_first make_first(host)
+            let temp_last make_last(host)
+            analyze(host, member(p, i), info, and_ancestor, and_group_index, temp_first, temp_last)
+            first_append(first, temp_first)
+            first_set_not_required(first)
+            last_append(last, temp_last)
+            p.inherently_optional := p.inherently_optional || member(p, i).inherently_optional
+            i := i + 1
+        }
+    }
+
+    ; SeqModelGroup::analyze1
+    procedure seq_analyze1(host: ref[Page], mutable p: ref[CmNode], mutable info: ref[GroupInfo], and_ancestor: ref[CmNode]?, and_group_index: u32, mutable first: ref[FirstSet], mutable last: ref[LastSet])
+    {
+        analyze(host, member(p, 0), info, and_ancestor, and_group_index, first, last)
+        p.inherently_optional := member(p, 0).inherently_optional
+        var i: u32 1
+        let n n_members(p)
+        while i < n
+        {
+            let temp_first make_first(host)
+            let temp_last make_last(host)
+            analyze(host, member(p, i), info, and_ancestor, and_group_index, temp_first, temp_last)
+            add_transitions(last, temp_first, true, and_index_of(and_ancestor), and_depth_of(and_ancestor), false, INVALID_U32, INVALID_U32)
+            if p.inherently_optional
+                first_append(first, temp_first)
+            if member(p, i).inherently_optional
+                last_append(last, temp_last)
+            if member(p, i).inherently_optional = false
+                last_move(last, temp_last)
+            p.inherently_optional := p.inherently_optional && member(p, i).inherently_optional
+            i := i + 1
+        }
+    }
+
+    ; AndModelGroup::analyze1
+    procedure and_analyze1(host: ref[Page], mutable p: ref[CmNode], mutable info: ref[GroupInfo], and_ancestor: ref[CmNode]?, and_group_index: u32, mutable first: ref[FirstSet], mutable last: ref[LastSet])
+    {
+        p.g_and_depth := and_depth_of(and_ancestor)
+        p.g_and_index := and_index_of(and_ancestor)
+        p.g_and_ancestor := and_ancestor
+        p.g_and_group_index := and_group_index
+        let n n_members(p)
+        if (p.g_and_index + n) > info.and_state_size
+            info.and_state_size := p.g_and_index + n
+
+        ; One FIRST/LAST set per member, kept for the cross-product below.
+        ; The elements are OPTIONAL references (`Slice[ref[X]?]`), the one
+        ; `ref` spelling a buffer of references has: with `pointer[ref[X]]`
+        ; elements, `set *(p + i): make_first(host)` was a store
+        ; THROUGH the (uninitialized) slot -- the RHS ref reads as its pointee,
+        ; the target ref writes as its pointee -- i.e. a struct copy into
+        ; garbage memory, measured in the IR on 2026-09-05. `put` stores INTO
+        ; the slot, and every read unwraps (`as ref[X]`); the slots are all
+        ; filled before the first read.
+        let first_vec allocate_slice[ref[FirstSet]?](host, n as size_t)
+        let last_vec allocate_slice[ref[LastSet]?](host, n as size_t)
+        var i: u32 0
+        while i < n
+        {
+            first_vec.put((i as size_t), make_first(host))
+            last_vec.put((i as size_t), make_last(host))
+            i := i + 1
+        }
+
+        analyze(host, member(p, 0), info, p, 0, (first_vec[0] as ref[FirstSet]), (last_vec[0] as ref[LastSet]))
+        first_append(first, (first_vec[0] as ref[FirstSet]))
+        first_set_not_required(first)
+        last_append(last, (last_vec[0] as ref[LastSet]))
+        p.inherently_optional := member(p, 0).inherently_optional
+        i := 1
+        while i < n
+        {
+            analyze(host, member(p, i), info, p, i, (first_vec[(i as size_t)] as ref[FirstSet]), (last_vec[(i as size_t)] as ref[LastSet]))
+            first_append(first, (first_vec[(i as size_t)] as ref[FirstSet]))
+            first_set_not_required(first)
+            last_append(last, (last_vec[(i as size_t)] as ref[LastSet]))
+            p.inherently_optional := p.inherently_optional && member(p, i).inherently_optional
+            i := i + 1
+        }
+
+        i := 0
+        while i < n
+        {
+            var j: u32 0
+            while j < n
+            {
+                if j <> i
+                {
+                    let iso member(p, j).inherently_optional = false
+                    add_transitions((last_vec[(i as size_t)] as ref[LastSet]), (first_vec[(j as size_t)] as ref[FirstSet]), false, p.g_and_index + n, p.g_and_depth + 1, iso, p.g_and_index + j, p.g_and_index + i)
+                }
+                j := j + 1
+            }
+            i := i + 1
+        }
+    }
+
+    ; static ContentToken::addTransitions over a LastSet
+    procedure add_transitions(mutable from: ref[LastSet], to: ref[FirstSet], maybe_required: bool, and_clear_index: u32, and_depth: u32, isolated: bool, require_clear: u32, to_set: u32)
+    {
+        var i: size_t 0
+        let n from.v.get_length()
+        let buf from.v.as_slice()
+        while i < n
+        {
+            leaf_add_transitions(buf[i] as ref[CmNode], to, maybe_required, and_clear_index, and_depth, isolated, require_clear, to_set)
+            i := i + 1
+        }
+    }
+
+    ; LeafContentToken::addTransitions
+    procedure leaf_add_transitions(mutable p: ref[CmNode], to: ref[FirstSet], maybe_required: bool, and_clear_index: u32, and_depth: u32, isolated: bool, require_clear: u32, to_set: u32)
+    {
+        if maybe_required && to.has_required
+        {
+            p.has_required := true
+            p.required_index := to.required_index + (p.follow.get_length() as u32)
+        }
+        let n to.v.get_length()
+        if n = 0
+            return
+        let buf to.v.get_buffer()
+        ; ★ONE growth for the whole batch instead of one per element. The batch
+        ; size is known right here, and a doubling Array on a bump region leaves
+        ; EVERY intermediate buffer behind — `Array.scaly` says it outright:
+        ; a sub-1-KB buffer "was never an exclusive page, so there is nothing to
+        ; release". The reference gets the reclaim for free because its
+        ; Vector<> is on malloc; we do not, so the batch size has to be used.
+        ;
+        ; Measured on the DocBook DTD before the change: this one loop abandoned
+        ; 48 332 buffers = 7.9 MB, which is 97 % of the whole content-model
+        ; compile's doubling garbage and 20 % of the DTD's entire cost.
+        ; ★Do NOT "fix" this class in Array instead: growing in place when the
+        ; old buffer sits at the page's bump frontier was measured and only
+        ; 1.5 % of these buffers qualify (the follow sets of many leaves grow
+        ; interleaved, so an array's buffer is almost never the last allocation).
+        let src Vector[ref[CmNode]?](n, buf)
+        p.follow.add(src)
+        if p.has_and_info
+        {
+            ; ai_follow takes n copies of ONE transition, so there is no source
+            ; vector to bulk-append from; it is also the rare arm (AND groups).
+            var i: size_t 0
+            while i < n
+            {
+                p.ai_follow.add(Transition(and_clear_index, and_depth, isolated, require_clear, to_set))
+                i := i + 1
+            }
+        }
+    }
+
+    ; ---- finish (CompiledModelGroup / LeafContentToken::finish) ----
+    procedure finish(mutable p: ref[CmNode], mutable min_buf: Slice[u32], mutable elem_buf: Slice[u32], mutable ambiguities: ref[Array[Ambiguity]], mutable pcdata_unreachable: ref[bool])
+    {
+        if p.kind = NK_GROUP
+        {
+            var i: u32 0
+            let n n_members(p)
+            while i < n
+            {
+                finish(member(p, i), min_buf, elem_buf, ambiguities, pcdata_unreachable)
+                i := i + 1
+            }
+            return
+        }
+        if p.has_and_info
+        {
+            leaf_and_finish(p, min_buf, elem_buf, ambiguities, pcdata_unreachable)
+            return
+        }
+        leaf_plain_finish(p, min_buf, elem_buf, ambiguities, pcdata_unreachable)
+    }
+
+    procedure reset_u32(mutable buf: Slice[u32])
+    {
+        var i: size_t 0
+        let n buf.length as size_t
+        while i < n
+        {
+            buf.put(i, INVALID_U32)
+            i := i + 1
+        }
+    }
+
+    ; LeafContentToken::finish (no AND-info)
+    procedure leaf_plain_finish(mutable p: ref[CmNode], mutable min_buf: Slice[u32], mutable elem_buf: Slice[u32], mutable ambiguities: ref[Array[Ambiguity]], mutable pcdata_unreachable: ref[bool])
+    {
+        reset_u32(min_buf)
+        reset_u32(elem_buf)
+        p.pcdata_transition_type := 0
+        p.simple_pcdata_transition := null
+        let n p.follow.get_length()
+        let fbuf p.follow.as_slice()
+        var j: u32 0
+        var i: size_t 0
+        while i < n
+        {
+            let target fbuf[i] as ref[CmNode]
+            let min_depth min_buf[(target.leaf_index as size_t)]
+            if min_depth <> 0
+            {
+                min_buf.put((target.leaf_index as size_t), 0)
+                if (j as size_t) <> i
+                    p.follow.put(j as size_t, target)
+                if p.has_required && (i = (p.required_index as size_t))
+                    p.required_index := j
+                var ei: u32 0
+                if target.element = null
+                {
+                    if target.has_and_info = false
+                    {
+                        p.simple_pcdata_transition := target
+                        p.pcdata_transition_type := 1
+                    }
+                    if target.has_and_info
+                        p.pcdata_transition_type := 2
+                    ei := 0
+                }
+                if target.element <> null
+                    ei := target.element.get_index() as u32
+                let prev elem_buf[(ei as size_t)]
+                if prev <> INVALID_U32
+                {
+                    let prevtok p.follow[(prev as size_t)] as ref[CmNode]
+                    if prevtok <> target
+                        ambiguities.add(Ambiguity(p, prevtok, target, 0))
+                }
+                elem_buf.put((ei as size_t), j)
+                j := j + 1
+            }
+            i := i + 1
+        }
+        if p.pcdata_transition_type = 0
+            pcdata_unreachable := true
+        p.n_follow := j
+    }
+
+    ; LeafContentToken::andFinish
+    procedure leaf_and_finish(mutable p: ref[CmNode], mutable min_buf: Slice[u32], mutable elem_buf: Slice[u32], mutable ambiguities: ref[Array[Ambiguity]], mutable pcdata_unreachable: ref[bool])
+    {
+        reset_u32(min_buf)
+        reset_u32(elem_buf)
+        p.pcdata_transition_type := 0
+        p.simple_pcdata_transition := null
+        var pcdata_min_covered: u32 0
+        let n p.follow.get_length()
+        let fbuf p.follow.as_slice()
+        let afbuf p.ai_follow.as_slice()
+        var j: u32 0
+        var i: size_t 0
+        while i < n
+        {
+            let target fbuf[i] as ref[CmNode]
+            let tr afbuf[i]
+            let min_depth min_buf[(target.leaf_index as size_t)]
+            if tr.and_depth < min_depth
+            {
+                min_buf.put((target.leaf_index as size_t), tr.and_depth)
+                if (j as size_t) <> i
+                {
+                    p.follow.put(j as size_t, target)
+                    p.ai_follow.put(j as size_t, tr)
+                }
+                if p.has_required && (i = (p.required_index as size_t))
+                    p.required_index := j
+                var ei: u32 0
+                if target.element = null
+                {
+                    ; Branch on the type as it was BEFORE this pcdata target
+                    ; (the first-target arm below flips it to 2).
+                    let was_zero p.pcdata_transition_type = 0
+                    if was_zero
+                    {
+                        var anc p.ai_ancestor
+                        var group_index p.ai_group_index
+                        var stop false
+                        while (anc <> null) && (stop = false)
+                        {
+                            var has_non_null false
+                            var k: u32 0
+                            let nm n_members(anc as ref[CmNode])
+                            while k < nm
+                            {
+                                if (k <> group_index) && (member(anc as ref[CmNode], k).inherently_optional = false)
+                                {
+                                    has_non_null := true
+                                    k := nm
+                                }
+                                if k < nm
+                                    k := k + 1
+                            }
+                            if has_non_null
+                            {
+                                if tr.and_depth <= anc.g_and_depth
+                                    pcdata_unreachable := true
+                                stop := true
+                            }
+                            if has_non_null = false
+                            {
+                                group_index := anc.g_and_group_index
+                                anc := anc.g_and_ancestor
+                            }
+                        }
+                        if tr.isolated
+                            pcdata_min_covered := tr.and_depth
+                        p.pcdata_transition_type := 2
+                    }
+                    if was_zero = false
+                    {
+                        if pcdata_min_covered > (tr.and_depth + 1)
+                            pcdata_unreachable := true
+                        if tr.isolated
+                            pcdata_min_covered := tr.and_depth
+                        if tr.isolated = false
+                            pcdata_min_covered := 0
+                    }
+                    ei := 0
+                }
+                if target.element <> null
+                    ei := target.element.get_index() as u32
+                let previ elem_buf[(ei as size_t)]
+                if previ <> INVALID_U32
+                {
+                    let prevtok p.follow[(previ as size_t)] as ref[CmNode]
+                    let prevtr p.ai_follow[(previ as size_t)]
+                    if (prevtok <> target) && ((prevtr.and_depth = tr.and_depth) || (prevtr.isolated = false))
+                        ambiguities.add(Ambiguity(p, prevtok, target, tr.and_depth))
+                    if prevtr.isolated
+                        elem_buf.put((ei as size_t), j)
+                }
+                if previ = INVALID_U32
+                    elem_buf.put((ei as size_t), j)
+                j := j + 1
+            }
+            i := i + 1
+        }
+        if (pcdata_min_covered > 0) || (p.pcdata_transition_type = 0)
+            pcdata_unreachable := true
+        p.n_follow := j
+    }
+
+    ; ---- compile (CompiledModelGroup::compile) ----
+    ; the analysis host for ONE content model: an exclusive page chain off
+    ; `host` when the seam is on, otherwise `host` itself.
+    procedure cm_scratch(host: ref[Page], on: bool) returns ref[Page]
+    {
+        if on = false
+            return host
+        host.allocate_exclusive_page()
+    }
+
+    procedure release_cm_scratch(host: ref[Page], scratch: ref[Page])
+    {
+        if scratch = host
+            return
+        host.deallocate_exclusive_page(scratch)
+    }
+
+    procedure compile(host: ref[Page], mutable model_group: ref[CmNode], n_element_type_index: size_t, mutable ambiguities: ref[Array[Ambiguity]], mutable pcdata_unreachable: ref[bool], scratch_on: bool) returns ref[CompiledModelGroup]
+    {
+        ; ★Every allocation below that is NOT explicitly on `host` goes on the
+        ; scratch and dies at the release at the end of this function. The two
+        ; that must stay are `cmg` and `initial` — see the note at
+        ; the scratch arena for why the follow arrays need no thought.
+        let scratch ContentToken.cm_scratch(host, scratch_on)
+        let first make_first(scratch)
+        let last make_last(scratch)
+        let info &GroupInfo^scratch(0, false, 0, allocate_slice[u32](scratch, n_element_type_index), n_element_type_index)
+        var ti: size_t 0
+        while ti < n_element_type_index
+        {
+            info.next_type_index.put(ti, 0)
+            ti := ti + 1
+        }
+
+        ; the whole analysis subtree allocates ONLY scratch: make_first /
+        ; make_last and, in the AND arm, the two n*8 member vectors. The
+        ; per-leaf writes it makes (leaf_index, type_index, and-info) are
+        ; scalars and pointers to CmNodes, never into the scratch.
+        analyze(scratch, model_group, info, null, 0, first, last)
+
+        var li: size_t 0
+        let ln last.v.get_length()
+        let lbuf last.v.as_slice()
+        while li < ln
+        {
+            let t lbuf[li]
+            t.is_final := true
+            li := li + 1
+        }
+
+        ; ★`initial` is reachable from `cmg` and its `follow` array is filled
+        ; below — it stays on `host`. The SET that carries it into
+        ; add_transitions is scratch.
+        let initial make_leaf(host, null, OI_NONE, false, true)
+        let cmg &CompiledModelGroup^host(model_group, initial, info.and_state_size, info.contains_pcdata)
+        let initial_set make_last(scratch)
+        initial_set.v.add(initial)
+        add_transitions(initial_set, first, true, 0, 0, false, INVALID_U32, INVALID_U32)
+        if model_group.inherently_optional
+            initial.is_final := true
+
+        pcdata_unreachable := false
+        let n_leaves info.next_leaf_index
+        var min_alloc n_leaves as size_t
+        if min_alloc < 1
+            min_alloc := 1
+        let min_buf allocate_slice[u32](scratch, min_alloc)
+        var elem_alloc n_element_type_index
+        if elem_alloc < 1
+            elem_alloc := 1
+        let elem_buf allocate_slice[u32](scratch, elem_alloc)
+        let min_view min_buf.slice_to(n_leaves as size_t)
+        let elem_view elem_buf.slice_to(n_element_type_index as size_t)
+
+        finish(initial, min_view, elem_view, ambiguities, pcdata_unreachable)
+        finish(model_group, min_view, elem_view, ambiguities, pcdata_unreachable)
+        if cmg.contains_pcdata = false
+            pcdata_unreachable := false
+        ContentToken.release_cm_scratch(host, scratch)
+        cmg
+    }
+
+    ; ---- AndState (class AndState) ----
+    function make_and_state(host: ref[Page], n: u32) returns ref[AndState]
+    {
+        var v Slice[u8]()
+        if n <> 0
+        {
+            v := allocate_slice[u8](host, n as size_t)
+            var i: size_t 0
+            while i < (n as size_t)
+            {
+                v.put(i, 0)
+                i := i + 1
+            }
+        }
+        let a &AndState^host(0, v, n)
+        a
+    }
+
+    function and_state_is_clear(a: ref[AndState], i: u32) returns bool
+        a.v[(i as size_t)] = 0
+
+    procedure and_state_set(mutable a: ref[AndState], i: u32)
+    {
+        a.v.put((i as size_t), 1)
+        if i >= a.clear_from
+            a.clear_from := i + 1
+    }
+
+    procedure and_state_clear_from(mutable a: ref[AndState], i: u32)
+    {
+        if i < a.clear_from
+            while a.clear_from > i
+            {
+                a.clear_from := a.clear_from - 1
+                a.v.put((a.clear_from as size_t), 0)
+            }
+    }
+
+    ; unsigned LeafContentToken::computeMinAndDepth
+    function compute_min_and_depth(p: ref[CmNode], a: ref[AndState]) returns u32
+    {
+        if p.has_and_info = false
+            return 0 as u32
+
+        var group_index p.ai_group_index
+        var group p.ai_ancestor
+        while group <> null
+        {
+            var i: u32 0
+            let nm n_members(group as ref[CmNode])
+            while i < nm
+            {
+                if (i <> group_index) && (member(group as ref[CmNode], i).inherently_optional = false) && and_state_is_clear(a, group.g_and_index + i)
+                    return group.g_and_depth + 1
+                i := i + 1
+            }
+            group_index := group.g_and_group_index
+            group := group.g_and_ancestor
+        }
+        0 as u32
+    }
+
+    ; Boolean LeafContentToken::tryTransition
+    procedure try_transition(p: ref[CmNode], to: ref[ElementType]?, mutable a: ref[AndState], mutable min_and_depth: ref[u32], mutable newpos: ref[ref[CmNode]?]) returns bool
+    {
+        var i: size_t 0
+        let n p.n_follow as size_t
+        let fbuf p.follow.as_slice()
+        while i < n
+        {
+            let target fbuf[i] as ref[CmNode]
+            if target.element = to
+            {
+                if p.has_and_info = false
+                {
+                    newpos := target
+                    min_and_depth := compute_min_and_depth(target, a)
+                    return true
+                }
+                let tr p.ai_follow[i]
+                if ((tr.require_clear = INVALID_U32) || and_state_is_clear(a, tr.require_clear)) && (tr.and_depth >= min_and_depth)
+                {
+                    if tr.to_set <> INVALID_U32
+                        and_state_set(a, tr.to_set)
+                    and_state_clear_from(a, tr.clear_and_state_start_index)
+                    newpos := target
+                    min_and_depth := compute_min_and_depth(target, a)
+                    return true
+                }
+            }
+            i := i + 1
+        }
+        newpos := null
+        false
+    }
+
+    ; Boolean LeafContentToken::tryTransitionPcdata
+    procedure try_transition_pcdata(p: ref[CmNode], mutable a: ref[AndState], mutable min_and_depth: ref[u32], mutable newpos: ref[ref[CmNode]?]) returns bool
+    {
+        if p.pcdata_transition_type = 1
+        {
+            newpos := p.simple_pcdata_transition
+            return true
+        }
+        if p.pcdata_transition_type = 0
+        {
+            newpos := null
+            return false
+        }
+        try_transition(p, null, a, min_and_depth, newpos)
+    }
+
+    ; ---- MatchState (class MatchState) ----
+    function make_match_state(host: ref[Page], model: ref[CompiledModelGroup]?) returns ref[MatchState]
+    {
+        var pos: ref[CmNode]? null
+        var and_state_size 0 as u32
+        if model <> null
+        {
+            pos := model.initial
+            and_state_size := model.and_state_size
+        }
+        let ms &MatchState^host(pos, make_and_state(host, and_state_size), 0)
+        ms
+    }
+
+    ; Re-arm an existing MatchState for `model` — make_match_state's
+    ; counterpart for a recycled OpenElement (ContentState.acquire_element).
+    ; The AndState is reused only when its size matches EXACTLY; a different
+    ; size gets a fresh one, which keeps `n` honest for every consumer that
+    ; iterates it. AND groups are rare, so nearly every element in a real
+    ; document wants size 0 and reuses.
+    procedure reset_match_state(host: ref[Page], mutable ms: ref[MatchState], model: ref[CompiledModelGroup]?)
+    {
+        ms.min_and_depth := 0
+        var want: u32 0
+        if model = null
+            ms.pos := null
+        else
+        {
+            ms.pos := model.initial
+            want := model.and_state_size
+        }
+        let a ms.and_state
+        if a.n <> want
+            ms.and_state := ContentToken.make_and_state(host, want)
+        else
+        {
+            a.clear_from := 0
+            var i: size_t 0
+            while i < (want as size_t)
+            {
+                a.v.put(i, 0)
+                i := i + 1
+            }
+        }
+    }
+
+    procedure ms_try_transition(mutable ms: ref[MatchState], to: ref[ElementType]?) returns bool
+    {
+        if ms.pos = null
+            return true
+
+        ; A CELL whose ADDRESS is handed to a `pointer[pointer[CmNode]]`
+        ; out-param: the outer pointer is what makes it writable from the
+        ; callee, so the inner stays a pointer too.
+        var newpos: ref[CmNode]? null
+        if try_transition(ms.pos as ref[CmNode], to, ms.and_state, &ms.min_and_depth, &newpos)
+        {
+            ms.pos := newpos
+            return true
+        }
+        false
+    }
+
+    procedure ms_try_transition_pcdata(mutable ms: ref[MatchState]) returns bool
+    {
+        if ms.pos = null
+            return true
+
+        ; A CELL whose ADDRESS is handed to a `pointer[pointer[CmNode]]`
+        ; out-param: the outer pointer is what makes it writable from the
+        ; callee, so the inner stays a pointer too.
+        var newpos: ref[CmNode]? null
+        if try_transition_pcdata(ms.pos as ref[CmNode], ms.and_state, &ms.min_and_depth, &newpos)
+        {
+            ms.pos := newpos
+            return true
+        }
+        false
+    }
+
+    function ms_is_finished(ms: ref[MatchState]) returns bool
+    {
+        if ms.pos = null
+            return true
+
+        ms.pos.is_final && (ms.min_and_depth = 0)
+    }
+
+    ; const LeafContentToken *currentPosition() const — the cursor's leaf.
+    function ms_current_position(ms: ref[MatchState]) returns ref[CmNode]
+        ms.pos as ref[CmNode]
+
+    ; LeafContentToken::impliedStartTag — the uniquely-required next element at
+    ; this position (OMITTAG start-tag omission), or null. Returns its element
+    ; type directly (the C++ caller only wants token->elementType()).
+    function ms_implied_start_tag(ms: ref[MatchState]) returns ref[ElementType]?
+    {
+        let p ms.pos
+        if p = null
+            return null
+        if p.has_required = false
+            return null
+        if p.has_and_info = false
+        {
+            let tok p.follow[(p.required_index as size_t)]
+            return tok.element
+        }
+        let tr p.ai_follow[(p.required_index as size_t)]
+        if ((tr.require_clear = INVALID_U32) || and_state_is_clear(ms.and_state, tr.require_clear)) && (tr.and_depth >= ms.min_and_depth)
+        {
+            let tok p.follow[(p.required_index as size_t)]
+            return tok.element
+        }
+        null
+    }
+
+    ; LeafContentToken::doRequiredTransition — advance the cursor along the
+    ; required transition (must follow a true ms_implied_start_tag).
+    procedure ms_do_required_transition(mutable ms: ref[MatchState])
+    {
+        let p ms.pos
+        if p = null
+            return
+        if p.has_and_info
+        {
+            let tr p.ai_follow[(p.required_index as size_t)]
+            if tr.to_set <> INVALID_U32
+                and_state_set(ms.and_state, tr.to_set)
+            and_state_clear_from(ms.and_state, tr.clear_and_state_start_index)
+        }
+        let newpos p.follow[(p.required_index as size_t)] as ref[CmNode]
+        ms.pos := newpos
+        ms.min_and_depth := compute_min_and_depth(newpos, ms.and_state)
+    }
+
+    ; LeafContentToken accessors for the parser (fields are module-local).
+    function token_element(tok: ref[CmNode]) returns ref[ElementType]?
+        tok.element
+
+    ; typeIndex — which occurrence of its element type this leaf is in the
+    ; model (feeds the "%1 occurrence of %2" ordinal messages).
+    function token_type_index(tok: ref[CmNode]) returns u32
+        tok.type_index
+
+    ; MatchState copy (the C++ value copy: pos + minAndDepth + a deep copy of
+    ; the AndState vector) — the OMITTAG undo machinery snapshots the state
+    ; before a speculative required transition and restores it on rollback.
+    function ms_copy(host: ref[Page], ms: ref[MatchState]) returns ref[MatchState]
+    {
+        let src ms.and_state
+        var v Slice[u8]()
+        if src.n <> 0
+        {
+            v := allocate_slice[u8](host, src.n as size_t)
+            var i: size_t 0
+            while i < (src.n as size_t)
+            {
+                v.put(i, src.v[i])
+                i := i + 1
+            }
+        }
+        let a &AndState^host(src.clear_from, v, src.n)
+        let c &MatchState^host(ms.pos, a, ms.min_and_depth)
+        c
+    }
+
+    ; LeafContentToken::impliedStartTag, returning the required TOKEN itself —
+    ; requiredElementExcluded needs its typeIndex (the ordinal occurrence of the
+    ; element in the model). ms_implied_start_tag keeps the element-only shape.
+    function ms_implied_start_token(ms: ref[MatchState]) returns ref[CmNode]?
+    {
+        let p ms.pos
+        if p = null
+            return null
+        if p.has_required = false
+            return null
+        if p.has_and_info = false
+            return p.follow[(p.required_index as size_t)]
+        let tr p.ai_follow[(p.required_index as size_t)]
+        if ((tr.require_clear = INVALID_U32) || and_state_is_clear(ms.and_state, tr.require_clear)) && (tr.and_depth >= ms.min_and_depth)
+            return p.follow[(p.required_index as size_t)]
+        null
+    }
+
+    ; LeafContentToken::possibleTransitions — every element type reachable by
+    ; one transition from the current position (null entries = the #PCDATA
+    ; leaf), and-gated exactly like tryTransition.
+    procedure ms_possible_transitions(ms: ref[MatchState], mutable v: ref[Array[ref[ElementType]?]])
+    {
+        let p ms.pos
+        if p = null
+            return
+        let n p.n_follow as size_t
+        let fbuf p.follow.as_slice()
+        var i: size_t 0
+        while i < n
+        {
+            let target fbuf[i] as ref[CmNode]
+            if p.has_and_info = false
+                v.add(target.element)
+            else
+            {
+                let tr p.ai_follow[i]
+                if ((tr.require_clear = INVALID_U32) || and_state_is_clear(ms.and_state, tr.require_clear)) && (tr.and_depth >= ms.min_and_depth)
+                    v.add(target.element)
+            }
+            i := i + 1
+        }
+    }
+
+    ; MatchState::invalidExclusion — the transition token for `to` when it is
+    ; neither inherently optional nor an OR-group member (excluding it would
+    ; break the model); null otherwise. transitionToken = the and-gated lookup
+    ; without taking the transition.
+    function ms_invalid_exclusion(ms: ref[MatchState], to: ref[ElementType]) returns ref[CmNode]?
+    {
+        let p ms.pos
+        if p = null
+            return null
+        var token: ref[CmNode]? null
+        let n p.n_follow as size_t
+        let fbuf p.follow.as_slice()
+        var i: size_t 0
+        while i < n
+        {
+            if token = null
+            {
+                let target fbuf[i] as ref[CmNode]
+                if target.element = to
+                {
+                    if p.has_and_info = false
+                        token := target
+                    else
+                    {
+                        let tr p.ai_follow[i]
+                        if ((tr.require_clear = INVALID_U32) || and_state_is_clear(ms.and_state, tr.require_clear)) && (tr.and_depth >= ms.min_and_depth)
+                            token := target
+                    }
+                }
+            }
+            i := i + 1
+        }
+        if token = null
+            return null
+        if (token.inherently_optional = false) && (token.or_group_member = false)
+            return token
+        null
+    }
+
+    ; AndState::operator== — equal up to the point where both have cleared.
+    function as_equals(a: ref[AndState], b: ref[AndState]) returns bool
+    {
+        var i: u32 0
+        while i < a.n
+        {
+            if (i >= a.clear_from) && (i >= b.clear_from)
+                return true
+            if a.v[(i as size_t)] <> b.v[(i as size_t)]
+                return false
+            i := i + 1
+        }
+        true
+    }
+
+    ; MatchState::operator== — same position, same AND state, same min depth.
+    function ms_equals(a: ref[MatchState], b: ref[MatchState]) returns bool
+    {
+        if a.pos <> b.pos
+            return false
+        if as_equals(a.and_state, b.and_state) = false
+            return false
+        a.min_and_depth = b.min_and_depth
+    }
+
+    ; ---- self-test helpers ----
+    ; make_group / compile take their group members and ambiguity list BY
+    ; POINTER (they become fields of the pointer-linked model graph).
+    ; ★ The reason recorded here used to be that `Array[...]^host()` "yields a
+    ; VALUE, so allocate a page slot and store the fresh Array through it".
+    ; That is FALSE and it seeded this idiom across three packages: `^host`
+    ; places the OBJECT on host, and `&` on a let-bound construction is the
+    ; IDENTITY there, so `let v Array[...]^host()` + `&v` already IS the real
+    ; pointer -- measured, `Page.get(&v)` answers host and the reference
+    ; survives the return. The allocate form builds a stack TEMPORARY and
+    ; copies it into the slot, which is one object identity too many and the
+    ; residency hazard whenever the init carries a `^this`. Kept here as
+    ; residue on the conversion list (tools/caretctor/), not as a pattern.
+    function new_node_vec(host: ref[Page]) returns ref[Array[ref[CmNode]?]]
+    {
+        let v host.allocate(sizeof Array[ref[CmNode]?], alignof Array[ref[CmNode]?]) as pointer[Array[ref[CmNode]?]]
+        *v := Array[ref[CmNode]?]^host()
+        v
+    }
+
+    function new_amb_vec(host: ref[Page]) returns ref[Array[Ambiguity]]
+    {
+        let v host.allocate(sizeof Array[Ambiguity], alignof Array[Ambiguity]) as pointer[Array[Ambiguity]]
+        *v := Array[Ambiguity]^host()
+        v
+    }
+
+    ; ---- self-test ----
+    ; Build models, compile, and drive MatchState through element sequences.
+    procedure test() returns int
+    {
+        ; Bootstrap the run region: a page-resident StringC gives us its page.
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+
+        ; element types a=1..d=4 (index 0 reserved for #PCDATA). Allocated as
+        ; host-page pointers (the ContentToken graph references ElementType by
+        ; pointer everywhere). ★ The "a `^host` construction yields a VALUE"
+        ; claim that used to stand here is FALSE -- see new_node_vec above.
+        ; These four additionally pass a CONTENT-BEARING `StringC("a")` into
+        ; the init, the one shape where the temporary is not merely wasteful.
+        let a &ElementType^host(StringC("a"), 1)
+        let b &ElementType^host(StringC("b"), 2)
+        let c &ElementType^host(StringC("c"), 3)
+        let d &ElementType^host(StringC("d"), 4)
+        let n_types: size_t 5
+
+        let amb new_amb_vec(host)
+        var unreach false
+
+        ; --- (a, b, c) : strict sequence ---
+        let m1 new_node_vec(host)
+        m1.add(make_leaf(host, a, OI_NONE, false, false))
+        m1.add(make_leaf(host, b, OI_NONE, false, false))
+        m1.add(make_leaf(host, c, OI_NONE, false, false))
+        let seq make_group(host, CONN_SEQ, m1, OI_NONE)
+        let cseq compile(host, seq, n_types, amb, &unreach, true)
+
+        let s1 make_match_state(host, cseq)
+        if ms_try_transition(s1, a) = false
+            return -1
+        if ms_is_finished(s1)
+            return -2
+        if ms_try_transition(s1, b) = false
+            return -3
+        if ms_try_transition(s1, c) = false
+            return -4
+        if ms_is_finished(s1) = false
+            return -5
+
+        ; wrong first element rejected
+        let s1b make_match_state(host, cseq)
+        if ms_try_transition(s1b, b)
+            return -6
+        ; skipping c mid-sequence: after a, b -> not finished, and c is required
+        let s1c make_match_state(host, cseq)
+        ms_try_transition(s1c, a)
+        ms_try_transition(s1c, b)
+        if ms_is_finished(s1c)
+            return -7
+
+        ; --- (a, b?, c) : optional middle ---
+        let m2 new_node_vec(host)
+        m2.add(make_leaf(host, a, OI_NONE, false, false))
+        m2.add(make_leaf(host, b, OI_OPT, false, false))
+        m2.add(make_leaf(host, c, OI_NONE, false, false))
+        let seq2 make_group(host, CONN_SEQ, m2, OI_NONE)
+        let cseq2 compile(host, seq2, n_types, amb, &unreach, true)
+
+        ; a then c (skip b)
+        let s2 make_match_state(host, cseq2)
+        if ms_try_transition(s2, a) = false
+            return -8
+        if ms_try_transition(s2, c) = false
+            return -9
+        if ms_is_finished(s2) = false
+            return -10
+        ; a, b, c
+        let s2b make_match_state(host, cseq2)
+        if ms_try_transition(s2b, a) = false
+            return -11
+        if ms_try_transition(s2b, b) = false
+            return -12
+        if ms_try_transition(s2b, c) = false
+            return -13
+        if ms_is_finished(s2b) = false
+            return -14
+
+        ; --- (a | b) : choice ---
+        let m3 new_node_vec(host)
+        m3.add(make_leaf(host, a, OI_NONE, false, false))
+        m3.add(make_leaf(host, b, OI_NONE, false, false))
+        let org make_group(host, CONN_OR, m3, OI_NONE)
+        let cor compile(host, org, n_types, amb, &unreach, true)
+
+        let s3 make_match_state(host, cor)
+        if ms_try_transition(s3, a) = false
+            return -15
+        if ms_is_finished(s3) = false
+            return -16
+        if ms_try_transition(s3, b)
+            return -17
+        let s3b make_match_state(host, cor)
+        if ms_try_transition(s3b, b) = false
+            return -18
+        if ms_is_finished(s3b) = false
+            return -19
+
+        ; --- (a+) : one or more ---
+        let m4 new_node_vec(host)
+        m4.add(make_leaf(host, a, OI_PLUS, false, false))
+        let seq4 make_group(host, CONN_SEQ, m4, OI_NONE)
+        let cplus compile(host, seq4, n_types, amb, &unreach, true)
+
+        let s4 make_match_state(host, cplus)
+        if ms_is_finished(s4)
+            return -20
+        if ms_try_transition(s4, a) = false
+            return -21
+        if ms_is_finished(s4) = false
+            return -22
+        if ms_try_transition(s4, a) = false
+            return -23
+        if ms_is_finished(s4) = false
+            return -24
+        if ms_try_transition(s4, b)
+            return -25
+
+        ; --- (#PCDATA | a)* : mixed content ---
+        let m5 new_node_vec(host)
+        m5.add(make_leaf(host, null, OI_REP, true, false))
+        m5.add(make_leaf(host, a, OI_NONE, false, false))
+        let org5 make_group(host, CONN_OR, m5, OI_REP)
+        let cmix compile(host, org5, n_types, amb, &unreach, true)
+
+        let s5 make_match_state(host, cmix)
+        ; empty is valid (rep => inherently optional)
+        if ms_is_finished(s5) = false
+            return -26
+        if ms_try_transition_pcdata(s5) = false
+            return -27
+        if ms_try_transition(s5, a) = false
+            return -28
+        if ms_try_transition_pcdata(s5) = false
+            return -29
+        if ms_is_finished(s5) = false
+            return -30
+
+        ; --- (a & b) : AND group, either order ---
+        let m6 new_node_vec(host)
+        m6.add(make_leaf(host, a, OI_NONE, false, false))
+        m6.add(make_leaf(host, b, OI_NONE, false, false))
+        let andg make_group(host, CONN_AND, m6, OI_NONE)
+        let cand compile(host, andg, n_types, amb, &unreach, true)
+
+        ; a then b
+        let s6 make_match_state(host, cand)
+        if ms_try_transition(s6, a) = false
+            return -31
+        if ms_is_finished(s6)
+            return -32
+        if ms_try_transition(s6, b) = false
+            return -33
+        if ms_is_finished(s6) = false
+            return -34
+        ; b then a
+        let s6b make_match_state(host, cand)
+        if ms_try_transition(s6b, b) = false
+            return -35
+        if ms_try_transition(s6b, a) = false
+            return -36
+        if ms_is_finished(s6b) = false
+            return -37
+        ; each AND member exactly once: a then a again is rejected
+        let s6c make_match_state(host, cand)
+        if ms_try_transition(s6c, a) = false
+            return -38
+        if ms_try_transition(s6c, a)
+            return -39
+
+        ; --- (a, (b | c), d) : nested OR inside a SEQ ---
+        let inner new_node_vec(host)
+        inner.add(make_leaf(host, b, OI_NONE, false, false))
+        inner.add(make_leaf(host, c, OI_NONE, false, false))
+        let inner_or make_group(host, CONN_OR, inner, OI_NONE)
+        let m7 new_node_vec(host)
+        m7.add(make_leaf(host, a, OI_NONE, false, false))
+        m7.add(inner_or)
+        m7.add(make_leaf(host, d, OI_NONE, false, false))
+        let seq7 make_group(host, CONN_SEQ, m7, OI_NONE)
+        let cnest compile(host, seq7, n_types, amb, &unreach, true)
+
+        ; a, b, d
+        let s7 make_match_state(host, cnest)
+        if ms_try_transition(s7, a) = false
+            return -40
+        if ms_try_transition(s7, b) = false
+            return -41
+        if ms_try_transition(s7, d) = false
+            return -42
+        if ms_is_finished(s7) = false
+            return -43
+        ; a, c, d (other OR branch)
+        let s7b make_match_state(host, cnest)
+        if ms_try_transition(s7b, a) = false
+            return -44
+        if ms_try_transition(s7b, c) = false
+            return -45
+        if ms_try_transition(s7b, d) = false
+            return -46
+        if ms_is_finished(s7b) = false
+            return -47
+        ; a then d directly (OR group is required, not optional) -> rejected
+        let s7c make_match_state(host, cnest)
+        if ms_try_transition(s7c, a) = false
+            return -48
+        if ms_try_transition(s7c, d)
+            return -49
+        ; both OR branches cannot both be taken: a, b, c -> c rejected
+        let s7d make_match_state(host, cnest)
+        ms_try_transition(s7d, a)
+        ms_try_transition(s7d, b)
+        if ms_try_transition(s7d, c)
+            return -50
+
+        0
+    }
+}

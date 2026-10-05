@@ -1,0 +1,551 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.ISet.ISet
+use opensp.Sd.Sd
+use opensp.Syntax.Syntax
+use opensp.Partition.Partition
+use opensp.Trie.TrieNode
+use opensp.Trie.TrieBuilder
+use opensp.ModeInfo.ModeInfo
+use opensp.ModeInfo.TokenInfo
+use opensp.ModeInfo.PackedTokenInfo
+use opensp.Location.InputSource
+use opensp.Location.Origin
+use opensp.Dtd.Dtd
+
+; Recognizer — the trie-driven token scanner (Recognizer.cs) plus the
+; compile-modes driver (Parser::compileModes, minus the shortref/DTD path).
+;
+; `build_recognizer` mirrors compileModes for a SINGLE mode: it walks that
+; mode's ModeInfo token list twice — first to collect the delimiter/function
+; chars and character sets it needs (which seed the Partition's equivalence
+; codes), then to thread each token's code sequence into a TrieBuilder. The
+; resulting Recognizer maps each scanned char to its EquivCode and walks the
+; trie greedily; `end_token` then commits the longest recognized prefix.
+;
+; The reference syntax is single-code (multicode = false), so `recognize`
+; takes the plain `start_token_no_multicode` path — no scanSuppress / markup-
+; scan table. Shortref B-sequences (the BlankTrie machinery) are deferred with
+; the Dtd increment; the driver never passes a DTD, so no blank node is built.
+
+define Recognizer (root: ref[TrieNode], partition: ref[Partition])
+{
+    init(root: ref[TrieNode], partition: ref[Partition])
+    {
+        this.root := root
+        this.partition := partition
+    }
+
+    ; Token recognize(InputSource*, Messenger&) const — one token at the cursor.
+    procedure recognize(this: Recognizer, mutable input: ref[InputSource]) returns u32
+    {
+        input.start_token_no_multicode()
+        var pos: ref[TrieNode]? root
+        repeat
+        {
+            let ch input.token_char()
+            let code partition.code_of_xchar(ch)
+            pos := pos.child(code as int)
+            if pos = null
+                break
+            if pos.has_next() = false
+                break
+        }
+        if pos = null
+        {
+            input.end_token(0)
+            return tokenUnrecognized
+        }
+        if pos.get_blank() = null
+        {
+            input.end_token(pos.get_token_length() as size_t)
+            return pos.get_token()
+        }
+        ; the BlankTrie scan (Recognizer.cxx:50): a shortref delimiter with a
+        ; B sequence hangs a blank subtree off the stem's leaf — scan up to
+        ; maxBlanksToScan blank codes, then walk the tail (chars2). A full
+        ; tail match commits stem + blanks + tail; otherwise fall back to the
+        ; stem's own token (adding the blanks only if the stem token itself
+        ; is a blank-priority match).
+        let b pos.get_blank()
+        var new_pos: ref[TrieNode] b as ref[TrieNode]
+        let max_blanks b.get_max_blanks_to_scan()
+        var n_blanks: size_t 0
+        var scanning true
+        while scanning and (n_blanks < max_blanks)
+        {
+            let ch2 input.token_char()
+            let code2 partition.code_of_xchar(ch2)
+            if b.code_is_blank_at(code2 as int)
+                n_blanks := n_blanks + 1
+            else
+            {
+                if new_pos.has_next()
+                    new_pos := new_pos.child(code2 as int) as ref[TrieNode]
+                scanning := false
+            }
+        }
+        while new_pos.has_next()
+        {
+            let ch3 input.token_char()
+            let code3 partition.code_of_xchar(ch3)
+            new_pos := new_pos.child(code3 as int) as ref[TrieNode]
+        }
+        if new_pos.get_token() <> 0
+        {
+            let full (new_pos.get_token_length() + b.get_additional_length()) as size_t
+            input.end_token(full + n_blanks)
+            return new_pos.get_token()
+        }
+        var extra: size_t 0
+        if pos.include_blanks()
+            extra := n_blanks
+        input.end_token((pos.get_token_length() as size_t) + extra)
+        pos.get_token()
+    }
+
+    ; Build the recognizer for one Mode from the syntax + mode token table.
+    ; The plain form: no DTD (no shortref delimiters), ambiguities dropped.
+    procedure build_recognizer(host: ref[Page], mode: int, mutable sd: Sd, syn: Syntax, mutable table: ref[Array[PackedTokenInfo]]) returns ref[Recognizer]
+        Recognizer.build_recognizer_sr(host, mode, sd, syn, table, null, null, null)
+
+    ; compileModes for a single mode WITH the DTD's shortref delimiters
+    ; (parseMode.cxx:135, the `includesShortref && dtd` half): a shortref-
+    ; including mode (econ/mcon/econnet/mconnet) threads each interned shortref
+    ; string as tokenFirstShortref+j — a plain delimiter at Priority::delim, a
+    ; B-sequence delimiter through the BlankTrie machinery bounded by BSEQLEN.
+    ; `amb_out`, when non-null, receives the TrieBuilder's ambiguity pairs so
+    ; the caller can report lexicalAmbiguity (the reference does this for every
+    ; compiled mode).
+    ; dd_chars: non-null iff -wdata-delim is on — the FIRST chars of the mcon-
+    ; mode delimiters (parseMode.cxx:263 dataDelimCodes). Shortref-including
+    ; modes and the a/talit literal modes recognize each as tokenCharDelim at
+    ; Priority::dataDelim (1); the plit modes recognize the PERO first char.
+    procedure build_recognizer_sr(host: ref[Page], mode: int, mutable sd: Sd, syn: Syntax, mutable table: ref[Array[PackedTokenInfo]], dtd: ref[Dtd]?, mutable amb_out: ref[Array[u32]]?, dd_chars: ref[ISet]?) returns ref[Recognizer]
+    {
+        var dd_kind: int 0
+        if dd_chars <> null
+        {
+            if (mode = plitMode) or (mode = plitaMode) or (mode = pliteMode)
+                dd_kind := 2
+            else if (mode = alitMode) or (mode = alitaMode) or (mode = aliteMode)
+                dd_kind := 1
+            else if (mode = talitMode) or (mode = talitaMode) or (mode = taliteMode)
+                dd_kind := 1
+            else if mode >= MIN_SHORTREF_MODE
+                dd_kind := 1
+        }
+        let used_delim allocate_slice[u8](host, N_DELIM_GENERAL as size_t)
+        let used_set allocate_slice[u8](host, N_SET as size_t)
+        let used_func allocate_slice[u8](host, 3)
+        zero_bytes(used_delim)
+        zero_bytes(used_set)
+        zero_bytes(used_func)
+
+        ; --- pass 1: which delimiters / sets / functions does this mode use? ---
+        let mi1 ModeInfo^host(mode, sd, table)
+        var t1 TokenInfo()
+        while mi1.next_token(&t1)
+        {
+            if t1.kind = TT_DELIM
+                used_delim.put((t1.delim1 as size_t), 1)
+            else if t1.kind = TT_DELIMDELIM
+            {
+                used_delim.put((t1.delim1 as size_t), 1)
+                used_delim.put((t1.delim2 as size_t), 1)
+            }
+            else if t1.kind = TT_DELIMSET
+            {
+                used_delim.put((t1.delim1 as size_t), 1)
+                used_set.put((t1.set_idx as size_t), 1)
+            }
+            else if t1.kind = TT_SET
+                used_set.put((t1.set_idx as size_t), 1)
+            else if t1.kind = TT_FUNCTION
+                used_func.put((t1.func_idx as size_t), 1)
+        }
+
+        ; --- the specific chars to distinguish (functions + delimiter chars) ---
+        let chars ISet^host()
+        var f: int 0
+        while f < 3
+        {
+            if used_func[(f as size_t)] <> 0
+                chars.add(syn.standard_function(f))
+            f := f + 1
+        }
+        var d: int 0
+        while d < N_DELIM_GENERAL
+        {
+            if used_delim[(d as size_t)] <> 0
+            {
+                var j: size_t 0
+                while j < syn.delim_general_len(d)
+                {
+                    chars.add(syn.delim_general_char(d, j))
+                    j := j + 1
+                }
+            }
+            d := d + 1
+        }
+
+        ; --- the data-delim chars must join the partition (see dd_kind) ---
+        if dd_kind = 1
+        {
+            var ddr: size_t 0
+            let ddn dd_chars.get_count()
+            while ddr < ddn
+            {
+                var ddc dd_chars.range_min(ddr)
+                let ddm dd_chars.range_max(ddr)
+                while ddc <= ddm
+                {
+                    chars.add(ddc)
+                    ddc := ddc + 1
+                }
+                ddr := ddr + 1
+            }
+        }
+        else if dd_kind = 2
+        {
+            if syn.delim_general_len(dPERO) > 0
+                chars.add(syn.delim_general_char(dPERO, 0))
+        }
+
+        ; --- the DTD's shortref delimiter chars (shortref-including modes) ---
+        ; a 'B' in a shortref string is the blank-sequence marker: it forces the
+        ; blank SET into the partition instead of contributing a char.
+        var n_sr: size_t 0
+        if dtd <> null
+        {
+            if mode >= MIN_SHORTREF_MODE
+                n_sr := dtd.n_shortref()
+        }
+        var si: size_t 0
+        while si < n_sr
+        {
+            let dstr dtd.shortref(si)
+            let dl dstr.get_size()
+            var sj: size_t 0
+            while sj < dl
+            {
+                let dc dstr.get(sj)
+                if dc = 0x42
+                    used_set.put((setBlank as size_t), 1)
+                else
+                    chars.add(dc)
+                sj := sj + 1
+            }
+            si := si + 1
+        }
+
+        ; --- the used character sets, and each set's partition position ---
+        let set_pos allocate_slice[i32](host, N_SET as size_t)
+        var n_used: int 0
+        var s: int 0
+        while s < N_SET
+        {
+            if used_set[(s as size_t)] <> 0
+                n_used := n_used + 1
+            s := s + 1
+        }
+        let csets allocate_slice[ref[ISet]?](host, n_used as size_t)
+        var p: int 0
+        s := 0
+        while s < N_SET
+        {
+            if used_set[(s as size_t)] <> 0
+            {
+                csets.put((p as size_t), syn.char_set(s))
+                set_pos.put(s as size_t, p as i32)
+                p := p + 1
+            }
+            else
+                set_pos.put(s as size_t, -1 as i32)
+            s := s + 1
+        }
+
+        let part Partition^host(chars, csets, n_used)
+
+        ; --- delimiter code sequences ---
+        let delim_codes allocate_slice[Slice[u16]](host, N_DELIM_GENERAL as size_t)
+        d := 0
+        while d < N_DELIM_GENERAL
+        {
+            if used_delim[(d as size_t)] <> 0
+            {
+                let ln syn.delim_general_len(d)
+                let cb allocate_slice[u16](host, ln)
+                var j: size_t 0
+                while j < ln
+                {
+                    cb.put(j, part.char_code(syn.delim_general_char(d, j)))
+                    j := j + 1
+                }
+                delim_codes.put((d as size_t), cb)
+            }
+            else
+                delim_codes.put((d as size_t), Slice[u16]())
+            d := d + 1
+        }
+
+        ; --- function codes (one each) ---
+        let func_codes allocate_slice[u16](host, 3)
+        f := 0
+        while f < 3
+        {
+            if used_func[(f as size_t)] <> 0
+                func_codes.put((f as size_t), part.char_code(syn.standard_function(f)))
+            f := f + 1
+        }
+
+        ; --- pass 2: thread each token into the trie ---
+        let tb TrieBuilder^host((part.max_code() as int) + 1)
+        var amb: ref[Array[u32]]? amb_out
+        if amb = null
+            amb := Array[u32]^host()
+        tb.recognize_ee(part.ee_code(), tokenEe)
+
+        let mi2 ModeInfo^host(mode, sd, table)
+        var t2 TokenInfo()
+        while mi2.next_token(&t2)
+        {
+            if t2.kind = TT_DELIM
+            {
+                let ln syn.delim_general_len(t2.delim1)
+                if ln > 0
+                    tb.recognize(delim_codes[(t2.delim1 as size_t)], t2.token, t2.priority, amb)
+            }
+            else if t2.kind = TT_DELIMDELIM
+            {
+                let l1 syn.delim_general_len(t2.delim1)
+                let l2 syn.delim_general_len(t2.delim2)
+                if (l1 > 0) and (l2 > 0)
+                {
+                    let cb allocate_slice[u16](host, l1 + l2)
+                    let c1 delim_codes[(t2.delim1 as size_t)]
+                    let c2 delim_codes[(t2.delim2 as size_t)]
+                    var j: size_t 0
+                    while j < l1
+                    {
+                        cb.put(j, c1[j])
+                        j := j + 1
+                    }
+                    var k: size_t 0
+                    while k < l2
+                    {
+                        cb.put((l1 + k), c2[k])
+                        k := k + 1
+                    }
+                    tb.recognize(cb, t2.token, t2.priority, amb)
+                }
+            }
+            else if t2.kind = TT_DELIMSET
+            {
+                let ln syn.delim_general_len(t2.delim1)
+                let pos set_pos[t2.set_idx as size_t]
+                if ln > 0
+                    tb.recognize_set(delim_codes[(t2.delim1 as size_t)], part.set_code_slice(pos as int), t2.token, t2.priority, amb)
+            }
+            else if t2.kind = TT_SET
+            {
+                let pos set_pos[t2.set_idx as size_t]
+                tb.recognize_set(func_codes.subslice(0, 0), part.set_code_slice(pos as int), t2.token, t2.priority, amb)
+            }
+            else if t2.kind = TT_FUNCTION
+                tb.recognize(func_codes.subslice(t2.func_idx as size_t, (t2.func_idx as size_t) + 1), t2.token, t2.priority, amb)
+        }
+
+        ; --- -wdata-delim: thread tokenCharDelim at Priority::dataDelim (1) ---
+        if dd_kind = 1
+        {
+            var ddr2: size_t 0
+            let ddn2 dd_chars.get_count()
+            while ddr2 < ddn2
+            {
+                var ddc2 dd_chars.range_min(ddr2)
+                let ddm2 dd_chars.range_max(ddr2)
+                while ddc2 <= ddm2
+                {
+                    let ddcb allocate_slice[u16](host, 1)
+                    ddcb.put(0, part.char_code(ddc2))
+                    tb.recognize(ddcb, tokenCharDelim, 1, amb)
+                    ddc2 := ddc2 + (1 as u32)
+                }
+                ddr2 := ddr2 + 1
+            }
+        }
+        else if dd_kind = 2
+        {
+            if syn.delim_general_len(dPERO) > 0
+            {
+                let pcb allocate_slice[u16](host, 1)
+                pcb.put(0, part.char_code(syn.delim_general_char(dPERO, 0)))
+                tb.recognize(pcb, tokenCharDelim, 1, amb)
+            }
+        }
+
+        ; --- thread the shortref delimiters (parseMode.cxx:348) ---
+        ; SrInfo per delimiter: the EquivCode run before the first 'B', the
+        ; consecutive-B count, and the codes after the B run. A B-sequence
+        ; delimiter goes through recognizeB bounded by BSEQLEN; a plain one is
+        ; an ordinary token at Priority::delim (255).
+        var srj: size_t 0
+        while srj < n_sr
+        {
+            let dstr dtd.shortref(srj)
+            let dl dstr.get_size()
+            let cb1 allocate_slice[u16](host, dl)
+            var n1: size_t 0
+            var k: size_t 0
+            var scanning1 true
+            while scanning1 and (k < dl)
+            {
+                let c1 dstr.get(k)
+                if c1 = 0x42
+                    scanning1 := false
+                else
+                {
+                    cb1.put(n1, part.char_code(c1))
+                    n1 := n1 + 1
+                    k := k + 1
+                }
+            }
+            var bseq: int 0
+            var scanning2 true
+            while scanning2 and (k < dl)
+            {
+                if dstr.get(k) = 0x42
+                {
+                    bseq := bseq + 1
+                    k := k + 1
+                }
+                else
+                    scanning2 := false
+            }
+            let cb2 allocate_slice[u16](host, dl)
+            var n2: size_t 0
+            while k < dl
+            {
+                cb2.put(n2, part.char_code(dstr.get(k)))
+                n2 := n2 + 1
+                k := k + 1
+            }
+            let tok tokenFirstShortref + (srj as u32)
+            if bseq > 0
+            {
+                let bpos set_pos[setBlank as size_t]
+                let bseqlen syn.get_quantity(qBSEQLEN)
+                tb.recognize_b(cb1.subslice(0, n1), bseq, bseqlen as size_t, part.set_code_slice(bpos as int), cb2.subslice(0, n2), tok, amb)
+            }
+            else
+                tb.recognize(cb1.subslice(0, n1), tok, 255, amb)
+            srj := srj + 1
+        }
+
+        Recognizer^host(tb.extract_trie(), part)
+    }
+
+    procedure zero_bytes(mutable p: Slice[u8])
+    {
+        var i: size_t 0
+        while i < p.length
+        {
+            p.put(i, 0)
+            i := i + 1
+        }
+    }
+
+    ; --- integration test: build recognizers, tokenize sample input ---
+    procedure tokenize(rec: ref[Recognizer], mutable src: ref[InputSource]) returns u32
+        rec.recognize(src)
+
+    procedure test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+        let sd Sd()
+        let syn Syntax^host(sd)
+        let table ModeInfo.build_table(host)
+
+        ; ---- grpMode: tokenize a content-model group "(a|b)" ----
+        let grp Recognizer.build_recognizer(host, grpMode, sd, syn, table)
+
+        var gbuf u32[6]
+        let pg gbuf as pointer[u32]
+        gbuf[0] := 0x28   ; (
+        gbuf[1] := 0x61   ; a
+        gbuf[2] := 0x7C   ; |
+        gbuf[3] := 0x62   ; b
+        gbuf[4] := 0x29   ; )
+        var origin Origin()
+        var gsrc InputSource(&origin, Slice[u32](5, pg))
+
+        if grp.recognize(&gsrc) <> tokenGrpo
+            return -1
+        if grp.recognize(&gsrc) <> tokenNameStart
+            return -2
+        if grp.recognize(&gsrc) <> tokenOr
+            return -3
+        if grp.recognize(&gsrc) <> tokenNameStart
+            return -4
+        if grp.recognize(&gsrc) <> tokenGrpc
+            return -5
+        if grp.recognize(&gsrc) <> tokenEe
+            return -6
+
+        ; ---- econMode: a start-tag open in element content ----
+        let econ Recognizer.build_recognizer(host, econMode, sd, syn, table)
+
+        var ebuf u32[5]
+        let pe ebuf as pointer[u32]
+        ebuf[0] := 0x3C   ; <
+        ebuf[1] := 0x61   ; a
+        ebuf[2] := 0x62   ; b
+        var origin2 Origin()
+        var esrc InputSource(&origin2, Slice[u32](3, pe))
+
+        ; "<a" -> tokenStagoNameStart (delimiter-in-context, length 2)
+        if econ.recognize(&esrc) <> tokenStagoNameStart
+            return -7
+        if esrc.current_token_length() <> 2
+            return -8
+        ; then 'b' is a data character
+        if econ.recognize(&esrc) <> tokenChar
+            return -9
+
+        ; ---- econMode: '<' NOT followed by a name-start char is data ----
+        var ebuf2 u32[3]
+        let pe2 ebuf2 as pointer[u32]
+        ebuf2[0] := 0x3C   ; <
+        ebuf2[1] := 0x20   ; space
+        var origin3 Origin()
+        var esrc2 InputSource(&origin3, Slice[u32](2, pe2))
+        if esrc2.get_length() <> 2
+            return -10
+        if econ.recognize(&esrc2) <> tokenChar   ; '<' as data (length 1)
+            return -11
+        if esrc2.current_token_length() <> 1
+            return -12
+        if econ.recognize(&esrc2) <> tokenS       ; the space
+            return -13
+
+        ; ---- mdMode: markup-declaration open comment "<!--" pieces ----
+        let md Recognizer.build_recognizer(host, mdMode, sd, syn, table)
+        var mbuf u32[4]
+        let pm mbuf as pointer[u32]
+        mbuf[0] := 0x28   ; (  GRPO recognized in mdMode
+        mbuf[1] := 0x2D   ; -
+        mbuf[2] := 0x2D   ; -
+        var origin4 Origin()
+        var msrc InputSource(&origin4, Slice[u32](3, pm))
+        if md.recognize(&msrc) <> tokenGrpo
+            return -14
+        ; "--" is the COM delimiter in mdMode
+        if md.recognize(&msrc) <> tokenCom
+            return -15
+
+        0
+    }
+}

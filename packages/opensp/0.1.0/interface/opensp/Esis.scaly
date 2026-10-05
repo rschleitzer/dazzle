@@ -1,0 +1,273 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.os.Path
+use scaly.fiber.Io
+use opensp.StringC.StringC
+use opensp.ParserState.ParserState
+use opensp.Event.Event
+use opensp.Location.Location
+use opensp.Location.Origin
+use opensp.Attribute.AttributeValue
+use opensp.Attribute.Attribute
+use opensp.Attribute.AttributeSemantics
+use opensp.Attribute.Text
+use opensp.AttributeList.AttributeList
+use opensp.ElementType.ElementType
+use opensp.ElementType.ElementDefinition
+use opensp.Entity.Entity
+use opensp.Entity.InternalEntity
+use opensp.Entity.ExternalTextEntity
+use opensp.Entity.ExternalDataEntity
+use opensp.Entity.SubdocEntity
+use opensp.Notation.Notation
+use opensp.ExternalId.ExternalId
+use opensp.CodingSystemKit.CodingSystemKit
+use opensp.CodingSystemKit.OutputEncoder
+use opensp.CodingSystemKit.OESC_NONE
+use opensp.CodingSystemKit.OESC_BACKSLASH
+
+; Esis — the ESIS event-dump writer (Stage 4 Increment 3 + the -o option axis).
+;
+; Ports SgmlsEventHandler (nsgmls/SgmlsEventHandler.cxx — the C++ oracle, NOT
+; the C# mirror, since escaping differs): walks the ParserState event queue and
+; produces the byte-identical ESIS text that `onsgmls` writes to stdout. This is
+; the harness the tests/sgml corpus counter measures.
+;
+; ESIS grammar produced here:
+;   A<NAME> <TYPE> <VALUE>   one per attribute with a value (before its (start)
+;                            TYPE = IMPLIED | TOKEN/NOTATION/ENTITY/ID <v> |
+;                            CDATA <v> | DATA <notation> <v> (-odata-attribute)
+;   (<GI> / )<GI>            start / end element
+;   -<data>                  character data (consecutive data coalesces; the
+;                            trailing '\n' is written when the run is flushed)
+;   C                        conforming document (only when errorCount == 0)
+;   N/E/I/S/T + p/s/f        entity + notation definitions
+;   &<NAME>                  external data entity reference in content
+;   D<ENAME> <NAME> <TYPE…>  data attributes of an external data entity
+;   ?<data> / #<appinfo>     processing instruction / APPINFO
+;   {<NAME> }<NAME>          subdocument brackets
+;   L<line> [<file>]         -oline location records
+;   i / e / o                -oincluded / -oempty / -o(tag|attr)omit records
+;   _<comment>               -ocomment records (instance comment declarations)
+;   V…                       -oversion parser-information records
+;
+; The -o flags arrive as ParserState.output_flags (OF_*, Event.scaly). The
+; mutable writer state (data-run flag, -oline line tracking, the per-document
+; definedEntities/definedNotations sets, the inDocument_ comment gate) lives in
+; one page-hosted EsisW record threaded through the helpers.
+;
+; Escaping (outputString, SgmlsEventHandler.cxx): '\' -> '\\'; RE (0x0D) -> '\n';
+; any char < 0x20 -> '\0' + two octal digits; everything else through the
+; output coding system.
+;
+; Output coding system (CmdLineApp::makeStdOut -> EncodeOutputCharStream): the
+; whole ESIS stream (names, data, attribute values) leaves through ONE encoder
+; (outputCodingSystem_): CmdLineApp::initCodingSystem's environment default,
+; overridable per run with -b (processOption 'b' -> lookupCodingSystem). The
+; writer accumulates the char stream as INTERNAL UTF-8 and encode_out re-runs
+; it through the selected system (CodingSystemKit.transcode) in one pass —
+; including the stream's escaper (SgmlsEventHandler::escaper, set once via
+; setEscaper): a char the encoder cannot represent writes escapePrefix
+; numEscape <decimal> escapeEnd = `\#<N>;` back through the same encoder.
+; The UTF-8 system is the internal representation itself, so that path is a
+; verbatim pass-through (its 5/6-byte forms stay unreachable — chars are
+; capped at charMax <= 0x10FFFF; surrogates encode blindly as 3-byte
+; sequences, exactly like the reference encoder).
+
+; The writer's mutable state (the SgmlsEventHandler data members).
+define EsisW
+(
+    acc: ref[Array[u8]]
+    flags: u32
+    ; haveData_ — a `-` data run is open.
+    var have_data: bool
+    ; inDocument_ — set at endProlog when -ocomment; comment records print
+    ; only afterwards (prolog comments are dropped). Never reset — a subdoc's
+    ; DTD comments print, bug-for-bug with the reference.
+    var in_document: bool
+    ; -oline: lastSos_/lastLineno_ — the resolved origin identity stands in
+    ; for the reference's StorageObjectSpec pointer. A multi-file document
+    ; origin is ONE origin covering several storage objects, so the segment
+    ; index joins the identity (a boundary crossing prints `L<line> <file>`).
+    var last_sos: ref[Origin]?
+    var last_seg: size_t
+    var last_lineno: u32
+    ps: ref[ParserState]?
+    ; definedEntities_/definedNotations_ — swapped fresh per subdocument
+    ; (SgmlsSubdocState::init/swap).
+    var seen_e: ref[Array[StringC]]
+    var seen_n: ref[Array[StringC]]
+    ; the writer's own page — fresh per-subdocument seen-sets allocate here
+    ; (streaming delivery consumes events in chunks, so the writer can no
+    ; longer borrow write()'s locals across calls).
+    whost: ref[Page]
+    ; SgmlsSubdocState::swap — the saved outer seen-sets, one level per
+    ; open subdocument (depth-indexed; Array has no remove, slots are
+    ; overwritten on re-push).
+    stack_e: ref[Array[ref[Array[StringC]]?]]
+    stack_n: ref[Array[ref[Array[StringC]]?]]
+    var sub_depth: size_t
+    ; Streaming output: the fd the accumulated ESIS goes out on at every drain,
+    ; or -1 to DISCARD it there (-s: the caller writes nothing, so the bytes are
+    ; dead as soon as they are rendered). Not streaming at all (the RAST and
+    ; unit-test paths, which construct the writer inside Esis.write) leaves this
+    ; -1 and never drains, so the full text still comes back as the return value.
+    ;
+    ; Why: the writer used to accumulate the WHOLE ESIS text and Esis.write then
+    ; copied it into a String — measured on a 13.1 MiB parse whose output is
+    ; 22.5 MiB, that is 31.6 MiB of accumulator capacity plus a 22.5 MiB String
+    ; alive at the same moment, 29 % of the peak, for bytes that were already
+    ; final. The reference writes to its stdout as it goes (EncodeOutputCharStream
+    ; over a FileOutputByteStream); flushing per drain is that behaviour.
+    out_fd: int
+    ; the BOM (UNICODE output) belongs to the STREAM, so only the first flush
+    ; may emit it — see Esis.encode_out's `bom` argument.
+    var bom_done: bool
+)
+
+define Esis
+{
+    procedure put(mutable acc: ref[Array[u8]], b: u8) @page true @direct true @ret_nonlocal true @deep true linked
+
+    ; append an ASCII literal (a byte String) verbatim.
+    procedure put_lit(mutable acc: ref[Array[u8]], s: String) @deep true linked
+
+    ; decimal digits of n (the escaper prints `(unsigned long)c` — plain
+    ; decimal, no padding).
+    procedure put_dec(mutable acc: ref[Array[u8]], n: u32) @deep true linked
+
+    ; Encode one Char as UTF-8. The C++ handler never narrows a Char itself: it
+    ; hands every Char to an OutputCharStream (`os().put(*p)`, `os() << name`)
+    ; whose UTF-8 encoder this mirrors (UTF8CodingSystem.cxx; the 5/6-byte
+    ; forms are unreachable, chars are capped at 0x10FFFF).
+    procedure put_utf8(mutable acc: ref[Array[u8]], c: u32) @ret_nonlocal true @deep true linked
+
+    ; one Char into the writer's INTERNAL stream — always UTF-8; the selected
+    ; output coding system (including the unencodable-char escaper) applies in
+    ; one pass at the end (Esis.encode_out -> CodingSystemKit.transcode).
+    procedure put_char(mutable acc: ref[Array[u8]], c: u32) @ret_nonlocal true @deep true linked
+
+    ; append a StringC as a name (no escaping; GIs/attr names are already
+    ; reference-syntax name characters) through the output encoder — the
+    ; escaper is set on the whole stream, so names take the same path as data.
+    procedure put_name(mutable acc: ref[Array[u8]], sc: StringC) @deep true linked
+
+    ; append a StringC as ESIS data with the C++ outputString escaping. The
+    ; control-char / '\' / RE escapes run BEFORE the coding system (they are
+    ; outputString's, upstream of the encoder); only the default arm is
+    ; encoding-dependent.
+    procedure put_data(mutable acc: ref[Array[u8]], sc: StringC) @deep true linked
+
+    ; outputString over an 8-bit String (system/public identifiers) — the same
+    ; escaping as put_data, byte-wise.
+    procedure put_data_bytes(mutable acc: ref[Array[u8]], s: String) @deep true linked
+
+    ; SgmlsEventHandler::markEntity/markNotation — StringSet::add: true when
+    ; the name was already output this document, else remember it. Names alias
+    ; run-page StringCs (stable for the writer's lifetime).
+    procedure mark(mutable seen: ref[Array[StringC]], name: StringC) @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true returns bool linked
+
+    ; ---- stateful writers (the SgmlsEventHandler members) -----------------
+
+    procedure start_data(mutable w: ref[EsisW]) @deep true linked
+
+    procedure flush_data(mutable w: ref[EsisW]) @deep true linked
+
+    ; outputString INSIDE the writer state: RE chars written while a data run
+    ; is open advance the -oline line tracker (outputString's lastLineno_++ —
+    ; multi-line data runs then need no L record per line).
+    procedure w_data(mutable w: ref[EsisW], sc: StringC) @deep true linked
+
+    procedure w_data_bytes(mutable w: ref[EsisW], s: String) @deep true linked
+
+    ; SgmlsEventHandler::outputLocation/outputLocation1 (-oline): resolve the
+    ; event's location to its real source (the same origin walk the message
+    ; header uses); a change of source prints `L<line> <storage id>`, a change
+    ; of line within the same source prints `L<line>`, anything else nothing.
+    procedure out_loc(mutable w: ref[EsisW], loc: Location) @deep true linked
+
+    ; SgmlsEventHandler::externalId (:585): p<pubid> / s<sysid> and, when
+    ; `output_file`, f<effective system id> — the storage id generateSystemId
+    ; stamped (declared system id resolved against the declaring directory, or
+    ; the catalog's SYSTEM/PUBLIC/name mapping), printed only when non-empty.
+    ; `base_dir` backs the pre-stamping fallback (a declared system id whose
+    ; entity never ran generateSystemId).
+    procedure put_external_id(mutable w: ref[EsisW], id: ExternalId, base_dir: String, output_file: bool) @ret_nonlocal true @deep true linked
+
+    ; SgmlsEventHandler::defineNotation (:575) — marks itself; a repeat is
+    ; silent. The f-line prints only under -onotation-sysid.
+    procedure define_notation(mutable w: ref[EsisW], nt: ref[Notation]) @deep true linked
+
+    ; SgmlsEventHandler::defineEntity (:488) — the CALLER checks markEntity
+    ; first (both the attribute and the `&` reference sites), exactly like the
+    ; reference; the -oentity endProlog sweep and the entity-defaulted replay
+    ; call it directly (no mark — reference behavior).
+    ;   internal        I<name> <CDATA|SDATA|TEXT|PI> <text>
+    ;   external data   the notation's definition, p/s/f, E<name> <TYPE> <not>,
+    ;                   then the entity's data attributes as D records
+    ;   subdoc          p/s/f, S<name>
+    ;   external text   p/s/f, T<name>
+    procedure define_entity(mutable w: ref[EsisW], ent: ref[Entity]?) @deep true linked
+
+    ; the CDATA value body (SgmlsEventHandler::attributes' TextIter loop):
+    ; data segments print plain, sdata runs between `\|` markers, non-SGML
+    ; items as `\%N;` under -ononsgml (dropped otherwise). Both item lists are
+    ; flat position-sorted pairs into the value string.
+    procedure put_value_cdata(mutable w: ref[EsisW], v: ref[AttributeValue]) @deep true linked
+
+    ; A<NAME> <TYPE> <VALUE> for each attribute in the list that has a value
+    ; (SgmlsEventHandler::attributes, :330). `code` is 'A' for start-tag
+    ; attributes, 'D' for an entity's data attributes, 'a' for link-rule
+    ; attributes (`owner` then prefixes the attribute name). A tokenized value
+    ; WITH semantics first prints the definitions its value references — the
+    ; notation, or (without -oentity) each not-yet-output entity — and types
+    ; the line NOTATION / ENTITY instead of TOKEN; -oid types ID declared
+    ; values as ID. -oattromit prints an `o` record before each attribute the
+    ; instance did not specify.
+    procedure put_attributes(mutable w: ref[EsisW], atts: ref[AttributeList]?, code: u8, owner: ref[StringC]?) @deep true linked
+
+    ; StartElementEvent::mustOmitEnd — EMPTY declared content or a specified
+    ; CONREF attribute (-oempty's `e` record).
+    function must_omit_end(ev: ref[Event]) @ret_nonlocal true @deep true returns bool linked
+
+    ; SgmlsEventHandler::features (-oversion): the V parser-information block,
+    ; written once before everything (handler construction time).
+    procedure features(mutable w: ref[EsisW]) @ret_nonlocal true @deep true linked
+
+    ; walk the event queue -> the ESIS byte String.
+    ; writer construction — everything write() did before the event loop.
+    ; Streaming delivery calls this BEFORE the parse; the classic whole-queue
+    ; path calls it from write().
+    procedure begin(host: ref[Page], mutable ps: ref[ParserState], out_fd: int) @ret_explicit_0 true @deep true returns ref[EsisW] linked
+
+    ; Hand the rendered ESIS bytes to the output and empty the accumulator —
+    ; called at every streaming drain, where everything in `acc` is already
+    ; final. `acc.clear()` keeps the buffer, so it stays chunk-sized instead of
+    ; growing with the document.
+    ;
+    ; ★The transcode temporaries go on the EVENT SCRATCH (ps.event_host()),
+    ; which the drain resets immediately after this returns — otherwise the
+    ; per-chunk copies would accumulate on the run region and this would move
+    ; the cost rather than remove it.
+    ;
+    ; ★The encoder is the RUN's (ps.get_output_encoder(), reached through
+    ; encode_out), so whatever state it carries continues across chunks; only
+    ; the BOM is per-stream, hence bom_done.
+    procedure flush_out(mutable w: ref[EsisW], mutable ps: ref[ParserState]) @deep true io linked
+
+    ; render the queued events [from, n) — the writer state carries across
+    ; calls, so streaming delivery can consume the queue in chunks.
+    procedure write_events(mutable w: ref[EsisW], ps: ref[ParserState], from: size_t, n: size_t) @deep true @deep_this_1 true linked
+
+    procedure write(host: ref[Page], mutable ps: ref[ParserState], conforming: bool) @page true @direct true @deep true @deep_beyond_3 true returns String linked
+
+    ; run a writer's internal UTF-8 stream through the run's output coding
+    ; system. A null encoder (unit-test / in-process JIT paths that never go
+    ; through the driver) falls back to the environment pair the driver would
+    ; have installed: UTF-8 under SP_CHARSET_FIXED+SP_ENCODING, else identity.
+    function encode_out(host: ref[Page], ps: ref[ParserState], internal: String, escaper: bool, bom: bool) @page true @direct true @deep true returns String linked
+
+    ; ---- self-test: escaping over a controlled StringC --------------------
+    function test() @ret_nonlocal true @deep true returns int linked
+}

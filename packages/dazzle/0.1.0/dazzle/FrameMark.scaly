@@ -1,0 +1,536 @@
+use scaly.memory.Page
+
+; ---- the FRAME MARK ------------------------------------------------------
+; Frame-granular reclamation for the DSSSL evaluator. `ProcessContext` brackets a
+; whole construction rule in one region; this brackets every VM FRAME inside it
+; by MARKING the region's bump pointer on entry and rewinding it on exit. The
+; measurements behind the shape:
+; 82 M frames on a heavy codegen at 415 bytes
+; each, 99.7 % of them under 4 KB, 4140 frames per eval bracket — so a region per
+; frame is unaffordable and unnecessary, while a mark costs a store.
+;
+; A rewind is only sound if nothing above the mark is reachable afterwards, so
+; everything here is the CONSERVATIVE test that decides it. Six conditions, all
+; O(1), and a frame is rewound only when every one holds:
+;
+;   1. VALID     — the mark was taken in the eval bracket that is still current.
+;   2. THE CHAIN — `rewind` refuses unless the mark's page is still the
+;                  region's end; the pages the frame appended go back with it.
+;   3. EXCLUSIVE — the mark page's exclusive-page list has not moved, so no
+;                  oversized allocation put a PageNode inside the span
+;                  (`rewind` checks this against the value taken at mark
+;                  time and changes nothing when it moved).
+;   4. RESULT    — the value the frame RETURNS does not lie in the span. This is
+;                  the one escape route the frame owns, and it is an address
+;                  comparison rather than a graph walk.
+;   5. QUIET     — nothing PUBLISHED while the frame was running.
+;   6. BACKFILL  — the region HEAD served no allocation while the frame ran.
+;                  `Page.allocate` bumps the page it was CALLED ON when that
+;                  page still has room, and every `ELObj.make_*` calls it on the
+;                  head — so the frontier is not the tail alone. See the block
+;                  above `below_sum`; this is the condition the memo seam's three
+;                  wrong codegens were pointing at.
+;
+; ★★★Condition 5 is the whole trick, and it is ONE global counter. A frame's
+; lifetime is exactly the window in which only IT and its DESCENDANTS run (a
+; sibling runs after the pop), and every ancestor's span CONTAINS this frame's.
+; So "no publication happened anywhere between my push and my pop" is sufficient
+; in the conservative reading, and needs no propagation to ancestors — just
+; `epoch` against `epoch_at_push`.
+;
+; ★★A publication is a store that could put a pointer into a marked span into
+; something that survives it. The audited list: the three `SetBox` variants, a
+; control-stack unwind (call/cc), a frame popped without a reported result, and
+; the lazy MEMOISATIONS the hot primitives reach (`force_select`, `force_axis`,
+; `concat_fill`, the view prefix and path). `store` decides each by TARGET — in
+; another region it can never receive such a pointer, and inside the running
+; frame's own span it dies together with it.
+;
+; Three memos carry NO hook, because their target can never lie in a marked
+; region — the decision `store` would reach anyway, made once here instead of
+; per call (2026-09-19, when the hooks lost their global state):
+;   * the grove's view arrays and SDATA views (`chunk_views`, `attr_views`,
+;     `attr_value_views`, `set_sdata_view`): a grove is built on the run arena
+;     (the document) or on the grove manager's host (the run arena too), and
+;     every view goes on its node's OWN page;
+;   * the builtin shadow of an Identifier (`maybe_save_builtin`): identifiers
+;     are interned on the run arena (Interpreter.lookup), the shadow beside them;
+;   * the string rope's flatten: its memo page is fixed when the rope is made
+;     (`StrCatObj.memo`) — the run arena while the mark is on, where the store
+;     is a pointer to something OLDER than the rope.
+; ★A grove or identifier built on an EVAL region would break the first two —
+; nothing does today; whoever adds one owes the hook back.
+;
+; ★★★The class that made the audit worth doing: the engine's `Page.get(object)`
+; idiom protects BRACKET granularity — object region and caller scratch are
+; different regions — but NOT a frame mark, because within ONE region
+; `Page.get(x)` resolves to the region's END, which is above every live mark.
+; That holds for every container grown off a PASSED-IN container.
+;
+; ★★★ON by default since 2026-08-07 — and what that decision rests on, stated
+; so nobody has to reconstruct it:
+;
+;   PROVEN, in the sense that a counter-example would have shown up:
+;     * conditions 1-4 are local arguments about addresses this frame owns;
+;     * condition 6's O(1) form was cross-checked against its GENERAL form
+;       (sum over every page below the mark, `DZ_FRAME_MARK_BACKFILL=N`, 27x
+;       slower) with ZERO missed cases: 260 860 rewinds exhaustively on one
+;       codegen and 4105 strided on the 1804-file one;
+;     * differentially: 48 real-world codegens, 469 ESIS models, three backends
+;       on the DocBook corpus and every suite, in BOTH engine modes.
+;
+;   NOT PROVEN, and this is the residual risk: condition 5's completeness. It
+;   rests on a SWEEP over the engine's store sites (all 29 `Page.get(` sites
+;   plus the mutating calls a primitive can reach). A store nobody hooked is
+;   invisible to every gate until an output differs, and this class HAS bitten
+;   once — the memo seam, where the fault turned out to be the allocator
+;   (condition 6) rather than a store. A runtime scan cannot close it either:
+;   a constantly rewound region is full of dead words no scan can tell from
+;   live pointers, so the OUTPUT is the only oracle. The proof belongs in the
+;   compiler, as an escape analysis —
+;   which exists now (dazzle/Escape.scaly) but proves 3.6 % of the bytes
+;   frame-local against this mark's 38 %, so it cannot stand in for it.
+;
+; ⇒ The escape hatch is therefore load-bearing, not decoration:
+; `DAZZLE_FRAME_MARK=0` or `--no-frame-mark` turns the mark off (and with it the
+; memo seam, which follows it). If a tree ever comes out wrong, that switch is
+; both the workaround and the first half of the diagnosis. tests/dazzle/
+; framemark/run.sh gates the OFF path, because ON is now what every other suite
+; runs. (The bisecting and verifying instruments — DZ_FRAME_MARK_LIMIT, SCAN,
+; TRAP, TRAP_POP, WATCH, VERIFY, BACKFILL and the stats — were removed with the
+; port's close on 2026-09-19.)
+; Measured on the heaviest codegen, with the memo seam that follows the mark
+; (Interpreter.memo_host): peak footprint 5968 -> 3463 MB (-42.0 %), max RSS
+; 5310 -> 3154 MB (-40.6 %), 17.22 GB reclaimed, cpu -0.6 % (noise).
+;
+; ★What was tried and MEASURED AWAY — do not rebuild it: a second arena for
+; frame-local values with the escaping result placed in the eval region. Sound
+; only if no argument of the escaping call lives in the frame arena, and that
+; collapses, because a value produced by a non-tail call taints every consumer:
+; 13 754 of 14 028 tail calls stayed behind and the win went negative. Breaking
+; that cycle needs to know at the PRODUCER whether its value escapes, which is
+; the dataflow and not a runtime test ("Sprosse 3 GEBAUT und VERWORFEN").
+;
+; ★★★And a SECOND one, measured away on 2026-08-07 — do not rebuild this either:
+; a granularity heuristic that skips the mark where it does not pay ("mark only
+; from the Nth frame of an eval bracket", `DZ_FRAME_MARK_MIN`, built and
+; swept). It is perfectly SOUND — not marking a frame can only cost yield — and
+; it is still worthless, because it treats the wrong half of the cost:
+;
+;   styling, 1.06 M frames | instructions | reclaimed
+;   mark off               |     7.004 G  |        —
+;   mark on, NOTHING marked|     7.078 G  |      0 B     <- the HOOK alone
+;   mark on                |     7.091 G  |   9.56 MB
+;
+; ★★★So 85 % of what the mark costs that workload is being CALLED — the wrapper,
+; the call, the entry, the pop's condition 1 — and only 15 % is the mark. On the
+; heaviest codegen the same experiment says 70 % hook / 30 % mark (5.24 of
+; 7.48 G), and there the marking half buys 14.25 GB, i.e. 6.4 bytes per
+; instruction. The best threshold found recovered 3 % of the styling cost while
+; giving up 77 % of the yield, and the knob cost 0.13 % just by being asked.
+; ⇒ Whoever wants this back has to move the decision to the CALL SITE, and then
+; owes a proof that push and pop can never disagree about it: a frame whose push
+; skipped and whose pop did not reads a STALE column, and a stale column with a
+; live generation is a rewind to a bogus mark. That is the corruption class this
+; whole file is written to avoid, for 1 % of one workload.
+;
+; ---- the SHAPE of this file, which is a measurement ----------------------
+;
+; ★★★The mechanism costs 173 instructions per frame on the heaviest codegen
+; (14.19 G for 81 775 653 frames) where its design says "one store".
+; Two findings of the decomposition that explains the gap are
+; BUILT INTO the code below — read
+; them before "simplifying" any of it back:
+;
+;   1. ONE STATE BLOCK, not eighteen globals. AArch64 materialises an `adrp`
+;      per GLOBAL, not per 4 KB page: every one of these globals lives in the
+;      same page and the hot path still paid ~25 `adrp` per frame. So the whole
+;      hot state — the scalars AND the per-frame columns — sits in one calloc'd
+;      block, held in a register as `f` (the VM's `frame_mark` copy on the
+;      frame path) and addressed by the FM_*/FC_* word offsets below. A new
+;      hot field goes in the block.
+;   2. The per-frame columns are ONE 64-byte line per frame (FM_COLS = 8), not
+;      seven parallel arrays. Same instruction count for the stores, one cache
+;      line instead of seven.
+;   The instruments that used to hang off a probe word in the block are gone,
+;   and with them the printers the inliner kept pulling into `push_on`. Check
+;   the hot prologue after any change here:
+;      objdump -d <bin> | sed -n '/<__ZN9FrameMark7push_onEi>:/,/ret/p'
+;   No `stp`, and no `bl` outside a cold branch.
+
+function getenv(name: pointer[const_char]) returns pointer[const_char] extern
+function calloc(count: size_t, size: size_t) returns pointer[void] extern
+
+; deeper frames are counted, not marked
+define FM_MAX_DEPTH: i64 65536
+
+; --- the state block, by word offset --------------------------------------
+; scalars first, then FM_MAX_DEPTH frames of FM_COLS words each
+define FM_HEAD: i64 0       ; the region being marked (the eval bracket's)
+define FM_GEN: i64 1        ; its generation — condition 1
+define FM_EPOCH: i64 2      ; the publication counter — condition 5
+define FM_TOP: i64 3        ; the innermost live frame's index
+define FM_REWOUND: i64 4    ; rewinds done — `--frame-mark-stats`, the gate's proof
+define FM_PERM: i64 5       ; the run arena — the memo seam's host (Interpreter.memo_host)
+define FM_HDR: i64 32       ; where the per-frame columns start
+
+; one 64-byte line per frame
+define FM_COLS: i64 8
+define FC_PAGE: i64 0       ; the mark's page
+define FC_OFF: i64 1        ; the mark itself
+define FC_EXCL: i64 2       ; the mark page's exclusive list — condition 3
+define FC_HEXCL: i64 3      ; the region HEAD's, a DIFFERENT list
+define FC_HEADAT: i64 4     ; the head's bump at the push — condition 6
+define FC_GEN: i64 5        ; -1 means "this frame carries no mark"
+define FC_EPOCH: i64 6
+
+; The state block is the ENGINE's, not the process's: `Interpreter.make` asks
+; `create` for one and keeps it in `frame_mark`, every VM copies it (the frame
+; hooks run on the VM's hot path), and a null block is the mark switched off.
+; The hooks below take it as their first argument.
+
+define FrameMark
+{
+    ; ★ON by default since 2026-08-07; `DAZZLE_FRAME_MARK=0` (or the CLI's
+    ; `--no-frame-mark`, Interpreter.disable_frame_mark) is the OPT-OUT, and it
+    ; is meant to be used: if a tree ever comes out wrong, that switch is the
+    ; answer, and the difference it makes is the diagnosis. Anything else,
+    ; including the variable being unset, turns the mark on. Null means off.
+    procedure create() returns pointer[i64]
+    {
+        let e getenv("DAZZLE_FRAME_MARK")
+        if e <> null
+        {
+            let zero "0" as char
+            if (*e as u32) = 0
+                return null
+            if (*e as u32) = (zero as u32)
+                return null
+        }
+        ; ONE block for the whole hot state — see finding 1 in the header.
+        calloc((FM_HDR + (FM_MAX_DEPTH * FM_COLS)) as size_t, 8) as pointer[i64]
+    }
+
+    ; --- the region's pages, read through their typed fields ---------------
+    ;
+    ; A page travels through the hot state as a word (the columns are i64), so
+    ; these read the `Page` field under the word. Rewinding — the one place a
+    ; region's structure CHANGES — is the stdlib's (`Page.rewind`); this file
+    ; only reads.
+
+    function bump(p: i64) returns i64
+    {
+        let pg p as pointer[Page]
+        pg.next_object as i64
+    }
+
+    function end_page(p: i64) returns i64
+    {
+        let pg p as pointer[Page]
+        pg.current_page as i64
+    }
+
+    function next_page(p: i64) returns i64
+    {
+        let pg p as pointer[Page]
+        pg.next_page as i64
+    }
+
+    function exclusive(p: i64) returns i64
+    {
+        let pg p as pointer[Page]
+        pg.exclusive_pages.head as i64
+    }
+
+    function head_of(p: i64) returns i64
+    {
+        let pg p as pointer[Page]
+        pg.region as i64
+    }
+
+    ; the END of the marked region's extension chain
+    function tail(head: i64) returns i64
+    {
+        let cp FrameMark.end_page(head)
+        if cp = 0
+            return head
+        cp
+    }
+
+    ; --- hooks --------------------------------------------------------------
+    ;
+    ; ★Each hook is a THIN wrapper around its `*_on` core, and that shape is
+    ; load-bearing for the OFF path (the escape hatch). The check used to sit at
+    ; the top of the big core, so every frame push, every frame pop and every
+    ; store site paid a CALL to find out that the mechanism is off — measured
+    ; 2026-08-07 at 2.0 % of a codegen run (`FrameMark::push` 1.10 %,
+    ; `::pop` 0.80 %, `::store` 0.09 % of self time, with the mark OFF). Split
+    ; this way, LTO inlines the wrapper into its callers and the off path is a
+    ; null test of the block plus a branch.
+
+    ; VM.push_frame, after csp was incremented: the new frame's index is csp-1
+    procedure push(mutable f: pointer[i64], csp: int)
+    {
+        if f <> null
+            FrameMark.push_on(f, csp)
+    }
+
+    procedure pop(mutable f: pointer[i64], csp: int, result: pointer[void])
+    {
+        if f <> null
+            FrameMark.pop_on(f, csp, result)
+    }
+
+    procedure pop_unknown(mutable f: pointer[i64])
+    {
+        if f <> null
+            FrameMark.publish_on(f)
+    }
+
+    procedure store(mutable f: pointer[i64], target: pointer[void])
+    {
+        if f <> null
+            FrameMark.store_on(f, target)
+    }
+
+    procedure publish(mutable f: pointer[i64])
+    {
+        if f <> null
+            FrameMark.publish_on(f)
+    }
+
+    procedure push_on(mutable f: pointer[i64], csp: int)
+    {
+        let idx (csp - 1) as i64
+        *(f + FM_TOP) := idx
+        if idx < 0
+            return
+        if idx >= FM_MAX_DEPTH
+            return
+        let head *(f + FM_HEAD)
+        let c f + (FM_HDR + (idx * FM_COLS))
+        if head = 0
+        {
+            ; outside any eval bracket the run page is the host, and that is
+            ; never rewound
+            *(c + FC_GEN) := 0 - 1
+            return
+        }
+        let t FrameMark.tail(head)
+        let b FrameMark.bump(t)
+        if b = 0
+        {
+            *(c + FC_GEN) := 0 - 1
+            return
+        }
+        *(c + FC_PAGE) := t
+        *(c + FC_OFF) := b
+        *(c + FC_EXCL) := FrameMark.exclusive(t)
+        *(c + FC_HEXCL) := FrameMark.exclusive(head)
+        *(c + FC_HEADAT) := FrameMark.bump(head)
+        *(c + FC_GEN) := *(f + FM_GEN)
+        *(c + FC_EPOCH) := *(f + FM_EPOCH)
+    }
+
+    ; The ReturnInsn arm and PrimitiveObj::tailCall, before VM.pop_frame — `csp`
+    ; is still the leaving frame's, so its index is csp-1, and `result` is the
+    ; value it yields. ★89 % of frames leave through the tail-call path, not
+    ; through the Return insn: a DSSSL body typically ends in a primitive call in
+    ; tail position, and treating that path as "no result reported" makes this
+    ; whole mechanism report zero.
+    procedure pop_on(mutable f: pointer[i64], csp: int, result: pointer[void])
+    {
+        let idx (csp - 1) as i64
+        *(f + FM_TOP) := idx - 1
+        if idx < 0
+            return
+        if idx >= FM_MAX_DEPTH
+            return
+        let head *(f + FM_HEAD)
+        if head = 0
+            return
+        let c f + (FM_HDR + (idx * FM_COLS))
+        ; 1. VALID
+        if *(c + FC_GEN) <> *(f + FM_GEN)
+            return
+        ; 5. QUIET — cheapest and the most common no
+        if *(c + FC_EPOCH) <> *(f + FM_EPOCH)
+            return
+        ; 4. RESULT
+        if FrameMark.in_span(c, head, result)
+            return
+        ; 6. BACKFILL — the region head served nothing while the frame ran.
+        ; ★Only when the head is NOT the mark's page: on a single-page region the
+        ; head's bump IS the span's, so testing it there refuses everything
+        ; (measured: 92 refusals instead of 3, and the 89 are all this case).
+        if *(c + FC_PAGE) <> head
+        {
+            if FrameMark.bump(head) <> *(c + FC_HEADAT)
+                return
+        }
+        ; 2. THE CHAIN and 3. EXCLUSIVE both live in `rewind`, which changes
+        ; nothing when it cannot honour the mark. The count is the one number
+        ; that shows the mark engaged: a silently disabled mark passes every
+        ; differential there is.
+        if FrameMark.rewind(c, head)
+            *(f + FM_REWOUND) := *(f + FM_REWOUND) + 1
+    }
+
+    ; the rewinds done so far (0 with the mark off)
+    function rewound(f: pointer[i64]) returns i64
+    {
+        if f = null
+            return 0
+        *(f + FM_REWOUND)
+    }
+
+    ; --- condition 6: BACKFILL ------------------------------------------------
+    ;
+    ; ★★★The store the sweep never hooked was not a store at all — it is the
+    ; ALLOCATOR. `Page.allocate` serves from the page it was CALLED ON whenever
+    ; that page still has room, and the engine calls it on the region HEAD
+    ; (`host.allocate` in every `ELObj.make_*`) and on arbitrary pages of the
+    ; chain (the `Page.get(object)` / `^this` / container-growth idiom). So the
+    ; frontier is NOT the tail alone: a page below the mark that kept a few free
+    ; bytes serves small requests forever, BELOW every live mark. Measured on the
+    ; reproducer, that turned 150 characters of generated output into garbage in
+    ; one file of 278.
+    ;
+    ; The test that ships is ONE comparison: the region HEAD's bump pointer must
+    ; be the same at the pop as it was at the push. Bump pointers only move
+    ; forward and no page before the mark's is released while the frame runs, so
+    ; equality means the head served nothing during the window. A MIDDLE page can
+    ; only become `this` through `Page.get(object)` on a PRE-EXISTING object —
+    ; precisely the set of sites the store sweep hooks, so such an allocation
+    ; already publishes and is stopped by condition 5. The general test (sum the
+    ; bumps of every page below the mark) costs 27x and refused nothing more
+    ; across the corpus; it was the verifier until the port's close.
+
+    ; is `v` inside the span the frame at `c` marked — its page from the mark
+    ; onward, plus every page appended after it?
+    function in_span(c: pointer[i64], head: i64, v: pointer[void]) returns bool
+    {
+        if v = null
+            return false
+        let mp *(c + FC_PAGE)
+        let vp Page.get(v) as i64
+        if vp = mp
+        {
+            if (v as i64) >= *(c + FC_OFF)
+                return true
+            return false
+        }
+        ; another region can never be in the span: a container growing off an
+        ; object there allocates at THAT region's end
+        if FrameMark.head_of(vp) <> head
+            return false
+        ; same region — only the pages AFTER the mark's page are in the span, and
+        ; a frame appends none in 99.7 % of cases, so this walk is usually empty
+        var p FrameMark.next_page(mp)
+        while p <> 0
+        {
+            if p = vp
+                return true
+            p := FrameMark.next_page(p)
+        }
+        false
+    }
+
+    ; Give back everything allocated in the marked region since the frame's mark
+    ; — `Page.rewind` on the region head, with what the push recorded. It
+    ; answers false and changes NOTHING when the mark cannot be honoured
+    ; (conditions 2 and 3 live there).
+    procedure rewind(c: pointer[i64], head: i64) returns bool
+    {
+        let hp head as pointer[Page]
+        hp.rewind(*(c + FC_PAGE) as pointer[Page], *(c + FC_OFF) as pointer[void], *(c + FC_EXCL) as pointer[PageNode], *(c + FC_HEXCL) as pointer[PageNode])
+    }
+
+    procedure publish_on(mutable f: pointer[i64])
+    {
+        *(f + FM_EPOCH) := *(f + FM_EPOCH) + 1
+    }
+
+    ; ★A STORE into a pre-existing object. It publishes in exactly one shape:
+    ; the target lives in the region being marked AND below the innermost frame's
+    ; mark — then whatever the store allocates lands at the region's END, inside
+    ; the span, while the target survives the rewind. A target in another region
+    ; (the grove, the run page) allocates at THAT region's end and can never
+    ; point into the span; a target inside the span dies with it.
+    procedure store_on(mutable f: pointer[i64], target: pointer[void])
+    {
+        if target = null
+            return
+        let head *(f + FM_HEAD)
+        if head = 0
+            return
+        let tp Page.get(target) as i64
+        if FrameMark.head_of(tp) <> head
+            return
+        let top *(f + FM_TOP)
+        if top < 0
+        {
+            FrameMark.publish_on(f)
+            return
+        }
+        if top >= FM_MAX_DEPTH
+        {
+            FrameMark.publish_on(f)
+            return
+        }
+        let c f + (FM_HDR + (top * FM_COLS))
+        if *(c + FC_GEN) <> *(f + FM_GEN)
+        {
+            FrameMark.publish_on(f)
+            return
+        }
+        ; ★★★Deliberately STRICTER than `in_span`: the target counts as safe only
+        ; when it sits on the innermost frame's own MARK PAGE at or above the
+        ; mark, and the region has not moved off that page since. Reasoning that
+        ; a target on a LATER page of the span is equally safe is what the
+        ; rewritten version did — and it made 3 of the 48 real-world codegens
+        ; differ while publishing 42 000 times less. The looser rule may well be
+        ; defensible; it is not GATED, and this one is.
+        let t FrameMark.tail(head)
+        if t <> *(c + FC_PAGE)
+        {
+            FrameMark.publish_on(f)
+            return
+        }
+        let r target as i64
+        if r >= *(c + FC_OFF)
+        {
+            if r < FrameMark.bump(t)
+                return
+        }
+        FrameMark.publish_on(f)
+    }
+
+    ; Interpreter.make — the run arena, where the memo seam puts its storage
+    ; while the mark is on (the seam follows the mark; see Interpreter.memo_host)
+    procedure set_perm(mutable f: pointer[i64], host: ref[Page])
+    {
+        if f = null
+            return
+        *(f + FM_PERM) := host as i64
+    }
+
+    ; the memo seam's host: the run arena while the mark is on, null otherwise
+    function perm(f: pointer[i64]) returns pointer[Page]
+    {
+        if f = null
+            return null
+        *(f + FM_PERM) as pointer[Page]
+    }
+
+    ; Interpreter.set_eval_region — the region under every live mark changes
+    procedure region(mutable f: pointer[i64], p: ref[Page]?)
+    {
+        if f = null
+            return
+        if (p as i64) = *(f + FM_HEAD)
+            return
+        *(f + FM_HEAD) := p as i64
+        *(f + FM_GEN) := *(f + FM_GEN) + 1
+    }
+}

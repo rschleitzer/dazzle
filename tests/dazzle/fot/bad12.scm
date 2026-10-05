@@ -1,0 +1,7 @@
+(define xx "one")
+(define xx "two")
+(define car "user-car")
+(element doc (make display-group (process-children)))
+(element title (make paragraph (literal xx)))
+(element p (make paragraph (literal (car (list "a" "b")))))
+(element em (make sequence (process-children)))

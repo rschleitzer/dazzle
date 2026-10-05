@@ -1,0 +1,4118 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use dazzle.TestScratch.TestScratch
+use opensp.Location.Location
+use opensp.Location.InputSource
+use opensp.Message.MessageType
+use dazzle.LangObj.LangObj
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
+use dazzle.ELObj.FlowObj
+use dazzle.ELObj.MacroDef
+use dazzle.ELObj.OutputCharStream
+use dazzle.Expression.Expression
+use dazzle.Expression.Environment
+use dazzle.Insn.Insn
+use dazzle.Insn.Signature
+use dazzle.VM.VM
+use dazzle.Interpreter.Interpreter
+use dazzle.Interpreter.Unit
+use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.Grove.GroveNode
+use dazzle.Grove.GroveInfo
+use dazzle.Grove.GroveBuilder
+use dazzle.ProcessingMode.ProcessingMode
+use dazzle.ProcessingMode.RT_STYLE
+use dazzle.ProcessingMode.RT_CONSTRUCTION
+use dazzle.Pattern.Pattern
+use dazzle.Pattern.Element
+use dazzle.Pattern.Qualifier
+use dazzle.ProcessContext.ProcessContext
+use dazzle.TransformFOTBuilder.TransformFOTBuilder
+use opensp.Parser.Parser
+use opensp.ParserState.ParserState
+use opensp.Syntax.Syntax
+use scaly.os.File
+
+; SchemeParser — the DSSSL expression-language reader
+; (style/SchemeParser.cxx; the C# mirror's lexer DIVERGES from the C++ —
+; lexCategory-driven scanning, #b/#o/#x/#d radix tokens, #A glyph ids,
+; keyword tokens with the colon already stripped — the C++ is the oracle).
+;
+; Inc-2 scope: the lexer (getToken and friends over the opensp InputSource
+; token cursor) and the DATUM reader (parseDatum / parseSelfEvaluating /
+; parseAbbreviation) plus the declaration-content parsers
+; (parseStandardChars / parseNameChars / parseSeparatorChars /
+; parseMapSdataEntity). The EXPRESSION half (parse()/parseTopLevel and the
+; parse<Form> family building Expression trees) lands with Inc 3 — it
+; shares this lexer unchanged.
+;
+; Line ends: SchemeParser reads OpenSP-normalized text (records end in RE =
+; 0x0D); skipComment therefore stops at '\r', exactly like the reference.
+
+; token-allow bits (SchemeParser.h; octal in the reference)
+define ALLOW_END_OF_ENTITY: int 0x1
+define ALLOW_FALSE: int 0x2
+define ALLOW_KEYWORD: int 0x4
+define ALLOW_OPEN_PAREN: int 0x8
+define ALLOW_CLOSE_PAREN: int 0x10
+define ALLOW_IDENTIFIER: int 0x20
+define ALLOW_PERIOD: int 0x40
+define ALLOW_OTHER_EXPR: int 0x80
+define ALLOW_EXPRESSION_KEY: int 0x100
+define ALLOW_KEY_DEFINE: int 0x200
+define ALLOW_KEY_ELSE: int 0x400
+define ALLOW_KEY_ARROW: int 0x800
+define ALLOW_STRING: int 0x1000
+define ALLOW_HASH_OPTIONAL: int 0x2000
+define ALLOW_HASH_KEY: int 0x4000
+define ALLOW_HASH_REST: int 0x8000
+define ALLOW_UNQUOTE: int 0x10000
+define ALLOW_UNQUOTE_SPLICING: int 0x20000
+define ALLOW_QUASIQUOTE_KEY: int 0x40000
+define ALLOW_VECTOR: int 0x80000
+define ALLOW_HASH_CONTENTS: int 0x100000
+; allowExpr = False|Keyword|OpenParen|Identifier|String|HashOptional
+;           | HashKey|HashRest|OtherExpr
+define ALLOW_EXPR: int 0xF0AE
+
+; tokens (SchemeParser.h enum Token)
+define TOKEN_END_OF_ENTITY: int 0
+define TOKEN_TRUE: int 1
+define TOKEN_FALSE: int 2
+define TOKEN_STRING: int 3
+define TOKEN_IDENTIFIER: int 4
+define TOKEN_KEYWORD: int 5
+define TOKEN_CHAR: int 6
+define TOKEN_NUMBER: int 7
+define TOKEN_GLYPH_ID: int 8
+define TOKEN_OPEN_PAREN: int 9
+define TOKEN_CLOSE_PAREN: int 10
+define TOKEN_PERIOD: int 11
+define TOKEN_VECTOR: int 12
+define TOKEN_QUOTE: int 13
+define TOKEN_QUASIQUOTE: int 14
+define TOKEN_UNQUOTE: int 15
+define TOKEN_UNQUOTE_SPLICING: int 16
+define TOKEN_HASH_REST: int 17
+define TOKEN_HASH_OPTIONAL: int 18
+define TOKEN_HASH_KEY: int 19
+define TOKEN_HASH_CONTENTS: int 20
+define TOKEN_VOID: int 21
+
+; every allow bit set (recovery / skipForm).
+define ALLOW_ALL: int 0x1FFFFF
+
+; parseFormals argument kinds.
+define FORMAL_REQUIRED: int 0
+define FORMAL_OPTIONAL: int 1
+define FORMAL_REST: int 2
+define FORMAL_KEY: int 3
+
+define SchemeParser
+(
+    host: ref[Page]
+    interp: ref[Interpreter]
+    input: ref[InputSource]
+    var current_token: StringC
+    dsssl2: bool
+    ; the mode currently being defined (SchemeParser::defMode_): the initial
+    ; mode at top level, a named mode inside a (mode NAME …) body.
+    var def_mode: ref[ProcessingMode]
+)
+{
+    function make(host: ref[Page], interp: ref[Interpreter], input: ref[InputSource]) returns ref[SchemeParser]
+    {
+        let p &SchemeParser^host(host, interp, input, StringC(), interp.is_dsssl2(), interp.initial_processing_mode())
+        p
+    }
+
+    ; --- helpers -----------------------------------------------------------
+    ; currentToken_.assign(in->currentTokenStart() + from, len): a fresh copy
+    ; on the run page (each token keeps its own buffer, so a StringObj built
+    ; from a token survives later tokens — arena semantics).
+    procedure set_token_slice(mutable this: ref[SchemeParser], from: size_t, len: size_t)
+    {
+        let host this.host
+        let start this.input.current_token_start_index()
+        let contents this.input.get_contents()
+        this.current_token := StringC^host(contents.subslice(start + from, start + from + len))
+    }
+
+    procedure set_token_char(mutable this: ref[SchemeParser], c: u32)
+    {
+        let host this.host
+        var buf u32[1]
+        *(buf as pointer[u32]) := c
+        this.current_token := StringC^host(buf as pointer[u32], 1)
+    }
+
+    function lex_cat(this: ref[SchemeParser], c: i32) returns int
+        this.interp.lex_category(c)
+
+    ; the reference's initMessage: messages carry the current input location —
+    ; in_->currentLocation() = the current TOKEN'S start, not the read cursor.
+    procedure message0(mutable this: ref[SchemeParser], mt: MessageType)
+    {
+        this.interp.set_next_location(this.input.token_start_location())
+        this.interp.message0(mt)
+    }
+
+    procedure message1(mutable this: ref[SchemeParser], mt: MessageType, a1: StringC)
+    {
+        this.interp.set_next_location(this.input.token_start_location())
+        this.interp.message1(mt, a1)
+    }
+
+    ; --- the lexer ---------------------------------------------------------
+    ; void extendToken(): extend to a delimiter.
+    procedure extend_token(mutable this: ref[SchemeParser])
+    {
+        var length this.input.current_token_length()
+        repeat
+        {
+            let c this.input.token_char()
+            if this.lex_cat(c) > LEX_OTHER
+                break
+            length := length + 1
+        }
+        this.input.end_token(length)
+    }
+
+    ; bool tokenRecover(unsigned allowed, Token &tok)
+    procedure token_recover(mutable this: ref[SchemeParser], allowed: int, mutable tok: ref[int]) returns bool
+    {
+        if allowed = ALLOW_CLOSE_PAREN
+        {
+            this.input.unget_token()
+            tok := TOKEN_CLOSE_PAREN
+            this.message0(InterpreterMessages.missingCloseParen())
+            return true
+        }
+        let tlen this.input.current_token_length()
+        if tlen = 0
+            this.message0(InterpreterMessages.unexpectedEof())
+        else
+        {
+            this.set_token_slice(0, tlen)
+            this.message1(InterpreterMessages.unexpectedToken(), this.current_token)
+        }
+        false
+    }
+
+    ; bool handleNumber(unsigned allowed, Token &tok)
+    procedure handle_number(mutable this: ref[SchemeParser], allowed: int, mutable tok: ref[int]) returns bool
+    {
+        if (allowed & ALLOW_OTHER_EXPR) = 0
+            return this.token_recover(allowed, tok)
+        tok := TOKEN_NUMBER
+        let tlen this.input.current_token_length()
+        this.set_token_slice(0, tlen)
+        true
+    }
+
+    ; bool handleIdentifier(unsigned allowed, Token &tok)
+    procedure handle_identifier(mutable this: ref[SchemeParser], allowed: int, mutable tok: ref[int]) returns bool
+    {
+        if (allowed & ALLOW_IDENTIFIER) = 0
+            return this.token_recover(allowed, tok)
+        let tlen this.input.current_token_length()
+        this.set_token_slice(0, tlen)
+        tok := TOKEN_IDENTIFIER
+        true
+    }
+
+    ; void skipComment(): to end of entity or RE.
+    procedure skip_comment(mutable this: ref[SchemeParser])
+    {
+        repeat
+        {
+            let c this.input.token_char()
+            if (c < 0) or (c = 0x0D)
+                break
+        }
+    }
+
+    ; bool scanString(unsigned allowed, Token &tok)
+    procedure scan_string(mutable this: ref[SchemeParser], allowed: int, mutable tok: ref[int]) returns bool
+    {
+        let host this.host
+        let chars Array[u32]^host()
+        repeat
+        {
+            var c this.input.token_char()
+            if c < 0
+            {
+                this.message0(InterpreterMessages.unterminatedString())
+                this.input.end_token(1)
+                return false
+            }
+            else if c = 0x22
+            {
+                this.current_token := StringC^host(chars.as_slice())
+                tok := TOKEN_STRING
+                return true
+            }
+            else if c = 0x5C
+            {
+                c := this.input.token_char()
+                if (c = 0x5C) or (c = 0x22)
+                    chars.add(c as u32)
+                else if c < 0
+                {
+                    ; end of entity mid-escape: the next iteration reports
+                    ; the unterminated string
+                }
+                else
+                {
+                    ; named character escape \name; (terminator other than
+                    ; ';' is pushed back)
+                    let name_chars Array[u32]()
+                    name_chars.add(c as u32)
+                    var nc this.input.token_char()
+                    while this.lex_cat(nc) < LEX_OTHER
+                    {
+                        name_chars.add(nc as u32)
+                        nc := this.input.token_char()
+                    }
+                    if nc <> 0x3B
+                    {
+                        let cur_len this.input.current_token_length()
+                        this.input.end_token(cur_len - 1)
+                    }
+                    let name StringC(name_chars.as_slice())
+                    var ch: u32 0
+                    if this.interp.convert_char_name(name, &ch)
+                        chars.add(ch)
+                    else
+                        this.message1(InterpreterMessages.unknownCharName(), name)
+                }
+            }
+            else
+                chars.add(c as u32)
+        }
+        false
+    }
+
+    ; bool getToken(unsigned allowed, Token &tok)
+    procedure get_token(mutable this: ref[SchemeParser], allowed: int, mutable tok: ref[int]) returns bool
+    {
+        repeat
+        {
+            this.input.start_token()
+            var c this.input.token_char()
+            if c < 0
+            {
+                if (allowed & ALLOW_END_OF_ENTITY) = 0
+                    return this.token_recover(allowed, tok)
+                tok := TOKEN_END_OF_ENTITY
+                return true
+            }
+            else if c = 0x28
+            {
+                if (allowed & ALLOW_OPEN_PAREN) = 0
+                    return this.token_recover(allowed, tok)
+                tok := TOKEN_OPEN_PAREN
+                return true
+            }
+            else if c = 0x29
+            {
+                if (allowed & ALLOW_CLOSE_PAREN) = 0
+                    return this.token_recover(allowed, tok)
+                tok := TOKEN_CLOSE_PAREN
+                return true
+            }
+            else if c = 0x27
+            {
+                if (allowed & ALLOW_OTHER_EXPR) = 0
+                    return this.token_recover(allowed, tok)
+                tok := TOKEN_QUOTE
+                return true
+            }
+            else if c = 0x60
+            {
+                if (allowed & ALLOW_OTHER_EXPR) = 0
+                    return this.token_recover(allowed, tok)
+                tok := TOKEN_QUASIQUOTE
+                return true
+            }
+            else if c = 0x2C
+            {
+                c := this.input.token_char()
+                if c = 0x40
+                {
+                    if (allowed & ALLOW_UNQUOTE_SPLICING) = 0
+                        return this.token_recover(allowed, tok)
+                    tok := TOKEN_UNQUOTE_SPLICING
+                }
+                else
+                {
+                    if (allowed & ALLOW_UNQUOTE) = 0
+                        return this.token_recover(allowed, tok)
+                    tok := TOKEN_UNQUOTE
+                    this.input.end_token(1)
+                }
+                return true
+            }
+            else if (c = 0x20) or (c = 0x0D) or (c = 0x0A) or (c = 0x09) or (c = 0x0C)
+            {
+                ; whitespace
+            }
+            else if c = 0x23
+            {
+                ; '#'
+                c := this.input.token_char()
+                if (c = 0x74)
+                {
+                    ; #t
+                    if (allowed & ALLOW_OTHER_EXPR) = 0
+                        return this.token_recover(allowed, tok)
+                    tok := TOKEN_TRUE
+                    return true
+                }
+                else if c = 0x66
+                {
+                    ; #f
+                    if (allowed & ALLOW_FALSE) = 0
+                        return this.token_recover(allowed, tok)
+                    tok := TOKEN_FALSE
+                    return true
+                }
+                else if c = 0x5C
+                {
+                    ; #\ character literal
+                    c := this.input.token_char()
+                    if c < 0
+                    {
+                        this.message0(InterpreterMessages.unexpectedEof())
+                        if (allowed & ALLOW_END_OF_ENTITY) <> 0
+                        {
+                            tok := TOKEN_END_OF_ENTITY
+                            return true
+                        }
+                        return false
+                    }
+                    if (allowed & ALLOW_OTHER_EXPR) = 0
+                    {
+                        this.extend_token()
+                        return this.token_recover(allowed, tok)
+                    }
+                    this.input.discard_initial()
+                    this.extend_token()
+                    tok := TOKEN_CHAR
+                    if this.input.current_token_length() = 1
+                        this.set_token_slice(0, 1)
+                    else
+                    {
+                        let host this.host
+                        let start this.input.current_token_start_index()
+                        let contents this.input.get_contents()
+                        let tlen this.input.current_token_length()
+                        let name StringC(contents.subslice(start, start + tlen))
+                        var ch: u32 DEFAULT_CHAR as u32
+                        if this.interp.convert_char_name(name, &ch) = false
+                        {
+                            this.message1(InterpreterMessages.unknownCharName(), name)
+                            ch := DEFAULT_CHAR as u32
+                        }
+                        this.set_token_char(ch)
+                    }
+                    return true
+                }
+                else if c = 0x21
+                {
+                    ; #!named-constant
+                    this.extend_token()
+                    let host this.host
+                    let start this.input.current_token_start_index()
+                    let contents this.input.get_contents()
+                    let tlen this.input.current_token_length()
+                    let tem StringC(contents.subslice(start + 2, start + tlen))
+                    if tem.equals(StringC("optional"))
+                    {
+                        if (allowed & ALLOW_HASH_OPTIONAL) = 0
+                            return this.token_recover(allowed, tok)
+                        tok := TOKEN_HASH_OPTIONAL
+                        return true
+                    }
+                    if tem.equals(StringC("key"))
+                    {
+                        if (allowed & ALLOW_HASH_KEY) = 0
+                            return this.token_recover(allowed, tok)
+                        tok := TOKEN_HASH_KEY
+                        return true
+                    }
+                    if tem.equals(StringC("rest"))
+                    {
+                        if (allowed & ALLOW_HASH_REST) = 0
+                            return this.token_recover(allowed, tok)
+                        tok := TOKEN_HASH_REST
+                        return true
+                    }
+                    if tem.equals(StringC("contents"))
+                    {
+                        if (allowed & ALLOW_HASH_CONTENTS) = 0
+                            return this.token_recover(allowed, tok)
+                        tok := TOKEN_HASH_CONTENTS
+                        return true
+                    }
+                    this.message1(InterpreterMessages.unknownNamedConstant(), tem)
+                }
+                else if (c = 0x62) or (c = 0x6F) or (c = 0x78) or (c = 0x64)
+                {
+                    ; #b #o #x #d radix-prefixed number
+                    this.extend_token()
+                    if (allowed & ALLOW_OTHER_EXPR) = 0
+                        return this.token_recover(allowed, tok)
+                    tok := TOKEN_NUMBER
+                    this.set_token_slice(0, this.input.current_token_length())
+                    return true
+                }
+                else if c = 0x41
+                {
+                    ; #A glyph id
+                    this.extend_token()
+                    if (allowed & ALLOW_OTHER_EXPR) = 0
+                        return this.token_recover(allowed, tok)
+                    tok := TOKEN_GLYPH_ID
+                    this.set_token_slice(2, this.input.current_token_length() - 2)
+                    return true
+                }
+                else if c < 0
+                {
+                    this.message0(InterpreterMessages.unexpectedEof())
+                    if (allowed & ALLOW_END_OF_ENTITY) <> 0
+                    {
+                        tok := TOKEN_END_OF_ENTITY
+                        return true
+                    }
+                    return false
+                }
+                else if (c = 0x76) and this.dsssl2
+                {
+                    ; #v (dsssl2)
+                    if (allowed & ALLOW_OTHER_EXPR) = 0
+                        return this.token_recover(allowed, tok)
+                    tok := TOKEN_VOID
+                    return true
+                }
+                else if (c = 0x28) and this.dsssl2
+                {
+                    ; #( vector (dsssl2)
+                    if (allowed & ALLOW_VECTOR) = 0
+                        return this.token_recover(allowed, tok)
+                    tok := TOKEN_VECTOR
+                    return true
+                }
+                else
+                    this.message0(InterpreterMessages.unknownHash())
+            }
+            else if c = 0x22
+            {
+                if (allowed & ALLOW_STRING) = 0
+                    return this.token_recover(allowed, tok)
+                return this.scan_string(allowed, tok)
+            }
+            else if c = 0x3B
+                this.skip_comment()
+            else if c = 0x2E
+            {
+                ; '.' — period, "..." identifier, or number
+                this.extend_token()
+                let len this.input.current_token_length()
+                if len = 1
+                {
+                    if (allowed & ALLOW_PERIOD) = 0
+                        return this.token_recover(allowed, tok)
+                    tok := TOKEN_PERIOD
+                    return true
+                }
+                if len = 3
+                {
+                    let start this.input.current_token_start_index()
+                    let contents this.input.get_contents()
+                    if (contents[start + 1] = 0x2E) and (contents[start + 2] = 0x2E)
+                        return this.handle_identifier(allowed, tok)
+                }
+                return this.handle_number(allowed, tok)
+            }
+            else
+            {
+                let cat this.lex_cat(c)
+                if cat = LEX_ADD_WHITESPACE
+                {
+                    ; declared separator char: whitespace
+                }
+                else if cat = LEX_OTHER_NUMBER_START
+                {
+                    this.extend_token()
+                    ; a lone + or - is an identifier
+                    if this.input.current_token_length() = 1
+                        return this.handle_identifier(allowed, tok)
+                    return this.handle_number(allowed, tok)
+                }
+                else if cat = LEX_DIGIT
+                {
+                    this.extend_token()
+                    return this.handle_number(allowed, tok)
+                }
+                else
+                {
+                    var invalid false
+                    var do_name true
+                    if cat = LEX_OTHER
+                    {
+                        if c < 0x20
+                        {
+                            ; ignore control characters
+                            this.message0(InterpreterMessages.invalidChar())
+                            do_name := false
+                        }
+                        else
+                            this.input.unget_token()
+                    }
+                    if do_name
+                    {
+                        ; name scan (letters, other name starts, declared
+                        ; name chars; lexOther chars join with a diagnostic)
+                        var length this.input.current_token_length()
+                        repeat
+                        {
+                            let nc this.input.token_char()
+                            let lc this.lex_cat(nc)
+                            if lc > LEX_OTHER
+                                break
+                            if lc = LEX_OTHER
+                                invalid := true
+                            length := length + 1
+                        }
+                        this.input.end_token(length)
+
+                        let tlen this.input.current_token_length()
+                        let start this.input.current_token_start_index()
+                        let contents this.input.get_contents()
+                        var is_keyword false
+                        if tlen > 1
+                        {
+                            if contents[(start + tlen) - 1] = 0x3A
+                                is_keyword := true
+                        }
+                        if is_keyword
+                        {
+                            if (allowed & ALLOW_KEYWORD) = 0
+                                return this.token_recover(allowed, tok)
+                            this.set_token_slice(0, tlen - 1)
+                            tok := TOKEN_KEYWORD
+                            var double_colon false
+                            if this.current_token.get_size() > 1
+                            {
+                                if this.current_token.get(this.current_token.get_size() - 1) = 0x3A
+                                    double_colon := true
+                            }
+                            if invalid or double_colon
+                                this.message1(InterpreterMessages.invalidIdentifier(), this.current_token)
+                            return true
+                        }
+                        if invalid
+                        {
+                            this.set_token_slice(0, tlen)
+                            this.message1(InterpreterMessages.invalidIdentifier(), this.current_token)
+                        }
+                        return this.handle_identifier(allowed, tok)
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    ; --- the datum reader --------------------------------------------------
+    ; ELObj *convertAfiiGlyphId(const StringC &): #Annnn -> GlyphIdObj (null
+    ; on a malformed suffix, exactly the reference).
+    procedure convert_afii_glyph_id(mutable this: ref[SchemeParser], str: StringC) returns ref[ELObj]?
+    {
+        var n 0
+        var i: size_t 0
+        while i < str.get_size()
+        {
+            let c str.get(i)
+            if (c < 0x30) or (c > 0x39)
+            {
+                n := 0
+                break
+            }
+            n := n * 10 + ((c - 0x30) as int)
+            i := i + 1
+        }
+        if n = 0
+        {
+            this.message1(InterpreterMessages.invalidAfiiGlyphId(), str)
+            return null
+        }
+        let interp this.interp
+        ELObj.make_glyph_id(interp.get_host(), StringC("ISO/IEC 10036/RA//Glyphs"), n)
+    }
+
+    ; bool parseSelfEvaluating(unsigned otherAllowed, ELObj *&result, Token &tok)
+    procedure parse_self_evaluating(mutable this: ref[SchemeParser], other_allowed: int, mutable result: ref[ref[ELObj]?], mutable tok: ref[int]) returns bool
+    {
+        result := null
+        if this.get_token(ALLOW_EXPR | other_allowed, tok) = false
+            return false
+        let interp this.interp
+        let t: int tok
+        if t = TOKEN_TRUE
+            result := interp.make_true()
+        else if t = TOKEN_FALSE
+            result := interp.make_false()
+        else if t = TOKEN_VOID
+            result := interp.make_unspecified()
+        else if t = TOKEN_STRING
+            result := ELObj.make_string(interp.get_host(), this.current_token)
+        else if t = TOKEN_KEYWORD
+            result := interp.make_keyword(this.current_token)
+        else if t = TOKEN_CHAR
+            result := ELObj.make_char(interp.get_host(), this.current_token.get(0))
+        else if t = TOKEN_NUMBER
+        {
+            let v interp.convert_number(this.current_token)
+            if v = null
+            {
+                this.message1(InterpreterMessages.invalidNumber(), this.current_token)
+                result := interp.make_error()
+            }
+            else
+                result := v
+        }
+        else if t = TOKEN_GLYPH_ID
+            result := this.convert_afii_glyph_id(this.current_token)
+        true
+    }
+
+    ; bool parseAbbreviation(const char *sym, ELObj *&result): 'x -> (quote x)
+    procedure parse_abbreviation(mutable this: ref[SchemeParser], sym: Slice[char], mutable result: ref[ref[ELObj]?]) returns bool
+    {
+        let interp this.interp
+        let quote_sym interp.make_symbol(StringC(sym))
+        var obj: ref[ELObj]? null
+        var ignore_loc Location()
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_datum(0, &obj, &ignore_loc, &tok) = false
+            return false
+        let hostp interp.get_host()
+        let tail ELObj.make_pair(hostp, obj, interp.make_nil())
+        result := ELObj.make_pair(hostp, quote_sym, tail)
+        true
+    }
+
+    ; bool parseDatum(unsigned otherAllowed, ELObj *&result, Location &loc, Token &tok)
+    procedure parse_datum(mutable this: ref[SchemeParser], other_allowed: int, mutable result: ref[ref[ELObj]?], mutable loc: ref[Location], mutable tok: ref[int]) returns bool
+    {
+        if this.parse_self_evaluating(other_allowed | ALLOW_VECTOR | ALLOW_UNQUOTE | ALLOW_UNQUOTE_SPLICING, result, tok) = false
+            return false
+        ; anchor at the TOKEN START (S69 rule: in_->currentLocation() is the
+        ; current token's startLocation_, never the read cursor) — a quoted
+        ; datum's diagnostics point at the datum, not past it. (Rebuilt from
+        ; components: storing the returned Location through the out pointer
+        ; trips the escape checker's conservative store rule.)
+        let tsl this.input.token_start_location()
+        loc := Location(tsl.get_origin(), tsl.get_index())
+        ; The cell is READ through a typed binding: the reference itself is
+        ; never null, so testing it would be constant.
+        let already: ref[ELObj]? result
+        if already <> null
+            return true
+        let interp this.interp
+        let t: int tok
+        if t = TOKEN_IDENTIFIER
+            result := interp.make_symbol(this.current_token)
+        else if t = TOKEN_QUOTE
+            return this.parse_abbreviation("quote", result)
+        else if t = TOKEN_QUASIQUOTE
+            return this.parse_abbreviation("quasiquote", result)
+        else if t = TOKEN_UNQUOTE
+            return this.parse_abbreviation("unquote", result)
+        else if t = TOKEN_UNQUOTE_SPLICING
+            return this.parse_abbreviation("unquote-splicing", result)
+        else if t = TOKEN_OPEN_PAREN
+        {
+            var tem: ref[ELObj]? null
+            var ignore_loc Location()
+            if this.parse_datum(ALLOW_CLOSE_PAREN, &tem, &ignore_loc, tok) = false
+                return false
+            if tem = null
+                result := interp.make_nil()
+            else
+            {
+                let hostp interp.get_host()
+                let list ELObj.make_pair(hostp, tem, null)
+                var last list
+                var done false
+                while done = false
+                {
+                    if this.parse_datum(ALLOW_CLOSE_PAREN | ALLOW_PERIOD, &tem, &ignore_loc, tok) = false
+                        return false
+                    if tem = null
+                    {
+                        if tok = TOKEN_CLOSE_PAREN
+                        {
+                            last.set_cdr(interp.make_nil())
+                            done := true
+                        }
+                        else
+                        {
+                            ; improper list: '.' cdr ')'
+                            if this.parse_datum(0, &tem, &ignore_loc, tok) = false
+                                return false
+                            last.set_cdr(tem)
+                            if this.get_token(ALLOW_CLOSE_PAREN, tok) = false
+                                return false
+                            done := true
+                        }
+                    }
+                    else
+                    {
+                        let p ELObj.make_pair(hostp, tem, null)
+                        last.set_cdr(p)
+                        last := p
+                    }
+                }
+                result := list
+            }
+        }
+        else if t = TOKEN_VECTOR
+        {
+            let hostv this.host
+            let elems Array[ref[ELObj]?]^hostv()
+            var ignore_loc Location()
+            var done false
+            while done = false
+            {
+                var tem: ref[ELObj]? null
+                if this.parse_datum(ALLOW_CLOSE_PAREN, &tem, &ignore_loc, tok) = false
+                    return false
+                if tem = null
+                    done := true
+                else
+                    elems.add(tem)
+            }
+            result := ELObj.make_vector_of(interp.get_host(), elems.get_buffer(), elems.get_length())
+        }
+        true
+    }
+
+    ; --- declaration-content parsers (style-specification declarations) ----
+    ; void parseStandardChars()
+    procedure parse_standard_chars(mutable this: ref[SchemeParser])
+    {
+        repeat
+        {
+            var tok TOKEN_END_OF_ENTITY
+            if this.get_token(ALLOW_IDENTIFIER | ALLOW_END_OF_ENTITY, &tok) = false
+                break
+            if tok = TOKEN_END_OF_ENTITY
+                break
+
+            let name this.current_token
+
+            if this.get_token(ALLOW_OTHER_EXPR, &tok) = false
+            {
+                this.message0(InterpreterMessages.badDeclaration())
+                break
+            }
+            if tok <> TOKEN_NUMBER
+            {
+                this.message0(InterpreterMessages.badDeclaration())
+                break
+            }
+
+            ; the name must be letters (digits, '-', '.' after the first)
+            var i: size_t 0
+            var ok true
+            while i < name.get_size()
+            {
+                let cat this.lex_cat(name.get(i) as i32)
+                if cat <> LEX_LETTER
+                {
+                    var tail_ok false
+                    if i > 0
+                    {
+                        if (cat = LEX_DIGIT) or (name.get(i) = 0x2D) or (name.get(i) = 0x2E)
+                            tail_ok := true
+                    }
+                    if tail_ok = false
+                    {
+                        ok := false
+                        break
+                    }
+                }
+                i := i + 1
+            }
+            if (ok = false) or (name.get_size() = 1)
+            {
+                this.message1(InterpreterMessages.invalidCharName(), name)
+                continue
+            }
+
+            ; the number must be all digits
+            var j: size_t 0
+            var num_ok true
+            while j < this.current_token.get_size()
+            {
+                if this.lex_cat(this.current_token.get(j) as i32) <> LEX_DIGIT
+                {
+                    num_ok := false
+                    break
+                }
+                j := j + 1
+            }
+            if num_ok = false
+            {
+                this.message1(InterpreterMessages.invalidCharNumber(), this.current_token)
+                continue
+            }
+
+            this.interp.add_standard_char(name, this.current_token)
+        }
+    }
+
+    ; void parseNameChars()
+    procedure parse_name_chars(mutable this: ref[SchemeParser])
+    {
+        repeat
+        {
+            var tok TOKEN_END_OF_ENTITY
+            if this.get_token(ALLOW_IDENTIFIER | ALLOW_END_OF_ENTITY, &tok) = false
+                break
+            if tok = TOKEN_END_OF_ENTITY
+                break
+            this.interp.add_name_char(this.current_token)
+        }
+    }
+
+    ; void parseSeparatorChars()
+    procedure parse_separator_chars(mutable this: ref[SchemeParser])
+    {
+        repeat
+        {
+            var tok TOKEN_END_OF_ENTITY
+            if this.get_token(ALLOW_IDENTIFIER | ALLOW_END_OF_ENTITY, &tok) = false
+                break
+            if tok = TOKEN_END_OF_ENTITY
+                break
+            this.interp.add_separator_char(this.current_token)
+        }
+    }
+
+    ; void parseMapSdataEntity(const StringC &ename, const StringC &etext)
+    procedure parse_map_sdata_entity(mutable this: ref[SchemeParser], mutable ename: StringC, mutable etext: StringC)
+    {
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER | ALLOW_END_OF_ENTITY, &tok) = false
+        {
+            this.message0(InterpreterMessages.badDeclaration())
+            return
+        }
+        if tok = TOKEN_END_OF_ENTITY
+        {
+            this.message0(InterpreterMessages.badDeclaration())
+            return
+        }
+        this.interp.add_sdata_entity(ename, etext, this.current_token)
+    }
+
+    ; ======================================================================
+    ; Inc 3 — the EXPRESSION reader (SchemeParser.cxx parseExpression family).
+    ; Builds Expression trees the Interpreter compiles + runs. Shares the Inc-2
+    ; lexer unchanged. make / style / with-mode / the query forms (there-exists?
+    ; ...) and quasiquote route to later increments; the pure-eval forms are
+    ; here (if/cond/case/and/or/let/let*/letrec/lambda/begin/set!/quote + define).
+    ; ======================================================================
+
+    ; in_->currentLocation() — the START of the current (last-scanned) token,
+    ; NOT the read cursor: a call expression anchors at its `(`, a special
+    ; form at its keyword (the reference captures right after the token is
+    ; consumed; verified against openjade's -G trace columns).
+    function cur_loc(this: SchemeParser) returns Location
+        this.input.token_start_location()
+
+    procedure expect_close_paren(mutable this: ref[SchemeParser]) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        this.get_token(ALLOW_CLOSE_PAREN, &tok)
+    }
+
+    ; bool parseExpression(out expr) — the public entry.
+    procedure parse_expression(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        var key SK_NOTKEY
+        var tok TOKEN_END_OF_ENTITY
+        this.parse_expr_full(ALLOW_EXPR, result, &key, &tok)
+    }
+
+    ; `key <= Identifier::lastSyntacticKey` (= keyWithMode). The EXPRESSION
+    ; keys are the eval-core forms plus the four query forms, make, style,
+    ; with-mode, and — ordered inside that run by the reference — define,
+    ; else and =>. Everything ABOVE lastSyntacticKey (element, mode, label,
+    ; define-unit, query, every NIC keyword) is an ordinary name in
+    ; expression position and must NOT be reported. In this port's numbering
+    ; that set is SK_DEFINE plus the contiguous SK_QUOTE..SK_ARROW run.
+    function is_expression_key(sk: int) returns bool
+    {
+        if sk = SK_DEFINE
+            return true
+        (sk >= SK_QUOTE) and (sk <= SK_ARROW)
+    }
+
+    ; the allow-bit half of that arm: define/else/=> each carry their own bit
+    ; (a cond clause may open with `else`, a body with `define`); unquote and
+    ; unquote-splicing have none in identifier position, so they always
+    ; report; every other expression key needs ALLOW_EXPRESSION_KEY, which
+    ; only the OPERATOR position of a form ever sets.
+    function expression_key_allowed(this: SchemeParser, sk: int, allowed: int) returns bool
+    {
+        if SchemeParser.is_expression_key(sk) = false
+            return true
+        if sk = SK_DEFINE
+            return (allowed & ALLOW_KEY_DEFINE) <> 0
+        if sk = SK_ARROW
+            return (allowed & ALLOW_KEY_ARROW) <> 0
+        if sk = SK_ELSE
+            return (allowed & ALLOW_KEY_ELSE) <> 0
+        if sk = SK_UNQUOTE
+            return false
+        if sk = SK_UNQUOTE_SPLICING
+            return false
+        (allowed & ALLOW_EXPRESSION_KEY) <> 0
+    }
+
+    ; bool parseExpression(allowed, out expr, out key, out tok).
+    procedure parse_expr_full(mutable this: ref[SchemeParser], allowed: int, mutable result: ref[ref[Expression]?], mutable key: ref[int], mutable tok: ref[int]) returns bool
+    {
+        result := null
+        key := SK_NOTKEY
+        tok := TOKEN_END_OF_ENTITY
+        if this.get_token(allowed, tok) = false
+            return false
+        let interp this.interp
+        let hp this.host
+        let t: int tok
+        if t = TOKEN_IDENTIFIER
+        {
+            let ident interp.lookup(this.current_token)
+            let sk ident.syntactic_key()
+            key := sk
+            ; parseExpression's tokenIdentifier arm (SchemeParser.cxx:873): an
+            ; EXPRESSION key in VARIABLE position is a diagnostic unless this
+            ; context allows it. The reference then builds the
+            ; VariableExpression anyway, so the message is the whole
+            ; observable difference.
+            if this.expression_key_allowed(sk, allowed) = false
+                this.message1(InterpreterMessages.syntacticKeywordAsVariable(), this.current_token)
+            result := Expression.make_variable(hp, ident, this.cur_loc())
+            return true
+        }
+        if t = TOKEN_NUMBER
+        {
+            let val interp.convert_number(this.current_token)
+            if val = null
+            {
+                this.message1(InterpreterMessages.invalidNumber(), this.current_token)
+                return false
+            }
+            result := Expression.make_constant(hp, val, this.cur_loc())
+            return true
+        }
+        if t = TOKEN_STRING
+        {
+            result := Expression.make_constant(hp, ELObj.make_string(interp.get_host(), this.current_token), this.cur_loc())
+            return true
+        }
+        if t = TOKEN_TRUE
+        {
+            result := Expression.make_constant(hp, interp.make_true(), this.cur_loc())
+            return true
+        }
+        if t = TOKEN_FALSE
+        {
+            result := Expression.make_constant(hp, interp.make_false(), this.cur_loc())
+            return true
+        }
+        if t = TOKEN_OPEN_PAREN
+            return this.parse_call(result)
+        if t = TOKEN_QUOTE
+            return this.parse_quoted_datum(result)
+        if t = TOKEN_QUASIQUOTE
+        {
+            ; use a LOCAL tok — parse_quasiquote_template consumes the qq's own
+            ; closing paren and would otherwise leave *tok = CLOSE_PAREN, which
+            ; the arg-loop (parse_regular_call / parse_call_args) reads as the
+            ; end of the CALL's argument list, dropping this qq argument. The
+            ; caller's *tok stays TOKEN_QUASIQUOTE (the arg's start token).
+            var splc false
+            var qtok TOKEN_END_OF_ENTITY
+            return this.parse_quasiquote_template(0, 0, result, key, &qtok, &splc)
+        }
+        if t = TOKEN_CHAR
+        {
+            var ch: u32 0
+            if this.current_token.get_size() > 0
+                ch := this.current_token.get(0)
+            result := Expression.make_constant(hp, ELObj.make_char(interp.get_host(), ch), this.cur_loc())
+            return true
+        }
+        ; CloseParen: expr stays null, tok carries the signal.
+        if t = TOKEN_CLOSE_PAREN
+            return true
+        if t = TOKEN_KEYWORD
+        {
+            ; the reference yields a ConstantExpression holding the KeywordObj —
+            ; ordinary call args RECEIVE keywords (node-property … default: #f);
+            ; tok still signals TOKEN_KEYWORD so parse_make's characteristic arm
+            ; (which re-parses the value) keeps its shape.
+            result := Expression.make_constant(hp, interp.make_keyword(this.current_token), this.cur_loc())
+            return true
+        }
+        false
+    }
+
+    ; bool parseCall(out expr) — the open paren has been consumed.
+    procedure parse_call(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let interp this.interp
+        let hp this.host
+        ; a call expression anchors at its OPEN PAREN — the current token at
+        ; entry (parseExpression's tokenOpenParen arm captures loc before
+        ; parsing the operator).
+        let call_loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER | ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+            return false
+        if tok = TOKEN_CLOSE_PAREN
+        {
+            result := Expression.make_constant(hp, interp.make_nil(), this.cur_loc())
+            return true
+        }
+        if tok = TOKEN_IDENTIFIER
+        {
+            let ident interp.lookup(this.current_token)
+            let sk ident.syntactic_key()
+            if sk = SK_QUOTE
+                return this.parse_quote(result)
+            if sk = SK_IF
+                return this.parse_if(result)
+            if sk = SK_COND
+                return this.parse_cond(result)
+            if sk = SK_CASE
+                return this.parse_case(result)
+            if sk = SK_AND
+                return this.parse_and(result)
+            if sk = SK_OR
+                return this.parse_or(result)
+            if sk = SK_LET
+                return this.parse_let(result)
+            if sk = SK_LET_STAR
+                return this.parse_let_star(result)
+            if sk = SK_LETREC
+                return this.parse_letrec(result)
+            if sk = SK_LAMBDA
+                return this.parse_lambda(result)
+            if sk = SK_BEGIN
+                return this.parse_begin(result)
+            if sk = SK_SET
+                return this.parse_set(result)
+            if sk = SK_QUASIQUOTE
+                return this.parse_quasiquote(result)
+            if sk = SK_MAKE
+                return this.parse_make(result)
+            if sk = SK_STYLE
+                return this.parse_style(result)
+            if sk = SK_WITH_MODE
+                return this.parse_with_mode(result)
+            ; the four query-language forms (SchemeParser.cxx:847) — each one
+            ; is nothing but a spelling of one builtins.dsl procedure.
+            if sk = SK_THERE_EXISTS
+                return this.parse_special_query(result, "node-list-some?")
+            if sk = SK_FOR_ALL
+                return this.parse_special_query(result, "node-list-every?")
+            if sk = SK_SELECT_EACH
+                return this.parse_special_query(result, "node-list-filter")
+            if sk = SK_UNION_FOR_EACH
+                return this.parse_special_query(result, "node-list-union-map")
+            ; The op VariableExpression anchors at the IDENTIFIER's own token
+            ; start (parseExpression's tokenIdentifier arm: in_->currentLocation()
+            ; after getToken) — only the CallExpression carries the paren loc.
+            let op_loc this.cur_loc()
+            return this.parse_regular_call(ident, call_loc, op_loc, result)
+        }
+        ; operator is itself a parenthesized call: (( ... ) args...)
+        var func_expr: ref[Expression]? null
+        if this.parse_call(&func_expr) = false
+            return false
+        this.parse_call_args(func_expr, call_loc, result)
+    }
+
+    procedure parse_regular_call(mutable this: ref[SchemeParser], func: ref[Identifier], loc: Location, op_loc: Location, mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let args Array[ref[Expression]?]^hp()
+        repeat
+        {
+            var key SK_NOTKEY
+            var tok TOKEN_END_OF_ENTITY
+            var arg: ref[Expression]? null
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &arg, &key, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if arg <> null
+                args.add(arg)
+        }
+        let op Expression.make_variable(hp, func, op_loc)
+        result := Expression.make_call(hp, op, args, loc)
+        true
+    }
+
+    ; parseWithMode (SchemeParser.cxx) — `(with-mode NAME expr)`. NAME is a
+    ; mode identifier (created on first reference, like the reference's
+    ; lookupProcessingMode) or #f for the initial mode; the single content
+    ; expression evaluates with the VM's processing mode switched.
+    procedure parse_with_mode(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let interp this.interp
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER | ALLOW_FALSE, &tok) = false
+            return false
+        var mode: ref[ProcessingMode]? null
+        if tok = TOKEN_FALSE
+            mode := interp.initial_processing_mode()
+        else
+            mode := interp.lookup_processing_mode(this.current_token)
+        var content: ref[Expression]? null
+        var key SK_NOTKEY
+        var ctok TOKEN_END_OF_ENTITY
+        if this.parse_expr_full(ALLOW_EXPR, &content, &key, &ctok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        result := Expression.make_with_mode(hp, mode, content as ref[Expression], loc)
+        true
+    }
+
+    ; parseStyle (SchemeParser.cxx) — `(style key: val …)`: keyword/value
+    ; pairs only, no class and no content.
+    procedure parse_style(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let interp this.interp
+        let loc this.cur_loc()
+        let keys Array[ref[Identifier]?]^hp()
+        let exprs Array[ref[Expression]?]^hp()
+        repeat
+        {
+            var tem: ref[Expression]? null
+            var key SK_NOTKEY
+            var etok TOKEN_END_OF_ENTITY
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &tem, &key, &etok) = false
+                return false
+            if etok = TOKEN_CLOSE_PAREN
+                break
+            if etok = TOKEN_KEYWORD
+            {
+                let k interp.lookup(this.current_token)
+                var val: ref[Expression]? null
+                var vkey SK_NOTKEY
+                var vtok TOKEN_END_OF_ENTITY
+                if this.parse_expr_full(ALLOW_EXPR, &val, &vkey, &vtok) = false
+                    return false
+                keys.add(k)
+                exprs.add(val)
+                continue
+            }
+            ; a non-keyword datum in a style form: skip (the reference's
+            ; getToken(allowKeyword|allowCloseParen) rejects it earlier).
+            0
+        }
+        result := Expression.make_style_expr(hp, keys, exprs, loc)
+        true
+    }
+
+    ; parseMake (SchemeParser.cxx) — (make FOC key: val … content…). FOC is the
+    ; flow-object-class identifier (declare-flow-object-class bound it); keyword:
+    ; value pairs are characteristics; the rest are content. The MakeExpr carries
+    ; exprs = [characteristic values …, content …] with `keys` parallel to the
+    ; leading value slice. Characteristics must precede content (the DSSSL make
+    ; idiom); duplicate keys keep the first (C++ dedup).
+    procedure parse_make(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let interp this.interp
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        ; the class identifier is stored UNRESOLVED — MakeExpression::compile
+        ; resolves it after the whole part is parsed (forward declares work).
+        let foc_ident interp.lookup(this.current_token)
+        let keys Array[ref[Identifier]?]^hp()
+        let exprs Array[ref[Expression]?]^hp()
+        repeat
+        {
+            var tem: ref[Expression]? null
+            var key SK_NOTKEY
+            var etok TOKEN_END_OF_ENTITY
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &tem, &key, &etok) = false
+                return false
+            if etok = TOKEN_CLOSE_PAREN
+                break
+            if etok = TOKEN_KEYWORD
+            {
+                ; a characteristic — only while no content has appeared yet.
+                if keys.get_length() = exprs.get_length()
+                {
+                    let k interp.lookup(this.current_token)
+                    var val: ref[Expression]? null
+                    var vkey SK_NOTKEY
+                    var vtok TOKEN_END_OF_ENTITY
+                    if this.parse_expr_full(ALLOW_EXPR, &val, &vkey, &vtok) = false
+                        return false
+                    ; dedup: first occurrence wins.
+                    var dup false
+                    var di 0
+                    while di < (keys.get_length() as int)
+                    {
+                        let kp keys.get(di as size_t)
+                        if kp <> null
+                        {
+                            let ke *kp
+                            let kn ke.get_name()
+                            let cn k.get_name()
+                            if kn.equals(cn)
+                                dup := true
+                        }
+                        di := di + 1
+                    }
+                    if dup = false
+                    {
+                        keys.add(k)
+                        exprs.add(val)
+                    }
+                    continue
+                }
+            }
+            if tem = null
+                break
+            exprs.add(tem)
+        }
+        result := Expression.make_make(hp, foc_ident, keys, exprs, loc)
+        true
+    }
+
+    procedure parse_call_args(mutable this: ref[SchemeParser], func: ref[Expression]?, loc: Location, mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        if func = null
+            return false
+        let hp this.host
+        let args Array[ref[Expression]?]^hp()
+        repeat
+        {
+            var key SK_NOTKEY
+            var tok TOKEN_END_OF_ENTITY
+            var arg: ref[Expression]? null
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &arg, &key, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if arg <> null
+                args.add(arg)
+        }
+        result := Expression.make_call(hp, func, args, loc)
+        true
+    }
+
+    procedure parse_if(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let loc this.cur_loc()
+        var test_e: ref[Expression]? null
+        var conseq: ref[Expression]? null
+        var alt: ref[Expression]? null
+        var key SK_NOTKEY
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_expr_full(ALLOW_EXPR, &test_e, &key, &tok) = false
+            return false
+        if this.parse_expr_full(ALLOW_EXPR, &conseq, &key, &tok) = false
+            return false
+        this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &alt, &key, &tok)
+        if tok <> TOKEN_CLOSE_PAREN
+        {
+            if this.expect_close_paren() = false
+                return false
+        }
+        result := Expression.make_if(hp, test_e as ref[Expression], conseq as ref[Expression], alt, loc)
+        true
+    }
+
+    ; collect a body's expressions until the close paren (parseBegin).
+    procedure parse_begin(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let loc this.cur_loc()
+        var key SK_NOTKEY
+        var tok TOKEN_END_OF_ENTITY
+        ; ★the FIRST expression is parsed WITHOUT ALLOW_CLOSE_PAREN in both
+        ; modes (SchemeParser.cxx:1252), so an EMPTY body — `(define (f x))`,
+        ; `(lambda (z))` — is `unexpected token ")"` and the form is skipped.
+        ; This port used to accept it and hand back an unspecified body.
+        var first: ref[Expression]? null
+        if this.parse_expr_full(ALLOW_EXPR, &first, &key, &tok) = false
+            return false
+        ; ★and the SEQUENCE half is -2-gated (SchemeParser.cxx:1254): without
+        ; the flag a body is exactly ONE expression, and a second one is
+        ; `missing closing parenthesis` — reported TWICE, because tokenRecover
+        ; ungets the offending token and answers SUCCESS, so the enclosing
+        ; body-close sees it again. Measured; this port used to take the -2
+        ; shape unconditionally.
+        if this.dsssl2 = false
+        {
+            result := first
+            return this.expect_close_paren()
+        }
+        let exprs Array[ref[Expression]?]^hp()
+        exprs.add(first)
+        repeat
+        {
+            var e: ref[Expression]? null
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &e, &key, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if e <> null
+                exprs.add(e)
+        }
+        result := this.collapse_body(exprs, loc)
+        true
+    }
+
+    ; an expression sequence -> unspecified / the single expr / a Sequence.
+    procedure collapse_body(mutable this: ref[SchemeParser], exprs: ref[Array[ref[Expression]?]], loc: Location) returns ref[Expression]
+    {
+        let hp this.host
+        let n exprs.get_length() as int
+        if n = 0
+            return Expression.make_constant(hp, this.interp.make_unspecified(), loc)
+        if n = 1
+            return *(exprs.get_buffer()) as ref[Expression]
+        Expression.make_sequence(hp, exprs, loc)
+    }
+
+    procedure parse_and(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let loc this.cur_loc()
+        let exprs Array[ref[Expression]?]^hp()
+        repeat
+        {
+            var key SK_NOTKEY
+            var tok TOKEN_END_OF_ENTITY
+            var e: ref[Expression]? null
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &e, &key, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if e <> null
+                exprs.add(e)
+        }
+        let n exprs.get_length() as int
+        if n = 0
+            result := Expression.make_constant(hp, this.interp.make_true(), loc)
+        else if n = 1
+            result := *(exprs.get_buffer())
+        else
+        {
+            let b exprs.as_slice()
+            var acc b[(n - 1)] as ref[Expression]
+            var i n - 2
+            while i >= 0
+            {
+                acc := Expression.make_and(hp, b[i] as ref[Expression], acc, loc)
+                i := i - 1
+            }
+            result := acc
+        }
+        true
+    }
+
+    procedure parse_or(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let loc this.cur_loc()
+        let exprs Array[ref[Expression]?]^hp()
+        repeat
+        {
+            var key SK_NOTKEY
+            var tok TOKEN_END_OF_ENTITY
+            var e: ref[Expression]? null
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &e, &key, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if e <> null
+                exprs.add(e)
+        }
+        let n exprs.get_length() as int
+        if n = 0
+            result := Expression.make_constant(hp, this.interp.make_false(), loc)
+        else if n = 1
+            result := *(exprs.get_buffer())
+        else
+        {
+            let b exprs.as_slice()
+            var acc b[(n - 1)] as ref[Expression]
+            var i n - 2
+            while i >= 0
+            {
+                acc := Expression.make_or(hp, b[i] as ref[Expression], acc, loc)
+                i := i - 1
+            }
+            result := acc
+        }
+        true
+    }
+
+    procedure parse_set(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let var_ident this.interp.lookup(this.current_token)
+        var value: ref[Expression]? null
+        var key SK_NOTKEY
+        if this.parse_expr_full(ALLOW_EXPR, &value, &key, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        result := Expression.make_assignment(hp, var_ident, value as ref[Expression], loc)
+        true
+    }
+
+    procedure parse_quote(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        var datum: ref[ELObj]? null
+        var loc Location()
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_datum(ALLOW_EXPR, &datum, &loc, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        result := Expression.make_constant(this.host, datum, loc)
+        true
+    }
+
+    procedure parse_quoted_datum(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        var datum: ref[ELObj]? null
+        var loc Location()
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_datum(ALLOW_EXPR, &datum, &loc, &tok) = false
+            return false
+        result := Expression.make_constant(this.host, datum, loc)
+        true
+    }
+
+    ; ======================================================================
+    ; quasiquote (SchemeParser.cxx parseQuasiquote / parseQuasiquoteTemplate).
+    ; The eval side (QuasiquoteExpr / compile_quasiquote) is already in place;
+    ; this builds the QuasiquoteExpr tree from `x / ,x / ,@x / nested levels.
+    ; ======================================================================
+
+    ; (quasiquote X) form — template then the closing paren.
+    procedure parse_quasiquote(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        var key SK_NOTKEY
+        var tok TOKEN_END_OF_ENTITY
+        var splc false
+        if this.parse_quasiquote_template(0, 0, result, &key, &tok, &splc) = false
+            return false
+        this.expect_close_paren()
+    }
+
+    ; createQuasiquoteAbbreviation: wrap `inner` as (sym inner), a listType QQ.
+    procedure create_quasiquote_abbrev(mutable this: ref[SchemeParser], sym: Slice[char], inner: ref[Expression]?) returns ref[Expression]
+    {
+        let hp this.host
+        let interp this.interp
+        var loc this.cur_loc()
+        if inner <> null
+            loc := inner.location()
+        let members Array[ref[Expression]?]^hp()
+        let sym_obj interp.make_symbol(StringC(sym))
+        members.add(Expression.make_constant(hp, sym_obj, loc))
+        members.add(inner)
+        let spliced Array[bool]^hp()
+        spliced.add(false)
+        spliced.add(false)
+        Expression.make_quasiquote(hp, members, spliced, QQ_LIST, loc)
+    }
+
+    ; bool parseQuasiquoteTemplate(level, allowed, expr, key, tok, spliced).
+    procedure parse_quasiquote_template(mutable this: ref[SchemeParser], level: int, allowed: int, mutable result: ref[ref[Expression]?], mutable key: ref[int], mutable tok: ref[int], mutable spliced: ref[bool]) returns bool
+    {
+        key := SK_NOTKEY
+        spliced := false
+        let interp this.interp
+        let hp this.host
+        var obj: ref[ELObj]? null
+        if this.parse_self_evaluating(allowed | ALLOW_UNQUOTE | ALLOW_VECTOR, &obj, tok) = false
+            return false
+        if obj <> null
+        {
+            result := Expression.make_constant(hp, obj, this.cur_loc())
+            return true
+        }
+        let t: int tok
+        if t = TOKEN_QUASIQUOTE
+        {
+            var inner: ref[Expression]? null
+            var sk SK_NOTKEY
+            var st TOKEN_END_OF_ENTITY
+            var ss false
+            if this.parse_quasiquote_template(level + 1, 0, &inner, &sk, &st, &ss) = false
+                return false
+            result := this.create_quasiquote_abbrev("quasiquote", inner)
+            return true
+        }
+        if t = TOKEN_QUOTE
+        {
+            var inner: ref[Expression]? null
+            var sk SK_NOTKEY
+            var st TOKEN_END_OF_ENTITY
+            var ss false
+            if this.parse_quasiquote_template(level, 0, &inner, &sk, &st, &ss)
+                result := this.create_quasiquote_abbrev("quote", inner)
+            else
+                result := inner
+            return true
+        }
+        if (t = TOKEN_UNQUOTE) or (t = TOKEN_UNQUOTE_SPLICING)
+        {
+            if level = 0
+            {
+                spliced := t = TOKEN_UNQUOTE_SPLICING
+                ; ALLOW_EXPR (not 0): parse_expr_full uses `allowed` verbatim,
+                ; unlike the C++ parseSelfEvaluating which always adds allowExpr.
+                return this.parse_expr_full(ALLOW_EXPR, result, key, tok)
+            }
+            var inner: ref[Expression]? null
+            var sk SK_NOTKEY
+            var st TOKEN_END_OF_ENTITY
+            var ss false
+            if this.parse_quasiquote_template(level - 1, 0, &inner, &sk, &st, &ss)
+            {
+                if t = TOKEN_UNQUOTE
+                    result := this.create_quasiquote_abbrev("unquote", inner)
+                else
+                    result := this.create_quasiquote_abbrev("unquote-splicing", inner)
+            }
+            else
+                result := inner
+            return true
+        }
+        if (t = TOKEN_OPEN_PAREN) or (t = TOKEN_VECTOR)
+            return this.parse_quasiquote_list(level, t, result, key, tok, spliced)
+        if t = TOKEN_IDENTIFIER
+        {
+            if (allowed & ALLOW_QUASIQUOTE_KEY) <> 0
+            {
+                let ident interp.lookup(this.current_token)
+                let sk ident.syntactic_key()
+                if (sk = SK_UNQUOTE_SPLICING) or (sk = SK_UNQUOTE) or (sk = SK_QUASIQUOTE)
+                {
+                    key := sk
+                    return true
+                }
+            }
+            obj := interp.make_symbol(this.current_token)
+        }
+        ; default: a self-quoting/symbol datum, or a bare signalling token
+        if obj <> null
+            result := Expression.make_constant(hp, obj, this.cur_loc())
+        true
+    }
+
+    ; the tokenOpenParen / tokenVector arm of parseQuasiquoteTemplate.
+    procedure parse_quasiquote_list(mutable this: ref[SchemeParser], level: int, open_tok: int, mutable result: ref[ref[Expression]?], mutable key: ref[int], mutable tok: ref[int], mutable spliced: ref[bool]) returns bool
+    {
+        result := null
+        let hp this.host
+        let interp this.interp
+        let loc this.cur_loc()
+        var qtype QQ_LIST
+        if open_tok = TOKEN_VECTOR
+            qtype := QQ_VECTOR
+        let members Array[ref[Expression]?]^hp()
+        let spl Array[bool]^hp()
+        ; --- first element (recognises leading key / empty list) -----------
+        var first: ref[Expression]? null
+        var temspl false
+        if this.parse_quasiquote_template(level, ALLOW_CLOSE_PAREN | ALLOW_QUASIQUOTE_KEY | ALLOW_UNQUOTE_SPLICING, &first, key, tok, &temspl) = false
+            return false
+        if first = null
+        {
+            let k: int key
+            if k = SK_QUASIQUOTE
+            {
+                var inner: ref[Expression]? null
+                var sk SK_NOTKEY
+                if this.parse_quasiquote_template(level + 1, 0, &inner, &sk, tok, spliced) = false
+                    return false
+                result := this.create_quasiquote_abbrev("quasiquotation", inner)
+                return this.expect_close_paren()
+            }
+            if (k = SK_UNQUOTE) or (k = SK_UNQUOTE_SPLICING)
+            {
+                var was_splice k = SK_UNQUOTE_SPLICING
+                if was_splice
+                    spliced := true
+                if level = 0
+                {
+                    var sk SK_NOTKEY
+                    if this.parse_expr_full(ALLOW_EXPR, result, &sk, tok) = false
+                        return false
+                }
+                else
+                {
+                    var inner: ref[Expression]? null
+                    var sk SK_NOTKEY
+                    var ss false
+                    if this.parse_quasiquote_template(level - 1, 0, &inner, &sk, tok, &ss) = false
+                        return false
+                    if was_splice
+                        result := this.create_quasiquote_abbrev("unquote-splicing", inner)
+                    else
+                        result := this.create_quasiquote_abbrev("unquote", inner)
+                    spliced := false
+                }
+                return this.expect_close_paren()
+            }
+            ; empty list -> nil
+            result := Expression.make_constant(hp, interp.make_nil(), loc)
+            return true
+        }
+        members.add(first)
+        spl.add(temspl)
+        ; --- remaining elements --------------------------------------------
+        var done false
+        while done = false
+        {
+            var extra 0
+            if qtype <> QQ_VECTOR
+                extra := ALLOW_PERIOD
+            var tem: ref[Expression]? null
+            var ts false
+            if this.parse_quasiquote_template(level, ALLOW_CLOSE_PAREN | ALLOW_UNQUOTE_SPLICING | extra, &tem, key, tok, &ts) = false
+                return false
+            if tem = null
+            {
+                if tok = TOKEN_CLOSE_PAREN
+                {
+                    done := true
+                }
+                else
+                {
+                    ; period -> improper list: parse the tail, expect ')'
+                    qtype := QQ_IMPROPER
+                    var tail: ref[Expression]? null
+                    var sk SK_NOTKEY
+                    var ss false
+                    if this.parse_quasiquote_template(level, 0, &tail, &sk, tok, &ss) = false
+                        return false
+                    if this.expect_close_paren() = false
+                        return false
+                    members.add(tail)
+                    spl.add(false)
+                    done := true
+                }
+            }
+            else
+            {
+                members.add(tem)
+                spl.add(ts)
+            }
+        }
+        result := Expression.make_quasiquote(hp, members, spl, qtype, loc)
+        true
+    }
+
+    ; (cond (test expr...) ... (else expr...)) -> nested ifs.
+    procedure parse_cond(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let loc this.cur_loc()
+        let tests Array[ref[Expression]?]()
+        let results Array[ref[Expression]?]()
+        let is_else_arr Array[bool]()
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            var test_e: ref[Expression]? null
+            var key SK_NOTKEY
+            if this.parse_expr_full(ALLOW_EXPR | ALLOW_KEY_ELSE, &test_e, &key, &tok) = false
+                return false
+            var is_else false
+            if key = SK_ELSE
+                is_else := true
+            let res_exprs Array[ref[Expression]?]^hp()
+            repeat
+            {
+                var r: ref[Expression]? null
+                if this.parse_expr_full(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &r, &key, &tok) = false
+                    return false
+                if tok = TOKEN_CLOSE_PAREN
+                    break
+                if r <> null
+                    res_exprs.add(r)
+            }
+            var conseq: ref[Expression]? null
+            if (res_exprs.get_length() as int) = 0
+                conseq := test_e
+            else
+                conseq := this.collapse_body(res_exprs, loc)
+            tests.add(test_e)
+            results.add(conseq)
+            is_else_arr.add(is_else)
+            ; An else clause is terminal: unlike a normal clause (whose trailing
+            ; loop iteration reads the cond's close paren at the top get_token),
+            ; breaking here skips that read, so consume the cond's close paren
+            ; now. Any further clause after else is thus a hard syntax error.
+            if is_else
+            {
+                if this.expect_close_paren() = false
+                    return false
+                break
+            }
+        }
+        var alternate Expression.make_cond_fail(hp, loc)
+        let n tests.get_length() as int
+        let tb tests.as_slice()
+        let rb results.as_slice()
+        let eb is_else_arr.as_slice()
+        var i n - 1
+        while i >= 0
+        {
+            if eb[i]
+                alternate := rb[i] as ref[Expression]
+            else
+                alternate := Expression.make_if(hp, tb[i] as ref[Expression], rb[i] as ref[Expression], alternate, loc)
+            i := i - 1
+        }
+        result := alternate
+        true
+    }
+
+    ; (case key ((d...) expr...) ... (else expr...)).
+    procedure parse_case(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let loc this.cur_loc()
+        var key_expr: ref[Expression]? null
+        var key SK_NOTKEY
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_expr_full(ALLOW_EXPR, &key_expr, &key, &tok) = false
+            return false
+        let datums Array[ref[ELObj]?]^hp()
+        let case_starts Array[int]^hp()
+        let results Array[ref[Expression]?]^hp()
+        var else_expr: ref[Expression]? null
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_IDENTIFIER, &tok) = false
+                return false
+            if tok = TOKEN_IDENTIFIER
+            {
+                let ident this.interp.lookup(this.current_token)
+                if ident.syntactic_key() = SK_ELSE
+                {
+                    if this.parse_begin(&else_expr) = false
+                        return false
+                    continue
+                }
+                ; caseElse (SchemeParser.cxx:1190) — a `case` clause whose
+                ; head is an identifier can only be `else`; anything else is
+                ; `expected "else" not %1`.
+                this.message1(InterpreterMessages.caseElse(), this.current_token)
+                return false
+            }
+            ; datum list
+            case_starts.add(datums.get_length() as int)
+            repeat
+            {
+                var d: ref[ELObj]? null
+                var dloc Location()
+                if this.parse_datum(ALLOW_EXPR | ALLOW_CLOSE_PAREN, &d, &dloc, &tok) = false
+                    return false
+                if tok = TOKEN_CLOSE_PAREN
+                    break
+                datums.add(d)
+            }
+            var res: ref[Expression]? null
+            if this.parse_begin(&res) = false
+                return false
+            results.add(res)
+        }
+        result := Expression.make_case(hp, key_expr as ref[Expression], datums, case_starts, results, else_expr, loc)
+        true
+    }
+
+    ; --- let family --------------------------------------------------------
+    ; parse `(var init) ...)` — the bindings-list open paren already consumed.
+    procedure parse_bindings(mutable this: ref[SchemeParser], mutable vars: ref[Array[ref[Identifier]?]], mutable inits: ref[Array[ref[Expression]?]]) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+                return false
+            vars.add(this.interp.lookup(this.current_token))
+            var init_e: ref[Expression]? null
+            var key SK_NOTKEY
+            if this.parse_expr_full(ALLOW_EXPR, &init_e, &key, &tok) = false
+                return false
+            inits.add(init_e)
+            if this.expect_close_paren() = false
+                return false
+        }
+        true
+    }
+
+    procedure parse_let(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let loc this.cur_loc()
+        let vars Array[ref[Identifier]?]^hp()
+        let inits Array[ref[Expression]?]^hp()
+        var body: ref[Expression]? null
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_OPEN_PAREN | ALLOW_IDENTIFIER, &tok) = false
+            return false
+        var name: ref[Identifier]? null
+        if tok = TOKEN_IDENTIFIER
+        {
+            name := this.interp.lookup(this.current_token)
+            ; the bindings list open paren follows.
+            if this.get_token(ALLOW_OPEN_PAREN, &tok) = false
+                return false
+            if this.parse_bindings(vars, inits) = false
+                return false
+            if this.parse_begin(&body) = false
+                return false
+        }
+        else
+        {
+            ; regular let — the bindings-list open paren is the tok we just read.
+            if this.parse_bindings(vars, inits) = false
+                return false
+            if this.parse_begin(&body) = false
+                return false
+        }
+        if name <> null
+        {
+            ; named let -> ((letrec ((name (lambda (vars) body))) name) inits...)
+            let loop_formal Array[ref[Identifier]?]^hp()
+            loop_formal.add(name)
+            let empty_inits Array[ref[Expression]?]^hp()
+            let lam_sig Signature((vars.get_length() as int), 0, false, 0, null)
+            let lambda Expression.make_lambda(hp, vars, empty_inits, lam_sig, body as ref[Expression], loc)
+            let loop_init Array[ref[Expression]?]^hp()
+            loop_init.add(lambda)
+            let loop_ref Expression.make_variable(hp, name, loc)
+            let letrec Expression.make_letrec(hp, loop_formal, loop_init, loop_ref, loc)
+            result := Expression.make_call(hp, letrec, inits, loc)
+        }
+        else
+            result := Expression.make_let(hp, vars, inits, body as ref[Expression], loc)
+        true
+    }
+
+    procedure parse_let_star(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let loc this.cur_loc()
+        let vars Array[ref[Identifier]?]^hp()
+        let inits Array[ref[Expression]?]^hp()
+        var body: ref[Expression]? null
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_OPEN_PAREN, &tok) = false
+            return false
+        if this.parse_bindings(vars, inits) = false
+            return false
+        if this.parse_begin(&body) = false
+            return false
+        result := Expression.make_let_star(hp, vars, inits, body as ref[Expression], loc)
+        true
+    }
+
+    procedure parse_letrec(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let loc this.cur_loc()
+        let vars Array[ref[Identifier]?]^hp()
+        let inits Array[ref[Expression]?]^hp()
+        var body: ref[Expression]? null
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_OPEN_PAREN, &tok) = false
+            return false
+        if this.parse_bindings(vars, inits) = false
+            return false
+        if this.parse_begin(&body) = false
+            return false
+        result := Expression.make_letrec(hp, vars, inits, body as ref[Expression], loc)
+        true
+    }
+
+    procedure parse_lambda(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?]) returns bool
+    {
+        result := null
+        let hp this.host
+        let loc this.cur_loc()
+        let formals Array[ref[Identifier]?]^hp()
+        let defaults Array[ref[Expression]?]^hp()
+        var n_required 0
+        var has_rest false
+        var n_key 0
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_OPEN_PAREN | ALLOW_IDENTIFIER, &tok) = false
+            return false
+        if tok = TOKEN_IDENTIFIER
+        {
+            ; (lambda x body) — a single rest parameter.
+            formals.add(this.interp.lookup(this.current_token))
+            has_rest := true
+        }
+        else
+        {
+            if this.parse_formals(formals, defaults, &n_required, &has_rest, &n_key) = false
+                return false
+        }
+        var body: ref[Expression]? null
+        if this.parse_begin(&body) = false
+            return false
+        var rest_slot 0
+        if has_rest
+            rest_slot := 1
+        let n_optional (formals.get_length() as int) - n_required - n_key - rest_slot
+        let sig this.build_signature(formals, n_required, n_optional, has_rest, n_key)
+        result := Expression.make_lambda(hp, formals, defaults, sig, body as ref[Expression], loc)
+        true
+    }
+
+    ; assemble a Signature, materializing the keyword-arg identifier table.
+    procedure build_signature(mutable this: ref[SchemeParser], formals: ref[Array[ref[Identifier]?]], n_required: int, n_optional: int, has_rest: bool, n_key: int) returns Signature
+    {
+        var keys: pointer[pointer[Identifier]] null
+        if n_key > 0
+        {
+            let hp this.host
+            keys := hp.allocate((n_key as size_t) * sizeof pointer[Identifier], alignof pointer[Identifier]) as pointer[pointer[Identifier]]
+            let base (formals.get_length() as int) - n_key
+            var i 0
+            while i < n_key
+            {
+                *(keys + i) := formals[(base + i)]
+                i := i + 1
+            }
+        }
+        Signature(n_required, n_optional, has_rest, n_key, keys)
+    }
+
+    ; bool parseSpecialQuery(out expr, const char *query) — SchemeParser.cxx:2401.
+    ; The whole DSSSL query language is this one desugaring: `(FORM v nl e)`
+    ; becomes `(PRIM (lambda (v) e) nl)`, PRIM being one of four builtins.dsl
+    ; procedures. Two things follow from the shape and are pinned in
+    ; tests/dazzle/engine/query1:
+    ;  - the bound variable is a LAMBDA variable, so it is in scope in the
+    ;    EXPRESSION only — the node-list argument still sees the outer binding;
+    ;  - the operator is a CONSTANT holding the primitive's BUILTIN value,
+    ;    read here at parse time, so a stylesheet that redefines
+    ;    node-list-filter changes its own calls and never `select-each`.
+    ; The order matters: the reference resolves the operator BEFORE parsing
+    ; the two argument expressions, and compute_builtin_value can run the VM.
+    procedure parse_special_query(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?], mutable prim: Slice[char]) returns bool
+    {
+        result := null
+        let hp this.host
+        let interp this.interp
+        ; currentLocation at entry: the START of the form keyword.
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let var_ident interp.lookup(this.current_token)
+        if SchemeParser.is_expression_key(var_ident.syntactic_key())
+            this.message1(InterpreterMessages.syntacticKeywordAsVariable(), this.current_token)
+        let prim_name Interpreter.ascii_string_c(hp, prim)
+        let prim_ident interp.lookup(prim_name)
+        let prim_value prim_ident.compute_builtin_value(true, interp)
+        let op Expression.make_constant(hp, prim_value, loc)
+        var key SK_NOTKEY
+        var nl_expr: ref[Expression]? null
+        if this.parse_expr_full(ALLOW_EXPR, &nl_expr, &key, &tok) = false
+            return false
+        var body: ref[Expression]? null
+        if this.parse_expr_full(ALLOW_EXPR, &body, &key, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        let formals Array[ref[Identifier]?]^hp()
+        formals.add(var_ident)
+        let defaults Array[ref[Expression]?]^hp()
+        let sig Signature(1, 0, false)
+        let lam Expression.make_lambda(hp, formals, defaults, sig, body as ref[Expression], loc)
+        let args Array[ref[Expression]?]^hp()
+        args.add(lam)
+        args.add(nl_expr)
+        result := Expression.make_call(hp, op, args, loc)
+        true
+    }
+
+    ; bool parseFormals(formals, inits, out nRequired, out hasRest, out nKey).
+    procedure parse_formals(mutable this: ref[SchemeParser], mutable formals: ref[Array[ref[Identifier]?]], mutable inits: ref[Array[ref[Expression]?]], mutable n_required: ref[int], mutable has_rest: ref[bool], mutable n_key: ref[int]) returns bool
+    {
+        n_required := 0
+        has_rest := false
+        n_key := 0
+        var kind FORMAL_REQUIRED
+        var allowed ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER | ALLOW_HASH_OPTIONAL | ALLOW_HASH_REST | ALLOW_HASH_KEY
+        var c_req 0
+        var c_opt 0
+        var c_rest 0
+        var c_key 0
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(allowed, &tok) = false
+                return false
+            if tok = TOKEN_HASH_OPTIONAL
+            {
+                allowed := ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER | ALLOW_HASH_REST | ALLOW_HASH_KEY
+                kind := FORMAL_OPTIONAL
+            }
+            else if tok = TOKEN_HASH_REST
+            {
+                allowed := ALLOW_IDENTIFIER
+                kind := FORMAL_REST
+            }
+            else if tok = TOKEN_HASH_KEY
+            {
+                allowed := ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER
+                kind := FORMAL_KEY
+            }
+            else if tok = TOKEN_OPEN_PAREN
+            {
+                if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+                    return false
+                formals.add(this.interp.lookup(this.current_token))
+                if kind = FORMAL_OPTIONAL
+                    c_opt := c_opt + 1
+                else
+                    c_key := c_key + 1
+                var init_e: ref[Expression]? null
+                var key SK_NOTKEY
+                if this.parse_expr_full(ALLOW_EXPR, &init_e, &key, &tok) = false
+                    return false
+                this.pad_inits(inits, c_opt + c_key)
+                inits.put((((c_opt + c_key) - 1) as size_t), init_e)
+                if this.get_token(ALLOW_CLOSE_PAREN, &tok) = false
+                    return false
+            }
+            else if tok = TOKEN_IDENTIFIER
+            {
+                formals.add(this.interp.lookup(this.current_token))
+                if kind = FORMAL_REQUIRED
+                    c_req := c_req + 1
+                else if kind = FORMAL_OPTIONAL
+                {
+                    c_opt := c_opt + 1
+                    this.pad_inits(inits, c_opt + c_key)
+                }
+                else if kind = FORMAL_REST
+                {
+                    c_rest := c_rest + 1
+                    allowed := ALLOW_HASH_KEY | ALLOW_CLOSE_PAREN
+                }
+                else
+                {
+                    c_key := c_key + 1
+                    this.pad_inits(inits, c_opt + c_key)
+                }
+            }
+            else if tok = TOKEN_CLOSE_PAREN
+                break
+            else
+                return false
+        }
+        n_required := c_req
+        n_key := c_key
+        if c_rest > 0
+            has_rest := true
+        this.pad_inits(inits, c_opt + c_key)
+        true
+    }
+
+    ; grow inits with null defaults up to n entries.
+    procedure pad_inits(this: ref[SchemeParser], mutable inits: ref[Array[ref[Expression]?]], n: int)
+    {
+        while (inits.get_length() as int) < n
+            inits.add(null)
+    }
+
+    ; --- top level ---------------------------------------------------------
+    ; the reader loop (SchemeParser::parse) — one top-level form per iteration.
+    procedure parse(mutable this: ref[SchemeParser])
+    {
+        var recovering false
+        repeat
+        {
+            var allowed ALLOW_OPEN_PAREN | ALLOW_END_OF_ENTITY
+            if recovering
+                allowed := ALLOW_ALL
+            var tok TOKEN_END_OF_ENTITY
+            if this.get_token(allowed, &tok) = false
+            {
+                recovering := true
+                continue
+            }
+            if tok = TOKEN_END_OF_ENTITY
+                break
+            if tok <> TOKEN_OPEN_PAREN
+            {
+                recovering := true
+                continue
+            }
+            ; ★the top-level loop does NOT skip a failed form
+            ; (SchemeParser.cxx:114): it only raises `recovering` and reads on
+            ; TOKEN BY TOKEN, so a `(` + keyed identifier INSIDE the wreckage
+            ; is parsed as a top-level form of its own —
+            ; `(bogus (define x 1))` really does define x, and the leftover
+            ; `)` is then an `unexpected token`. Only the three deliberately
+            ; ignored declarations skipForm, and they do it in parse_top_level.
+            let success this.parse_top_level(recovering)
+            recovering := success = false
+        }
+    }
+
+    ; `recovering` gates the DIAGNOSTIC and, like the reference, widens the
+    ; head token's allow set to everything (SchemeParser.cxx:126).
+    procedure parse_top_level(mutable this: ref[SchemeParser], recovering: bool) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        var head_allowed ALLOW_IDENTIFIER
+        if recovering
+            head_allowed := ALLOW_ALL
+        if this.get_token(head_allowed, &tok) = false
+            return false
+        if tok = TOKEN_IDENTIFIER
+        {
+            let ident this.interp.lookup(this.current_token)
+            let sk ident.syntactic_key()
+            if sk = SK_DEFINE
+                return this.do_define()
+            if sk = SK_DEFINE_UNIT
+                return this.do_define_unit()
+            if sk = SK_ELEMENT
+                return this.do_element()
+            if sk = SK_OR_ELEMENT
+                return this.do_or_element()
+            if sk = SK_DEFAULT
+                return this.do_default()
+            if sk = SK_ROOT
+                return this.do_root()
+            if sk = SK_ID
+                return this.do_id()
+            if sk = SK_MODE
+                return this.do_mode()
+            if sk = SK_DECLARE_FLOW_OBJECT_CLASS
+                return this.do_declare_flow_object_class()
+            if sk = SK_DECLARE_INITIAL_VALUE
+                return this.do_declare_initial_value()
+            if sk = SK_DECLARE_CHARACTERISTIC
+                return this.do_declare_characteristic()
+            if sk = SK_DEFINE_LANGUAGE
+                return this.do_define_language()
+            if sk = SK_DECLARE_DEFAULT_LANGUAGE
+                return this.do_declare_default_language()
+            if sk = SK_DECLARE_CHAR_PROPERTY
+                return this.do_declare_char_property()
+            if sk = SK_ADD_CHAR_PROPERTIES
+                return this.do_add_char_properties()
+            if sk = SK_DECLARE_CHAR_CHARACTERISTIC_AND_PROPERTY
+                return this.do_declare_char_characteristic_and_property()
+            if sk = SK_DECLARE_CLASS_ATTRIBUTE
+                return this.do_declare_class_attribute()
+            if sk = SK_DECLARE_ID_ATTRIBUTE
+                return this.do_declare_id_attribute()
+            if sk = SK_DECLARE_FLOW_OBJECT_MACRO
+                return this.do_declare_flow_object_macro()
+            ; ★Only THREE keys are skipped without a word in the reference
+            ; (SchemeParser.cxx:197): declare-reference-value-type,
+            ; define-page-model, define-column-set-model. Everything else —
+            ; a key with no top-level meaning (`if`, `lambda`, a
+            ; characteristic name) just as much as an identifier with no key
+            ; at all — is `unknown top level form`. This port used to skip
+            ; every one of them silently, which HID the unported
+            ; declarations instead of reporting them.
+            if sk = SK_DECLARE_REFERENCE_VALUE_TYPE
+                return this.skip_form()
+            if sk = SK_DEFINE_PAGE_MODEL
+                return this.skip_form()
+            if sk = SK_DEFINE_COLUMN_SET_MODEL
+                return this.skip_form()
+            if recovering = false
+                this.message1(InterpreterMessages.unknownTopLevelForm(), this.current_token)
+            return false
+        }
+        ; head is not an identifier: the reference falls straight through to
+        ; `recovering = 1` with no message and no skip.
+        false
+    }
+
+    ; --- construction-rule top-level forms (SchemeParser.cxx do*) -----------
+    ; (element PATTERN body) — PATTERN is a GI string/symbol or an ancestor /
+    ; attribute-qualifier list (convertToPattern). A malformed pattern still
+    ; consumes the body (matching the reference), it just adds no rule.
+    procedure do_element(mutable this: ref[SchemeParser]) returns bool
+    {
+        let host this.host
+        let loc this.cur_loc()
+        var obj: ref[ELObj]? null
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_datum(0, &obj, &loc, &tok) = false
+            return false
+        let pat Pattern.convert(host, this.interp, obj, loc)
+        var expr: ref[Expression]? null
+        var rt RT_CONSTRUCTION
+        if this.parse_rule_body(&expr, &rt) = false
+            return false
+        if pat <> null
+        {
+            let patterns Array[ref[Pattern]?]^host()
+            patterns.add(pat)
+            this.def_mode.add_rule(false, patterns, expr, loc, this.interp, rt)
+        }
+        true
+    }
+
+    ; (or-element (GI …) body) — one action, several GI patterns.
+    procedure do_or_element(mutable this: ref[SchemeParser]) returns bool
+    {
+        let host this.host
+        var loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_OPEN_PAREN, &tok) = false
+            return false
+        let patterns Array[ref[Pattern]?]^host()
+        var allowed 0
+        var ok true
+        repeat
+        {
+            var obj: ref[ELObj]? null
+            if this.parse_datum(allowed, &obj, &loc, &tok) = false
+                return false
+            if obj = null
+                break
+            allowed := ALLOW_CLOSE_PAREN
+            if ok
+            {
+                let pat Pattern.convert(host, this.interp, obj, loc)
+                if pat = null
+                    ok := false
+                else
+                    patterns.add(pat)
+            }
+        }
+        var expr: ref[Expression]? null
+        var rt RT_CONSTRUCTION
+        if this.parse_rule_body(&expr, &rt) = false
+            return false
+        if ok
+            this.def_mode.add_rule(false, patterns, expr, loc, this.interp, rt)
+        true
+    }
+
+    ; (default body) — the empty-GI pattern (matches any element).
+    procedure do_default(mutable this: ref[SchemeParser]) returns bool
+    {
+        let host this.host
+        let loc this.cur_loc()
+        var expr: ref[Expression]? null
+        var rt RT_CONSTRUCTION
+        if this.parse_rule_body(&expr, &rt) = false
+            return false
+        let pat Pattern.convert(host, this.interp, this.interp.make_true(), loc)
+        let patterns Array[ref[Pattern]?]^host()
+        patterns.add(pat)
+        this.def_mode.add_rule(false, patterns, expr, loc, this.interp, rt)
+        true
+    }
+
+    ; (id ID body) — SchemeParser::doId (SchemeParser.cxx:349). A construction
+    ; rule keyed by the node's ID-typed attribute: one pattern element with an
+    ; EMPTY GI (so it matches any element) carrying a single IdQualifier.
+    ; ★Found by the 2026-08-08 message audit, via `badModeForm`: the form was
+    ; not ported anywhere — `unknown top level form "id"` at top level, a
+    ; silently dropped mode group inside `(mode …)` — and it is OUTPUT-
+    ; AFFECTING, not a diagnostic gap. Everything it needs was already here
+    ; (`Qualifier.make_id`, the QK_ID arms of `satisfies` and of the
+    ; specificity vector); only this parser half was missing.
+    procedure do_id(mutable this: ref[SchemeParser]) returns bool
+    {
+        let host this.host
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_STRING | ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let id this.current_token
+        var expr: ref[Expression]? null
+        var rt RT_CONSTRUCTION
+        if this.parse_rule_body(&expr, &rt) = false
+            return false
+        let elem Element.make(host, StringC())
+        elem.add_qualifier(Qualifier.make_id(host, id))
+        let pat Pattern.make(host)
+        pat.add_element(elem)
+        pat.finish()
+        let patterns Array[ref[Pattern]?]^host()
+        patterns.add(pat)
+        this.def_mode.add_rule(false, patterns, expr, loc, this.interp, rt)
+        true
+    }
+
+    ; (root body) — the root rule (matches the grove root).
+    procedure do_root(mutable this: ref[SchemeParser]) returns bool
+    {
+        let loc this.cur_loc()
+        var expr: ref[Expression]? null
+        var rt RT_CONSTRUCTION
+        if this.parse_rule_body(&expr, &rt) = false
+            return false
+        this.def_mode.add_rule(true, null, expr, loc, this.interp, rt)
+        true
+    }
+
+    ; (mode NAME rule…) — set the def-mode, parse its nested rules, restore.
+    procedure do_mode(mutable this: ref[SchemeParser]) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let mode_name this.current_token
+        this.def_mode := this.interp.lookup_processing_mode(mode_name)
+        this.def_mode.set_defined()
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+                return false
+            let ident this.interp.lookup(this.current_token)
+            let k ident.syntactic_key()
+            if k = SK_DEFAULT
+            {
+                if this.do_default() = false
+                    return false
+            }
+            else if k = SK_ELEMENT
+            {
+                if this.do_element() = false
+                    return false
+            }
+            else if k = SK_OR_ELEMENT
+            {
+                if this.do_or_element() = false
+                    return false
+            }
+            else if k = SK_ROOT
+            {
+                if this.do_root() = false
+                    return false
+            }
+            else if k = SK_ID
+            {
+                if this.do_id() = false
+                    return false
+            }
+            else
+            {
+                ; badModeForm (SchemeParser.cxx:261 and the switch default at
+                ; :288) — the reference reports the SAME message for a head
+                ; with no syntactic key at all and for a key that means
+                ; nothing inside a mode group, so one arm covers both.
+                ; ★`(id …)` lands here too: that form is not ported,
+                ; and until it is, this is the honest
+                ; answer rather than silence.
+                this.message1(InterpreterMessages.badModeForm(), this.current_token)
+                return false
+            }
+        }
+        this.def_mode := this.interp.initial_processing_mode()
+        true
+    }
+
+    ; doDeclareFlowObjectClass — (declare-flow-object-class NAME "public-id").
+    ; Binds NAME's value to a FlowObjBox for the transform flow-object class
+    ; (FOC_* resolved from the public id). ★The duplicate gate is the same one
+    ; declare-flow-object-macro uses and reads the INHERITED-CHARACTERISTIC
+    ; record: only a name this part already declared with
+    ; declare-characteristic is refused (a second declare-flow-object-class
+    ; overwrites in silence, since nothing here ever writes that record).
+    procedure do_declare_flow_object_class(mutable this: ref[SchemeParser]) returns bool
+    {
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let ident this.interp.lookup(this.current_token)
+        if this.get_token(ALLOW_STRING, &tok) = false
+            return false
+        var def_part: u32 0
+        var def_loc Location()
+        if this.interp.inherited_c_defined(ident, &def_part, &def_loc) and (def_part <= this.interp.current_part_index())
+        {
+            if def_part = this.interp.current_part_index()
+            {
+                this.interp.set_next_location(loc)
+                this.interp.message1(InterpreterMessages.duplicateFlowObjectClass(), ident.get_name())
+                this.interp.emit_aux(InterpreterMessages.duplicateFlowObjectClass_aux(), def_loc)
+            }
+        }
+        else
+            this.interp.install_extension_flow_object_class(ident, this.current_token)
+        this.expect_close_paren()
+    }
+
+    ; doDeclareFlowObjectMacro — (declare-flow-object-macro NAME (NIC …
+    ; (NIC default) … [#!contents VAR]) BODY). A keys2[] form, so DSSSL2-only.
+    ; The declaration binds NAME to a macro flow object: a `make NAME` binds
+    ; the listed characteristics (defaulting to their declared expression, or
+    ; #f) plus, with `#!contents`, the content sosofo, and evaluates BODY,
+    ; whose sosofo is processed inside a sequence.
+    ;
+    ; ★The duplicate gate reads the INHERITED-CHARACTERISTIC definition record,
+    ; not a flow-object one (the reference has no flowObjDefined test here) —
+    ; so a name already declared by declare-characteristic in this part is
+    ; `duplicate flow object class` and the macro is NOT installed, while a
+    ; second declare-flow-object-macro of the same name simply overwrites.
+    ; A BUILT-IN characteristic name (font-size) has part -1 and never
+    ; triggers it.
+    procedure do_declare_flow_object_macro(mutable this: ref[SchemeParser]) returns bool
+    {
+        let host this.host
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let ident this.interp.lookup(this.current_token)
+        if this.get_token(ALLOW_OPEN_PAREN, &tok) = false
+            return false
+        let nics Array[ref[Identifier]?]^host()
+        let inits Array[ref[Expression]?]^host()
+        var contents_id: ref[Identifier]? null
+        var allowed ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER | ALLOW_HASH_CONTENTS
+        repeat
+        {
+            if this.get_token(allowed, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if tok = TOKEN_HASH_CONTENTS
+            {
+                if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+                    return false
+                contents_id := this.interp.lookup(this.current_token)
+                ; nothing may follow the contents variable
+                allowed := ALLOW_CLOSE_PAREN
+            }
+            else if tok = TOKEN_IDENTIFIER
+                nics.add(this.interp.lookup(this.current_token))
+            else if tok = TOKEN_OPEN_PAREN
+            {
+                ; (NIC default-expr)
+                if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+                    return false
+                nics.add(this.interp.lookup(this.current_token))
+                this.pad_inits(inits, nics.get_length() as int)
+                var init_e: ref[Expression]? null
+                var key SK_NOTKEY
+                if this.parse_expr_full(ALLOW_EXPR, &init_e, &key, &tok) = false
+                    return false
+                inits.put((((nics.get_length() as int) - 1) as size_t), init_e)
+                if this.get_token(ALLOW_CLOSE_PAREN, &tok) = false
+                    return false
+            }
+            else
+                return false
+        }
+        var body: ref[Expression]? null
+        var bkey SK_NOTKEY
+        if this.parse_expr_full(ALLOW_EXPR, &body, &bkey, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        ; Definition's constructor pads the default list to the
+        ; characteristic count.
+        this.pad_inits(inits, nics.get_length() as int)
+        var def_part: u32 0
+        var def_loc Location()
+        if this.interp.inherited_c_defined(ident, &def_part, &def_loc) and (def_part <= this.interp.current_part_index())
+        {
+            if def_part = this.interp.current_part_index()
+            {
+                this.interp.set_next_location(loc)
+                this.interp.message1(InterpreterMessages.duplicateFlowObjectClass(), ident.get_name())
+                this.interp.emit_aux(InterpreterMessages.duplicateFlowObjectClass_aux(), def_loc)
+            }
+        }
+        else
+        {
+            let def MacroDef.make(host, nics, inits, contents_id, body)
+            this.interp.bind_flow_object_macro(ident, def)
+        }
+        true
+    }
+
+    ; parseRuleBody: one expression + the closing paren. Inc 5a is
+    ; construction-rule only (a dsssl2 style rule — a keyword-headed body — is
+    ; deferred with the print path); no keyword branch here.
+    ; SchemeParser::parseRuleBody (SchemeParser.cxx:399). ★A rule whose body
+    ; STARTS WITH A KEYWORD is a dsssl2 STYLE RULE — `(element p font-size:
+    ; 14pt)` sets characteristics without building a flow object — and the
+    ; whole body is then a keyword/value sequence gathered into one
+    ; StyleExpression. Anything else is a construction rule and its body is a
+    ; single expression yielding a sosofo.
+    ; ★The keyword test is `expr->keyword()` on the FIRST parsed expression,
+    ; not a token peek: `font-size:` is an ordinary constant expression whose
+    ; value happens to be a keyword object, so the parse is unchanged and only
+    ; the classification is new.
+    procedure parse_rule_body(mutable this: ref[SchemeParser], mutable result: ref[ref[Expression]?], mutable rule_type: ref[int]) returns bool
+    {
+        rule_type := RT_CONSTRUCTION
+        var key SK_NOTKEY
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_expr_full(ALLOW_EXPR, result, &key, &tok) = false
+            return false
+        ; ★bind the deref: `(*result).keyword()` hands the callee the SLOT
+        ; address instead of the pointer (the deref-receiver trap)
+        ; — it cost the first build of this function, which read
+        ; garbage, found no keyword and quietly parsed every style rule as a
+        ; construction rule.
+        let first: ref[Expression]? result
+        var k: ref[Identifier]? null
+        if this.dsssl2 and (first <> null)
+            k := first.keyword()
+        if k = null
+            return this.expect_close_paren()
+        let hp this.host
+        let loc first.location()
+        let keys Array[ref[Identifier]?]^hp()
+        let exprs Array[ref[Expression]?]^hp()
+        repeat
+        {
+            keys.add(k)
+            var val: ref[Expression]? null
+            var vkey SK_NOTKEY
+            var vtok TOKEN_END_OF_ENTITY
+            if this.parse_expr_full(ALLOW_EXPR, &val, &vkey, &vtok) = false
+                return false
+            exprs.add(val)
+            if this.get_token(ALLOW_KEYWORD | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            k := this.interp.lookup(this.current_token)
+        }
+        result := Expression.make_style_expr(hp, keys, exprs, loc)
+        rule_type := RT_STYLE
+        true
+    }
+
+    ; (declare-initial-value NAME expr) — SchemeParser::doDeclareInitialValue.
+    ; The identifier must already carry an inherited characteristic
+    ; (notABuiltinInheritedC otherwise); the expression is collected for
+    ; compileInitialValues.
+    procedure do_declare_initial_value(mutable this: ref[SchemeParser]) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let ident this.interp.lookup(this.current_token)
+        var known ident.get_inherited_c() <> null
+        if known = false
+            this.message1(InterpreterMessages.notABuiltinInheritedC(), ident.get_name())
+        var expr: ref[Expression]? null
+        var key SK_NOTKEY
+        if this.parse_expr_full(ALLOW_EXPR, &expr, &key, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        if known
+            this.interp.install_initial_value(ident, expr as ref[Expression])
+        true
+    }
+
+    ; The pubid token both characteristic declarations read: a string, or —
+    ; under -2 only — `#f` for "no public identifier", in which case the
+    ; reference leaves `pubid` EMPTY (`if (tok == tokenString) pubid = …`).
+    procedure get_pubid_token(mutable this: ref[SchemeParser], mutable out: ref[StringC]) returns bool
+    {
+        var allowed ALLOW_STRING
+        if this.dsssl2
+            allowed := ALLOW_STRING | ALLOW_FALSE
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(allowed, &tok) = false
+            return false
+        if tok = TOKEN_STRING
+            out := this.current_token
+        true
+    }
+
+    ; (declare-characteristic NAME PUBID expr) — SchemeParser::
+    ; doDeclareCharacteristic: bind the identifier to the backend extension
+    ; characteristic named by PUBID (IgnoredC when the backend has none —
+    ; see installExtensionInheritedC) and collect the initial value.
+    ; ★The duplicate gate is two-stage and asymmetric: a name already
+    ; registered as a CHAR NIC is refused outright (no part comparison at
+    ; all), while a name already carrying a characteristic is refused only
+    ; when the record is from THIS part — an earlier part wins in silence, and
+    ; a BUILT-IN characteristic (part -1, i.e. 0xFFFFFFFF) fails the
+    ; `defPart <= currentPartIndex` test and so may be re-declared.
+    procedure do_declare_characteristic(mutable this: ref[SchemeParser]) returns bool
+    {
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let ident this.interp.lookup(this.current_token)
+        var pubid StringC()
+        if this.get_pubid_token(&pubid) = false
+            return false
+        var expr: ref[Expression]? null
+        var key SK_NOTKEY
+        if this.parse_expr_full(ALLOW_EXPR, &expr, &key, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        var def_part: u32 0
+        var def_loc Location()
+        if ident.char_nic_defined(&def_part, &def_loc)
+        {
+            this.interp.set_next_location(loc)
+            this.interp.message1(InterpreterMessages.duplicateCharacteristic(), ident.get_name())
+            this.interp.emit_aux(InterpreterMessages.duplicateCharacteristic_aux(), def_loc)
+            return true
+        }
+        if this.interp.inherited_c_defined(ident, &def_part, &def_loc) and (def_part <= this.interp.current_part_index())
+        {
+            if def_part = this.interp.current_part_index()
+            {
+                this.interp.set_next_location(loc)
+                this.interp.message1(InterpreterMessages.duplicateCharacteristic(), ident.get_name())
+                this.interp.emit_aux(InterpreterMessages.duplicateCharacteristic_aux(), def_loc)
+            }
+            return true
+        }
+        this.interp.install_extension_inherited_c(ident, pubid, loc)
+        this.interp.stamp_inherited_c_def(ident, this.interp.current_part_index(), loc)
+        this.interp.install_initial_value(ident, expr as ref[Expression])
+        true
+    }
+
+    ; (declare-char-characteristic+property NAME PUBID default) —
+    ; SchemeParser::doDeclareCharCharacteristicAndProperty. The one
+    ; declaration that installs TWO things: a non-inherited characteristic of
+    ; the `character` flow object (the CHAR NIC — a flag on the Identifier,
+    ; read by CharacterFlowObj::hasNonInheritedC) and a character property of
+    ; the same name with the same default (the very same addCharProperty
+    ; declare-char-property uses, so the default must be a CONSTANT).
+    ; ★The gate is the MIRROR IMAGE of declare-characteristic's: here a name
+    ; carrying a characteristic is refused unconditionally — a BUILT-IN one
+    ; too, since there is no part comparison on this arm — and a name already
+    ; registered as a char NIC only within the same part.
+    ; ★The diagnostic points at the FORM (setNextLocation(loc) taken at
+    ; entry), unlike declare-char-property, whose diagnostics point at the
+    ; value expression.
+    procedure do_declare_char_characteristic_and_property(mutable this: ref[SchemeParser]) returns bool
+    {
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let ident this.interp.lookup(this.current_token)
+        var pubid StringC()
+        if this.get_pubid_token(&pubid) = false
+            return false
+        var expr: ref[Expression]? null
+        var key SK_NOTKEY
+        if this.parse_expr_full(ALLOW_EXPR, &expr, &key, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        var def_part: u32 0
+        var def_loc Location()
+        if this.interp.inherited_c_defined(ident, &def_part, &def_loc)
+        {
+            this.interp.set_next_location(loc)
+            this.interp.message1(InterpreterMessages.duplicateCharacteristic(), ident.get_name())
+            this.interp.emit_aux(InterpreterMessages.duplicateCharacteristic_aux(), def_loc)
+            return true
+        }
+        if ident.char_nic_defined(&def_part, &def_loc) and (def_part <= this.interp.current_part_index())
+        {
+            if def_part = this.interp.current_part_index()
+            {
+                this.interp.set_next_location(loc)
+                this.interp.message1(InterpreterMessages.duplicateCharacteristic(), ident.get_name())
+                this.interp.emit_aux(InterpreterMessages.duplicateCharacteristic_aux(), def_loc)
+            }
+            return true
+        }
+        this.interp.install_extension_char_nic(ident, pubid, loc)
+        ; the property half — addCharProperty, whose own diagnostics DO point
+        ; at the value expression.
+        let eloc expr.location()
+        let v this.const_value_of(expr)
+        this.interp.add_char_property(ident, v, eloc)
+        true
+    }
+
+    ; (define-unit NAME expr) — SchemeParser::doDefineUnit. The name must be
+    ; all letters and not the single letter `e` (the exponent marker); the
+    ; body computes lazily in Unit::tryCompute. The defined gate mirrors
+    ; doDefine: an earlier part wins silently, a same-part redefinition is
+    ; duplicateUnitDefinition with the first definition as the aux line.
+    procedure do_define_unit(mutable this: ref[SchemeParser]) returns bool
+    {
+        let def_loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let name this.current_token
+        let n name.get_size()
+        var bad false
+        var i: size_t 0
+        while i < n
+        {
+            if this.interp.lex_category(name.get(i) as i32) <> LEX_LETTER
+                bad := true
+            i := i + 1
+        }
+        if n = 1
+        {
+            if name.get(0) = 0x65
+                bad := true
+        }
+        if bad
+        {
+            this.message1(InterpreterMessages.invalidUnitName(), name)
+            return false
+        }
+        let unit this.interp.lookup_unit(name)
+        var expr: ref[Expression]? null
+        var key SK_NOTKEY
+        if this.parse_expr_full(ALLOW_EXPR, &expr, &key, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        var prev_part: u32 0
+        var prev_loc Location()
+        if unit.defined(&prev_part, &prev_loc) and (prev_part <= this.interp.current_part_index())
+        {
+            if prev_part = this.interp.current_part_index()
+            {
+                this.message1(InterpreterMessages.duplicateUnitDefinition(), unit.get_name())
+                this.interp.emit_aux(InterpreterMessages.duplicateUnitDefinition_aux(), prev_loc)
+            }
+        }
+        else
+            unit.set_definition(expr, this.interp.current_part_index(), def_loc)
+        true
+    }
+
+    procedure do_define(mutable this: ref[SchemeParser]) returns bool
+    {
+        let hp this.host
+        ; the define's location anchors at ENTRY (reference doDefine) — the
+        ; built lambda carries it (VarargsInsn runtime key diagnostics).
+        let def_loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER | ALLOW_OPEN_PAREN, &tok) = false
+            return false
+        if tok = TOKEN_IDENTIFIER
+        {
+            ; (define var expr)
+            let ident this.interp.lookup(this.current_token)
+            var expr: ref[Expression]? null
+            var key SK_NOTKEY
+            if this.parse_expr_full(ALLOW_EXPR, &expr, &key, &tok) = false
+                return false
+            if this.expect_close_paren() = false
+                return false
+            ; doDefine's defined gate: an EARLIER part's definition wins
+            ; silently; a SAME-part redefinition reports duplicateDefinition
+            ; (with the first definition's location as the auxiliary line).
+            let idp ident.get_def_part()
+            if (ident.is_def() and (idp <> 0xFFFFFFFF)) and (idp <= this.interp.current_part_index())
+            {
+                if idp = this.interp.current_part_index()
+                {
+                    this.message1(InterpreterMessages.duplicateDefinition(), ident.get_name())
+                    this.interp.emit_aux(InterpreterMessages.duplicateDefinition_aux(), ident.get_def_loc())
+                }
+            }
+            else
+                ident.set_expression(expr, this.interp.current_part_index(), def_loc)
+            return true
+        }
+        ; (define (name formals) body)
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let name this.interp.lookup(this.current_token)
+        let formals Array[ref[Identifier]?]^hp()
+        let defaults Array[ref[Expression]?]^hp()
+        var n_required 0
+        var has_rest false
+        var n_key 0
+        if this.parse_formals(formals, defaults, &n_required, &has_rest, &n_key) = false
+            return false
+        var body: ref[Expression]? null
+        if this.parse_begin(&body) = false
+            return false
+        var rest_slot 0
+        if has_rest
+            rest_slot := 1
+        let n_optional (formals.get_length() as int) - n_required - n_key - rest_slot
+        let sig this.build_signature(formals, n_required, n_optional, has_rest, n_key)
+        let lambda Expression.make_lambda(hp, formals, defaults, sig, body as ref[Expression], def_loc)
+        let ndp name.get_def_part()
+        if (name.is_def() and (ndp <> 0xFFFFFFFF)) and (ndp <= this.interp.current_part_index())
+        {
+            if ndp = this.interp.current_part_index()
+            {
+                this.message1(InterpreterMessages.duplicateDefinition(), name.get_name())
+                this.interp.emit_aux(InterpreterMessages.duplicateDefinition_aux(), name.get_def_loc())
+            }
+        }
+        else
+            name.set_expression(lambda, this.interp.current_part_index(), def_loc)
+        true
+    }
+
+    ; doDefineLanguage — `(define-language NAME (collate …) (toupper (lc UC)…)
+    ; (tolower (UC lc)…))`: build a LangObj, compile it and bind it as the
+    ; identifier's definition (a constant, the reference's
+    ; ConstantExpression(LangObj)).
+    ;
+    ; ★Its duplicate gate is NOT doDefine's: a same-part redefinition reports
+    ; and FAILS the form (so the first language survives), while an
+    ; earlier-part definition falls through and is OVERWRITTEN — doDefine
+    ; skips that case instead.
+    ; ★Every clause dispatches on the KEY, and a head that is no key at all,
+    ; or a key with no meaning here, fails the form SILENTLY: no diagnostic
+    ; is reported anywhere in define-language's sub-parsers, only the
+    ; top-level recovery is entered.
+    procedure do_define_language(mutable this: ref[SchemeParser]) returns bool
+    {
+        let interp this.interp
+        ; the language and its tables outlive the parse and every eval
+        ; bracket — the run arena, never a scratch region.
+        let hp interp.get_perm_host()
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let ident interp.lookup(this.current_token)
+        let sk ident.syntactic_key()
+        if (sk <> SK_NOTKEY) and (sk <= SK_WITH_MODE)
+            this.message1(InterpreterMessages.syntacticKeywordAsVariable(), this.current_token)
+        let dp ident.get_def_part()
+        if (ident.is_def() and (dp <> 0xFFFFFFFF)) and (dp <= interp.current_part_index())
+        {
+            if dp = interp.current_part_index()
+            {
+                this.message1(InterpreterMessages.duplicateDefinition(), ident.get_name())
+                interp.emit_aux(InterpreterMessages.duplicateDefinition_aux(), ident.get_def_loc())
+                return false
+            }
+        }
+        let lang LangObj.make(hp)
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+                return false
+            let clause interp.lookup(this.current_token)
+            let ck clause.syntactic_key()
+            if ck = SK_COLLATE
+            {
+                if this.do_collate(lang) = false
+                    return false
+            }
+            else if ck = SK_TOUPPER
+            {
+                if this.do_case_pairs(lang, true) = false
+                    return false
+            }
+            else if ck = SK_TOLOWER
+            {
+                if this.do_case_pairs(lang, false) = false
+                    return false
+            }
+            else
+                return false
+        }
+        if lang.compile() = false
+            return false
+        let value ELObj.make_language(hp, lang)
+        ; ★the constant carries the location AFTER the form; the definition
+        ; the one from before it (the reference passes both separately).
+        let expr Expression.make_constant(hp, value, this.cur_loc())
+        ident.set_expression(expr, interp.current_part_index(), loc)
+        true
+    }
+
+    ; doCollate — the `(collate …)` clause: multi-collating elements,
+    ; collating symbols and the order. ★`element` and `position` are the same
+    ; keys the construction rules and the NIC tables use.
+    procedure do_collate(mutable this: ref[SchemeParser], mutable lang: ref[LangObj]) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+                return false
+            let ident this.interp.lookup(this.current_token)
+            let k ident.syntactic_key()
+            if k = SK_ELEMENT
+            {
+                if this.do_multi_collating_element(lang) = false
+                    return false
+            }
+            else if k = SK_SYMBOL
+            {
+                if this.do_collating_symbol(lang) = false
+                    return false
+            }
+            else if k = SK_ORDER
+            {
+                if this.do_collating_order(lang) = false
+                    return false
+            }
+            else
+                return false
+        }
+        true
+    }
+
+    ; doMultiCollatingElement — `(element SYM "string")`: SYM collates as one
+    ; unit standing for that character sequence.
+    procedure do_multi_collating_element(mutable this: ref[SchemeParser], mutable lang: ref[LangObj]) returns bool
+    {
+        let hp lang.get_host()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        ; currentToken_ is overwritten by the next token — copy onto the
+        ; language's own page.
+        let ct this.current_token
+        let sym StringC^hp(ct.as_slice())
+        if this.get_token(ALLOW_STRING, &tok) = false
+            return false
+        let ct2 this.current_token
+        let str StringC^hp(ct2.as_slice())
+        if this.expect_close_paren() = false
+            return false
+        lang.add_multi_collating_element(sym, str)
+        true
+    }
+
+    ; doCollatingSymbol — `(symbol SYM)`: a name that takes a collating
+    ; position of its own without standing for any characters.
+    procedure do_collating_symbol(mutable this: ref[SchemeParser], mutable lang: ref[LangObj]) returns bool
+    {
+        let hp lang.get_host()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let ct this.current_token
+        let sym StringC^hp(ct.as_slice())
+        if this.expect_close_paren() = false
+            return false
+        lang.add_collating_symbol(sym)
+        true
+    }
+
+    ; doCollatingOrder — `(order (LEVELS…) POSITIONS…)`. The first list gives
+    ; one sort level per parenthesized group; then the collating positions in
+    ; ascending order, each of them an identifier, a character, `#t` (the
+    ; position unknown characters take) or a `(SYM WEIGHTS…)` group.
+    ;
+    ; ★The LevelSort accumulator is NEVER reset between levels — that is the
+    ; reference's own structure, and it is observable: a `(forward)` level
+    ; followed by a `(backward)` one fails the whole define-language form
+    ; (silently), and a `position` flag, once set, holds for every level
+    ; after it.
+    procedure do_collating_order(mutable this: ref[SchemeParser], mutable lang: ref[LangObj]) returns bool
+    {
+        let hp lang.get_host()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_OPEN_PAREN, &tok) = false
+            return false
+        var nested 0
+        var s_forward false
+        var s_backward false
+        var s_position false
+        repeat
+        {
+            var allowed ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER
+            if nested = 0
+                allowed := allowed | ALLOW_OPEN_PAREN
+            if this.get_token(allowed, &tok) = false
+                return false
+            if tok = TOKEN_OPEN_PAREN
+                nested := nested + 1
+            else if tok = TOKEN_CLOSE_PAREN
+                nested := nested - 1
+            else
+            {
+                let ident this.interp.lookup(this.current_token)
+                let k ident.syntactic_key()
+                if k = SK_FORWARD
+                {
+                    if s_backward
+                        return false
+                    s_forward := true
+                }
+                else if k = SK_BACKWARD
+                {
+                    if s_forward
+                        return false
+                    s_backward := true
+                }
+                else if k = SK_POSITION
+                    s_position := true
+                else
+                    return false
+            }
+            if nested < 0
+                break
+            if nested = 0
+            {
+                if s_backward = false
+                    s_forward := true
+                lang.add_level(s_forward, s_backward, s_position)
+            }
+        }
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER | ALLOW_OTHER_EXPR, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if tok = TOKEN_TRUE
+            {
+                ; #t — the DEFAULT position: unknown characters collate here
+                ; (and, unlike the implicit default, they then have weights).
+                lang.add_default_pos()
+                let empty StringC()
+                let n lang.levels()
+                var i: u32 0
+                while i < n
+                {
+                    let ok lang.add_level_weight(i, empty)
+                    i := i + 1
+                }
+            }
+            else if (tok = TOKEN_IDENTIFIER) or (tok = TOKEN_CHAR)
+            {
+                let ct this.current_token
+                let sym StringC^hp(ct.as_slice())
+                if lang.add_collating_pos(sym) = false
+                    return false
+                let n lang.levels()
+                var i: u32 0
+                while i < n
+                {
+                    let ok lang.add_level_weight(i, sym)
+                    i := i + 1
+                }
+            }
+            else if tok = TOKEN_OPEN_PAREN
+            {
+                if this.do_weights(lang) = false
+                    return false
+            }
+            else
+                return false
+        }
+        true
+    }
+
+    ; doWeights — `(SYM (level-0 weights…) (level-1 weights…) …)`: a
+    ; collating position with explicit weights per level. ★A STRING weight
+    ; contributes one weight PER CHARACTER, and an unparenthesized weight
+    ; advances the level just like a group does (the level counter is bumped
+    ; whenever the nesting is back at zero).
+    procedure do_weights(mutable this: ref[SchemeParser], mutable lang: ref[LangObj]) returns bool
+    {
+        let hp lang.get_host()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER | ALLOW_OTHER_EXPR, &tok) = false
+            return false
+        let ct this.current_token
+        let sym StringC^hp(ct.as_slice())
+        if lang.add_collating_pos(sym) = false
+            return false
+        var nested 0
+        var l: u32 0
+        repeat
+        {
+            var allowed ALLOW_CLOSE_PAREN | ALLOW_IDENTIFIER | ALLOW_OTHER_EXPR | ALLOW_STRING
+            if nested = 0
+                allowed := allowed | ALLOW_OPEN_PAREN
+            if this.get_token(allowed, &tok) = false
+                return false
+            if tok = TOKEN_OPEN_PAREN
+                nested := nested + 1
+            else if tok = TOKEN_CLOSE_PAREN
+                nested := nested - 1
+            else if tok = TOKEN_STRING
+            {
+                let s this.current_token
+                let sn s.get_size()
+                var i: size_t 0
+                while i < sn
+                {
+                    let one StringC^hp(s.as_slice().subslice(i, i + 1))
+                    if lang.add_level_weight(l, one) = false
+                        return false
+                    i := i + 1
+                }
+            }
+            else if (tok = TOKEN_IDENTIFIER) or (tok = TOKEN_CHAR)
+            {
+                let ct2 this.current_token
+                let w StringC^hp(ct2.as_slice())
+                if lang.add_level_weight(l, w) = false
+                    return false
+            }
+            else
+                return false
+            if nested < 0
+                break
+            if nested = 0
+                l := l + 1
+        }
+        true
+    }
+
+    ; doToupper / doTolower — `(toupper (lc UC) …)` / `(tolower (UC lc) …)`.
+    ; The pairs go into a CharMap in the reference, so a repeated left-hand
+    ; character is REPLACED: the last pair wins.
+    procedure do_case_pairs(mutable this: ref[SchemeParser], mutable lang: ref[LangObj], up: bool) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(ALLOW_OPEN_PAREN | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+            if this.get_token(ALLOW_OTHER_EXPR, &tok) = false
+                return false
+            if tok <> TOKEN_CHAR
+                return false
+            var from: u32 0
+            if this.current_token.get_size() > 0
+                from := this.current_token.get(0)
+            if this.get_token(ALLOW_OTHER_EXPR, &tok) = false
+                return false
+            if tok <> TOKEN_CHAR
+                return false
+            var to: u32 0
+            if this.current_token.get_size() > 0
+                to := this.current_token.get(0)
+            if this.expect_close_paren() = false
+                return false
+            if up
+                lang.add_toupper(from, to)
+            else
+                lang.add_tolower(from, to)
+        }
+        true
+    }
+
+    ; doDeclareDefaultLanguage — `(declare-default-language EXPR)`: store the
+    ; expression; Interpreter.compile() evaluates it (compileDefaultLanguage).
+    procedure do_declare_default_language(mutable this: ref[SchemeParser]) returns bool
+    {
+        let loc this.cur_loc()
+        var expr: ref[Expression]? null
+        var key SK_NOTKEY
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_expr_full(ALLOW_EXPR, &expr, &key, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        ; doDeclareDefaultLanguage's part gate (SchemeParser.cxx:2101): a
+        ; declaration in THIS part when one is already in force is a duplicate
+        ; (reported, with the first one as the auxiliary line); one already in
+        ; force from an EARLIER part simply wins, and the new one is dropped
+        ; without a word. Only a genuinely first declaration is stored.
+        let part this.interp.current_part_index() as int
+        if this.interp.default_language_is_set() and (this.interp.get_default_language_part() <= part)
+        {
+            if this.interp.get_default_language_part() = part
+            {
+                this.interp.set_next_location(loc)
+                this.message0(InterpreterMessages.duplicateDefLangDecl())
+                this.interp.emit_aux(InterpreterMessages.duplicateDefLangDecl_aux(), this.interp.get_default_language_loc())
+            }
+            return true
+        }
+        this.interp.set_default_language_def(expr, part, loc)
+        true
+    }
+
+    ; (declare-class-attribute NAME) / (declare-id-attribute NAME) —
+    ; SchemeParser::doDeclareClassAttribute / doDeclareIdAttribute
+    ; (SchemeParser.cxx:639). Both are dsssl2-only KEYS, so without `-2` the
+    ; form is an unknown top level form. The name feeds the MatchContext
+    ; vectors the class/id pattern qualifiers read; it is stored VERBATIM (the
+    ; reference pushes currentToken_ unfolded) and normalized at match time.
+    procedure do_declare_class_attribute(mutable this: ref[SchemeParser]) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_STRING | ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let perm this.interp.get_perm_host()
+        let ct this.current_token
+        let nm StringC^perm(ct.as_slice())
+        this.interp.add_class_attribute_name(nm)
+        this.expect_close_paren()
+    }
+
+    procedure do_declare_id_attribute(mutable this: ref[SchemeParser]) returns bool
+    {
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_STRING | ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let perm this.interp.get_perm_host()
+        let ct this.current_token
+        let nm StringC^perm(ct.as_slice())
+        this.interp.add_id_attribute_name(nm)
+        this.expect_close_paren()
+    }
+
+    ; (declare-char-property NAME default-expr) — SchemeParser::
+    ; doDeclareCharProperty. ★The default must be a CONSTANT: the reference
+    ; optimizes the expression and then demands `constantValue()`, so even
+    ; `(+ 1 2)` is varCharPropertyExprUnsupported. Measured.
+    procedure do_declare_char_property(mutable this: ref[SchemeParser]) returns bool
+    {
+        let loc this.cur_loc()
+        var tok TOKEN_END_OF_ENTITY
+        if this.get_token(ALLOW_IDENTIFIER, &tok) = false
+            return false
+        let ident this.interp.lookup(this.current_token)
+        var expr: ref[Expression]? null
+        var key SK_NOTKEY
+        if this.parse_expr_full(ALLOW_EXPR, &expr, &key, &tok) = false
+            return false
+        if this.expect_close_paren() = false
+            return false
+        ; ★the diagnostics point at the DEFAULT EXPRESSION, not at the form
+        ; (`setNextLocation(defval->location())`).
+        let eloc expr.location()
+        let v this.const_value_of(expr)
+        this.interp.add_char_property(ident, v, eloc)
+        true
+    }
+
+    ; (add-char-properties PROP: expr … #\c …) — SchemeParser::
+    ; doAddCharProperties: a run of keyword/value pairs followed by a run of
+    ; CHARACTERS, and every pair is applied to every character. A non-char in
+    ; the second run is badAddCharProperty.
+    procedure do_add_char_properties(mutable this: ref[SchemeParser]) returns bool
+    {
+        let host this.host
+        let keys Array[ref[Identifier]?]^host()
+        let vals Array[ref[ELObj]?]^host()
+        ; each pair remembers ITS OWN expression location — that is where the
+        ; reference reports an unknown property or a non-constant value.
+        let locs Array[Location]^host()
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(ALLOW_KEYWORD | ALLOW_OTHER_EXPR, &tok) = false
+                return false
+            if tok <> TOKEN_KEYWORD
+                break
+            keys.add(this.interp.lookup(this.current_token))
+            var expr: ref[Expression]? null
+            var key SK_NOTKEY
+            if this.parse_expr_full(ALLOW_EXPR, &expr, &key, &tok) = false
+                return false
+            locs.add(expr.location())
+            vals.add(this.const_value_of(expr))
+        }
+        repeat
+        {
+            if tok <> TOKEN_CHAR
+            {
+                this.message0(InterpreterMessages.badAddCharProperty())
+                return false
+            }
+            var c: u32 0
+            if this.current_token.get_size() > 0
+                c := this.current_token.get(0)
+            let n keys.get_length()
+            var j: size_t 0
+            while j < n
+            {
+                let kp keys.get(j)
+                let vp vals.get(j)
+                let lp locs.get(j)
+                if (kp <> null) and (vp <> null) and (lp <> null)
+                    this.interp.set_char_property((*kp) as ref[Identifier], c, *vp, *lp)
+                j := j + 1
+            }
+            if this.get_token(ALLOW_OTHER_EXPR | ALLOW_CLOSE_PAREN, &tok) = false
+                return false
+            if tok = TOKEN_CLOSE_PAREN
+                break
+        }
+        true
+    }
+
+    ; Expression::optimize + constantValue — null when the expression is not
+    ; a compile-time constant, which both char-property declarations reject.
+    procedure const_value_of(mutable this: ref[SchemeParser], mutable expr: ref[Expression]?) returns ref[ELObj]?
+    {
+        if expr = null
+            return null
+        let interp this.interp
+        ; Expression::optimize + constantValue, the CallExpression::compile
+        ; idiom: fold in place against an EMPTY environment (the reference
+        ; passes `Environment()`), then ask for the constant.
+        let env Environment.make(this.host)
+        expr.fold_variable(interp, env)
+        ; ★`constant_value` answers only for the RESOLVED arm; a freshly
+        ; parsed literal is still the plain `Constant` arm, so the datum
+        ; accessor that covers BOTH is the one the reference's post-optimize
+        ; `constantValue()` corresponds to. Quantities resolve the way
+        ; optimize resolves them.
+        let d expr.constant_datum()
+        if d = null
+            return null
+        d.resolve_quantities(false, interp, expr.location())
+    }
+
+    ; skip a form to its matching close paren (recovery / unhandled forms).
+    procedure skip_form(mutable this: ref[SchemeParser]) returns bool
+    {
+        var depth 1
+        var tok TOKEN_END_OF_ENTITY
+        repeat
+        {
+            if this.get_token(ALLOW_ALL, &tok) = false or tok = TOKEN_END_OF_ENTITY
+                return true
+            if (tok = TOKEN_OPEN_PAREN) or (tok = TOKEN_VECTOR)
+                depth := depth + 1
+            else if tok = TOKEN_CLOSE_PAREN
+            {
+                depth := depth - 1
+                if depth = 0
+                    break
+            }
+        }
+        true
+    }
+
+    ; --- self-test ---------------------------------------------------------
+    ; parse one datum from an ASCII snippet and print it; empty result means
+    ; parse failure. (Line ends in snippets are RE = \r, the OpenSP record
+    ; convention this reader lives on.)
+    procedure dump_one(mutable this: ref[SchemeParser], mutable os: ref[OutputCharStream]) returns bool
+    {
+        var datum: ref[ELObj]? null
+        var loc Location()
+        var tok TOKEN_END_OF_ENTITY
+        if this.parse_datum(ALLOW_END_OF_ENTITY, &datum, &loc, &tok) = false
+            return false
+        if datum = null
+            return false
+        let interp this.interp
+        let resolved datum.resolve_quantities(false, interp, loc)
+        resolved.print(os, 1440)
+        true
+    }
+
+    procedure check(host: ref[Page], mutable interp: ref[Interpreter], mutable src: Slice[char], expect: Slice[char]) returns bool
+    {
+        let text StringC(src)
+        let src_in InputSource.make(host, null, text.as_slice())
+        let sp SchemeParser.make(host, interp, src_in)
+        let os OutputCharStream.make(host)
+        if sp.dump_one(os) = false
+            return false
+        os.is_ascii(expect)
+    }
+
+    ; The suite is split across functions so each runs on its OWN local region
+    ; (its `_rp`, released on return): a single region accumulating every
+    ; interpreter + eval + grove parse crosses a page boundary the RBMM growth
+    ; edge mishandles. reader_test's interps die before eval_test's ei is made.
+    procedure test() returns int
+    {
+        var r SchemeParser.reader_test()
+        if r <> 0
+            return r
+        SchemeParser.eval_test()
+    }
+
+    procedure reader_test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+        let interp Interpreter.make(host, 1440, false, false, false)
+
+        ; atoms
+        if SchemeParser.check(host, interp, "42", "42") = false
+            return 1
+        if SchemeParser.check(host, interp, "-17", "-17") = false
+            return 2
+        if SchemeParser.check(host, interp, "#x1a", "26") = false
+            return 3
+        if SchemeParser.check(host, interp, "1.5", "1.5") = false
+            return 4
+        if SchemeParser.check(host, interp, ".5", "0.5") = false
+            return 5
+        if SchemeParser.check(host, interp, "#t", "#t") = false
+            return 6
+        if SchemeParser.check(host, interp, "#f", "#f") = false
+            return 7
+        if SchemeParser.check(host, interp, "foo", "foo") = false
+            return 8
+        if SchemeParser.check(host, interp, "list->string", "list->string") = false
+            return 9
+        if SchemeParser.check(host, interp, "...", "...") = false
+            return 10
+        if SchemeParser.check(host, interp, "-", "-") = false
+            return 11
+        if SchemeParser.check(host, interp, "foo:", "foo:") = false
+            return 12
+
+        ; strings (named character escapes, not C escapes)
+        if SchemeParser.check(host, interp, "\"hi\"", "\"hi\"") = false
+            return 13
+        if SchemeParser.check(host, interp, "\"a\\U-0041;b\"", "\"aAb\"") = false
+            return 14
+        if SchemeParser.check(host, interp, "\"q\\\"w\"", "\"q\\\"w\"") = false
+            return 15
+
+        ; characters
+        if SchemeParser.check(host, interp, "#\\a", "#\\a") = false
+            return 16
+        if SchemeParser.check(host, interp, "#\\space", "#\\ ") = false
+            return 17
+
+        ; quantities resolve through the builtin units
+        if SchemeParser.check(host, interp, "2in", "144pt") = false
+            return 18
+
+        ; lists
+        if SchemeParser.check(host, interp, "()", "()") = false
+            return 19
+        if SchemeParser.check(host, interp, "(a b c)", "(a b c)") = false
+            return 20
+        if SchemeParser.check(host, interp, "(a . b)", "(a . b)") = false
+            return 21
+        if SchemeParser.check(host, interp, "(a (b c) d)", "(a (b c) d)") = false
+            return 22
+
+        ; abbreviations
+        if SchemeParser.check(host, interp, "'foo", "(quote foo)") = false
+            return 23
+        if SchemeParser.check(host, interp, "\`(a ,b ,@c)", "(quasiquote (a (unquote b) (unquote-splicing c)))") = false
+            return 24
+
+        ; comments end at RE (\r), the OpenSP record convention
+        if SchemeParser.check(host, interp, "; note\r42", "42") = false
+            return 25
+
+        ; vectors are dsssl2-gated
+        if SchemeParser.check(host, interp, "#(1 2)", "#(1 2)")
+            return 26
+        let interp2 Interpreter.make(host, 1440, false, true, false)
+        if SchemeParser.check(host, interp2, "#(1 2)", "#(1 2)") = false
+            return 27
+
+        0
+    }
+
+    ; ================= Inc 3: the evaluator =============================
+    procedure eval_test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+        let ei Interpreter.make(host, 1440, false, false, false)
+
+        ; arithmetic + comparison
+        if SchemeParser.eval_int(host, ei, "(+ 1 2)") <> 3
+            return 30
+        if SchemeParser.eval_int(host, ei, "(* 6 7)") <> 42
+            return 31
+        if SchemeParser.eval_int(host, ei, "(- 10 3 2)") <> 5
+            return 32
+        if SchemeParser.eval_int(host, ei, "(+ 1 (* 2 3) (- 8 4))") <> 11
+            return 33
+        if SchemeParser.eval_bool(host, ei, "(< 1 2 3)") = false
+            return 34
+        if SchemeParser.eval_bool(host, ei, "(= 5 5)") = false
+            return 35
+
+        ; if / and / or
+        if SchemeParser.eval_int(host, ei, "(if #t 11 22)") <> 11
+            return 36
+        if SchemeParser.eval_int(host, ei, "(if #f 11 22)") <> 22
+            return 37
+        ; ★`begin` lives in the reference's keys2[] table and is -2-ONLY —
+        ; without the flag it is an undefined VARIABLE. It is exercised
+        ; further down on the dsssl2 interpreter (tests 74/174).
+
+        ; lambda application + closures
+        if SchemeParser.eval_int(host, ei, "((lambda (x) (* x x)) 5)") <> 25
+            return 39
+        if SchemeParser.eval_int(host, ei, "((lambda (x y) (+ x y)) 3 4)") <> 7
+            return 40
+
+        ; let / let* / letrec
+        if SchemeParser.eval_int(host, ei, "(let ((a 3) (b 4)) (+ a b))") <> 7
+            return 41
+        if SchemeParser.eval_int(host, ei, "(let* ((a 3) (b (* a 2))) (+ a b))") <> 9
+            return 42
+
+        ; named let — TCO: 100k tail calls must not grow the stack
+        if SchemeParser.eval_int(host, ei, "(let loop ((i 0) (s 0)) (if (= i 100000) s (loop (+ i 1) (+ s i))))") <> 4999950000
+            return 43
+
+        ; list ops
+        if SchemeParser.eval_int(host, ei, "(car (cdr (list 1 2 3)))") <> 2
+            return 44
+        if SchemeParser.eval_int(host, ei, "(length (list 1 2 3 4))") <> 4
+            return 45
+
+        ; cond
+        if SchemeParser.eval_int(host, ei, "(cond (#f 1) (#t 2) (else 3))") <> 2
+            return 46
+
+        ; top-level define + non-tail recursion (control stack)
+        SchemeParser.run_program(host, ei, "(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))")
+        if SchemeParser.eval_int(host, ei, "(fact 5)") <> 120
+            return 47
+
+        ; top-level mutual recursion via lazy top-level refs
+        SchemeParser.run_program(host, ei, "(define (my-even? n) (if (= n 0) #t (my-odd? (- n 1))))")
+        SchemeParser.run_program(host, ei, "(define (my-odd? n) (if (= n 0) #f (my-even? (- n 1))))")
+        if SchemeParser.eval_bool(host, ei, "(my-even? 10)") = false
+            return 48
+        if SchemeParser.eval_bool(host, ei, "(my-even? 7)")
+            return 49
+
+        ; ★string<? / string<=? / char<? / char<=? / char-upcase /
+        ; char-downcase are COLLATING and need a current language — without
+        ; one the reference reports `no current language` and yields the
+        ; error object (lang2 in tests/dazzle/prims pins it). Declare one, as
+        ; a real stylesheet must.
+        let tl LangObj.make(host)
+        tl.add_toupper(0x61, 0x41)
+        tl.add_tolower(0x5A, 0x7A)
+        let tlok tl.compile()
+        ei.default_language := ELObj.make_language(host, tl)
+
+        ; --- string primitives --------------------------------------------
+        if SchemeParser.eval_int(host, ei, "(string-length \"hello\")") <> 5
+            return 50
+        if SchemeParser.eval_str_eq(host, ei, "(string-append \"ab\" \"cd\" \"ef\")", "abcdef") = false
+            return 51
+        if SchemeParser.eval_str_eq(host, ei, "(substring \"hello\" 1 4)", "ell") = false
+            return 52
+        ; ★no char->integer / integer->char in the reference (primitive.h has
+        ; no entry) — a char is compared through `string`, which does.
+        if SchemeParser.eval_str_eq(host, ei, "(string (string-ref \"abc\" 1))", "b") = false
+            return 53
+        if SchemeParser.eval_bool(host, ei, "(string=? \"abc\" \"abc\")") = false
+            return 54
+        ; ★testlang has no `collate` clause, so it has zero collating levels
+        ; and LangObj::compare answers 0 for every pair: string<? is always
+        ; #f and string<=? always #t, whatever the code points are.
+        if SchemeParser.eval_bool(host, ei, "(string<? \"abc\" \"abd\")")
+            return 55
+        if SchemeParser.eval_bool(host, ei, "(string<=? \"abd\" \"abc\")") = false
+            return 56
+        if SchemeParser.eval_int(host, ei, "(length (string->list \"abcd\"))") <> 4
+            return 57
+        if SchemeParser.eval_int(host, ei, "(string-length (list->string (string->list \"xy\")))") <> 2
+            return 58
+
+        ; --- number <-> string --------------------------------------------
+        if SchemeParser.eval_str_eq(host, ei, "(number->string 42)", "42") = false
+            return 59
+        if SchemeParser.eval_str_eq(host, ei, "(number->string 255 16)", "ff") = false
+            return 60
+        if SchemeParser.eval_int(host, ei, "(string->number \"42\")") <> 42
+            return 61
+        if SchemeParser.eval_int(host, ei, "(string->number \"ff\" 16)") <> 255
+            return 62
+        if SchemeParser.eval_bool(host, ei, "(string->number \"abc\")")
+            return 63
+
+        ; --- char primitives ----------------------------------------------
+        ; the reference's char family is char? char=? char<? char<=?
+        ; char-upcase char-downcase — no conversion to or from integers.
+        if SchemeParser.eval_bool(host, ei, "(char=? (string-ref \"A\" 0) (string-ref \"A\" 0))") = false
+            return 64
+        if SchemeParser.eval_bool(host, ei, "(char<? (string-ref \"a\" 0) (string-ref \"b\" 0))")
+            return 65
+        if SchemeParser.eval_str_eq(host, ei, "(string (char-upcase (string-ref \"a\" 0)))", "A") = false
+            return 66
+        if SchemeParser.eval_str_eq(host, ei, "(string (char-downcase (string-ref \"Z\" 0)))", "z") = false
+            return 67
+        ; a character the language does not map folds to ITSELF — there is no
+        ; ASCII fallback behind a declared language.
+        if SchemeParser.eval_str_eq(host, ei, "(string (char-upcase (string-ref \"q\" 0)))", "q") = false
+            return 167
+
+        ; --- symbol / keyword <-> string -----------------------------------
+        if SchemeParser.eval_str_eq(host, ei, "(symbol->string (string->symbol \"greta\"))", "greta") = false
+            return 68
+        ; ★eqv? and the whole vector family are PRIMITIVE2, i.e. installed
+        ; only under -2 — `ei` (dsssl2 off) does not have them, so they run
+        ; on a second interpreter, and there is no vector-length at all.
+        let ei2 Interpreter.make(host, 1440, false, true, false)
+        if SchemeParser.eval_bool(host, ei2, "(eqv? (string->symbol \"x\") (string->symbol \"x\"))") = false
+            return 69
+
+        ; --- vector primitives (dsssl2) -------------------------------------
+        if SchemeParser.eval_int(host, ei2, "(vector-ref (vector 10 20 30) 1)") <> 20
+            return 70
+        if SchemeParser.eval_int(host, ei2, "(length (vector->list (make-vector 5 0)))") <> 5
+            return 71
+        if SchemeParser.eval_int(host, ei2, "(vector-ref (list->vector (list 7 8 9)) 2)") <> 9
+            return 72
+        if SchemeParser.eval_int(host, ei2, "(length (vector->list (vector 1 2 3 4)))") <> 4
+            return 73
+        if SchemeParser.eval_int(host, ei2, "(let ((v (make-vector 3 0))) (begin (vector-set! v 1 99) (vector-ref v 1)))") <> 99
+            return 74
+        ; vector-fill! (new in the completeness package)
+        if SchemeParser.eval_int(host, ei2, "(let ((v (vector 1 2 3))) (begin (vector-fill! v 7) (vector-ref v 2)))") <> 7
+            return 174
+        ; `begin` and `set!` themselves, on the interpreter that has them
+        if SchemeParser.eval_int(host, ei2, "(begin 1 2 3)") <> 3
+            return 38
+        if SchemeParser.eval_int(host, ei2, "(let ((x 1)) (begin (set! x 5) x))") <> 5
+            return 138
+
+        ; --- list-tail -----------------------------------------------------
+        if SchemeParser.eval_int(host, ei, "(car (list-tail (list 1 2 3 4) 2))") <> 3
+            return 75
+
+        ; --- quasiquote ----------------------------------------------------
+        if SchemeParser.eval_int(host, ei, "(car \`(1 2 3))") <> 1
+            return 76
+        if SchemeParser.eval_int(host, ei, "(length \`(1 2 3 4))") <> 4
+            return 77
+        ; computed unquote ,(expr)
+        if SchemeParser.eval_int(host, ei, "(car (cdr \`(1 ,(+ 2 3) 9)))") <> 5
+            return 78
+        ; unquote-splicing ,@
+        if SchemeParser.eval_int(host, ei, "(length \`(1 ,@(list 2 3 4) 5))") <> 5
+            return 79
+        if SchemeParser.eval_int(host, ei, "(car (cdr \`(1 ,@(list 7 8) 9)))") <> 7
+            return 80
+        ; improper tail
+        if SchemeParser.eval_int(host, ei, "(cdr \`(1 . 2))") <> 2
+            return 81
+        ; nested quasiquote: ``(a b) = (quasiquote (a b)) — a 2-element list
+        if SchemeParser.eval_int(host, ei, "(length \`\`(a b))") <> 2
+            return 82
+
+        ; --- apply ---------------------------------------------------------
+        if SchemeParser.eval_int(host, ei, "(apply + (list 1 2 3 4))") <> 10
+            return 83
+        if SchemeParser.eval_int(host, ei, "(apply + 1 2 (list 3 4))") <> 10
+            return 84
+        if SchemeParser.eval_int(host, ei, "(apply * (list 2 3 4))") <> 24
+            return 85
+        SchemeParser.run_program(host, ei, "(define (add3 a b c) (+ a b c))")
+        if SchemeParser.eval_int(host, ei, "(apply add3 (list 10 20 30))") <> 60
+            return 86
+
+        ; --- call-with-current-continuation (dsssl2) ------------------------
+        ; ★also -2-only, and only under its LONG name: the reference installs
+        ; no `call/cc` abbreviation.
+        ; escape: (k 42) discards the enclosing (+ 1 ...) -> 42
+        if SchemeParser.eval_int(host, ei2, "(call-with-current-continuation (lambda (k) (+ 1 (k 42))))") <> 42
+            return 87
+        ; non-escaping: the continuation is never invoked -> 5 + 10
+        if SchemeParser.eval_int(host, ei2, "(+ 5 (call-with-current-continuation (lambda (k) 10)))") <> 15
+            return 88
+        ; escape past an intermediate frame -> 1 + 100
+        if SchemeParser.eval_int(host, ei2, "(+ 1 (call-with-current-continuation (lambda (k) (+ 2 (k 100)))))") <> 101
+            return 89
+
+        ; --- grove / node-list (Inc 4) -------------------------------------
+        ; bind `root` to a singleton node-list over a hand-built grove:
+        ;   document > para > ["Hello", emph > "world"]
+        let doc GroveBuilder.build_test_grove(host)
+        let root_nl ELObj.make_node_singleton(host, doc)
+        let rid ei.lookup(StringC("groot"))
+        rid.set_definition(0, Location(), root_nl)
+        if SchemeParser.eval_bool(host, ei, "(node-list? groot)") = false
+            return 90
+        if SchemeParser.eval_bool(host, ei, "(node-list-empty? groot)")
+            return 91
+        if SchemeParser.eval_bool(host, ei, "(node-list-empty? (empty-node-list))") = false
+            return 92
+        ; the sgml-document node has NO children AXIS (Node::firstChild is
+        ; overridden only by ElementNode), so children/descendants/data are all
+        ; empty at the grove root — the document element is reached through the
+        ; 'document-element property.
+        if SchemeParser.eval_int(host, ei, "(node-list-length (children groot))") <> 0
+            return 93
+        ; the para element's GI
+        if SchemeParser.eval_str_eq(host, ei, "(gi (node-property 'document-element groot))", "para") = false
+            return 94
+        ; para's children are per-character data nodes plus the emph element:
+        ; "Hello" is FIVE data-char nodes (DataNode = (chunk, index)), so 5 + 1.
+        if SchemeParser.eval_int(host, ei, "(node-list-length (children (node-property 'document-element groot)))") <> 6
+            return 95
+        ; the emph element's GI (after the five characters of "Hello")
+        if SchemeParser.eval_str_eq(host, ei, "(gi (node-list-ref (children (node-property 'document-element groot)) 5))", "emph") = false
+            return 96
+        ; data string value = all descendant chars joined (of the document
+        ; ELEMENT — `(data groot)` is "" for want of a children axis)
+        if SchemeParser.eval_str_eq(host, ei, "(data (node-property 'document-element groot))", "Helloworld") = false
+            return 97
+        if SchemeParser.eval_str_eq(host, ei, "(data groot)", "") = false
+            return 98
+
+        ; --- property axis on the hand-built grove -------------------------
+        ; document > para > ["Hello", emph > "world"] (root still bound above)
+        SchemeParser.run_program(host, ei, "(define para (node-property 'document-element groot))")
+        SchemeParser.run_program(host, ei, "(define emph (node-list-ref (children para) 5))")
+        ; parent axis: parent of emph is the para element
+        if SchemeParser.eval_str_eq(host, ei, "(gi (parent emph))", "para") = false
+            return 101
+        ; ancestor: nearest ancestor named para (walks up from emph)
+        if SchemeParser.eval_str_eq(host, ei, "(gi (ancestor \"para\" emph))", "para") = false
+            return 102
+        ; descendants (document order, self excluded), data expanded per
+        ; character: 5 chars of "Hello" + emph + 5 chars of "world" = 11 below
+        ; para; the grove ROOT has no children axis, hence no descendants.
+        if SchemeParser.eval_int(host, ei, "(node-list-length (descendants groot))") <> 0
+            return 103
+        if SchemeParser.eval_int(host, ei, "(node-list-length (descendants para))") <> 11
+            return 104
+
+        ; --- sosofos (Inc 4 foundation) ------------------------------------
+        if SchemeParser.eval_bool(host, ei, "(sosofo? (empty-sosofo))") = false
+            return 105
+        if SchemeParser.eval_bool(host, ei, "(sosofo? 5)")
+            return 106
+        if SchemeParser.eval_bool(host, ei, "(sosofo? (sosofo-append (empty-sosofo) (empty-sosofo)))") = false
+            return 107
+
+        ; --- grove from a REAL parse (opensp -> GroveBuilder -> primitives) -
+        ; parse a small SGML instance, build the grove, and drive the axis over
+        ; it. Uppercase GIs/attr names so NAMECASE folding can't perturb the
+        ; expected strings; the instance is on ONE line so no whitespace data
+        ; nodes appear in the mixed content.
+        let sgml String("<!DOCTYPE DOC [\n<!ELEMENT DOC O O (PARA)+>\n<!ELEMENT PARA O O (#PCDATA|EMPH)*>\n<!ELEMENT EMPH O O (#PCDATA)>\n<!ATTLIST PARA ALIGN CDATA #IMPLIED XID ID #IMPLIED>\n]>\n<DOC><PARA ALIGN=\"center\" XID=\"P1\">Hello<EMPH>world</EMPH></PARA></DOC>\n")
+        let gpath TestScratch.path("dazzle_grove_test.sgml")
+        if File.write_from_string(gpath, sgml) = false
+            return 108
+        let gps Parser.parse_simple(host, gpath, String("dazzle"))
+        let gdoc GroveBuilder.build(host, gps)
+        ; ★the grove's GENERAL substitution table has to be filled in right
+        ; after the build (GroveManager.fill_from_parse does it for the driver),
+        ; and the pattern matcher needs it: ElementNode::hasGi folds the
+        ; PATTERN's gi through that table and matches NOTHING without one. The
+        ; harness has to do what the driver does — the construction rules below
+        ; match `DOC`/`PARA`/`EMPH`.
+        let ginfo GroveInfo.of(gdoc)
+        let inst_syntax gps.get_instance_syntax()
+        if inst_syntax <> null
+        {
+            let tab inst_syntax.general_subst()
+            ginfo.subst := tab
+        }
+        else
+        {
+            let base_syntax gps.get_syntax()
+            if base_syntax <> null
+            {
+                let tab2 base_syntax.general_subst()
+                ginfo.subst := tab2
+            }
+        }
+        ; ★guard, not decoration: the table reached the record only after
+        ; `use opensp.ParserState.ParserState` was added above — a method call
+        ; on a record type whose concept the root does not `use` silently
+        ; answers null, and the pattern tests below then fail far from here.
+        if GroveInfo.subst_of(gdoc).is_empty()
+            return 119
+        let rroot ELObj.make_node_singleton(host, gdoc)
+        let rrid ei.lookup(StringC("rroot"))
+        rrid.set_definition(0, Location(), rroot)
+        SchemeParser.run_program(host, ei, "(define rdoc (node-property 'document-element rroot))")
+        SchemeParser.run_program(host, ei, "(define rpara (node-list-first (children rdoc)))")
+        ; the sgml-document node's children axis is empty (see 93); DOC is its
+        ; 'document-element
+        if SchemeParser.eval_int(host, ei, "(node-list-length (children rroot))") <> 0
+            return 110
+        if SchemeParser.eval_str_eq(host, ei, "(gi rdoc)", "DOC") = false
+            return 111
+        if SchemeParser.eval_str_eq(host, ei, "(gi rpara)", "PARA") = false
+            return 112
+        ; attribute-string over the real grove: PARA carries ALIGN="center";
+        ; an absent attribute (ALIGN on DOC) yields #f.
+        if SchemeParser.eval_str_eq(host, ei, "(attribute-string \"ALIGN\" rpara)", "center") = false
+            return 113
+        if SchemeParser.eval_bool(host, ei, "(not (attribute-string \"ALIGN\" rdoc))") = false
+            return 114
+        ; parent + ancestor axes over the real grove
+        if SchemeParser.eval_str_eq(host, ei, "(gi (parent rpara))", "DOC") = false
+            return 115
+        if SchemeParser.eval_str_eq(host, ei, "(gi (ancestor \"DOC\" rpara))", "DOC") = false
+            return 116
+        ; data string value = concatenated descendant character data
+        if SchemeParser.eval_str_eq(host, ei, "(data rdoc)", "Helloworld") = false
+            return 117
+        ; descendants of DOC in document order. The grove builder coalesces the
+        ; parser's per-character data events into one data CHUNK (the reference's
+        ; DataNode::add), and the axis then hands out one node per CHARACTER
+        ; again: PARA + 5 + EMPH + 5 = 12.
+        if SchemeParser.eval_int(host, ei, "(node-list-length (descendants rdoc))") <> 12
+            return 118
+
+        ; --- Inc 5 style engine: construction rules over the real grove ----
+        ; A fresh interp per stylesheet (rules accumulate on the mode); process
+        ; gdoc (document > DOC > PARA[ALIGN=center] > "Hello" + EMPH > "world")
+        ; and observe the collected characters.
+        ; (1) process-children threads root->DOC->PARA->{data, EMPH}; EMPH wraps.
+        ; The transform FOTBuilder escapes the literal < > as character data
+        ; (sgml mode: numeric char refs, outputNumericCharRef).
+        if SchemeParser.style_eq("(root (process-children)) (element DOC (process-children)) (element PARA (process-children)) (element EMPH (sosofo-append (literal \"<\") (process-children) (literal \">\")))", gdoc, "Hello&#60;world&#62;") = false
+            return 120
+        ; (2) a default rule catches DOC + PARA; EMPH's literal replaces content.
+        if SchemeParser.style_eq("(root (process-children)) (default (process-children)) (element EMPH (literal \"X\"))", gdoc, "HelloX") = false
+            return 121
+        ; (3) an attribute-qualified rule outranks the plain GI rule (specificity).
+        if SchemeParser.style_eq("(root (process-children)) (element DOC (process-children)) (element (PARA (ALIGN \"center\")) (literal \"C\")) (element PARA (literal \"P\"))", gdoc, "C") = false
+            return 122
+        ; (4) current-node + gi feed a computed literal.
+        if SchemeParser.style_eq("(root (process-children)) (element DOC (process-children)) (element PARA (literal (gi (current-node))))", gdoc, "PARA") = false
+            return 123
+        ; (5) select-elements + process-node-list: process only the EMPH child.
+        if SchemeParser.style_eq("(root (process-children)) (element DOC (process-children)) (element PARA (process-node-list (select-elements (children (current-node)) \"EMPH\"))) (element EMPH (literal \"E\"))", gdoc, "E") = false
+            return 124
+
+        ; --- Inc 5b slice B: the `make` special form -> flow objects --------
+        ; (6) an element flow object brackets its content with start/end tags.
+        ; (start/end tags close RE_ + '>', attributes are SP_(=RE)-prefixed)
+        if SchemeParser.style_eq("(declare-flow-object-class element \"UNREGISTERED::James Clark//Flow Object Class::element\") (root (make element gi: \"x\" (literal \"hi\")))", gdoc, "<x\r>hi</x\r>") = false
+            return 125
+        ; (7) attributes: characteristic -> a name/value pair list.
+        if SchemeParser.style_eq("(declare-flow-object-class element \"UNREGISTERED::James Clark//Flow Object Class::element\") (root (make element gi: \"a\" attributes: (list (list \"href\" \"u\")) (literal \"L\")))", gdoc, "<a\rhref=\"u\"\r>L</a\r>") = false
+            return 126
+        ; (8) an empty gi falls back to the current node's GI (ElementFlowObj).
+        if SchemeParser.style_eq("(declare-flow-object-class element \"UNREGISTERED::James Clark//Flow Object Class::element\") (root (process-children)) (element DOC (make element (process-children))) (default (process-children))", gdoc, "<DOC\r>Helloworld</DOC\r>") = false
+            return 127
+        ; (9) empty-element: atomic, no content (xml off -> no self-close).
+        if SchemeParser.style_eq("(declare-flow-object-class empty-element \"UNREGISTERED::James Clark//Flow Object Class::empty-element\") (root (make empty-element gi: \"br\"))", gdoc, "<br>") = false
+            return 128
+        ; (10) entity-ref: atomic reference syntax.
+        if SchemeParser.style_eq("(declare-flow-object-class entity-ref \"UNREGISTERED::James Clark//Flow Object Class::entity-ref\") (root (make entity-ref name: \"amp\"))", gdoc, "&amp;") = false
+            return 129
+        ; (11) processing-instruction: atomic.
+        if SchemeParser.style_eq("(declare-flow-object-class pi \"UNREGISTERED::James Clark//Flow Object Class::processing-instruction\") (root (make pi data: \"go\"))", gdoc, "<?go>") = false
+            return 130
+        ; (12) the built-in sequence flow object just processes content.
+        if SchemeParser.style_eq("(root (make sequence (literal \"S\")))", gdoc, "S") = false
+            return 131
+
+        ; --- element-with-id over the real grove's ID index -----------------
+        ; The driver installs the index after building the grove (dazzle_cli);
+        ; an ID-typed attribute value resolves to its element, an unknown ID
+        ; yields the empty node-list.
+        let ididx GroveBuilder.build_id_index(host, gdoc)
+        if ididx.get_length() <> 1
+            return 132
+        ginfo.id_index := ididx
+        ginfo.id_table := GroveBuilder.build_id_table(host, ididx)
+        ; ★the SECOND argument is what names the grove to search. Outside a
+        ; construction rule there is no current node, and the reference then
+        ; reports noCurrentNode instead of answering — so the harness passes
+        ; the grove root, exactly as a stylesheet would have to.
+        if SchemeParser.eval_str_eq(host, ei, "(gi (element-with-id \"P1\" rroot))", "PARA") = false
+            return 133
+        if SchemeParser.eval_bool(host, ei, "(node-list-empty? (element-with-id \"NOPE\" rroot))") = false
+            return 134
+
+        ; --- errors are LOUD ------------------------------------------------
+        ; An unbound top-level reference is a compile-time error message plus
+        ; an ErrorInsn (VariableExpression::compile), never a silent no-op.
+        var ec0 ei.get_error_count()
+        let ub SchemeParser.eval_str(host, ei, "bogusvar")
+        if ei.is_error(ub) = false
+            return 135
+        if ei.get_error_count() <> ec0 + 1
+            return 136
+        ; A wrong-typed primitive argument reports name/ordinal/object
+        ; (PrimitiveObj::argError) and yields the error object.
+        ec0 := ei.get_error_count()
+        let sa SchemeParser.eval_str(host, ei, "(string-append \"a\" 3)")
+        if ei.is_error(sa) = false
+            return 137
+        if ei.get_error_count() <> ec0 + 1
+            return 138
+
+        0
+    }
+
+    ; --- style-engine test helper (Inc 5) ----------------------------------
+    ; Self-contained: its own local region (own interp + FOTBuilder), released
+    ; on return, so a stylesheet's whole footprint never accumulates on the
+    ; caller's region. `root` lives on the caller's (persisting) region; only
+    ; the scalar result crosses back. Loads the stylesheet, processes `root`,
+    ; and compares the collected output to `expected`.
+    procedure style_eq(mutable src: Slice[char], mutable root: ref[GroveNode], expected: Slice[char]) returns bool
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+        let interp Interpreter.make(host, 1440, false, false, false)
+        let text StringC(src)
+        let src_in InputSource.make(host, null, text.as_slice())
+        let sp SchemeParser.make(host, interp, src_in)
+        sp.parse()
+        interp.compile()
+        let fotb TransformFOTBuilder.make(host, false)
+        let pc ProcessContext.make(host, interp, fotb)
+        pc.process(root)
+        let s fotb.root_to_stringc(host)
+        s.equals(StringC(expected))
+    }
+
+    ; --- eval-test helpers -------------------------------------------------
+    ; parse ONE expression from src, compile it, run it on a fresh VM.
+    procedure eval_str(host: ref[Page], mutable interp: ref[Interpreter], mutable src: Slice[char]) returns ref[ELObj]?
+    {
+        let text StringC(src)
+        let src_in InputSource.make(host, null, text.as_slice())
+        let sp SchemeParser.make(host, interp, src_in)
+        var expr: ref[Expression]? null
+        if sp.parse_expression(&expr) = false
+            return interp.make_error()
+        if expr = null
+            return interp.make_error()
+        let env Environment.make(host)
+        let insn Expression.optimize_compile(expr, interp, env, 0, null)
+        let vm VM.make(host, interp)
+        vm.eval(insn, null, null)
+    }
+
+    ; run a whole program (its top-level defines register on interp).
+    procedure run_program(host: ref[Page], mutable interp: ref[Interpreter], mutable src: Slice[char])
+    {
+        let text StringC(src)
+        let src_in InputSource.make(host, null, text.as_slice())
+        let sp SchemeParser.make(host, interp, src_in)
+        sp.parse()
+    }
+
+    procedure eval_int(host: ref[Page], mutable interp: ref[Interpreter], mutable src: Slice[char]) returns int
+    {
+        let v SchemeParser.eval_str(host, interp, src)
+        if v = null
+            return 0 - 999999
+        if v.is_exact_integer() = false
+            return 0 - 999998
+        v.exact_integer_value()
+    }
+
+    procedure eval_bool(host: ref[Page], mutable interp: ref[Interpreter], mutable src: Slice[char]) returns bool
+    {
+        let v SchemeParser.eval_str(host, interp, src)
+        if v = null
+            return false
+        v.is_true()
+    }
+
+    ; eval src and compare the resulting string to an ASCII expected value.
+    procedure eval_str_eq(host: ref[Page], mutable interp: ref[Interpreter], mutable src: Slice[char], expected: Slice[char]) returns bool
+    {
+        let v SchemeParser.eval_str(host, interp, src)
+        if v = null
+            return false
+        if v.has_string_data() = false
+            return false
+        let s v.string_data(host)
+        let e StringC(expected)
+        s.equals(e)
+    }
+}

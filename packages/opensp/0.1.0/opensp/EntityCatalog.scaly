@@ -1,0 +1,1112 @@
+use scaly.memory.Page
+use scaly.os.Path
+use scaly.memory.runtime.fopen
+use scaly.memory.runtime.fclose
+use scaly.memory.runtime.fread
+use opensp.ExternalId.ExternalId
+use opensp.StringC.StringC
+use opensp.Message.MessageType
+use opensp.CatalogMessages.CatalogMessages
+use opensp.PosixStorageMessages.PosixStorageMessages
+use opensp.Location.Location
+use opensp.Location.Origin
+
+; SGML Open catalog resolution — SOEntityCatalog.cxx (SOCatalogManagerImpl /
+; SOEntityCatalog / CatalogParser).
+;
+; ONE EntityCatalog accumulates every catalog file of a run in parse order
+; (command-line -c/-m catalogs, the document's implicit `catalog`, the
+; SGML_CATALOG_FILES entries, plus CATALOG-chained sub-catalogs); each file
+; bumps n_catalogs (SOEntityCatalog::endCatalog), and every entry records the
+; catalog number it came from plus the directory its target resolves against
+; (the catalog file's own directory, or the current BASE file's — the port
+; stores the resolved BASE DIRECTORY where the reference stores base
+; Locations). Lookup priority is the reference's: within a kind the FIRST
+; entry for a key wins (the hash-table first-insert semantics); across kinds
+; the entry from the LOWEST-numbered catalog wins, system id beating public
+; id beating entity name on ties (SOEntityCatalog::lookup, :427).
+;
+; The CatalogParser scans the DECODED Char buffer of a catalog file (the same
+; make_char_source normalization documents get, so message locations render
+; through the ordinary Origin line/col walk) and is a pure collector: entries
+; go into the EntityCatalog, diagnostics into a CatMsg list and CATALOG
+; chain requests into a SubCatalog list — the caller (Parser.scaly) replays
+; the messages through the parser's Messenger and drives the chaining (it
+; owns file access and the loop check). Byte-String identifiers throughout
+; (I/O-boundary rule, see ExternalId).
+
+; strerror(3)/errno — the BASE-entry file probe reports read errors with the
+; live errno text (rule (c): errno is a thread-local macro behind a shim).
+function strerror(code: i32) returns pointer[const_char] extern
+function scaly_eio_errno() returns i32 extern
+; Through the eio shim, not libc's fseek/ftell: `long` offsets are 32-bit on
+; Win64 and one seed serves every target (check 4 of tests/abi/run.sh).
+function scaly_eio_seek(stream: pointer[OpaqueFile], offset: int, whence: int) returns int extern
+function scaly_eio_tell(stream: pointer[OpaqueFile]) returns int extern
+function rewind(stream: pointer[OpaqueFile]) extern
+
+define CAT_PUBLIC: int 0
+define CAT_SYSTEM: int 1
+define CAT_DOCTYPE: int 2
+define CAT_ENTITY: int 3
+define CAT_SGMLDECL: int 4
+define CAT_CATALOG: int 5
+define CAT_NOTATION: int 6
+define CAT_LINKTYPE: int 7
+define CAT_SGML: int 8
+define CAT_DELEGATE: int 9
+define CAT_DTDDECL: int 10
+
+define TOK_EOF: int 0
+define TOK_NAME: int 1
+define TOK_LITERAL: int 2
+
+; CatMsg.kind — how the replay renders the args.
+define CMK_NONE: int 0
+define CMK_STR: int 1
+define CMK_STR_RAW: int 2
+
+; a collected catalog diagnostic: replayed by the caller through the parser
+; Messenger (report_at when has_loc, the location-less app shape otherwise).
+define CatMsg (mt: MessageType, kind: int, a1: String, a2: String, has_loc: bool, loc: Location)
+{
+    init(mt: MessageType, kind: int, a1: String, a2: String, has_loc: bool, loc: Location)
+    {
+        this.mt := mt
+        this.kind := kind
+        this.a1 := a1
+        this.a2 := a2
+        this.has_loc := has_loc
+        this.loc := loc
+    }
+}
+
+; a CATALOG chain request: the resolved sub-catalog path + the entry's
+; location (the parent location a failed open reports under).
+define SubCatalog (sysid: String, raw: String, loc: Location)
+{
+    init(sysid: String, raw: String, loc: Location)
+    {
+        this.sysid := sysid
+        this.raw := raw
+        this.loc := loc
+    }
+}
+
+define TokenResult (kind: int, token: String, start: size_t, next_pos: size_t)
+{
+    init(kind: int, token: String, start: size_t, next_pos: size_t)
+    {
+        this.kind := kind
+        this.token := token
+        this.start := start
+        this.next_pos := next_pos
+    }
+}
+
+define CatalogEntry (decl_type: int, key: String, target: String, base: String, base_file: String, catalog_number: int, is_override: bool)
+{
+    init(decl_type: int, key: String, target: String, base: String, base_file: String, catalog_number: int, is_override: bool)
+    {
+        this.decl_type := decl_type
+        this.key := key
+        this.target := target
+        this.base := base
+        this.base_file := base_file
+        this.catalog_number := catalog_number
+        this.is_override := is_override
+    }
+}
+
+; a lookup verdict: `path` is the entry's resolved target; a DELEGATE hit
+; instead names the delegate CATALOG (resolution against it happens at open
+; time — the effective system id renders the `<CATALOG PUBLIC=...>` map).
+define CatLookup (found: bool, path: String, delegated: bool, delegate_catalog: String, target: String, base: String, base_file: String)
+{
+    init(found: bool, path: String, delegated: bool, delegate_catalog: String, target: String, base: String, base_file: String)
+    {
+        this.found := found
+        this.path := path
+        this.delegated := delegated
+        this.delegate_catalog := delegate_catalog
+        this.target := target
+        this.base := base
+        this.base_file := base_file
+    }
+}
+
+define EntityCatalog (entries: Array[CatalogEntry], var n_catalogs: int, var have_sgml_decl: bool, var sgml_decl: String, var sgml_decl_base: String, var have_document: bool, var document: String, var document_base: String)
+{
+    init()
+    {
+        this.entries := Array[CatalogEntry]()
+        this.n_catalogs := 0
+        this.have_sgml_decl := false
+        this.sgml_decl := String()
+        this.sgml_decl_base := String()
+        this.have_document := false
+        this.document := String()
+        this.document_base := String()
+    }
+
+    function make(host: ref[Page]) returns ref[EntityCatalog]
+    {
+        let p &EntityCatalog^host()
+        p
+    }
+
+    ; SOEntityCatalog::endCatalog — one catalog file finished.
+    procedure end_catalog(mutable this: ref[EntityCatalog])
+        this.n_catalogs := this.n_catalogs + 1
+
+    ; PosixStorageManager::combineDir via extractDir: an absolute target (or
+    ; an empty base) stands alone; otherwise it joins the entry's base dir.
+    function resolve_target(base: String, target: String) returns String
+    {
+        if target.get_length() > 0
+        {
+            if target.get(0) = 0x2F
+                return target
+        }
+        if base.get_length() = 0
+            return target
+
+        Path.join(base, target)
+    }
+
+    function resolve(this: EntityCatalog, e: ref[CatalogEntry]) returns String
+        EntityCatalog.resolve_target(e.base, e.target)
+
+    ; Table::lookup / insert first-wins semantics over the flat entry list:
+    ; the first entry of the kind with the key wins; with override_only (the
+    ; entity DECLARED a system id) only OVERRIDE YES entries apply
+    ; (SOEntityCatalog.cxx:736-758 — see the design note in the header).
+    function find_of(this: EntityCatalog, decl_type: int, key: String, override_only: bool, subst: bool) returns ref[CatalogEntry]?
+    {
+        ; index walk in APPEND order — first-wins (Array; a List would
+        ; iterate LIFO and flip the priority).
+        let n entries.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let e entries.at(i)
+            if e.decl_type = decl_type
+            {
+                if (override_only = false) or e.is_override
+                {
+                    if EntityCatalog.key_matches(e.key, key, subst)
+                        return e
+                }
+            }
+            i := i + 1
+        }
+        null
+    }
+
+    ; entry keys match exactly, or through the ASCII upper subst table when
+    ; the syntax namecase-folds the lookup name (the NAME arrives folded, so
+    ; the ENTRY key is upcased for the comparison — SOEntityCatalog.cxx:761).
+    function key_matches(ek: String, key: String, subst: bool) returns bool
+    {
+        let n ek.get_length()
+        if n <> key.get_length()
+            return false
+        var i: size_t 0
+        while i < n
+        {
+            var c ek.get(i)
+            if subst
+            {
+                if (c >= 0x61) and (c <= 0x7A)
+                    c := c - 0x20
+            }
+            if c <> key.get(i)
+                return false
+            i := i + 1
+        }
+        true
+    }
+
+    ; a DELEGATE entry whose key equals public_id[0..plen) — compared IN
+    ; PLACE: lookups must not allocate before a match, because the queried
+    ; strings can alias the parser's transient literal buffer (a fresh String
+    ; here lands on that region and clobbers the caller's public id).
+    function find_delegate_prefix(this: EntityCatalog, public_id: String, plen: size_t, override_only: bool) returns ref[CatalogEntry]?
+    {
+        let n entries.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let e entries.at(i)
+            if e.decl_type = CAT_DELEGATE
+            {
+                if (override_only = false) or e.is_override
+                {
+                    let ek e.key
+                    if ek.get_length() = plen
+                    {
+                        var same true
+                        var j: size_t 0
+                        while j < plen
+                        {
+                            if ek.get(j) <> public_id.get(j)
+                            {
+                                same := false
+                                j := plen
+                            }
+                            else
+                                j := j + 1
+                        }
+                        if same
+                            return e
+                    }
+                }
+            }
+            i := i + 1
+        }
+        null
+    }
+
+    ; findBestPublicEntry (SOEntityCatalog.cxx:552): DELEGATE prefixes (every
+    ; partitioned prefix of the public id — the split points around a doubled
+    ; `/` or `:`) compete with the PUBLIC entry; the lowest catalog number
+    ; wins and the PUBLIC entry takes ties (checked second with <=).
+    procedure find_public_entry(this: EntityCatalog, public_id: String, override_only: bool, mutable out_delegated: ref[bool]) returns ref[CatalogEntry]?
+    {
+        out_delegated := false
+        var best: ref[CatalogEntry]? null
+        let n public_id.get_length()
+        var i: size_t 0
+        while i <= n
+        {
+            var split false
+            if (i + 1) < n
+            {
+                let c public_id.get(i)
+                if (c = 0x2F) or (c = 0x3A)
+                {
+                    if public_id.get(i + 1) = c
+                        split := true
+                }
+            }
+            if (split = false) and (i >= 2)
+            {
+                let c1 public_id.get(i - 1)
+                if (c1 = 0x2F) or (c1 = 0x3A)
+                {
+                    if public_id.get(i - 2) = c1
+                        split := true
+                }
+            }
+            if split
+            {
+                let de this.find_delegate_prefix(public_id, i, override_only)
+                if de <> null
+                {
+                    var better best = null
+                    if best <> null
+                    {
+                        if (*de).catalog_number <= (*best).catalog_number
+                            better := true
+                    }
+                    if better
+                    {
+                        best := de
+                        out_delegated := true
+                    }
+                }
+            }
+            i := i + 1
+        }
+        let pe this.find_of(CAT_PUBLIC, public_id, override_only, false)
+        if pe <> null
+        {
+            var better best = null
+            if best <> null
+            {
+                if (*pe).catalog_number <= (*best).catalog_number
+                    better := true
+            }
+            if better
+            {
+                best := pe
+                out_delegated := false
+            }
+        }
+        best
+    }
+
+    ; SOEntityCatalog::lookup (:427) — the full external-id resolution an
+    ; EntityDecl gets: SYSTEM entry keyed by the declared system id; PUBLIC
+    ; entry (override-gated when a system id was declared, DELEGATE-aware);
+    ; the name table (only consulted while the best entry so far came from a
+    ; catalog other than the first) — each cross-kind contest won by the
+    ; LOWER catalog number. `name_key` arrives PERO-prefixed for parameter
+    ; entities and empty when the name table must not be consulted.
+    function lookup_external(this: EntityCatalog, has_sys: bool, sys: String, has_pub: bool, pub: String, name_key: String, name_decl_type: int, name_subst: bool) returns CatLookup
+    {
+        var entry: ref[CatalogEntry]? null
+        var delegated false
+        if has_sys
+            entry := this.find_of(CAT_SYSTEM, sys, false, false)
+        if has_pub
+        {
+            var pd false
+            let pe this.find_public_entry(pub, has_sys, &pd)
+            if pe <> null
+            {
+                var wins entry = null
+                if entry <> null
+                {
+                    if (*pe).catalog_number < (*entry).catalog_number
+                        wins := true
+                }
+                if wins
+                {
+                    entry := pe
+                    delegated := pd
+                }
+            }
+        }
+        if name_key.get_length() > 0
+        {
+            var consult entry = null
+            if entry <> null
+            {
+                if (*entry).catalog_number > 0
+                    consult := true
+            }
+            if consult
+            {
+                let ne this.find_of(name_decl_type, name_key, has_sys, name_subst)
+                if ne <> null
+                {
+                    var wins entry = null
+                    if entry <> null
+                    {
+                        if (*ne).catalog_number < (*entry).catalog_number
+                            wins := true
+                    }
+                    if wins
+                    {
+                        entry := ne
+                        delegated := false
+                    }
+                }
+            }
+        }
+        if entry = null
+            return CatLookup(false, String(), false, String(), String(), String(), String())
+        if delegated
+            return CatLookup(true, String(), true, this.resolve(entry), String(), String(), String())
+        CatLookup(true, this.resolve(entry), false, String(), (*entry).target, (*entry).base, (*entry).base_file)
+    }
+
+    function lookup_of(this: EntityCatalog, decl_type: int, key: String) returns String
+    {
+        let e this.find_of(decl_type, key, false, false)
+        if e = null
+            return String()
+        this.resolve(e)
+    }
+
+    ; non-delegate PUBLIC resolution (the DOCTYPE/LINKTYPE subset and SD
+    ; referencePublic sites); a DELEGATE winner reports as a miss here — the
+    ; delegate-aware sites go through find_public_entry/lookup_external.
+    function lookup_public(this: EntityCatalog, public_id: String) returns String
+        lookup_public_entry(public_id, false)
+
+    function lookup_public_entry(this: EntityCatalog, public_id: String, override_only: bool) returns String
+    {
+        var pd false
+        let e this.find_public_entry(public_id, override_only, &pd)
+        if e = null
+            return String()
+        if pd
+            return String()
+        this.resolve(e)
+    }
+
+    function lookup_system(this: EntityCatalog, system_id: String) returns String
+        lookup_of(CAT_SYSTEM, system_id)
+
+    ; DOCTYPE and NOTATION names match through the syntax's UPPER substitution
+    ; table under NAMECASE GENERAL (SOEntityCatalog.cxx:472-481).
+    function lookup_doctype(this: EntityCatalog, name: String, upcase: bool) returns String
+        lookup_name_of(CAT_DOCTYPE, name, upcase)
+
+    function lookup_notation(this: EntityCatalog, name: String, upcase: bool) returns String
+        lookup_name_of(CAT_NOTATION, name, upcase)
+
+    function lookup_name_of(this: EntityCatalog, decl_type: int, name: String, upcase: bool) returns String
+    {
+        let e this.find_of(decl_type, name, false, upcase)
+        if e = null
+            return String()
+        this.resolve(e)
+    }
+
+    function lookup_entity(this: EntityCatalog, name: String) returns String
+        lookup_of(CAT_ENTITY, name)
+
+    ; the first catalog's SGMLDECL entry (setSgmlDecl is first-wins), resolved
+    ; against the catalog (or BASE) directory current at its declaration.
+    function lookup_sgmldecl(this: EntityCatalog) returns String
+    {
+        if have_sgml_decl = false
+            return String()
+        EntityCatalog.resolve_target(sgml_decl_base, sgml_decl)
+    }
+
+    ; the DOCUMENT entry (-C / SOEntityCatalog::document), first-wins.
+    function lookup_document(this: EntityCatalog) returns String
+    {
+        if have_document = false
+            return String()
+        EntityCatalog.resolve_target(document_base, document)
+    }
+
+    ; EntityCatalog.lookup(EntityDecl): prefer PUBLIC, then SYSTEM, else the
+    ; entity's own system id resolved relative to the catalog dir. (Stage-2
+    ; convenience used by Entity.stack and tests; the parser proper resolves
+    ; through lookup_external and the per-site chains.)
+    function lookup(this: EntityCatalog, id: ExternalId) returns String
+    {
+        if id.has_public_id()
+        {
+            let bypub lookup_public(id.get_public_id())
+            if bypub.get_length() <> 0
+                return bypub
+        }
+        if id.has_system_id()
+        {
+            let bysys lookup_system(id.get_system_id())
+            if bysys.get_length() <> 0
+                return bysys
+
+            ; SYSTEM fallback: the id's own system id, first-catalog-relative.
+            var base String()
+            if entries.get_length() > 0
+            {
+                let e0 entries.get_buffer()
+                base := (*e0).base
+            }
+            return EntityCatalog.resolve_target(base, id.get_system_id())
+        }
+        String()
+    }
+}
+
+; the parse chain — ancestor catalog paths for the CATALOG loop check
+; (CatalogParser::inLoop compares the current file's storage id against its
+; own inclusion ancestry).
+define CatChain (path: String, parent: ref[CatChain]?)
+{
+    ; ★The init parameter tracks the FIELD's nullability: `parent` is
+    ; `ref[CatChain]?` (a chain root has none), so this must be too, or
+    ; `check_initializer_match` rejects the init and the construction falls
+    ; through to the positional-tuple path.
+    init(path: String, parent: ref[CatChain]?)
+    {
+        this.path := path
+        this.parent := parent
+    }
+
+    function contains(this: CatChain, p: String) returns bool
+    {
+        if path = p
+            return true
+        if parent = null
+            return false
+        (*parent).contains(p)
+    }
+}
+
+define CatalogParser ()
+{
+    ; ---- the Char scanner (CatalogParser::parseParam and friends) ----------
+    ; Char classes over the decoded buffer: s = space/tab and the normalized
+    ; RE/RS; lit/lita the two quotes; `-` opens a comment when doubled; NUL
+    ; reports and is otherwise a name char; everything else names.
+
+    function is_s(c: u32) returns bool
+        (c = 0x20) or (c = 0x09) or (c = 0x0D) or (c = 0x0A)
+
+    ; CatalogParser::isMinimumData: lc/uc letters, digits, the minimum-data
+    ; specials `-.'()+,/:=?`, the WWW additions `! # $ % * ; @ _`, and
+    ; space/RE/RS (s minus TAB); `'` (lita) counts, `"` (lit) does not.
+    function is_minimum_data(c: u32) returns bool
+    {
+        if (c >= 0x61) and (c <= 0x7A)
+            return true
+        if (c >= 0x41) and (c <= 0x5A)
+            return true
+        if (c >= 0x30) and (c <= 0x39)
+            return true
+        if (c = 0x2D) or (c = 0x2E) or (c = 0x27) or (c = 0x28)
+            return true
+        if (c = 0x29) or (c = 0x2B) or (c = 0x2C) or (c = 0x2F)
+            return true
+        if (c = 0x3A) or (c = 0x3D) or (c = 0x3F)
+            return true
+        if (c = 0x21) or (c = 0x23) or (c = 0x24) or (c = 0x25) or (c = 0x2A) or (c = 0x3B) or (c = 0x40) or (c = 0x5F)
+            return true
+        (c = 0x20) or (c = 0x0D) or (c = 0x0A)
+    }
+
+    ; narrow a u32 token run to a byte String pinned on hp.
+    function narrow(this: CatalogParser, hp: ref[Page], buf: Slice[u32], start: size_t, len: size_t) returns String
+    {
+        let bytes Array[u8]()
+        var i: size_t 0
+        while i < len
+        {
+            bytes.add(buf[start + i] as u8)
+            i := i + 1
+        }
+        let s String^hp(bytes.get_buffer() as pointer[const_char], bytes.get_length())
+        *s
+    }
+
+    procedure add_msg0(this: CatalogParser, hp: ref[Page], mutable msgs: ref[Array[CatMsg]], mt: MessageType, org: ref[Origin], index: size_t)
+    {
+        let loc Location(org, index as u32)
+        msgs.add(CatMsg(mt, CMK_NONE, String(), String(), true, loc))
+    }
+
+    ; scan one parameter from buf[pos..len): skips s runs and `--…--`
+    ; comments, reports NUL chars, returns EOF / a literal / a name.
+    ; minimum_literal applies the PUBLIC-id literal rules (per-char minimum
+    ; data check, RS dropped, space/RE runs collapsing, edges stripped).
+    procedure scan(this: CatalogParser, hp: ref[Page], buf: Slice[u32], pos: size_t, minimum_literal: bool, org: ref[Origin], mutable msgs: ref[Array[CatMsg]]) returns TokenResult
+    {
+        var i pos
+        while i < buf.length
+        {
+            let c buf[i]
+            if is_s(c)
+                i := i + 1
+            else if c = 0
+            {
+                ; nulChar, reported at the char itself; scanning continues.
+                add_msg0(hp, msgs, CatalogMessages.nulChar(), org, i)
+                i := i + 1
+            }
+            else if (c = 0x2D) and ((i + 1) < buf.length) and ((buf[i + 1]) = 0x2D)
+            {
+                ; `--` comment: consume through the closing `--`; EOF inside
+                ; reports eofInComment at the end of the entity.
+                i := i + 2
+                var closed false
+                while (closed = false) and (i < buf.length)
+                {
+                    if ((buf[i]) = 0x2D) and ((i + 1) < buf.length) and ((buf[i + 1]) = 0x2D)
+                    {
+                        closed := true
+                        i := i + 2
+                    }
+                    else
+                        i := i + 1
+                }
+                if closed = false
+                    add_msg0(hp, msgs, CatalogMessages.eofInComment(), org, buf.length)
+            }
+            else
+                break
+        }
+
+        if i >= buf.length
+            return TokenResult(TOK_EOF, String(), i, i)
+
+        let c buf[i]
+        if (c = 0x22) or (c = 0x27)
+        {
+            let quote c
+            let lit_start i
+            i := i + 1
+            let out Array[u8]()
+            ; minimum-literal space handling: 0 = no, 1 = begin, 2 = middle.
+            var skipping 1
+            var closed false
+            while (closed = false) and (i < buf.length)
+            {
+                let lc buf[i]
+                if lc = quote
+                    closed := true
+                else
+                {
+                    if minimum_literal
+                    {
+                        if CatalogParser.is_minimum_data(lc) = false
+                            add_msg0(hp, msgs, CatalogMessages.minimumData(), org, i)
+                        if lc = 0x0A
+                        {
+                            ; RS is dropped entirely.
+                        }
+                        else if (lc = 0x20) or (lc = 0x0D)
+                        {
+                            if skipping = 0
+                            {
+                                out.add(0x20)
+                                skipping := 2
+                            }
+                        }
+                        else
+                        {
+                            skipping := 0
+                            out.add(lc as u8)
+                        }
+                    }
+                    else
+                        out.add(lc as u8)
+                    i := i + 1
+                }
+            }
+            if closed = false
+                add_msg0(hp, msgs, CatalogMessages.eofInLiteral(), org, buf.length)
+            else
+                i := i + 1
+            var olen out.get_length()
+            if minimum_literal and (skipping = 2) and (olen > 0)
+                olen := olen - 1
+            let tok String^hp(out.get_buffer() as pointer[const_char], olen)
+            return TokenResult(TOK_LITERAL, *tok, lit_start, i)
+        }
+
+        let start i
+        while i < buf.length
+        {
+            let nc buf[i]
+            if is_s(nc)
+                break
+            if nc = 0
+                add_msg0(hp, msgs, CatalogMessages.nulChar(), org, i)
+            i := i + 1
+        }
+        TokenResult(TOK_NAME, this.narrow(hp, buf, start, i - start), start, i)
+    }
+
+    ; the reference's currentLocation() after a parameter: a NAME is a real
+    ; token (endToken) — its START; a literal was consumed char-wise — the
+    ; CLOSING QUOTE; at EOF the end of the entity. (Probed: overrideYesOrNo
+    ; at the name start, top-level nameExpected at the closing quote.)
+    function anchor_of(this: CatalogParser, t: TokenResult) returns size_t
+    {
+        if t.kind = TOK_NAME
+            return t.start
+        if t.kind = TOK_LITERAL
+        {
+            if t.next_pos > 0
+                return t.next_pos - 1
+        }
+        t.next_pos
+    }
+
+    ; ASCII-upcase a token for the keyword match (keywords are recognized
+    ; case-insensitively — CatalogParser::upcase via the subst table).
+    function upcased(this: CatalogParser, tok: String) returns String
+    {
+        let n tok.get_length()
+        let out Array[u8]()
+        var i: size_t 0
+        while i < n
+        {
+            var c tok.get(i)
+            if (c >= 0x61) and (c <= 0x7A)
+                c := c - 0x20
+            out.add(c)
+            i := i + 1
+        }
+        String(out.get_buffer() as pointer[const_char], out.get_length())
+    }
+
+    ; the BASE entry's file probe (parseCatalog's baseKey_ arm): the argument
+    ; must OPEN and READ (an empty file passes; a failed open reports
+    ; openSystemCall, a failed read — a directory — readSystemCall; both
+    ; location-less like the reference's un-parented messenger) — only then
+    ; does the file's directory become the base for subsequent entries.
+    procedure probe_base_file(this: CatalogParser, hp: ref[Page], path: String, mutable msgs: ref[Array[CatMsg]], mutable out_ok: ref[bool])
+    {
+        out_ok := false
+        let f fopen(path.to_c_string(), "rb")
+        if f = null
+        {
+            let perr String^hp(strerror(scaly_eio_errno()))
+            let parg String^hp(path)
+            msgs.add(CatMsg(PosixStorageMessages.openSystemCall(), CMK_STR_RAW, *parg, *perr, false, Location()))
+            return
+        }
+        let sought scaly_eio_seek(f, 0 as i64, 2)
+        let size scaly_eio_tell f
+        rewind f
+        if size > 0
+        {
+            var probe u8[4]
+            let got fread(probe as pointer[void], 1 as size_t, 1 as size_t, f)
+            if got = 0
+            {
+                let rerr String^hp(strerror(scaly_eio_errno()))
+                let rarg String^hp(path)
+                msgs.add(CatMsg(PosixStorageMessages.readSystemCall(), CMK_STR_RAW, *rarg, *rerr, false, Location()))
+                let closed_err fclose(f)
+                return
+            }
+        }
+        let closed fclose(f)
+        out_ok := true
+    }
+
+    ; ---- parseCatalog (SOEntityCatalog.cxx:851) over one decoded file ------
+    ; Appends entries/messages/chain requests; the caller replays messages,
+    ; recurses into `subs` and calls cat.end_catalog(). `in_loop` says this
+    ; file already appears in its own inclusion ancestry — the first CATALOG
+    ; entry then reports inLoop at `incl_loc` (the parent's entry location)
+    ; and abandons the rest of the file, exactly like the reference's break.
+    procedure parse_into(mutable this: CatalogParser, hp: ref[Page], mutable cat: ref[EntityCatalog], mutable buf: Slice[u32], mutable org: ref[Origin], mutable cat_dir: String, cat_file: String, in_loop: bool, incl_loc: Location, mutable msgs: ref[Array[CatMsg]], mutable subs: ref[Array[SubCatalog]])
+    {
+        var pos: size_t 0
+        var override_flag false
+        var current_base String^hp(cat_dir)
+        ; the file id resolution defers to under search dirs (the SOIBASE
+        ; form of the effective system id) — the catalog file, or the
+        ; current BASE file.
+        var current_base_file String^hp(cat_file)
+        var recovering false
+
+        while true
+        {
+            let parm scan(hp, buf, pos, false, org, msgs)
+            pos := parm.next_pos
+            if parm.kind = TOK_EOF
+                break
+
+            if parm.kind = TOK_LITERAL
+            {
+                ; a stray literal at parameter level: nameExpected (once per
+                ; recovery run), anchored at the last consumed char.
+                if recovering = false
+                {
+                    recovering := true
+                    add_msg0(hp, msgs, CatalogMessages.nameExpected(), org, anchor_of(parm))
+                }
+                continue
+            }
+
+            let was_recovering recovering
+            recovering := false
+            let word upcased(parm.token)
+
+            if word = "PUBLIC"
+            {
+                let k scan(hp, buf, pos, true, org, msgs)
+                pos := k.next_pos
+                if k.kind <> TOK_LITERAL
+                {
+                    add_msg0(hp, msgs, CatalogMessages.literalExpected(), org, anchor_of(k))
+                    continue
+                }
+                let v scan(hp, buf, pos, false, org, msgs)
+                pos := v.next_pos
+                if (v.kind <> TOK_NAME) and (v.kind <> TOK_LITERAL)
+                {
+                    add_msg0(hp, msgs, CatalogMessages.nameOrLiteralExpected(), org, anchor_of(v))
+                    continue
+                }
+                cat.entries.add(CatalogEntry(CAT_PUBLIC, k.token, v.token, *current_base, *current_base_file, cat.n_catalogs, override_flag))
+            }
+            else if word = "SYSTEM"
+            {
+                let k scan(hp, buf, pos, false, org, msgs)
+                pos := k.next_pos
+                if (k.kind <> TOK_NAME) and (k.kind <> TOK_LITERAL)
+                {
+                    add_msg0(hp, msgs, CatalogMessages.nameOrLiteralExpected(), org, anchor_of(k))
+                    continue
+                }
+                let v scan(hp, buf, pos, false, org, msgs)
+                pos := v.next_pos
+                if v.kind = TOK_NAME
+                {
+                    ; systemShouldQuote (W) at the unquoted argument's start.
+                    add_msg0(hp, msgs, CatalogMessages.systemShouldQuote(), org, v.start)
+                }
+                else if v.kind <> TOK_LITERAL
+                {
+                    add_msg0(hp, msgs, CatalogMessages.literalExpected(), org, anchor_of(v))
+                    continue
+                }
+                ; SYSTEM entries are never override-gated (Table::insert false).
+                cat.entries.add(CatalogEntry(CAT_SYSTEM, k.token, v.token, *current_base, *current_base_file, cat.n_catalogs, false))
+            }
+            else if (word = "ENTITY") or (word = "DOCTYPE") or (word = "LINKTYPE") or (word = "NOTATION") or (word = "SGML")
+            {
+                var dt CAT_ENTITY
+                if word = "DOCTYPE"
+                    dt := CAT_DOCTYPE
+                if word = "LINKTYPE"
+                    dt := CAT_LINKTYPE
+                if word = "NOTATION"
+                    dt := CAT_NOTATION
+                if word = "SGML"
+                    dt := CAT_SGML
+                let k scan(hp, buf, pos, false, org, msgs)
+                pos := k.next_pos
+                if (k.kind <> TOK_NAME) and (k.kind <> TOK_LITERAL)
+                {
+                    add_msg0(hp, msgs, CatalogMessages.nameOrLiteralExpected(), org, anchor_of(k))
+                    continue
+                }
+                let v scan(hp, buf, pos, false, org, msgs)
+                pos := v.next_pos
+                if (v.kind <> TOK_NAME) and (v.kind <> TOK_LITERAL)
+                {
+                    add_msg0(hp, msgs, CatalogMessages.nameOrLiteralExpected(), org, anchor_of(v))
+                    continue
+                }
+                cat.entries.add(CatalogEntry(dt, k.token, v.token, *current_base, *current_base_file, cat.n_catalogs, override_flag))
+            }
+            else if (word = "DELEGATE") or (word = "DTDDECL")
+            {
+                var dt2 CAT_DELEGATE
+                if word = "DTDDECL"
+                    dt2 := CAT_DTDDECL
+                let k scan(hp, buf, pos, true, org, msgs)
+                pos := k.next_pos
+                if k.kind <> TOK_LITERAL
+                {
+                    add_msg0(hp, msgs, CatalogMessages.literalExpected(), org, anchor_of(k))
+                    continue
+                }
+                let v scan(hp, buf, pos, false, org, msgs)
+                pos := v.next_pos
+                if (v.kind <> TOK_NAME) and (v.kind <> TOK_LITERAL)
+                {
+                    add_msg0(hp, msgs, CatalogMessages.nameOrLiteralExpected(), org, anchor_of(v))
+                    continue
+                }
+                ; DTDDECL entries parse and store; resolution is the
+                ; reference's #if SP_DTDDECL — compiled out, so they are inert.
+                cat.entries.add(CatalogEntry(dt2, k.token, v.token, *current_base, *current_base_file, cat.n_catalogs, override_flag))
+            }
+            else if word = "SGMLDECL"
+            {
+                let v scan(hp, buf, pos, false, org, msgs)
+                pos := v.next_pos
+                if (v.kind <> TOK_NAME) and (v.kind <> TOK_LITERAL)
+                {
+                    add_msg0(hp, msgs, CatalogMessages.nameOrLiteralExpected(), org, anchor_of(v))
+                    continue
+                }
+                ; setSgmlDecl: first entry wins.
+                if cat.have_sgml_decl = false
+                {
+                    cat.have_sgml_decl := true
+                    let sd String^hp(v.token)
+                    cat.sgml_decl := *sd
+                    cat.sgml_decl_base := *current_base
+                }
+            }
+            else if word = "DOCUMENT"
+            {
+                let v scan(hp, buf, pos, false, org, msgs)
+                pos := v.next_pos
+                if (v.kind <> TOK_NAME) and (v.kind <> TOK_LITERAL)
+                {
+                    add_msg0(hp, msgs, CatalogMessages.nameOrLiteralExpected(), org, anchor_of(v))
+                    continue
+                }
+                ; setDocument: first entry wins.
+                if cat.have_document = false
+                {
+                    cat.have_document := true
+                    let dc String^hp(v.token)
+                    cat.document := *dc
+                    cat.document_base := *current_base
+                }
+            }
+            else if word = "OVERRIDE"
+            {
+                let a scan(hp, buf, pos, false, org, msgs)
+                pos := a.next_pos
+                if a.kind <> TOK_NAME
+                {
+                    add_msg0(hp, msgs, CatalogMessages.overrideYesOrNo(), org, anchor_of(a))
+                    continue
+                }
+                let ov upcased(a.token)
+                if ov = "YES"
+                    override_flag := true
+                else if ov = "NO"
+                    override_flag := false
+                else
+                    add_msg0(hp, msgs, CatalogMessages.overrideYesOrNo(), org, a.start)
+            }
+            else if word = "CATALOG"
+            {
+                let v scan(hp, buf, pos, false, org, msgs)
+                pos := v.next_pos
+                if (v.kind <> TOK_NAME) and (v.kind <> TOK_LITERAL)
+                {
+                    add_msg0(hp, msgs, CatalogMessages.nameOrLiteralExpected(), org, anchor_of(v))
+                    continue
+                }
+                if in_loop
+                {
+                    ; inLoop: reported at the PARENT's inclusion location; the
+                    ; rest of this catalog is abandoned (the reference break).
+                    msgs.add(CatMsg(CatalogMessages.inLoop(), CMK_NONE, String(), String(), true, incl_loc))
+                    return
+                }
+                let resolved EntityCatalog.resolve_target(*current_base, v.token)
+                let rp2 String^hp(resolved)
+                let raw2 String^hp(v.token)
+                subs.add(SubCatalog(*rp2, *raw2, Location(org, v.start as u32)))
+            }
+            else if word = "BASE"
+            {
+                let v scan(hp, buf, pos, false, org, msgs)
+                pos := v.next_pos
+                if (v.kind <> TOK_NAME) and (v.kind <> TOK_LITERAL)
+                {
+                    add_msg0(hp, msgs, CatalogMessages.nameOrLiteralExpected(), org, anchor_of(v))
+                    continue
+                }
+                ; the BASE argument resolves against the CATALOG's own
+                ; directory (not a prior BASE); the file must open+read.
+                let bpath EntityCatalog.resolve_target(cat_dir, v.token)
+                var ok false
+                probe_base_file(hp, bpath, msgs, &ok)
+                if ok
+                {
+                    let bdir Path.get_directory_name(bpath)
+                    let nb String^hp(bdir)
+                    current_base := nb
+                    let nbf String^hp(bpath)
+                    current_base_file := nbf
+                }
+            }
+            else
+            {
+                ; unknown keyword: silently consume ONE argument (unless the
+                ; previous parameter already began a recovery run); EOF right
+                ; after ends the parse (the reference's eofParam break).
+                if was_recovering = false
+                {
+                    let a2 scan(hp, buf, pos, false, org, msgs)
+                    pos := a2.next_pos
+                    if a2.kind = TOK_EOF
+                        break
+                }
+                recovering := true
+            }
+        }
+    }
+
+    ; ---- byte-String convenience (stage-2 API kept for Entity.stack and the
+    ;      unit tests): parse one catalog text with no message/chain plumbing.
+    procedure parse(mutable this: CatalogParser, text: String, mutable base_dir: String) returns EntityCatalog
+    {
+        var cat EntityCatalog()
+        let n text.get_length()
+        let anchor StringC#("x")
+        let hp Page.get(anchor.data_ptr())
+        let buf allocate_slice[u32](hp, n)
+        var i: size_t 0
+        while i < n
+        {
+            buf.put(i, text.get(i) as u32)
+            i := i + 1
+        }
+        var org Origin()
+        let msgs Array[CatMsg]()
+        let subs Array[SubCatalog]()
+        parse_into(hp, &cat, buf, &org, base_dir, base_dir, false, Location(), &msgs, &subs)
+        cat.end_catalog()
+        cat
+    }
+
+    procedure test() returns int
+    {
+        let src "-- catalog --\nOVERRIDE YES\npublic \"-//Example//DTD Model v1//EN\" model.dtd\nSYSTEM \"grammar.dtd\" \"grammar/grammar.dtd\"\nDOCTYPE ACTIVITY-PROTOCOL empty.dtd\nENTITY logo images/logo.gif\nSGMLDECL xml.dcl\n"
+        let parser CatalogParser()
+        let cat parser.parse(src, "/base")
+
+        ; PUBLIC resolves relative to the catalog dir (keyword case-folded)
+        let p cat.lookup_public("-//Example//DTD Model v1//EN")
+        if (p = "/base/model.dtd") = false
+            return -1
+
+        ; SYSTEM
+        let s cat.lookup_system("grammar.dtd")
+        if (s = "/base/grammar/grammar.dtd") = false
+            return -2
+
+        ; DOCTYPE
+        let d cat.lookup_doctype("ACTIVITY-PROTOCOL", true)
+        if (d = "/base/empty.dtd") = false
+            return -3
+
+        ; ENTITY
+        let e cat.lookup_entity("logo")
+        if (e = "/base/images/logo.gif") = false
+            return -4
+
+        ; miss returns empty
+        let miss cat.lookup_public("-//nobody//EN")
+        if miss.get_length() <> 0
+            return -5
+
+        ; lookup(ExternalId): PUBLIC hit
+        let byid cat.lookup(ExternalId(true, "-//Example//DTD Model v1//EN", true, "ignored.dtd"))
+        if (byid = "/base/model.dtd") = false
+            return -6
+
+        ; lookup(ExternalId): no PUBLIC match -> SYSTEM fallback, catalog-relative
+        let byfallback cat.lookup(ExternalId(false, String(), true, "local.dtd"))
+        if (byfallback = "/base/local.dtd") = false
+            return -7
+
+        ; an OVERRIDE YES public entry applies even beside a declared system id
+        let ov cat.lookup_public_entry("-//Example//DTD Model v1//EN", true)
+        if (ov = "/base/model.dtd") = false
+            return -8
+
+        ; an absolute target ignores the base
+        let cat2 parser.parse("PUBLIC \"-//A//B x//EN\" /abs/b.dtd\n", "/base")
+        let ab cat2.lookup_public("-//A//B x//EN")
+        if (ab = "/abs/b.dtd") = false
+            return -9
+
+        ; DELEGATE: prefix hit wins, reported as delegated (not a plain path)
+        let cat3 parser.parse("DELEGATE \"-//Ex//\" del.cat\nPUBLIC \"-//Other//DTD d//EN\" o.dtd\n", "/b")
+        var deleg false
+        let de cat3.find_public_entry("-//Ex//TEXT chunk//EN", false, &deleg)
+        if de = null
+            return -10
+        if deleg = false
+            return -11
+        let dl cat3.lookup_external(false, String(), true, "-//Ex//TEXT chunk//EN", String(), CAT_ENTITY, false)
+        if dl.found = false
+            return -12
+        if dl.delegated = false
+            return -13
+        if (dl.delegate_catalog = "/b/del.cat") = false
+            return -14
+
+        ; lookup_external: SYSTEM beats PUBLIC in the same catalog
+        let cat4 parser.parse("PUBLIC \"-//P//DTD p//EN\" viapub.dtd\nSYSTEM \"decl.dtd\" viasys.dtd\n", "")
+        let le cat4.lookup_external(true, "decl.dtd", true, "-//P//DTD p//EN", String(), CAT_ENTITY, false)
+        if le.found = false
+            return -15
+        if (le.path = "viasys.dtd") = false
+            return -16
+
+        ; first-wins within a kind
+        let cat5 parser.parse("PUBLIC \"-//P//DTD p//EN\" first.dtd\nPUBLIC \"-//P//DTD p//EN\" second.dtd\n", "")
+        let fw cat5.lookup_public("-//P//DTD p//EN")
+        if (fw = "first.dtd") = false
+            return -17
+
+        0
+    }
+}

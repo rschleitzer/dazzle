@@ -1,0 +1,390 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.Sd.Sd
+
+; ModeInfo — the master delimiter/token table and its per-mode iterator
+; (ModeInfo.cs + Mode.cs). For a given scanner Mode it yields every token that
+; can begin markup there (a delimiter, a delimiter-in-context, a character set,
+; or a standard function), which the compile-modes driver threads into that
+; mode's Trie. `Priority` values: delim=255, function=2, data=0.
+;
+; The C++ static table is rebuilt here per driver run (`build_table`) and shared
+; across the ModeInfo iterators for all modes; each entry's mode membership is
+; a u64 bit vector (nModes = 45 fits in one word). `missing_requirements` drops
+; tokens whose delimiter needs a feature the Sd lacks (CONCUR/LINK/empty tags).
+
+; --- Mode ordinals (Mode enum order) ---
+define grpMode: int 0
+define alitMode: int 1
+define alitaMode: int 2
+define aliteMode: int 3
+define talitMode: int 4
+define talitaMode: int 5
+define taliteMode: int 6
+define mdMode: int 7
+define mdMinusMode: int 8
+define mdPeroMode: int 9
+define sdMode: int 10
+define comMode: int 11
+define sdcomMode: int 12
+define piMode: int 13
+define refMode: int 14
+define imsMode: int 15
+define cmsMode: int 16
+define rcmsMode: int 17
+define proMode: int 18
+define dsMode: int 19
+define dsiMode: int 20
+define plitMode: int 21
+define plitaMode: int 22
+define pliteMode: int 23
+define sdplitMode: int 24
+define sdplitaMode: int 25
+define grpsufMode: int 26
+define mlitMode: int 27
+define mlitaMode: int 28
+define asMode: int 29
+define piPasMode: int 30
+define slitMode: int 31
+define slitaMode: int 32
+define sdslitMode: int 33
+define sdslitaMode: int 34
+define cconMode: int 35
+define rcconMode: int 36
+define cconnetMode: int 37
+define rcconnetMode: int 38
+define rcconeMode: int 39
+define tagMode: int 40
+define econMode: int 41
+define mconMode: int 42
+define econnetMode: int 43
+define mconnetMode: int 44
+define N_MODES: int 45
+define MIN_SHORTREF_MODE: int 41       ; econMode
+
+; --- contents-byte encoding: c < SET is a DelimGeneral; c < SET+nSet is a
+; Set; else a StandardFunction. NOTHING = no second component. ---
+define MI_SET: int 33                  ; == N_DELIM_GENERAL
+define MI_FUNCTION: int 44             ; == MI_SET + N_SET
+define MI_NOTHING: int 255
+
+; --- token-info type tags ---
+define TT_DELIM: int 0
+define TT_SET: int 1
+define TT_FUNCTION: int 2
+define TT_DELIMDELIM: int 3
+define TT_DELIMSET: int 4
+
+; --- requirement flags (octal in C++) ---
+define REQUIRE_EMPTY_STARTTAG: u32 1
+define REQUIRE_EMPTY_ENDTAG: u32 2
+define REQUIRE_CONCUR: u32 4
+define REQUIRE_LINK_OR_CONCUR: u32 8
+define REQUIRE_NOT_KEEPRSRE: u32 16
+
+define TokenInfo
+(
+    var kind: int
+    var priority: u8
+    var token: u32
+    var delim1: int
+    var delim2: int
+    var set_idx: int
+    var func_idx: int
+)
+{
+    init()
+    {
+        kind := TT_DELIM
+        priority := 0
+        token := 0
+        delim1 := 0
+        delim2 := 0
+        set_idx := 0
+        func_idx := 0
+    }
+}
+
+define PackedTokenInfo
+(
+    token: u32
+    flags: u32
+    c0: u8
+    c1: u8
+    mode_bits: u64
+)
+{
+    init(token: u32, flags: u32, c0: u8, c1: u8, mode_bits: u64)
+    {
+        this.token := token
+        this.flags := flags
+        this.c0 := c0
+        this.c1 := c1
+        this.mode_bits := mode_bits
+    }
+}
+
+define ModeInfo
+(
+    mode: int
+    table: ref[Array[PackedTokenInfo]]
+    var p_index: size_t
+    var count: size_t
+    missing: u32
+)
+{
+    init(mode: int, sd: Sd, table: ref[Array[PackedTokenInfo]])
+    {
+        this.mode := mode
+        this.table := table
+        p_index := 0
+        count := table.get_length()
+
+        var m: u32 0
+        if sd.start_tag_empty() = false
+            m := m | REQUIRE_EMPTY_STARTTAG
+        if sd.end_tag_empty() = false
+            m := m | REQUIRE_EMPTY_ENDTAG
+        if sd.concur() = 0
+            m := m | REQUIRE_CONCUR
+        if (sd.concur() = 0) and (sd.link() = false)
+            m := m | REQUIRE_LINK_OR_CONCUR
+        if sd.keeprsre()
+            m := m | REQUIRE_NOT_KEEPRSRE
+        missing := m
+    }
+
+    function includes_shortref(this: ModeInfo) returns bool
+        mode >= MIN_SHORTREF_MODE
+
+    function entry(this: ModeInfo, i: size_t) returns ref[PackedTokenInfo]
+        table.at(i)
+
+    ; Boolean nextToken(TokenInfo&) — advance to the next token recognized in
+    ; this mode, decoding its contents bytes into `t`.
+    procedure next_token(mutable this: ModeInfo, mutable t: ref[TokenInfo]) returns bool
+    {
+        while count > 0
+        {
+            let p entry(p_index)
+            if ((p.mode_bits >> (mode as u64)) & 1) <> 0
+            {
+                if (p.flags & missing) = 0
+                {
+                    t.token := p.token
+                    t.priority := 255
+                    let c0 p.c0 as int
+                    count := count - 1
+                    p_index := p_index + 1
+                    if c0 < MI_SET
+                        t.delim1 := c0
+                    else if c0 < MI_FUNCTION
+                    {
+                        t.set_idx := c0 - MI_SET
+                        t.kind := TT_SET
+                        if (t.set_idx = 6) or (t.set_idx = 4) or (t.set_idx = 5)
+                            t.priority := 2   ; sepchar/s/blank -> function
+                        else
+                            t.priority := 0   ; -> data
+                        return true
+                    }
+                    else
+                    {
+                        t.func_idx := c0 - MI_FUNCTION
+                        t.priority := 2
+                        t.kind := TT_FUNCTION
+                        return true
+                    }
+                    let c1 p.c1 as int
+                    if c1 = MI_NOTHING
+                    {
+                        t.kind := TT_DELIM
+                        return true
+                    }
+                    if c1 < MI_SET
+                    {
+                        t.delim2 := c1
+                        t.kind := TT_DELIMDELIM
+                        return true
+                    }
+                    if c1 < MI_FUNCTION
+                    {
+                        t.set_idx := c1 - MI_SET
+                        t.kind := TT_DELIMSET
+                        return true
+                    }
+                    return false
+                }
+            }
+            count := count - 1
+            p_index := p_index + 1
+        }
+        false
+    }
+
+    function bit(m: int) returns u64
+        1 << (m as u64)
+
+    procedure add(mutable arr: ref[Array[PackedTokenInfo]], token: u32, flags: u32, c0: int, c1: int, bits: u64)
+        arr.add(PackedTokenInfo(token, flags, c0 as u8, c1 as u8, bits))
+
+    ; Build the master token table (ModeInfo.cs tokenTable_).
+    function build_table(host: ref[Page]) returns ref[Array[PackedTokenInfo]]
+    {
+        let arr Array[PackedTokenInfo]^host()
+
+        ; shared mode masks for the repeated entries
+        let m_cro bit(econMode) | bit(mconMode) | bit(rcconMode) | bit(econnetMode) | bit(mconnetMode) | bit(rcconnetMode) | bit(rcconeMode) | bit(plitMode) | bit(plitaMode) | bit(pliteMode) | bit(sdplitMode) | bit(sdplitaMode) | bit(alitMode) | bit(alitaMode) | bit(aliteMode) | bit(talitMode) | bit(talitaMode) | bit(taliteMode) | bit(rcmsMode)
+        let m_ero bit(econMode) | bit(mconMode) | bit(rcconMode) | bit(econnetMode) | bit(mconnetMode) | bit(rcconnetMode) | bit(rcconeMode) | bit(alitMode) | bit(alitaMode) | bit(aliteMode) | bit(talitMode) | bit(talitaMode) | bit(taliteMode) | bit(rcmsMode)
+        let m_etagoc bit(econMode) | bit(mconMode) | bit(cconMode) | bit(rcconMode) | bit(econnetMode) | bit(mconnetMode) | bit(cconnetMode) | bit(rcconnetMode)
+        let m_mdoc bit(econMode) | bit(mconMode) | bit(econnetMode) | bit(mconnetMode) | bit(proMode) | bit(dsMode) | bit(dsiMode)
+        let m_pero bit(mdMode) | bit(mdMinusMode) | bit(mdPeroMode) | bit(dsMode) | bit(dsiMode) | bit(grpMode) | bit(plitMode) | bit(plitaMode) | bit(pliteMode) | bit(sdplitMode) | bit(sdplitaMode)
+        let m_stagoc bit(econMode) | bit(mconMode) | bit(econnetMode) | bit(mconnetMode)
+        let m_hcro bit(econMode) | bit(mconMode) | bit(rcconMode) | bit(econnetMode) | bit(mconnetMode) | bit(rcconnetMode) | bit(rcconeMode) | bit(plitMode) | bit(plitaMode) | bit(pliteMode) | bit(alitMode) | bit(alitaMode) | bit(aliteMode) | bit(talitMode) | bit(talitaMode) | bit(taliteMode) | bit(rcmsMode)
+        let m_rsre_con bit(mconMode) | bit(cconMode) | bit(rcconMode) | bit(mconnetMode) | bit(cconnetMode) | bit(rcconnetMode) | bit(rcconeMode) | bit(cmsMode) | bit(rcmsMode)
+
+        add(arr, tokenAnd, 0, dAND, MI_NOTHING, bit(grpMode))
+        add(arr, tokenCom, 0, dCOM, MI_NOTHING, bit(mdMode) | bit(mdMinusMode) | bit(mdPeroMode) | bit(sdMode) | bit(comMode) | bit(sdcomMode) | bit(piPasMode))
+        add(arr, tokenCroDigit, 0, dCRO, MI_SET + setDigit, m_cro)
+        add(arr, tokenCroNameStart, 0, dCRO, MI_SET + setNameStart, m_cro)
+        add(arr, tokenDsc, 0, dDSC, MI_NOTHING, bit(asMode) | bit(dsMode))
+        add(arr, tokenDso, 0, dDSO, MI_NOTHING, bit(mdMode))
+        add(arr, tokenDtgc, 0, dDTGC, MI_NOTHING, bit(grpMode))
+        add(arr, tokenDtgo, 0, dDTGO, MI_NOTHING, bit(grpMode))
+        add(arr, tokenEroNameStart, 0, dERO, MI_SET + setNameStart, m_ero)
+        add(arr, tokenEroGrpo, REQUIRE_LINK_OR_CONCUR, dERO, dGRPO, m_ero)
+        add(arr, tokenEtago, 0, dETAGO, MI_NOTHING, bit(tagMode))
+        add(arr, tokenEtagoNameStart, 0, dETAGO, MI_SET + setNameStart, m_etagoc)
+        add(arr, tokenEtagoTagc, REQUIRE_EMPTY_ENDTAG, dETAGO, dTAGC, m_etagoc)
+        add(arr, tokenEtagoGrpo, REQUIRE_CONCUR, dETAGO, dGRPO, m_etagoc)
+        add(arr, tokenGrpc, 0, dGRPC, MI_NOTHING, bit(grpMode))
+        add(arr, tokenGrpo, 0, dGRPO, MI_NOTHING, bit(mdMode) | bit(mdMinusMode) | bit(grpMode))
+        add(arr, tokenHcroHexDigit, 0, dHCRO, MI_SET + setHexDigit, m_hcro)
+        add(arr, tokenLit, 0, dLIT, MI_NOTHING, bit(alitMode) | bit(talitMode) | bit(plitMode) | bit(sdplitMode) | bit(mlitMode) | bit(slitMode) | bit(sdslitMode) | bit(asMode) | bit(piPasMode) | bit(tagMode) | bit(mdMode) | bit(sdMode) | bit(grpMode))
+        add(arr, tokenLita, 0, dLITA, MI_NOTHING, bit(alitaMode) | bit(talitaMode) | bit(plitaMode) | bit(sdplitaMode) | bit(mlitaMode) | bit(slitaMode) | bit(sdslitaMode) | bit(asMode) | bit(piPasMode) | bit(tagMode) | bit(mdMode) | bit(sdMode) | bit(grpMode))
+        add(arr, tokenMdc, 0, dMDC, MI_NOTHING, bit(mdMode) | bit(sdMode))
+        add(arr, tokenMdoNameStart, 0, dMDO, MI_SET + setNameStart, m_mdoc)
+        add(arr, tokenMdoMdc, 0, dMDO, dMDC, m_mdoc)
+        add(arr, tokenMdoCom, 0, dMDO, dCOM, m_mdoc)
+        add(arr, tokenMdoDso, 0, dMDO, dDSO, bit(econMode) | bit(mconMode) | bit(econnetMode) | bit(mconnetMode) | bit(dsMode) | bit(dsiMode) | bit(imsMode))
+        add(arr, tokenMinus, 0, dMINUS, MI_NOTHING, bit(mdMinusMode) | bit(sdMode))
+        add(arr, tokenMinusGrpo, 0, dMINUS, dGRPO, bit(mdMode))
+        add(arr, tokenMscMdc, 0, dMSC, dMDC, bit(imsMode) | bit(cmsMode) | bit(rcmsMode) | bit(econMode) | bit(mconMode) | bit(econnetMode) | bit(mconnetMode) | bit(dsMode) | bit(dsiMode))
+        add(arr, tokenNestc, 0, dNESTC, MI_NOTHING, bit(tagMode))
+        add(arr, tokenNet, 0, dNET, MI_NOTHING, bit(econnetMode) | bit(mconnetMode) | bit(cconnetMode) | bit(rcconnetMode))
+        add(arr, tokenOpt, 0, dOPT, MI_NOTHING, bit(grpMode) | bit(grpsufMode))
+        add(arr, tokenOr, 0, dOR, MI_NOTHING, bit(grpMode))
+        add(arr, tokenPero, 0, dPERO, MI_NOTHING, bit(mdPeroMode))
+        add(arr, tokenPeroNameStart, 0, dPERO, MI_SET + setNameStart, m_pero)
+        add(arr, tokenPeroGrpo, REQUIRE_LINK_OR_CONCUR, dPERO, dGRPO, m_pero)
+        add(arr, tokenPic, 0, dPIC, MI_NOTHING, bit(piMode))
+        add(arr, tokenPio, 0, dPIO, MI_NOTHING, bit(econMode) | bit(mconMode) | bit(econnetMode) | bit(mconnetMode) | bit(proMode) | bit(dsMode) | bit(dsiMode))
+        add(arr, tokenPlus, 0, dPLUS, MI_NOTHING, bit(grpMode) | bit(grpsufMode))
+        add(arr, tokenPlusGrpo, 0, dPLUS, dGRPO, bit(mdMode))
+        add(arr, tokenRefc, 0, dREFC, MI_NOTHING, bit(refMode))
+        add(arr, tokenRep, 0, dREP, MI_NOTHING, bit(grpMode) | bit(grpsufMode))
+        add(arr, tokenRni, 0, dRNI, MI_NOTHING, bit(grpMode) | bit(mdMode) | bit(mdPeroMode))
+        add(arr, tokenSeq, 0, dSEQ, MI_NOTHING, bit(grpMode))
+        add(arr, tokenStago, 0, dSTAGO, MI_NOTHING, bit(tagMode))
+        add(arr, tokenStagoNameStart, 0, dSTAGO, MI_SET + setNameStart, m_stagoc)
+        add(arr, tokenStagoTagc, REQUIRE_EMPTY_STARTTAG, dSTAGO, dTAGC, m_stagoc)
+        add(arr, tokenStagoGrpo, REQUIRE_CONCUR, dSTAGO, dGRPO, m_stagoc)
+        add(arr, tokenTagc, 0, dTAGC, MI_NOTHING, bit(tagMode))
+        add(arr, tokenVi, 0, dVI, MI_NOTHING, bit(tagMode) | bit(asMode) | bit(piPasMode))
+        add(arr, tokenRe, REQUIRE_NOT_KEEPRSRE, MI_FUNCTION + fRE, MI_NOTHING, m_rsre_con)
+        add(arr, tokenRe, 0, MI_FUNCTION + fRE, MI_NOTHING, bit(refMode) | bit(mlitMode) | bit(mlitaMode) | bit(alitMode) | bit(alitaMode) | bit(aliteMode) | bit(talitMode) | bit(talitaMode) | bit(taliteMode))
+        add(arr, tokenRs, REQUIRE_NOT_KEEPRSRE, MI_FUNCTION + fRS, MI_NOTHING, m_rsre_con)
+        add(arr, tokenRs, 0, MI_FUNCTION + fRS, MI_NOTHING, bit(mlitMode) | bit(mlitaMode) | bit(alitMode) | bit(alitaMode) | bit(aliteMode) | bit(talitMode) | bit(talitaMode) | bit(taliteMode))
+        add(arr, tokenSpace, 0, MI_FUNCTION + fSPACE, MI_NOTHING, bit(mlitMode) | bit(mlitaMode) | bit(talitMode) | bit(talitaMode) | bit(taliteMode))
+        add(arr, tokenSepchar, 0, MI_SET + setSepchar, MI_NOTHING, bit(alitMode) | bit(alitaMode) | bit(aliteMode) | bit(talitMode) | bit(talitaMode) | bit(taliteMode))
+        add(arr, tokenS, 0, MI_SET + setS, MI_NOTHING, bit(econMode) | bit(econnetMode) | bit(grpMode) | bit(mdMode) | bit(mdMinusMode) | bit(mdPeroMode) | bit(sdMode) | bit(proMode) | bit(dsMode) | bit(dsiMode) | bit(asMode) | bit(piPasMode) | bit(tagMode))
+        add(arr, tokenNameStart, 0, MI_SET + setNameStart, MI_NOTHING, bit(grpMode) | bit(mdMode) | bit(mdMinusMode) | bit(mdPeroMode) | bit(sdMode) | bit(asMode) | bit(piPasMode) | bit(tagMode))
+        add(arr, tokenDigit, 0, MI_SET + setDigit, MI_NOTHING, bit(grpMode) | bit(mdMode) | bit(mdMinusMode) | bit(sdMode) | bit(asMode) | bit(piPasMode) | bit(tagMode))
+        add(arr, tokenLcUcNmchar, 0, MI_SET + setNmchar, MI_NOTHING, bit(grpMode) | bit(mdMode) | bit(asMode) | bit(piPasMode) | bit(tagMode))
+        add(arr, tokenIgnoredChar, 0, MI_SET + setSgmlChar, MI_NOTHING, bit(imsMode))
+        add(arr, tokenChar, 0, MI_SET + setSgmlChar, MI_NOTHING, bit(alitMode) | bit(alitaMode) | bit(aliteMode) | bit(talitMode) | bit(talitaMode) | bit(taliteMode) | bit(comMode) | bit(piMode) | bit(cmsMode) | bit(rcmsMode) | bit(plitMode) | bit(plitaMode) | bit(pliteMode) | bit(slitMode) | bit(slitaMode) | bit(econMode) | bit(mconMode) | bit(cconMode) | bit(rcconMode) | bit(econnetMode) | bit(mconnetMode) | bit(cconnetMode) | bit(rcconnetMode) | bit(rcconeMode))
+        add(arr, tokenChar, 0, MI_SET + setMinimumData, MI_NOTHING, bit(mlitMode) | bit(mlitaMode))
+        add(arr, tokenChar, 0, MI_SET + setSignificant, MI_NOTHING, bit(sdplitMode) | bit(sdplitaMode) | bit(sdslitMode) | bit(sdslitaMode) | bit(sdcomMode))
+
+        arr
+    }
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+        let sd Sd()
+        let table build_table(host)
+
+        ; the table has the full 62 entries
+        if table.get_length() <> 62
+            return -1
+
+        ; grpMode: '(' GRPO, ')' GRPC, ',' SEQ, '|' OR, '&' AND, '?' OPT etc.
+        ; collect the delimType/setType tokens seen; check a few are present.
+        let mi ModeInfo^host(grpMode, sd, table)
+        var saw_grpo false
+        var saw_or false
+        var saw_namestart false
+        var saw_stago false
+        var ti TokenInfo()
+        while mi.next_token(&ti)
+        {
+            if (ti.kind = TT_DELIM) and (ti.token = tokenGrpo)
+                saw_grpo := true
+            if (ti.kind = TT_DELIM) and (ti.token = tokenOr)
+                saw_or := true
+            if (ti.kind = TT_SET) and (ti.token = tokenNameStart)
+                saw_namestart := true
+            if ti.token = tokenStago
+                saw_stago := true
+        }
+        if saw_grpo = false
+            return -2
+        if saw_or = false
+            return -3
+        if saw_namestart = false
+            return -4
+        ; STAGO is a tag/content delimiter, NOT recognized in grpMode
+        if saw_stago
+            return -5
+
+        ; tagMode DOES recognize STAGO and TAGC
+        let mt ModeInfo^host(tagMode, sd, table)
+        var saw_tagc false
+        saw_stago := false
+        var ti2 TokenInfo()
+        while mt.next_token(&ti2)
+        {
+            if ti2.token = tokenStago
+                saw_stago := true
+            if ti2.token = tokenTagc
+                saw_tagc := true
+        }
+        if saw_stago = false
+            return -6
+        if saw_tagc = false
+            return -7
+
+        ; econMode: the STAGO+nameStart delimiter-in-context (delimSetType),
+        ; and CONCUR-requiring StagoGrpo must be DROPPED (no concur in ref Sd).
+        let me ModeInfo^host(econMode, sd, table)
+        var saw_stago_ns false
+        var saw_stago_grpo false
+        var ti3 TokenInfo()
+        while me.next_token(&ti3)
+        {
+            if (ti3.kind = TT_DELIMSET) and (ti3.token = tokenStagoNameStart)
+                saw_stago_ns := true
+            if ti3.token = tokenStagoGrpo
+                saw_stago_grpo := true
+        }
+        if saw_stago_ns = false
+            return -8
+        if saw_stago_grpo
+            return -9
+
+        0
+    }
+}

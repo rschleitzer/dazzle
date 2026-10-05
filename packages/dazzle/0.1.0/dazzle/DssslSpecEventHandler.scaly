@@ -1,0 +1,1419 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use dazzle.TestScratch.TestScratch
+use opensp.Location.Location
+use opensp.Location.InputSource
+use opensp.Location.Origin
+use opensp.Location.TextChunk
+use opensp.ParserState.ParserState
+use opensp.Parser.Parser
+use opensp.Event.Event
+use opensp.ElementType.ElementType
+use opensp.AttributeList.AttributeList
+use opensp.Attribute.Attribute
+use opensp.Attribute.AttributeValue
+use opensp.Attribute.AttributeSemantics
+use opensp.Attribute.Text
+use opensp.Entity.Entity
+use opensp.Entity.InternalEntity
+use opensp.Notation.Notation
+use opensp.ExternalId.ExternalId
+use opensp.Dtd.Dtd
+use opensp.ArcEngine.ArcEngine
+use dazzle.Interpreter.Interpreter
+use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.OutputCharStream
+use dazzle.SchemeParser.SchemeParser
+use scaly.os.File
+
+; DssslSpecEventHandler — assembles a DSSSL style specification from a parsed
+; `.dsl` document (style/DssslSpecEventHandler.cxx / .cs). A `.dsl` is an SGML
+; document conforming to the DSSSL style-sheet DTD; parsing it produces the
+; STYLE-SHEET / STYLE-SPECIFICATION / STYLE-SPECIFICATION-BODY element events
+; with the Scheme source arriving as character data (external `.scm` text
+; entities + CDATA marked sections are expanded inline by the parser into DATA
+; events). This handler walks those events, assembles the Part/Doc structure,
+; extracts each part's body text, and resolves the USE closure — the ordered
+; list of parts the interpreter then reads with the SchemeParser.
+;
+; SEAM (the ArcEngine/Rast precedent): a POST-PARSE pass over `ps.events`
+; (opensp.Parser.parse_simple produced them), not a live EventHandler. The C++
+; loadDoc routes the parse through ArcEngine to SELECT the DSSSL architecture
+; (arcEventHandler matches the arch's notation public id); the C# mirror
+; DIVERGES and parses directly ("ArcEngine architecture processing is
+; incomplete").
+;
+; ★Since 2026-08-09 the port does route it (route_through_arch): the walk below
+; consumes the DSSSL architecture's GENERATED stream, which is loadDoc's
+; `ArcEngine::parseAll`. Two halves make that possible, and both are in opensp:
+; the validating half of the engine (ArcEngine.scaly's STATUS note) and
+; mungeMetaDtd, without which the arch stream carries no ENTITY semantics — and
+; `document`/`content` below are exactly ENTITY-declared attributes, so a
+; routing without it would have cut the 37-document chain of a DocBook style
+; sheet off in silence.
+;
+; The architecture GATE stays where it was and keeps its own job:
+; check_dsssl_arch asks opensp whether the spec declares the DSSSL architecture
+; as a BASE architecture (`IS10744 ArcBase` PI + a notation with the arch public
+; id, the conjunction that sets the reference's gotArc_) and reports specNotArc
+; when it does not, processing on with no rules. It must run BEFORE the routing,
+; because it reads the PI that the routing replaces.
+;
+; Inc-2 scope: single-document assembly with USE-within-document part chaining
+; and inline/gathered bodies (ImmediateBodyElement). The cross-file
+; EXTERNAL-SPECIFICATION path (a `document` entity referencing another `.dsl`,
+; resolved by a NESTED parse) is ported structurally; its resolve re-parses
+; through parse_simple when a system id is present.
+
+function getenv(name: pointer[const_char]) returns pointer[const_char] extern
+procedure scaly_eputs(s: pointer[const_char]) extern
+procedure scaly_eputi(value: i64) extern
+procedure scaly_eputnl() extern
+
+; --- the per-document parse ARENA ------------------------------------------
+;
+; A style sheet is not one SGML document but 38 (`docbook.dsl` declares 37
+; <external-specification>, each loaded by its own parse), and every one of
+; those parses used to live to program end on the run region — 234 of 270 MB
+; requested, measured by tests/dazzle/startbytes. What survives a spec parse is
+; the assembled Part/Doc structure and, per body element, the gathered text plus
+; its chunk table; all of that is on the handler's own host, and since the
+; pinning step (Origin.pin, StringC copies in declaration_start) NOTHING in it
+; points into the parse any more. So each document's parse gets an exclusive
+; page chain that falls when its walk is done.
+;
+; ★The escape hatch is not comfort. Condition (b) below is an audit of the
+; structures the walk keeps, and an audit is exactly the kind of claim that is
+; invisible when it is wrong (the frame mark's store sweep, 2026-08-06) —
+; `DZ_SPEC_ARENA=0` restores the old lifetime, and tests/dazzle/specarena
+; checks BOTH paths.
+;
+; NOT freed, two conditions:
+;   (a) DZ_SPEC_ARENA=0.
+;   (b) the document produced a BodyElement.Entity (a CONTENT= entity body).
+;       That arm keeps a pointer[Entity] INTO the parse, and make_input_source
+;       dereferences it after every parse is over. Pinning it would mean a deep
+;       copy of an Entity, and no corpus style sheet uses the form — an
+;       untested pin is worse than a held arena, and the hold costs nothing
+;       measurable because it never fires.
+
+; DssslSpecEventHandler::DeclarationType
+define DECL_FEATURES: int 0
+define DECL_BASESET_ENCODING: int 1
+define DECL_LITERAL_DESCRIBED_CHAR: int 2
+define DECL_ADD_NAME_CHARS: int 3
+define DECL_ADD_SEPARATOR_CHARS: int 4
+define DECL_STANDARD_CHARS: int 5
+define DECL_OTHER_CHARS: int 6
+define DECL_COMBINE_CHAR: int 7
+define DECL_MAP_SDATA_ENTITY: int 8
+define DECL_CHAR_REPERTOIRE: int 9
+define DECL_SGML_GROVE_PLAN: int 10
+
+; opensp Event.event_type discriminants (module-level consts in opensp.Event
+; are not cross-package-visible; mirrored here — the values are the stable
+; Event ABI: EVK_START=0, EVK_END=1, EVK_DATA=2).
+define EVK_START: int 0
+define EVK_END: int 1
+define EVK_DATA: int 2
+define EVK_END_PROLOG: int 8
+
+; --- the assembled structures (Link subclasses in the reference) -----------
+
+; A DSSSL declaration element's gathered content (features, char-repertoire,
+; standard-chars, …). name/text/modadd/desc are the attribute-sourced fields.
+; ★`chunks` is the declaration's own location table, kept for the same
+; reason `ImmediateBody` keeps one: the four declaration parsers DO
+; report (badDeclaration, badCharName, duplicateCharName), and without
+; the table a diagnostic in an entity-expanded declaration anchors
+; nowhere. StyleEngine.cxx builds the same thing —
+; `TextInputSourceOrigin(content_)`.
+define DeclarationElement (decl_type: int, var content: StringC, var chunks: ref[Array[TextChunk]]?, var name: StringC, var text: StringC, var modadd: StringC, var desc: StringC)
+{
+    function make(host: ref[Page], decl_type: int) returns ref[DeclarationElement]
+    {
+        let d &DeclarationElement^host(decl_type, StringC(), null, StringC(), StringC(), StringC(), StringC())
+        d
+    }
+
+    function get_type(this: DeclarationElement) returns int
+        decl_type
+
+    function get_content(this: DeclarationElement) returns StringC
+        content
+
+    function get_name(this: DeclarationElement) returns StringC
+        name
+
+    function get_text(this: DeclarationElement) returns StringC
+        text
+}
+
+; A body element: either immediate gathered text or an entity reference
+; (STYLE-SPECIFICATION-BODY with a CONTENT= entity attribute). The immediate
+; arm carries the per-chunk source-location table (the reference Text object)
+; so a diagnostic in the gathered Scheme resolves to the original source —
+; a chunk gathered from an expanded `&file.scm;` reference resolves INTO that
+; file (TextInputSourceOrigin::defLocation → Text::charLocation).
+define ImmediateBody (text: StringC, chunks: ref[Array[TextChunk]]?)
+define EntityBody (entity: ref[Entity]?)
+
+define BodyElement union
+(
+    Immediate: ImmediateBody
+    Entity: EntityBody
+)
+{
+    function make_immediate(host: ref[Page], text: StringC, chunks: ref[Array[TextChunk]]) returns ref[BodyElement]
+    {
+        let b BodyElement.Immediate^host(ImmediateBody(text, chunks))
+        &b
+    }
+
+    function make_entity(host: ref[Page], entity: ref[Entity]) returns ref[BodyElement]
+    {
+        let b BodyElement.Entity^host(EntityBody(entity))
+        &b
+    }
+}
+
+; A concrete specification part: its declarations, body elements, and the
+; headers of the parts it USEs.
+define Part
+(
+    declarations: ref[Array[ref[DeclarationElement]?]]
+    body_elements: ref[Array[ref[BodyElement]?]]
+    use_headers: ref[Array[ref[PartHeader]?]]
+    var mark: bool
+    doc: ref[Doc]?
+)
+{
+    function make(host: ref[Page], doc: ref[Doc]?) returns ref[Part]
+    {
+        let p &Part^host(Array[ref[DeclarationElement]?]^host(), Array[ref[BodyElement]?]^host(), Array[ref[PartHeader]?]^host(), false, doc)
+        p
+    }
+
+    procedure add_use(mutable this: ref[Part], header: ref[PartHeader])
+        this.use_headers.add(header)
+
+    procedure append_body(mutable this: ref[Part], b: ref[BodyElement])
+        this.body_elements.add(b)
+
+    procedure append_decl(mutable this: ref[Part], d: ref[DeclarationElement]?)
+        this.declarations.add(d)
+
+    function get_body_elements(this: Part) returns ref[Array[ref[BodyElement]?]]
+        body_elements
+
+    ; the document this part came from — StyleEngine::parseSpec reads its
+    ; declarations before the part's own.
+    function get_doc(this: Part) returns ref[Doc]?
+        doc
+
+    ; StyleEngine::parseSpec walks the DOC's declarations and then the PART's
+    ; (the `local` do-while), so both lists need an accessor.
+    function get_declarations(this: Part) returns ref[Array[ref[DeclarationElement]?]]
+        declarations
+
+    function get_use_headers(this: Part) returns ref[Array[ref[PartHeader]?]]
+        use_headers
+
+    ; setMark(b): return the previous mark, set the new one (use-loop guard).
+    procedure set_mark(mutable this: ref[Part], b: bool) returns bool
+    {
+        let prev this.mark
+        this.mark := b
+        prev
+    }
+}
+
+; SpecPart — how a PartHeader resolves to a concrete Part.
+define ExternalPartRef (header: ref[PartHeader])
+define ExternalFirstPartRef (doc: ref[Doc])
+define ConcretePartRef (part: ref[Part])
+
+define SpecPart union
+(
+    External: ExternalPartRef
+    ExternalFirst: ExternalFirstPartRef
+    Concrete: ConcretePartRef
+)
+
+; A reference to a specification part by ID within a document.
+define PartHeader
+(
+    doc: ref[Doc]
+    id: StringC
+    var ref_loc: Location
+    var spec_part: ref[SpecPart]?
+)
+{
+    function make(host: ref[Page], doc: ref[Doc], id: StringC) returns ref[PartHeader]
+    {
+        let h &PartHeader^host(doc, StringC^host(id.as_slice()), Location(), null)
+        h
+    }
+
+    function get_id(this: PartHeader) returns StringC
+        id
+
+    ; setRefLoc — first reference wins (the reference guards on a null origin).
+    ; The location is PINNED (Origin.pin): a header outlives the parse of the
+    ; document that referenced it, and missingPart renders this anchor later,
+    ; from resolve_parts.
+    procedure set_ref_loc(mutable this: ref[PartHeader], host: ref[Page], mutable loc: Location)
+    {
+        if this.ref_loc.get_origin() = null
+            this.ref_loc := Origin.pin_location(host, loc)
+    }
+
+    procedure set_concrete(mutable this: ref[PartHeader], host: ref[Page], part: ref[Part])
+    {
+        let sp_v SpecPart.Concrete^host(ConcretePartRef(part))
+        let sp &sp_v
+        this.spec_part := sp
+    }
+
+    procedure set_external(mutable this: ref[PartHeader], host: ref[Page], header: ref[PartHeader])
+    {
+        let sp_v SpecPart.External^host(ExternalPartRef(header))
+        let sp &sp_v
+        this.spec_part := sp
+    }
+
+    procedure set_external_first(mutable this: ref[PartHeader], host: ref[Page], doc: ref[Doc])
+    {
+        let sp_v SpecPart.ExternalFirst^host(ExternalFirstPartRef(doc))
+        let sp &sp_v
+        this.spec_part := sp
+    }
+
+    ; PartHeader::resolve — force the owning doc loaded, then resolve the part.
+    procedure resolve(mutable this: ref[PartHeader], mutable eh: ref[DssslSpecEventHandler]) returns ref[Part]?
+    {
+        this.doc.load(eh)
+        if this.spec_part = null
+        {
+            eh.interp.set_next_location(this.ref_loc)
+            eh.interp.message1(InterpreterMessages.missingPart(), this.id)
+            return null
+        }
+        DssslSpecEventHandler.resolve_spec_part(this.spec_part, eh)
+    }
+}
+
+; A source document (the main `.dsl` or a referenced external spec file).
+define Doc
+(
+    var loaded: bool
+    sysid: StringC
+    declarations: ref[Array[ref[DeclarationElement]?]]
+    headers: ref[Array[ref[PartHeader]?]]
+    var loc: Location
+)
+{
+    function make(host: ref[Page], sysid: StringC) returns ref[Doc]
+    {
+        let d &Doc^host(false, StringC^host(sysid.as_slice()), Array[ref[DeclarationElement]?]^host(), Array[ref[PartHeader]?]^host(), Location())
+        d
+    }
+
+    function get_declarations(this: Doc) returns ref[Array[ref[DeclarationElement]?]]
+        declarations
+
+    function get_sysid(this: Doc) returns StringC
+        sysid
+
+    ; refPart(id): find or create the header for a part ID in this doc.
+    procedure ref_part(mutable this: ref[Doc], host: ref[Page], id: StringC) returns ref[PartHeader]
+    {
+        let n this.headers.get_length()
+        let buf this.headers.as_slice()
+        var i: size_t 0
+        while i < n
+        {
+            let h buf[i]
+            if h.get_id().equals(id)
+                return h as ref[PartHeader]
+            i := i + 1
+        }
+        let header PartHeader.make(host, this, id)
+        this.headers.add(header)
+        header
+    }
+
+    procedure append_decl(mutable this: ref[Doc], d: ref[DeclarationElement]?)
+        this.declarations.add(d)
+
+    ; the doc's own location (its end-prolog event; anchors noParts) — PINNED
+    ; for the same reason as PartHeader.ref_loc: resolve_first_part renders it
+    ; after the walk that produced it.
+    procedure set_location(mutable this: ref[Doc], host: ref[Page], mutable loc: Location)
+        this.loc := Origin.pin_location(host, loc)
+
+    ; resolveFirstPart: the FIRST-created header's part — the reference walks
+    ; its headers_ IList to the last iteration position, and IList::insert
+    ; PREPENDS, so that is the EARLIEST refPart (the document's first
+    ; style-specification in practice; a USE ref can create headers later).
+    procedure resolve_first_part(mutable this: ref[Doc], mutable eh: ref[DssslSpecEventHandler]) returns ref[Part]?
+    {
+        this.load(eh)
+        let n this.headers.get_length()
+        if n = 0
+        {
+            ; the reference messages only when the doc's location is known
+            if this.loc.get_origin() <> null
+            {
+                eh.interp.set_next_location(this.loc)
+                eh.interp.message0(InterpreterMessages.noParts())
+            }
+            return null
+        }
+        let first *(this.headers.get_buffer())
+        first.resolve(eh)
+    }
+
+    ; Doc::load — parse the referenced spec file (sysid) and assemble it.
+    ; The main doc (empty sysid) is already assembled by the driver's walk;
+    ; this fires only for an external-spec document with its own file.
+    procedure load(mutable this: ref[Doc], mutable eh: ref[DssslSpecEventHandler])
+    {
+        if this.loaded
+            return
+        this.loaded := true
+        if this.sysid.get_size() = 0
+            return
+        eh.load_external_doc(this)
+    }
+}
+
+; --- the handler -----------------------------------------------------------
+define DssslSpecEventHandler
+(
+    host: ref[Page]
+    interp: ref[Interpreter]
+    var got_arc: bool
+    var gathering_body: bool
+    var current_part: ref[Part]?
+    current_body: ref[Array[u32]]
+    ; the gathered text's per-chunk source locations (the reference gathers
+    ; into a Text, which records a chunk per addChars) — cleared with
+    ; current_body, snapshotted into the ImmediateBody.
+    current_chunks: ref[Array[TextChunk]]
+    var current_doc: ref[Doc]?
+    var current_decl: ref[DeclarationElement]?
+    ; condition (b) of the per-document arena: this document's walk kept a
+    ; pointer INTO its parse. Saved/restored around every walk like current_doc,
+    ; and read directly by load_stylesheet after load() returns — the accessor
+    ; that used to sit beside it was SHADOWED by this field at every call site
+    ; (a field wins over a same-named method, silently), so it was never the
+    ; thing that ran.
+    var keeps_parse: bool
+    docs: ref[Array[ref[Doc]?]]
+    ; parse parameters for loading EXTERNAL-SPECIFICATION documents (the
+    ; reference derives a child SgmlParser from the main parser's params;
+    ; we re-parse with the same program name and DSSSL catalog).
+    prog_name: String
+    catalog_path: String
+    ; chunk-table coalescing (Text::addChars, see the walk's data arm): the
+    ; chunks kept and the characters gathered over this handler's walks. The
+    ; mechanism is INVISIBLE in the output — one chunk per character resolves
+    ; every offset to the same location — so the self-test reads the ratio.
+    var chunks_kept: i64
+    var chunk_chars: i64
+    ; the per-document arenas this handler released and held (condition (b)) —
+    ; what `--spec-arena-stats` prints, the gate's proof that the arena engages
+    var arenas_released: i64
+    var arenas_held: i64
+)
+{
+    function make(host: ref[Page], interp: ref[Interpreter], prog_name: String, catalog_path: String) returns ref[DssslSpecEventHandler]
+    {
+        let eh &DssslSpecEventHandler^host(host, interp, false, false, null, Array[u32]^host(), Array[TextChunk]^host(), null, null, false, Array[ref[Doc]?]^host(), String^host(prog_name), String^host(catalog_path), 0, 0, 0, 0)
+        eh
+    }
+
+    ; DZ_SPEC_ARENA — see the arena comment at the top of this file.
+    ; read per spec DOCUMENT — a style sheet has a few dozen — so there is no
+    ; state worth caching
+    procedure spec_arena_on() returns bool
+    {
+        let e getenv("DZ_SPEC_ARENA")
+        if e = null
+            return true
+        let zero "0" as char
+        (*e as u32) <> (zero as u32)
+    }
+
+    ; the parse host for ONE spec document: an exclusive page chain off `host`
+    ; when the arena is on, otherwise `host` itself (the historical lifetime).
+    procedure spec_arena(host: ref[Page]) returns ref[Page]
+    {
+        if DssslSpecEventHandler.spec_arena_on() = false
+            return host
+        host.allocate_exclusive_page()
+    }
+
+    ; …and its release. `keep` is condition (b), decided by the walk.
+    procedure release_spec_arena(mutable this: ref[DssslSpecEventHandler], host: ref[Page], arena: ref[Page], keep: bool)
+    {
+        if arena = host
+            return
+        if keep
+        {
+            this.arenas_held := this.arenas_held + 1
+            return
+        }
+        this.arenas_released := this.arenas_released + 1
+        host.deallocate_exclusive_page(arena)
+    }
+
+    ; `--spec-arena-stats`: the gate's proof that the arena and the chunk
+    ; coalescing engaged — both are invisible in the output
+    procedure report_spec_arena(this: ref[DssslSpecEventHandler])
+    {
+        scaly_eputs "specarena: documents released "
+        scaly_eputi this.arenas_released
+        scaly_eputs ", held "
+        scaly_eputi this.arenas_held
+        scaly_eputnl()
+        scaly_eputs "specarena: chunks kept "
+        scaly_eputi this.chunks_kept
+        scaly_eputs " of "
+        scaly_eputi this.chunk_chars
+        scaly_eputs " gathered chars"
+        scaly_eputnl()
+    }
+
+    ; findDoc(sysid): the doc registry (one Doc per system id; empty = main).
+    procedure find_doc(mutable this: ref[DssslSpecEventHandler], sysid: StringC) returns ref[Doc]
+    {
+        let n this.docs.get_length()
+        let buf this.docs.as_slice()
+        var i: size_t 0
+        while i < n
+        {
+            let d buf[i]
+            if d.get_sysid().equals(sysid)
+                return d as ref[Doc]
+            i := i + 1
+        }
+        let doc Doc.make(this.host, sysid)
+        this.docs.add(doc)
+        doc
+    }
+
+    ; SpecPart::resolve dispatch.
+    procedure resolve_spec_part(mutable sp: ref[SpecPart]?, mutable eh: ref[DssslSpecEventHandler]) returns ref[Part]?
+    {
+        ; ★a `choose` SUBJECT may not be an Option -- the wrapper hides the
+        ; union's arms. Nothing to dispatch on is the neutral answer.
+        if sp = null
+            return null
+        choose (sp as ref[SpecPart])
+            when c: Concrete
+                return c.part
+            when e: External
+                return e.header.resolve(eh)
+            when ef: ExternalFirst
+                return ef.doc.resolve_first_part(eh)
+        null
+    }
+
+    ; check_dsssl_arch — loadDoc's gotArc_ gate: the document must declare the
+    ; DSSSL architecture as a BASE architecture, i.e. carry an `IS10744 ArcBase`
+    ; PI naming an architecture whose notation in the DTD has the DSSSL arch
+    ; public id. That conjunction (ArcBase PI + lookupNotation + the director's
+    ; pubid test) lives in opensp, where the ArcEngine already parses the PI form.
+    ;
+    ; ★It used to test the NOTATION alone, which is strictly weaker: a spec whose
+    ; internal subset declares the DSSSL notation but no ArcBase PI passed here
+    ; while both reference binaries report specNotArc and then process with NO
+    ; rules (tests/dazzle/cli/notarc.dsl pins the difference).
+    procedure check_dsssl_arch(mutable this: ref[DssslSpecEventHandler], ps: ref[ParserState]) returns bool
+        ArcEngine.declares_base_architecture(this.host, ps, "ISO/IEC 10179:1996//NOTATION DSSSL Architecture Definition Document//EN")
+
+    ; --- attribute helpers -------------------------------------------------
+    function attribute_string(ev: ref[Event], name: Slice[char]) returns StringC
+    {
+        let atts ev.get_attributes()
+        if atts = null
+            return StringC()
+        let idx atts.attribute_index(StringC(name))
+        if idx < 0
+            return StringC()
+        let v atts.value(idx as size_t)
+        if v = null
+            return StringC()
+        let t v.get_text()
+        if t = null
+            return StringC()
+        t.string()
+    }
+
+    ; attributeText — the attribute's value Text (per-char source locations).
+    function attribute_text(ev: ref[Event], name: Slice[char]) returns ref[Text]?
+    {
+        let atts ev.get_attributes()
+        if atts = null
+            return null
+        let idx atts.attribute_index(StringC(name))
+        if idx < 0
+            return null
+        let v atts.value(idx as size_t)
+        if v = null
+            return null
+        v.get_text()
+    }
+
+    ; Text::charLocation(i) — the recorded per-char location (one past the
+    ; last for i == size, like the reference).
+    function text_char_loc(t: ref[Text], i: size_t) returns Location
+    {
+        let locs t.get_locs()
+        if locs.data = null
+            return Location()
+        let n t.size()
+        if n = 0
+            return Location()
+        if i < n
+            return locs[i]
+        let last locs[n - 1]
+        Location(last.get_origin(), last.get_index() + 1)
+    }
+
+    function attribute_entity(ev: ref[Event], name: Slice[char]) returns ref[Entity]?
+    {
+        let atts ev.get_attributes()
+        if atts = null
+            return null
+        let idx atts.attribute_index(StringC(name))
+        if idx < 0
+            return null
+        let att atts.attribute(idx as size_t)
+        if att = null
+            return null
+        let sem att.get_semantics()
+        if sem = null
+            return null
+        if sem.n_entities() <> 1
+            return null
+        sem.entity(0) as ref[Entity]
+    }
+
+    ; --- element handlers (the mapping table's targets) --------------------
+    procedure external_specification_start(mutable this: ref[DssslSpecEventHandler], mutable ev: ref[Event])
+    {
+        let host this.host
+        let id_str DssslSpecEventHandler.attribute_string(ev, "ID")
+        let header this.current_doc.ref_part(this.host, id_str)
+        let ent DssslSpecEventHandler.attribute_entity(ev, "DOCUMENT")
+        if ent = null
+            return
+        let xid ent.get_external_id()
+        if xid.has_effective_system() = false
+            return
+        let sysid_str StringC^host(xid.get_effective_system().to_c_string())
+        if sysid_str.get_size() = 0
+            return
+        let doc this.find_doc(sysid_str)
+        let specid DssslSpecEventHandler.attribute_string(ev, "SPECID")
+        if specid.get_size() = 0
+            header.set_external_first(this.host, doc)
+        else
+        {
+            ; refPart(specid, event.location()) — the missingPart anchor.
+            ; ★`event.location()` of a StartElementEvent is its MARKUP location:
+            ; the reference builds it with `markupLocation()` (parseInstance.cxx:
+            ; 468/471), i.e. the STAGO. This port's Event carries TWO locations —
+            ; `loc` is the position past the GI name, which elementNotAllowed
+            ; reports at — so reading `get_loc()` here anchored the diagnostic at
+            ; the attribute list (col 23 of `<external-specification …`) instead
+            ; of at the element (col 0). Everything else that wants an element's
+            ; position already reads markup_loc (Grove.node.loc, ESIS -l).
+            let sub_header doc.ref_part(this.host, specid)
+            let sub_loc ev.get_markup_loc()
+            sub_header.set_ref_loc(host, sub_loc)
+            header.set_external(this.host, sub_header)
+        }
+    }
+
+    procedure style_specification_start(mutable this: ref[DssslSpecEventHandler], mutable ev: ref[Event]?)
+    {
+        let id_str DssslSpecEventHandler.attribute_string(ev as ref[Event], "ID")
+        let header this.current_doc.ref_part(this.host, id_str)
+        let part Part.make(this.host, this.current_doc)
+        this.current_part := part
+        header.set_concrete(this.host, part)
+        ; USE="id1 id2 …" — space-separated part references (this doc); each
+        ; header's refLoc anchors at the id's char inside the attribute value
+        ; (reference useP->charLocation(i)).
+        let use_text DssslSpecEventHandler.attribute_text(ev as ref[Event], "USE")
+        if use_text = null
+            return
+        let use_str use_text.string()
+        let un use_str.get_size()
+        var i: size_t 0
+        while i < un
+        {
+            var j i
+            while j < un
+            {
+                if use_str.get(j) = 0x20
+                    break
+                j := j + 1
+            }
+            if j > i
+            {
+                let sub use_str.substr(i, j - i)
+                let uh this.current_doc.ref_part(this.host, sub)
+                let uloc DssslSpecEventHandler.text_char_loc(use_text, i)
+                uh.set_ref_loc(this.host, uloc)
+                part.add_use(uh)
+            }
+            if j >= un
+                break
+            i := j + 1
+        }
+    }
+
+    procedure style_specification_end(mutable this: ref[DssslSpecEventHandler])
+        this.current_part := null
+
+    procedure style_specification_body_start(mutable this: ref[DssslSpecEventHandler], ev: ref[Event]?)
+    {
+        if this.current_part = null
+            return
+        ; reset the gather buffers — Text::clear(). ★KEEP the buffers: both are
+        ; wholly copied out at the end of the element (the body into an exact
+        ; StringC, the chunks into the pinned snapshot), so refilling them costs
+        ; no allocation and the 39 gathered elements pay ONE high-water buffer
+        ; instead of abandoning 39 of them on a host that lives to program end.
+        ; (The historical `Array[u32]^bhost()` here was not a preference: back
+        ; then Array had no clear and the .clear() calls were silently dropped
+        ; no-ops, so every element accumulated ALL prior body text.)
+        this.current_body.clear()
+        this.current_chunks.clear()
+        let ent DssslSpecEventHandler.attribute_entity(ev as ref[Event], "CONTENT")
+        if ent = null
+            this.gathering_body := true
+        else
+        {
+            ; the CONTENT= entity arm keeps a pointer into the parse — see the
+            ; arena comment at the top of this file, condition (b)
+            this.keeps_parse := true
+            this.current_part.append_body(BodyElement.make_entity(this.host, ent))
+        }
+    }
+
+    procedure style_specification_body_end(mutable this: ref[DssslSpecEventHandler])
+    {
+        let host this.host
+        if this.gathering_body
+        {
+            if this.current_part <> null
+            {
+                this.chunks_kept := this.chunks_kept + (this.current_chunks.get_length() as i64)
+                this.chunk_chars := this.chunk_chars + (this.current_body.get_length() as i64)
+                let text StringC^host(this.current_body.as_slice())
+                ; snapshot the chunk table — current_chunks is reused by the
+                ; next gathered element. ★This is THE copy-out of the parse:
+                ; a chunk's Location holds an origin on the parse arena, and
+                ; the table is read long after that parse (a runtime diagnostic
+                ; in the assembled Scheme resolves through it into the original
+                ; source — tests/dazzle/cli/trace). Pin the chain here, while
+                ; the parse is still alive; Origin.pin memoizes, so the
+                ; hundreds of thousands of chunks cost one copy per distinct
+                ; origin.
+                let chunks Array[TextChunk]^host()
+                let cn this.current_chunks.get_length()
+                var ci: size_t 0
+                while ci < cn
+                {
+                    ; ★copy the chunk and overwrite its location — do NOT build
+                    ; a fresh `TextChunk(...)` as the argument: a by-value
+                    ; construction in argument position is REGION-ALLOCATED, so
+                    ; that spelling put a `scaly_force_frame` + a 24-byte
+                    ; `Page.allocate` inside this loop, once per gathered
+                    ; character (+2.7 % of the whole start run; one line of
+                    ; objdump over this function shows it).
+                    var ch this.current_chunks[ci]
+                    ch.loc := Origin.pin_location(host, ch.loc)
+                    chunks.add(ch)
+                    ci := ci + 1
+                }
+                this.current_part.append_body(BodyElement.make_immediate(this.host, text, chunks))
+            }
+            this.gathering_body := false
+        }
+    }
+
+    procedure declaration_start(mutable this: ref[DssslSpecEventHandler], ev: ref[Event]?, decl_type: int)
+    {
+        if (this.current_part = null) and (this.current_doc = null)
+            return
+        ; reset the gather buffers, keeping them — see style_specification_body_start
+        let bhost this.host
+        this.current_body.clear()
+        this.current_chunks.clear()
+        this.gathering_body := true
+        let decl DeclarationElement.make(this.host, decl_type)
+        ; ★an attribute_string is BORROWED from the parse arena (it is the
+        ; attribute value's Text, not a copy) and the declaration element
+        ; outlives the parse — so every one of the four is copied onto the
+        ; handler's own host here, at the point it is kept.
+        let nm DssslSpecEventHandler.attribute_string(ev as ref[Event], "NAME")
+        if nm.get_size() > 0
+            decl.name := StringC^bhost(nm.as_slice())
+        let tx DssslSpecEventHandler.attribute_string(ev as ref[Event], "TEXT")
+        if tx.get_size() > 0
+            decl.text := StringC^bhost(tx.as_slice())
+        let md DssslSpecEventHandler.attribute_string(ev as ref[Event], "MODADD")
+        if md.get_size() > 0
+            decl.modadd := StringC^bhost(md.as_slice())
+        let ds DssslSpecEventHandler.attribute_string(ev as ref[Event], "DESC")
+        if ds.get_size() > 0
+            decl.desc := StringC^bhost(ds.as_slice())
+        this.current_decl := decl
+    }
+
+    procedure declaration_end(mutable this: ref[DssslSpecEventHandler])
+    {
+        let host this.host
+        if this.gathering_body and (this.current_decl <> null)
+        {
+            this.chunks_kept := this.chunks_kept + (this.current_chunks.get_length() as i64)
+            this.chunk_chars := this.chunk_chars + (this.current_body.get_length() as i64)
+            let text StringC^host(this.current_body.as_slice())
+            this.current_decl.content := text
+            ; pin the chunk chain exactly as the body path does (same reason,
+            ; same by-value-construction trap avoided by copying the chunk).
+            let chunks Array[TextChunk]^host()
+            let cn this.current_chunks.get_length()
+            var ci: size_t 0
+            while ci < cn
+            {
+                var ch this.current_chunks[ci]
+                ch.loc := Origin.pin_location(host, ch.loc)
+                chunks.add(ch)
+                ci := ci + 1
+            }
+            this.current_decl.chunks := chunks
+            if this.current_part <> null
+                this.current_part.append_decl(this.current_decl)
+            else if this.current_doc <> null
+                this.current_doc.append_decl(this.current_decl)
+            this.gathering_body := false
+            this.current_decl := null
+        }
+    }
+
+    ; the decl-type of a declaration GI (the reference's declarationStart switch).
+    function decl_type_of(gi: StringC) returns int
+    {
+        if gi.equals(StringC("FEATURES"))
+            return DECL_FEATURES
+        if gi.equals(StringC("BASESET-ENCODING"))
+            return DECL_BASESET_ENCODING
+        if gi.equals(StringC("LITERAL-DESCRIBED-CHAR"))
+            return DECL_LITERAL_DESCRIBED_CHAR
+        if gi.equals(StringC("ADD-NAME-CHARS"))
+            return DECL_ADD_NAME_CHARS
+        if gi.equals(StringC("ADD-SEPARATOR-CHARS"))
+            return DECL_ADD_SEPARATOR_CHARS
+        if gi.equals(StringC("STANDARD-CHARS"))
+            return DECL_STANDARD_CHARS
+        if gi.equals(StringC("OTHER-CHARS"))
+            return DECL_OTHER_CHARS
+        if gi.equals(StringC("COMBINE-CHAR"))
+            return DECL_COMBINE_CHAR
+        if gi.equals(StringC("MAP-SDATA-ENTITY"))
+            return DECL_MAP_SDATA_ENTITY
+        if gi.equals(StringC("CHAR-REPERTOIRE"))
+            return DECL_CHAR_REPERTOIRE
+        if gi.equals(StringC("SGML-GROVE-PLAN"))
+            return DECL_SGML_GROVE_PLAN
+        0 - 1
+    }
+
+    function is_declaration_gi(gi: StringC) returns bool
+        DssslSpecEventHandler.decl_type_of(gi) >= 0
+
+    ; --- the event walk (mapping-table dispatch) ---------------------------
+    procedure walk(mutable this: ref[DssslSpecEventHandler], mutable ps: ref[ParserState])
+    {
+        let n ps.n_events()
+        ; ★ONE reused chunk record for the data arm below. Spelling that arm
+        ; `current_chunks.add(TextChunk(len, ev.get_loc()))` puts the argument's
+        ; storage on the REGION — a `scaly_force_frame` plus a 24-byte
+        ; `Page.allocate` per data event, and this parser makes one data event
+        ; per CHARACTER (445 317 of them for the DocBook style sheet). Whether
+        ; the planner puts such a temporary on the stack or on the region
+        ; depends on the rest of the function, so it is not stable enough to
+        ; rely on: hold the record in a local and set its fields.
+        var chunk TextChunk(0, Location())
+        var k: size_t 0
+        while k < n
+        {
+            let ev ps.get_event(k)
+            let ty ev.get_type()
+            if ty = EVK_START
+            {
+                let et ev.get_element_type()
+                if et <> null
+                {
+                    let gi et.get_name()
+                    if gi.equals(StringC("STYLE-SPECIFICATION"))
+                        this.style_specification_start(ev)
+                    else if gi.equals(StringC("STYLE-SPECIFICATION-BODY"))
+                        this.style_specification_body_start(ev)
+                    else if gi.equals(StringC("EXTERNAL-SPECIFICATION"))
+                        this.external_specification_start(ev as ref[Event])
+                    else if DssslSpecEventHandler.is_declaration_gi(gi)
+                        this.declaration_start(ev, DssslSpecEventHandler.decl_type_of(gi))
+                }
+            }
+            else if ty = EVK_END
+            {
+                let et ev.get_element_type()
+                if et <> null
+                {
+                    let gi et.get_name()
+                    if gi.equals(StringC("STYLE-SPECIFICATION"))
+                        this.style_specification_end()
+                    else if gi.equals(StringC("STYLE-SPECIFICATION-BODY"))
+                        this.style_specification_body_end()
+                    else if DssslSpecEventHandler.is_declaration_gi(gi)
+                        this.declaration_end()
+                }
+            }
+            else if ty = EVK_END_PROLOG
+            {
+                ; endProlog — the current doc's own location (anchors noParts)
+                if this.current_doc <> null
+                {
+                    let ep_loc ev.get_loc()
+                    this.current_doc.set_location(this.host, ep_loc)
+                }
+            }
+            else if ty = EVK_DATA
+            {
+                if this.gathering_body
+                {
+                    let d ev.get_data()
+                    let dloc ev.get_loc()
+                    let body_len this.current_body.get_length()
+                    ; Text::addChars (Text.cxx:39) — a new chunk ONLY where this
+                    ; run does not CONTINUE the last one: same origin, and a
+                    ; source index that picks up exactly where the gathered text
+                    ; left off. The reference's test, minus its `type != data`
+                    ; arm, which cannot fire here (the walk builds chunks from
+                    ; EVK_DATA and nowhere else).
+                    ;
+                    ; It is not a micro-optimization: this parser emits one data
+                    ; event per CHARACTER (Parser.handle_shortref, and the
+                    ; reference carries a `// FIXME speed this up` beside it), so
+                    ; without the test the table costs 24 B per character of
+                    ; stylesheet source — 436 907 chunks for the DocBook print
+                    ; sheet, gathered and then snapshotted, where the runs
+                    ; collapse to a few thousand.
+                    ;
+                    ; Output-neutral by construction, not by luck:
+                    ; Origin.resolve_chain already reads the table the
+                    ; reference's way (Text::charLocation — the last chunk with
+                    ; start <= index, re-anchored at `ch.loc.index + (index -
+                    ; ch.start)`), which is exactly the arithmetic this test
+                    ; asserts, so a coalesced run answers every offset with the
+                    ; location the per-character entries would have given.
+                    var fresh true
+                    let cn this.current_chunks.get_length()
+                    if cn > 0
+                    {
+                        let last this.current_chunks[(cn - 1)]
+                        let lloc last.loc
+                        if lloc.get_origin() = dloc.get_origin()
+                            if (dloc.get_index() as size_t) = ((lloc.get_index() as size_t) + (body_len - last.start))
+                                fresh := false
+                    }
+                    if fresh
+                    {
+                        chunk.start := body_len
+                        chunk.loc := dloc
+                        this.current_chunks.add(chunk)
+                    }
+                    var di: size_t 0
+                    let dn d.get_size()
+                    while di < dn
+                    {
+                        this.current_body.add(d.get(di))
+                        di := di + 1
+                    }
+                }
+            }
+            k := k + 1
+        }
+    }
+
+    ; load an external spec document by re-parsing its file, then walk it
+    ; (reference Doc::load → loadDoc: a child SgmlParser over the sysid, the
+    ; DSSSL-architecture gate per document, currentDoc_ rebound for the walk).
+    procedure load_external_doc(mutable this: ref[DssslSpecEventHandler], doc: ref[Doc])
+    {
+        let host this.host
+        var sysid doc.get_sysid()
+        ; the effective system id is a storage object spec — strip the
+        ; storage-manager prefix (`<OSFILE>…`) down to the file path (the
+        ; reference hands the spec to a child parser's entity manager).
+        if (sysid.get_size() > 0) and (sysid.get(0) = 0x3C)
+        {
+            var gt: size_t 0
+            let sn sysid.get_size()
+            while gt < sn
+            {
+                if sysid.get(gt) = 0x3E
+                    break
+                gt := gt + 1
+            }
+            if gt < sn
+                sysid := sysid.substr(gt + 1, sn - (gt + 1))
+        }
+        ; StringC (u32 chars) -> NUL-terminated byte path
+        let n sysid.get_size()
+        let pb allocate_slice[u8](host, n + 1)
+        var ci: size_t 0
+        while ci < n
+        {
+            pb.put(ci, sysid.get(ci) as u8)
+            ci := ci + 1
+        }
+        pb.put(n, 0)
+        let path String^host(pb.data as pointer[char])
+        ; this document's parse gets its own arena, released at the END of this
+        ; call — resolve_parts recurses over the USE closure, so the child
+        ; parses NEST and each bracket must belong to its own call.
+        let arena DssslSpecEventHandler.spec_arena(host)
+        let ps Parser.parse_simple_cat(arena, path, this.prog_name, this.catalog_path, null, null, false)
+        let saved_doc this.current_doc
+        let saved_part this.current_part
+        let saved_gathering this.gathering_body
+        let saved_keeps this.keeps_parse
+        this.current_part := null
+        this.gathering_body := false
+        this.keeps_parse := false
+        if this.check_dsssl_arch(ps) = false
+            this.interp.message0(InterpreterMessages.specNotArc())
+        else
+        {
+            this.current_doc := doc
+            DssslSpecEventHandler.route_through_arch(ps)
+            this.walk(ps)
+        }
+        let keep this.keeps_parse
+        this.current_doc := saved_doc
+        this.current_part := saved_part
+        this.gathering_body := saved_gathering
+        this.keeps_parse := saved_keeps
+        this.release_spec_arena(host, arena, keep)
+    }
+
+    ; loadDoc's `ArcEngine::parseAll` (DssslSpecEventHandler.cxx:88): replace the
+    ; base event stream with the DSSSL architecture's generated one, so the walk
+    ; below sees the ARCHITECTURAL forms. Called only once the gate has already
+    ; said the architecture is declared — the gate reads the ArcBase PI out of
+    ; the base events, which this call removes, so the ORDER is load-bearing.
+    ;
+    ; The host is the PARSE's own region, not the handler's: the generated stream
+    ; and the meta-DTD must live exactly as long as the base parse they came from
+    ; (the reference allocates them in the ArcEngineImpl's Allocator, same
+    ; lifetime), and that is also what makes the per-document arena above still
+    ; correct — condition (b) holds the arena for a CONTENT= entity, and under
+    ; routing that entity is the meta-DTD's COPY, which sits on the same arena.
+    procedure route_through_arch(mutable ps: ref[ParserState])
+    {
+        let ah ps.get_host()
+        let names Array[String]^ah()
+        let dsssl String^ah("DSSSL")
+        names.add(*dsssl)
+        ArcEngine.transform(ah, ps, names)
+    }
+
+    ; --- top-level entry ---------------------------------------------------
+    ; load(): assemble the parts of the main document from ps.events. Returns
+    ; the ordered part list (the resolved part + its USE closure).
+    ;
+    ; A document that does not declare the DSSSL architecture as a base
+    ; architecture is NOT fatal: loadDoc reports specNotArc and RETURNS, and
+    ; load() then runs its normal tail over a doc that was never walked — so the
+    ; part list comes back EMPTY and the engine processes with no construction
+    ; rules (default processing). Nothing is skipped besides the walk: an
+    ; explicit `-d sysid#ID` still creates its header and still reports the
+    ; missing-ID error, exactly like the reference. resolve_first_part stays
+    ; silent because the doc's location is only set by the (never delivered)
+    ; end-prolog event.
+    procedure load(mutable this: ref[DssslSpecEventHandler], mutable ps: ref[ParserState], mutable id: StringC) returns ref[Array[ref[Part]?]]?
+    {
+        let host this.host
+        this.got_arc := this.check_dsssl_arch(ps)
+        if this.got_arc = false
+            this.interp.message0(InterpreterMessages.specNotArc())
+        let doc this.find_doc(StringC())
+        doc.loaded := true
+        this.current_doc := doc
+        this.keeps_parse := false
+        if this.got_arc
+        {
+            DssslSpecEventHandler.route_through_arch(ps)
+            this.walk(ps)
+        }
+
+        var tem: ref[Part]? null
+        if id.get_size() = 0
+            tem := doc.resolve_first_part(this)
+        else
+            tem := doc.ref_part(this.host, id).resolve(this)
+
+        let parts Array[ref[Part]?]^host()
+        this.resolve_parts(tem, parts)
+        parts
+    }
+
+    ; resolveParts: collect the part and, transitively, its USE closure
+    ; (mark guards the use-loop).
+    procedure resolve_parts(mutable this: ref[DssslSpecEventHandler], mutable part: ref[Part]?, mutable parts: ref[Array[ref[Part]?]])
+    {
+        if part = null
+            return
+        parts.add(part)
+        if part.set_mark(true)
+        {
+            this.interp.message0(InterpreterMessages.useLoop())
+            return
+        }
+        let uses part.get_use_headers()
+        let un uses.get_length()
+        var i: size_t 0
+        while i < un
+        {
+            let h uses[i]
+            let tem h.resolve(this)
+            this.resolve_parts(tem, parts)
+            i := i + 1
+        }
+        part.set_mark(false)
+    }
+
+    ; makeInputSource (BodyElement::makeInputSource): ONE InputSource per body
+    ; element, each read by its own SchemeParser (StyleEngine::parseSpec). An
+    ; immediate body reads the gathered text through a text origin whose chunk
+    ; table resolves a diagnostic back into the original source — a chunk
+    ; gathered from an expanded `&file.scm;` reference anchors INSIDE that
+    ; file. A CONTENT= internal entity reads its replacement text under an
+    ; entity origin with no reference location (EntityOrigin::make(entity,
+    ; Location()) — renders "(invalid location)", like the reference). The
+    ; CONTENT= EXTERNAL entity fresh-open (entityManager().open) is not
+    ; wired yet — no corpus stylesheet uses it; returns null (skipped).
+    ; DeclarationElement::makeInputSource (DssslSpecEventHandler.cxx:523) —
+    ; a TextInputSourceOrigin over the gathered content, i.e. exactly the
+    ; Immediate body arm below with the declaration's own chunk table.
+    ; StyleEngine::parseSpec's DECLARATION phase (StyleEngine.cxx:40-80) — the
+    ; part of the spec that runs BEFORE any Scheme body, and which this port
+    ; gathered but never executed until 2026-08-08 (found by the dazzle-side
+    ; message audit: `Interpreter.set_char_repertoire` and the four
+    ; `SchemeParser.parse_*` declaration readers were fully ported and had ZERO
+    ; callers).
+    ;
+    ; Three shapes of the reference are load-bearing here:
+    ;
+    ;  * TWO PHASES over the whole part list. `char-repertoire` and
+    ;    `standard-chars` run in phase 0, everything else in phase 1 — a
+    ;    `map-sdata-entity` in the FIRST part may name a character that the LAST
+    ;    part's `standard-chars` defines, so the character tables must be complete
+    ;    before anything reads them.
+    ;  * per part, the DOC's declarations first, then the PART's own (the
+    ;    reference's `local` do-while).
+    ;  * `dEndPart` after each part, in BOTH phases — the declaration phase has
+    ;    its own part counter, and it is what decides whether a redefinition
+    ;    overwrites, is ignored, or is a duplicate diagnostic.
+    procedure parse_declarations(host: ref[Page], mutable interp: ref[Interpreter], parts: ref[Array[ref[Part]?]])
+    {
+        let n parts.get_length()
+        var phase 0
+        while phase < 2
+        {
+            var i: size_t 0
+            while i < n
+            {
+                let part parts[i]
+                var local 0
+                while local < 2
+                {
+                    var decls: ref[Array[ref[DeclarationElement]?]]? null
+                    if local = 0
+                    {
+                        let doc part.get_doc()
+                        if doc <> null
+                            decls := doc.get_declarations()
+                    }
+                    else
+                        decls := part.get_declarations()
+                    if decls <> null
+                    {
+                        let dn decls.get_length()
+                        var j: size_t 0
+                        while j < dn
+                        {
+                            let d decls[j]
+                            let ty d.get_type()
+                            var want 1
+                            if (ty = DECL_CHAR_REPERTOIRE) or (ty = DECL_STANDARD_CHARS)
+                                want := 0
+                            if want = phase
+                                DssslSpecEventHandler.run_declaration(host, interp, d as ref[DeclarationElement], ty)
+                            j := j + 1
+                        }
+                    }
+                    local := local + 1
+                }
+                interp.d_end_part()
+                i := i + 1
+            }
+            phase := phase + 1
+        }
+    }
+
+    ; the switch of StyleEngine::parseSpec. ★Every arm gets its OWN SchemeParser
+    ; over the declaration's own input source, exactly as the reference does —
+    ; the reader state (token, current entity) must not leak between declarations.
+    procedure run_declaration(host: ref[Page], mutable interp: ref[Interpreter], mutable d: ref[DeclarationElement], ty: int)
+    {
+        if ty = DECL_CHAR_REPERTOIRE
+        {
+            interp.set_char_repertoire(d.get_name())
+            return
+        }
+        if ty = DECL_STANDARD_CHARS
+        {
+            let src DssslSpecEventHandler.make_decl_input_source(host, d)
+            if src = null
+                return
+            let sp SchemeParser.make(host, interp, src)
+            sp.parse_standard_chars()
+            return
+        }
+        if ty = DECL_MAP_SDATA_ENTITY
+        {
+            let src DssslSpecEventHandler.make_decl_input_source(host, d)
+            if src = null
+                return
+            let sp SchemeParser.make(host, interp, src)
+            sp.parse_map_sdata_entity(d.get_name(), d.get_text())
+            return
+        }
+        if ty = DECL_ADD_NAME_CHARS
+        {
+            let src DssslSpecEventHandler.make_decl_input_source(host, d)
+            if src = null
+                return
+            let sp SchemeParser.make(host, interp, src)
+            sp.parse_name_chars()
+            return
+        }
+        if ty = DECL_ADD_SEPARATOR_CHARS
+        {
+            let src DssslSpecEventHandler.make_decl_input_source(host, d)
+            if src = null
+                return
+            let sp SchemeParser.make(host, interp, src)
+            sp.parse_separator_chars()
+            return
+        }
+        ; the reference's `default:` — every OTHER declaration kind (features,
+        ; baseset-encoding, literal-described-char, other-chars, combine-char,
+        ; sgml-grove-plan) is a warning and is ignored. ★It carries NO location:
+        ; the reference calls `interpreter_->message(...)` without a preceding
+        ; setNextLocation, so the line is the bare `<prog>:W: …`.
+        interp.message0(InterpreterMessages.unsupportedDeclaration())
+    }
+
+    function make_decl_input_source(host: ref[Page], d: ref[DeclarationElement]) returns ref[InputSource]?
+    {
+        let t d.get_content()
+        if t.get_size() = 0
+            return null
+        let org Origin.make_text(host, d.chunks)
+        InputSource.make(host, org, t.as_slice())
+    }
+
+    function make_input_source(host: ref[Page], be: ref[BodyElement]?) returns ref[InputSource]?
+    {
+        ; ★a `choose` SUBJECT may not be an Option -- the wrapper hides the
+        ; union's arms. Nothing to dispatch on is the neutral answer.
+        if be = null
+            return null
+        choose (be as ref[BodyElement])
+            when im: Immediate
+            {
+                if im.text.get_size() = 0
+                    return null
+                let org Origin.make_text(host, im.chunks)
+                return InputSource.make(host, org, im.text.as_slice())
+            }
+            when en: Entity
+            {
+                let ent en.entity
+                choose *ent
+                    when ie: Internal
+                    {
+                        let t ie.get_text()
+                        if t.get_size() = 0
+                            return null
+                        let org Origin.make_entity_origin(host, ent)
+                        return InputSource.make(host, org, t.as_slice())
+                    }
+                    else
+                        return null
+            }
+        null
+    }
+
+    ; body_text(part): concatenate the part's immediate body elements into one
+    ; StringC — the Scheme source the SchemeParser reads. (Entity body elements
+    ; are resolved by the interpreter at read time; Inc 2 gathers immediate.)
+    function body_text(host: ref[Page], part: ref[Part]) returns StringC
+    {
+        let acc Array[u32]^host()
+        let bes part.get_body_elements()
+        let n bes.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let be bes[i]
+            choose *be
+                when im: Immediate
+                {
+                    var j: size_t 0
+                    let s im.text
+                    let sn s.get_size()
+                    while j < sn
+                    {
+                        acc.add(s.get(j))
+                        j := j + 1
+                    }
+                }
+                else
+                    0
+            i := i + 1
+        }
+        StringC^host(acc.as_slice())
+    }
+
+    ; --- self-test ---------------------------------------------------------
+    ; Parse a self-contained `.dsl` (inline DTD subset declaring the style-sheet
+    ; forms + the DSSSL arch notation for the gate), assemble the part, extract
+    ; the body, and dump its datums through the SchemeParser — the Inc-2 seam
+    ; end to end: opensp parse → part assembly → Scheme reader.
+    procedure test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+        let interp Interpreter.make(host, 1440, false, false, false)
+
+        ; ★The specification must carry a real META-DTD, because `load` ROUTES the
+        ; parse through the architecture engine (route_through_arch): the walk
+        ; consumes the DSSSL architecture's generated stream, and an architecture
+        ; whose ArcDTD does not resolve generates nothing at all. The older
+        ; fixture declared the notation and the ArcBase PI but no ArcDTD, which
+        ; is a configuration the REFERENCE also assembles no parts from (measured:
+        ; it warns noArcDTDAtt and processes with default rules) — so the fixture
+        ; was wrong, not the routing. ArcDocF names the meta document element,
+        ; exactly as the shipped dsssl/style-sheet.dtd does.
+        let meta String("<!ELEMENT dsssl-specification - O (style-specification+)>\n<!ELEMENT style-specification - O (style-specification-body*)>\n<!ATTLIST style-specification id ID #IMPLIED use IDREFS #IMPLIED>\n<!ELEMENT style-specification-body - - CDATA>\n<!ATTLIST style-specification-body content ENTITY #CONREF>\n")
+        let meta_path TestScratch.path("dazzle_spec_test_meta.dtd")
+        if File.write_from_string(meta_path, meta) = false
+            return 1
+        ; the meta DTD is named RELATIVE to the style sheet, which lies beside it
+        ; in the scratch directory: that is how the corpus reaches its DTDs, and
+        ; an absolute Windows path in a system identifier is not resolved by the
+        ; ported (POSIX) storage manager
+        let dsl String("<!DOCTYPE STYLE-SHEET [\n<!ELEMENT style-sheet o o ((style-specification)+)>\n<!ELEMENT style-specification o o (style-specification-body)>\n<!ATTLIST style-specification id id #implied use idrefs #implied>\n<!ELEMENT style-specification-body o o (#pcdata)>\n<!ATTLIST style-specification-body content entity #conref>\n<?IS10744 ArcBase DSSSL>\n<!NOTATION DSSSL PUBLIC \"ISO/IEC 10179:1996//NOTATION DSSSL Architecture Definition Document//EN\">\n<!ATTLIST #NOTATION DSSSL\n  ArcDTD CDATA #FIXED \"dssslmeta\"\n  ArcDocF NAME #FIXED dsssl-specification>\n<!ENTITY dssslmeta SYSTEM \"dazzle_spec_test_meta.dtd\">\n]>\n<STYLE-SHEET>\n<STYLE-SPECIFICATION ID=main>\n<![CDATA[\n(define x 42)\n(element para (quote bar))\n]]>\n</STYLE-SPECIFICATION>\n</STYLE-SHEET>\n")
+        ; the document opens via the file path (the reserved-name-correct route)
+        let path1 TestScratch.path("dazzle_spec_test1.dsl")
+        if File.write_from_string(path1, dsl) = false
+            return 1
+        let ps Parser.parse_simple(host, path1, String("dazzle"))
+
+        let eh DssslSpecEventHandler.make(host, interp, String("dazzle"), String(""))
+        ; the arch gate must recognize the DSSSL notation
+        if eh.check_dsssl_arch(ps) = false
+            return 2
+
+        let parts eh.load(ps, StringC())
+        if parts = null
+            return 3
+        if parts.get_length() <> 1
+            return 4
+        ; the gathered body must be COALESCED: this parser makes one data event
+        ; per character, so without Text::addChars' continuation test every
+        ; character would be a chunk of its own
+        if eh.chunk_chars < 10
+            return 30
+        if (eh.chunks_kept * 4) > eh.chunk_chars
+            return 31
+
+        let part *(parts.get_buffer())
+        let body DssslSpecEventHandler.body_text(host, part as ref[Part])
+        if body.get_size() = 0
+            return 5
+
+        ; dump every datum in the body through the SchemeParser
+        let src_in InputSource.make(host, null, body.as_slice())
+        let sp SchemeParser.make(host, interp, src_in)
+        let os OutputCharStream.make(host)
+        var count 0
+        repeat
+        {
+            var datum: ref[ELObj]? null
+            var loc Location()
+            var tok 0
+            if sp.parse_datum(0x1, &datum, &loc, &tok) = false
+                break
+            if datum = null
+                break
+            if count > 0
+                os.put_ascii("|")
+            datum.print(os, 1440)
+            count := count + 1
+        }
+        if count <> 2
+            return 6
+        if os.is_ascii("(define x 42)|(element para (quote bar))") = false
+            return 7
+
+        ; the specNotArc gate: a document WITHOUT the DSSSL notation is rejected
+        let dsl2 String("<!DOCTYPE STYLE-SHEET [\n<!ELEMENT style-sheet o o ((style-specification)+)>\n<!ELEMENT style-specification o o (style-specification-body)>\n<!ELEMENT style-specification-body o o (#pcdata)>\n]>\n<STYLE-SHEET>\n<STYLE-SPECIFICATION>\n<![CDATA[\n(define y 1)\n]]>\n</STYLE-SPECIFICATION>\n</STYLE-SHEET>\n")
+        let path2 TestScratch.path("dazzle_spec_test2.dsl")
+        if File.write_from_string(path2, dsl2) = false
+            return 8
+        let ps2 Parser.parse_simple(host, path2, String("dazzle"))
+        let eh2 DssslSpecEventHandler.make(host, interp, String("dazzle"), String(""))
+        if eh2.check_dsssl_arch(ps2)
+            return 9
+
+        ; ...and so is a document that DECLARES the notation but never names it in
+        ; an `IS10744 ArcBase` PI — the architecture is not a base architecture.
+        ; (This is the case the notation-only gate used to let through.)
+        let dsl3 String("<!DOCTYPE STYLE-SHEET [\n<!ELEMENT style-sheet o o ((style-specification)+)>\n<!ELEMENT style-specification o o (style-specification-body)>\n<!ELEMENT style-specification-body o o (#pcdata)>\n<!NOTATION DSSSL PUBLIC \"ISO/IEC 10179:1996//NOTATION DSSSL Architecture Definition Document//EN\">\n]>\n<STYLE-SHEET>\n<STYLE-SPECIFICATION>\n<![CDATA[\n(define y 1)\n]]>\n</STYLE-SPECIFICATION>\n</STYLE-SHEET>\n")
+        let path3 TestScratch.path("dazzle_spec_test3.dsl")
+        if File.write_from_string(path3, dsl3) = false
+            return 10
+        let ps3 Parser.parse_simple(host, path3, String("dazzle"))
+        let eh3 DssslSpecEventHandler.make(host, interp, String("dazzle"), String(""))
+        if eh3.check_dsssl_arch(ps3)
+            return 11
+
+        0
+    }
+}

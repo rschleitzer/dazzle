@@ -1,0 +1,533 @@
+; LangObj — the value of a `define-language` form (style/LangObj.cxx, Matthias
+; Clasen). Two halves: the CASE tables (`toupper` / `tolower`) that
+; char-upcase / char-downcase read, and the COLLATION machinery (`collate`)
+; behind char<? / char<=? / string<? / string<=? / string-equiv?.
+;
+; The collation model, in the reference's own words: a `collate` clause names
+; multi-collating ELEMENTS (a symbol standing for a character SEQUENCE),
+; collating SYMBOLS (a name with no characters of its own) and an ORDER — a
+; list of sort LEVELS followed by the collating positions in ascending order.
+; Comparison then runs in three phases (LangObj::compare): the strings are
+; mapped to collating POSITIONS (asCollatingElts), each level turns positions
+; into a string of WEIGHTS (atLevel, reversed for a backward level), and the
+; weight strings are compared lexicographically, level by level, until the
+; requested strength is exhausted.
+;
+; Two data sets, exactly as in the reference: LangBuildData lives only while
+; the form is being parsed (`order`, `ce`, `syms`, `currentpos`) and is
+; dropped by compile(); LangData (`level`, `weights`, `collate`, the two case
+; maps) is what a comparison reads. The reference's HashTable<StringC, …> is
+; an association ARRAY here — the tables are small (a language declares tens
+; of positions), and `insert` REPLACES, which is observable: the last
+; `(toupper (#\a #\A) (#\a #\B))` pair wins, measured against the reference.
+;
+; ★A language with NO `collate` clause has ZERO levels, so compare()'s loop
+; body never runs and every pair compares EQUAL: `string<?` is #f and
+; `string<=?` #t whatever the code points say. That is the reference's
+; behaviour, not a shortcut.
+;
+; ★An UNKNOWN character (one with no collating position) maps to the default
+; position, which is `currentpos` unless a `#t` item in the order list moved
+; it. Without a `#t` no weights exist for that position, atLevel bails out at
+; the first miss and returns the weights it has SO FAR — so an unknown
+; character truncates the level string and therefore sorts FIRST, not last
+; (`(string<? "z" "a")` is #t in a language that orders only a b c).
+
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+
+; constant.h charMax (SP_MULTI_BYTE) — the "no entry" marker of both case
+; maps and of a collating symbol that never got a position.
+define LANG_CHAR_MAX: u32 0x10FFFF
+
+; LangObj::LevelSort — the three flags of one sort level.
+define LangLevel (forward: bool, backward: bool, position: bool)
+{
+    init(forward: bool, backward: bool, position: bool)
+    {
+        this.forward := forward
+        this.backward := backward
+        this.position := position
+    }
+}
+
+; HashTable<StringC, StringC>
+define LangSS (key: StringC, var val: StringC)
+{
+    init(key: StringC, val: StringC)
+    {
+        this.key := key
+        this.val := val
+    }
+}
+
+; HashTable<StringC, Char>
+define LangSC (key: StringC, var val: u32)
+{
+    init(key: StringC, val: u32)
+    {
+        this.key := key
+        this.val := val
+    }
+}
+
+; CharMap<Char> — sparse here; a miss answers charMax like setAll(charMax).
+define LangCC (key: u32, var val: u32)
+{
+    init(key: u32, val: u32)
+    {
+        this.key := key
+        this.val := val
+    }
+}
+
+define LangObj
+(
+    ; --- LangBuildData (dropped by compile) ---
+    order: ref[Array[LangSS]]
+    ce: ref[Array[LangSS]]
+    syms: ref[Array[LangSC]]
+    var currentpos: u32
+    ; --- LangData ---
+    levels_: ref[Array[LangLevel]]
+    weights: ref[Array[LangSS]]
+    collate: ref[Array[LangSC]]
+    upper: ref[Array[LangCC]]
+    lower: ref[Array[LangCC]]
+    ; the page the tables live on (the run arena — a language outlives the
+    ; parse and every eval bracket).
+    host: ref[Page]
+)
+{
+    function make(host: ref[Page]) returns ref[LangObj]
+    {
+        let p &LangObj^host(Array[LangSS]^host(), Array[LangSS]^host(), Array[LangSC]^host(), 0, Array[LangLevel]^host(), Array[LangSS]^host(), Array[LangSC]^host(), Array[LangCC]^host(), Array[LangCC]^host(), host)
+        p
+    }
+
+    function get_host(this: LangObj) returns ref[Page]
+        host
+
+    ; --- the association tables ------------------------------------------
+    ; HashTable::lookup — null on a miss. The returned pointer is only valid
+    ; until the next insert (an Array reallocation moves the buffer).
+    function lookup_ss(m: ref[Array[LangSS]], key: StringC) returns ref[LangSS]?
+    {
+        let n m.get_length()
+        let b m.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let e b + i
+            if e.key.equals(key)
+                return e
+            i := i + 1
+        }
+        null
+    }
+
+    function lookup_sc(m: ref[Array[LangSC]], key: StringC) returns ref[LangSC]?
+    {
+        let n m.get_length()
+        let b m.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let e b + i
+            if e.key.equals(key)
+                return e
+            i := i + 1
+        }
+        null
+    }
+
+    ; HashTable::insert — REPLACES an existing entry (the reference's default).
+    procedure insert_ss(mutable m: ref[Array[LangSS]], mutable key: StringC, val: StringC)
+    {
+        let e LangObj.lookup_ss(m, key)
+        if e <> null
+        {
+            e.val := val
+            return
+        }
+        m.add(LangSS(key, val))
+    }
+
+    procedure insert_sc(mutable m: ref[Array[LangSC]], mutable key: StringC, val: u32)
+    {
+        let e LangObj.lookup_sc(m, key)
+        if e <> null
+        {
+            e.val := val
+            return
+        }
+        m.add(LangSC(key, val))
+    }
+
+    procedure insert_cc(mutable m: ref[Array[LangCC]], key: u32, val: u32)
+    {
+        let n m.get_length()
+        let b m.get_buffer()
+        var i: size_t 0
+        while i < n
+        {
+            let e b + i
+            if e.key = key
+            {
+                e.val := val
+                return
+            }
+            i := i + 1
+        }
+        m.add(LangCC(key, val))
+    }
+
+    function lookup_cc(m: ref[Array[LangCC]], key: u32) returns u32
+    {
+        let n m.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let e m.at(i)
+            if e.key = key
+                return e.val
+            i := i + 1
+        }
+        LANG_CHAR_MAX
+    }
+
+    ; a StringC over `n` Chars taken from `src`, resident on `host` — the
+    ; small keys the reference builds with StringC::resize + element writes.
+    function key_of(host: ref[Page], src: Slice[u32]) returns StringC
+    {
+        let k StringC^host(src)
+        k
+    }
+
+    function key1(host: ref[Page], c0: u32) returns StringC
+    {
+        let b allocate_slice[u32](host, 1)
+        b.put(0, c0)
+        let k StringC^host(b)
+        k
+    }
+
+    function key2(host: ref[Page], c0: u32, c1: u32) returns StringC
+    {
+        let b allocate_slice[u32](host, 2)
+        b.put(0, c0)
+        b.put(1, c1)
+        let k StringC^host(b)
+        k
+    }
+
+    function key3(host: ref[Page], c0: u32, c1: u32, c2: u32) returns StringC
+    {
+        let b allocate_slice[u32](host, 3)
+        b.put(0, c0)
+        b.put(1, c1)
+        b.put(2, c2)
+        let k StringC^host(b)
+        k
+    }
+
+    ; --- the build-time half (SchemeParser calls these) -------------------
+    procedure add_multi_collating_element(mutable this: ref[LangObj], mutable sym: StringC, str: StringC)
+        LangObj.insert_ss(this.ce, sym, str)
+
+    procedure add_collating_symbol(mutable this: ref[LangObj], mutable sym: StringC)
+        LangObj.insert_sc(this.syms, sym, LANG_CHAR_MAX)
+
+    procedure add_level(mutable this: ref[LangObj], forward: bool, backward: bool, position: bool)
+        this.levels_.add(LangLevel(forward, backward, position))
+
+    procedure add_default_pos(mutable this: ref[LangObj])
+    {
+        let empty StringC()
+        let ok this.add_collating_pos(empty)
+    }
+
+    ; LangObj::addCollatingPos — a position for `sym`. A name that is neither
+    ; a declared multi-collating element nor a collating symbol is accepted
+    ; only if it is a SINGLE character (it then becomes a one-character
+    ; collating element of itself); a longer one fails the whole form.
+    procedure add_collating_pos(mutable this: ref[LangObj], mutable sym: StringC) returns bool
+    {
+        if (LangObj.lookup_ss(this.ce, sym) = null) and (LangObj.lookup_sc(this.syms, sym) = null)
+        {
+            if sym.get_size() <= 1
+                LangObj.insert_ss(this.ce, sym, sym)
+            else
+                return false
+        }
+        let hp this.host
+        LangObj.insert_ss(this.order, LangObj.key1(hp, this.currentpos), sym)
+        this.currentpos := this.currentpos + 1
+        true
+    }
+
+    ; LangObj::addLevelWeight — append weight `w` to (the position just
+    ; added, level `l`). The key is [currentpos-1, l, nth]; `nth` counts up
+    ; until a free slot is found, so several weights may sit at one level.
+    procedure add_level_weight(mutable this: ref[LangObj], l: u32, mutable w: StringC) returns bool
+    {
+        if (LangObj.lookup_ss(this.ce, w) = null) and (LangObj.lookup_sc(this.syms, w) = null)
+        {
+            if w.get_size() <= 1
+                LangObj.insert_ss(this.ce, w, w)
+            else
+                return false
+        }
+        let hp this.host
+        let pos this.currentpos - 1
+        var nth: u32 0
+        while LangObj.lookup_ss(this.order, LangObj.key3(hp, pos, l, nth)) <> null
+            nth := nth + 1
+        LangObj.insert_ss(this.order, LangObj.key3(hp, pos, l, nth), w)
+        true
+    }
+
+    procedure add_toupper(mutable this: ref[LangObj], lc: u32, uc: u32)
+        LangObj.insert_cc(this.upper, lc, uc)
+
+    procedure add_tolower(mutable this: ref[LangObj], uc: u32, lc: u32)
+        LangObj.insert_cc(this.lower, uc, lc)
+
+    ; LangObj::compile — invert `order` into `syms`/`collate` (phase 1), then
+    ; build the `weights` map (phase 2). The reference frees LangBuildData
+    ; here; the arrays just stop being read.
+    procedure compile(mutable this: ref[LangObj]) returns bool
+    {
+        let hp this.host
+        let empty StringC()
+        LangObj.insert_sc(this.collate, empty, this.currentpos)
+        var pos: u32 0
+        while pos < this.currentpos
+        {
+            let m LangObj.lookup_ss(this.order, LangObj.key1(hp, pos))
+            if m = null
+                return false
+            let mv m.val
+            let m2 LangObj.lookup_ss(this.ce, mv)
+            if m2 = null
+                LangObj.insert_sc(this.syms, mv, pos)
+            else
+                LangObj.insert_sc(this.collate, m2.val, pos)
+            pos := pos + 1
+        }
+        let nlev this.levels()
+        var p: u32 0
+        while p < this.currentpos
+        {
+            var l: u32 0
+            while l < nlev
+            {
+                let val Array[u32]^hp()
+                var nth: u32 0
+                repeat
+                {
+                    let m LangObj.lookup_ss(this.order, LangObj.key3(hp, p, l, nth))
+                    if m = null
+                        break
+                    let mv m.val
+                    let m2 LangObj.lookup_ss(this.ce, mv)
+                    var col LANG_CHAR_MAX
+                    if m2 = null
+                    {
+                        let s LangObj.lookup_sc(this.syms, mv)
+                        if s = null
+                            return false
+                        col := s.val
+                    }
+                    else
+                    {
+                        let c LangObj.lookup_sc(this.collate, m2.val)
+                        if c = null
+                            return false
+                        col := c.val
+                    }
+                    val.add(col)
+                    nth := nth + 1
+                }
+                LangObj.insert_ss(this.weights, LangObj.key2(hp, p, l), LangObj.key_of(hp, val.as_slice()))
+                l := l + 1
+            }
+            p := p + 1
+        }
+        true
+    }
+
+    function levels(this: LangObj) returns u32
+        levels_.get_length() as u32
+
+    ; --- the comparison half ---------------------------------------------
+    ; LangObj::toUpper / toLower — a miss (charMax) is identity.
+    function to_upper(this: LangObj, c: u32) returns u32
+    {
+        let uc LangObj.lookup_cc(upper, c)
+        if uc = LANG_CHAR_MAX
+            return c
+        uc
+    }
+
+    function to_lower(this: LangObj, c: u32) returns u32
+    {
+        let lc LangObj.lookup_cc(lower, c)
+        if lc = LANG_CHAR_MAX
+            return c
+        lc
+    }
+
+    ; LangObj::asCollatingElts — map each character to its collating
+    ; position, taking the LONGEST prefix that has one (that is what makes a
+    ; multi-collating element like "ch" one unit). A character with no
+    ; position at all takes the default (the entry under the empty key).
+    function as_collating_elts(this: LangObj, host: ref[Page], s: StringC) returns StringC
+    {
+        let empty StringC()
+        let d LangObj.lookup_sc(collate, empty)
+        var def_val LANG_CHAR_MAX
+        if d <> null
+            def_val := d.val
+        let n s.get_size()
+        let res Array[u32]^host()
+        let sp s.as_slice()
+        var i: size_t 0
+        while i < n
+        {
+            var col def_val
+            var j i
+            while j < n
+            {
+                let c LangObj.lookup_sc(collate, LangObj.key_of(host, sp.subslice(i, j + 1)))
+                if c = null
+                    break
+                col := c.val
+                j := j + 1
+            }
+            if i = j
+                ; a single unknown character — do not reconsider it, or the
+                ; outer loop never advances (the reference's own comment).
+                j := j + 1
+            res.add(col)
+            i := j
+        }
+        let out StringC^host(res.as_slice())
+        out
+    }
+
+    ; LangObj::atLevel — the weight string of a position string at level `l`.
+    ; ★A position with no weights entry (the default position of a language
+    ; whose order list has no `#t`) ABORTS the walk: the level string ends
+    ; there, so a string containing an unknown character compares SHORTER and
+    ; therefore LESS.
+    function at_level(this: LangObj, host: ref[Page], s: StringC, l: u32) returns StringC
+    {
+        let lv levels_.at(l as size_t)
+        let back lv.backward
+        let posn lv.position
+        let n s.get_size()
+        let cols Array[u32]()
+        if back
+        {
+            var i n
+            while i > 0
+            {
+                i := i - 1
+                cols.add(s.get(i))
+            }
+        }
+        else
+        {
+            var i: size_t 0
+            while i < n
+            {
+                cols.add(s.get(i))
+                i := i + 1
+            }
+        }
+        let res Array[u32]^host()
+        let cn cols.get_length()
+        let cb cols.as_slice()
+        var i: size_t 0
+        while i < cn
+        {
+            let w LangObj.lookup_ss(weights, LangObj.key2(host, cb[i], l))
+            if w = null
+            {
+                let cut StringC^host(res.as_slice())
+                return cut
+            }
+            let wv w.val
+            let wn wv.get_size()
+            if back
+            {
+                var j wn
+                while j > 0
+                {
+                    j := j - 1
+                    if posn
+                        res.add(i as u32)
+                    res.add(wv.get(j))
+                }
+            }
+            else
+            {
+                var j: size_t 0
+                while j < wn
+                {
+                    if posn
+                        res.add(i as u32)
+                    res.add(wv.get(j))
+                    j := j + 1
+                }
+            }
+            i := i + 1
+        }
+        let out StringC^host(res.as_slice())
+        out
+    }
+
+    ; LangObj::compare — collating comparison at strength `k`.
+    function compare(this: LangObj, host: ref[Page], rr: StringC, ss: StringC, k: u32) returns int
+    {
+        let rc this.as_collating_elts(host, rr)
+        let sc this.as_collating_elts(host, ss)
+        let nlev this.levels()
+        var l: u32 0
+        while (l < k) and (l < nlev)
+        {
+            let r this.at_level(host, rc, l)
+            let s this.at_level(host, sc, l)
+            let rn r.get_size()
+            let sn s.get_size()
+            var i: size_t 0
+            while (i < rn) or (i < sn)
+            {
+                if i = rn
+                    return 0 - 1
+                if i = sn
+                    return 1
+                let rv r.get(i)
+                let sv s.get(i)
+                if rv < sv
+                    return 0 - 1
+                if rv > sv
+                    return 1
+                i := i + 1
+            }
+            l := l + 1
+        }
+        0
+    }
+
+    function is_less(this: LangObj, host: ref[Page], r: StringC, s: StringC) returns bool
+        this.compare(host, r, s, this.levels()) < 0
+
+    function is_less_or_equal(this: LangObj, host: ref[Page], r: StringC, s: StringC) returns bool
+        this.compare(host, r, s, this.levels()) <= 0
+
+    function are_equivalent(this: LangObj, host: ref[Page], r: StringC, s: StringC, k: u32) returns bool
+        this.compare(host, r, s, k) = 0
+}

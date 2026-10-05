@@ -1,0 +1,663 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.ElementType.ElementType
+use opensp.ElementType.RankStem
+use opensp.ShortReferenceMap.ShortReferenceMap
+use opensp.Syntax.Syntax
+use opensp.Notation.Notation
+use opensp.Entity.Entity
+use opensp.Entity.InternalEntity
+use opensp.AttributeList.AttributeDefinitionList
+
+; Dtd — Dtd.cs (451 LOC). The Document Type Definition: the run's central table
+; of element types, entities (general + parameter), notations, rank stems, and
+; shortref maps, plus the shortref-string interning table and the index
+; allocators that hand out dense indices for element types / definitions /
+; current attributes / attribute-definition lists.
+;
+; PORT SHAPE: page-hosted flat struct (one region per run). C++'s
+; NamedTable / NamedResourceTable (hash-bucket keyed on the object's Named name)
+; are ported as flat Array-of-pointers keyed by StringC name with a LINEAR SCAN.
+; The C++ tables use a hash for scale; this increment builds + unit-tests the
+; construction/lookup API on small hand-built DTDs (the perf path is the
+; Parser increment's concern, where real corpus DTDs are parsed). Iteration
+; order is insertion order (C++'s is hash-bucket order) — not semantically
+; load-bearing for lookups. `remove` tombstones the slot (Array cannot shrink);
+; lookups skip null slots.
+;
+; ENTITY TABLE KEYING: C++ splits general vs parameter entities into two tables;
+; lookupEntity/removeEntity already take `isParameter` explicitly, and only
+; insertEntity derives it from declType(). Our Entity union stays FOLDED (no
+; shared EntityDecl base — the notation increment's open decision, resolved
+; here: staying folded), so insert_entity ALSO takes `is_parameter` explicitly
+; (the parser knows it — it parsed the `%`). Faithful to the two-table split.
+
+define Dtd
+(
+    var name: StringC
+    var is_base: bool
+    var is_instantiated: bool
+    var general_entity_table: ref[Array[ref[Entity]?]]
+    var parameter_entity_table: ref[Array[ref[Entity]?]]
+    var default_entity: ref[Entity]?
+    var element_type_table: ref[Array[ref[ElementType]?]]
+    var rank_stem_table: ref[Array[ref[RankStem]?]]
+    var short_reference_map_table: ref[Array[ref[ShortReferenceMap]?]]
+    var notation_table: ref[Array[ref[Notation]?]]
+    var shortrefs: ref[Array[StringC]]
+    var n_current_attribute: size_t
+    var n_element_definition: size_t
+    var n_attribute_definition_list: size_t
+    var n_element_type: size_t
+    var document_element_type: ref[ElementType]
+    var implicit_element_attribute_def: ref[AttributeDefinitionList]?
+    var implicit_notation_attribute_def: ref[AttributeDefinitionList]?
+)
+{
+    ; Dtd(const StringC &name, Boolean isBase).
+    function make(host: ref[Page], name: StringC, is_base: bool) returns ref[Dtd]
+    {
+        let d host.allocate(sizeof Dtd, alignof Dtd) as pointer[Dtd]
+        d.name := name
+        d.is_base := is_base
+        d.is_instantiated := false
+        d.general_entity_table := Array[ref[Entity]?]^host()
+        d.parameter_entity_table := Array[ref[Entity]?]^host()
+        d.default_entity := null
+        d.element_type_table := Array[ref[ElementType]?]^host()
+        d.rank_stem_table := Array[ref[RankStem]?]^host()
+        d.short_reference_map_table := Array[ref[ShortReferenceMap]?]^host()
+        d.notation_table := Array[ref[Notation]?]^host()
+        d.shortrefs := Array[StringC]^host()
+        d.n_current_attribute := 0
+        d.n_element_definition := 0
+        d.n_attribute_definition_list := 0
+        d.n_element_type := 0
+        d.implicit_element_attribute_def := null
+        d.implicit_notation_attribute_def := null
+        ; the document element type takes dense index 1 (0 is reserved for #PCDATA).
+        d.document_element_type := ElementType.make(host, name, d.alloc_element_type_index())
+        d.insert_element_type(d.document_element_type)
+        d
+    }
+
+    function get_name(this: Dtd) returns StringC
+        name
+
+    ; ---- element types (NamedTable<ElementType>) -------------------------
+    function lookup_element_type(this: Dtd, name: StringC) returns ref[ElementType]?
+    {
+        let n element_type_table.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let p element_type_table[i]
+            if p <> null
+            {
+                if p.get_name().equals(name)
+                    return p
+            }
+            i := i + 1
+        }
+        null
+    }
+
+    ; insert — replace an existing same-name entry (returning the old one) or
+    ; append (returning null), mirroring NamedTable::insert.
+    procedure insert_element_type(mutable this: ref[Dtd], e: ref[ElementType]) returns ref[ElementType]?
+    {
+        let n this.element_type_table.get_length()
+        let buf this.element_type_table.as_slice()
+        var i: size_t 0
+        while i < n
+        {
+            let p buf[i]
+            if p <> null
+            {
+                if p.get_name().equals(e.get_name())
+                {
+                    buf.put(i, e)
+                    return p
+                }
+            }
+            i := i + 1
+        }
+        this.element_type_table.add(e)
+        null
+    }
+
+    procedure remove_element_type(mutable this: ref[Dtd], name: StringC) returns ref[ElementType]?
+    {
+        let n this.element_type_table.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let p this.element_type_table[i]
+            if p <> null
+            {
+                if p.get_name().equals(name)
+                {
+                    this.element_type_table.put(i, null)
+                    return p
+                }
+            }
+            i := i + 1
+        }
+        null
+    }
+
+    ; size_t nElementTypeIndex() — index 0 is reserved for #pcdata.
+    function n_element_type_index(this: Dtd) returns size_t
+        1 + n_element_type
+
+    procedure alloc_element_type_index(mutable this: ref[Dtd]) returns size_t
+    {
+        let idx 1 + this.n_element_type
+        this.n_element_type := this.n_element_type + 1
+        idx
+    }
+
+    ; the raw element-type table (Dtd::ElementTypeIter) — checkDtd walks it to give
+    ; every element type declared only by reference its undefined definition.
+    ; Slots emptied by remove_element_type read back null.
+    function n_element_types(this: Dtd) returns size_t
+        element_type_table.get_length()
+
+    function get_element_type_at(this: Dtd, i: size_t) returns ref[ElementType]?
+        element_type_table[i]
+
+    function get_document_element_type(this: Dtd) returns ref[ElementType]?
+        document_element_type
+
+    ; ---- entities (NamedResourceTable<Entity>, split param/general) ------
+    function lookup_entity(this: Dtd, is_parameter: bool, name: StringC) returns ref[Entity]?
+    {
+        var tab general_entity_table
+        if is_parameter
+            tab := parameter_entity_table
+        let n tab.get_length()
+        let buf tab.as_slice()
+        var i: size_t 0
+        while i < n
+        {
+            let p buf[i]
+            if p <> null
+            {
+                if p.get_name().equals(name)
+                    return p
+            }
+            i := i + 1
+        }
+        null
+    }
+
+    ; insertEntity(entity, replace) — C++ routes by declType(); we take
+    ; is_parameter explicitly (see file header). Without replace, an existing
+    ; same-name entry wins (returned unchanged); with replace it is overwritten.
+    procedure insert_entity(mutable this: ref[Dtd], entity: ref[Entity], is_parameter: bool, replace: bool) returns ref[Entity]
+    {
+        var tab this.general_entity_table
+        if is_parameter
+            tab := this.parameter_entity_table
+        let n tab.get_length()
+        let buf tab.as_slice()
+        var i: size_t 0
+        while i < n
+        {
+            let p buf[i]
+            if p <> null
+            {
+                if p.get_name().equals(entity.get_name())
+                {
+                    if replace
+                    {
+                        buf.put(i, entity)
+                        return entity
+                    }
+                    return p as ref[Entity]
+                }
+            }
+            i := i + 1
+        }
+        tab.add(entity)
+        entity
+    }
+
+    procedure remove_entity(mutable this: ref[Dtd], is_parameter: bool, name: StringC) returns ref[Entity]?
+    {
+        var tab this.general_entity_table
+        if is_parameter
+            tab := this.parameter_entity_table
+        let n tab.get_length()
+        let buf tab.as_slice()
+        var i: size_t 0
+        while i < n
+        {
+            let p buf[i]
+            if p <> null
+            {
+                if p.get_name().equals(name)
+                {
+                    buf.put(i, null)
+                    return p
+                }
+            }
+            i := i + 1
+        }
+        null
+    }
+
+    function get_default_entity(this: Dtd) returns ref[Entity]?
+        default_entity
+
+    ; setDefaultEntity — the LPD/defaulted-entity fan-out (copy the default into
+    ; every general entity flagged `defaulted`) needs the live ParserState and
+    ; the entity-decl `defaulted` flag, so it lands with the parser stage; here
+    ; we record the default pointer (the common case).
+    procedure set_default_entity(mutable this: ref[Dtd], entity: ref[Entity])
+        this.default_entity := entity
+
+    ; ---- table iteration (checkDtd's entity/notation sweeps) --------------
+    ; INSERTION order; the reference's NamedTableIter yields BUCKET order —
+    ; the caller (check_dtd_notations) re-derives that with an IdTable.
+    function n_entities(this: Dtd, is_parameter: bool) returns size_t
+    {
+        if is_parameter
+            return parameter_entity_table.get_length()
+        general_entity_table.get_length()
+    }
+
+    function entity_at(this: Dtd, is_parameter: bool, i: size_t) returns ref[Entity]?
+    {
+        if is_parameter
+            return parameter_entity_table[i]
+        general_entity_table[i]
+    }
+
+    function n_notations(this: Dtd) returns size_t
+        notation_table.get_length()
+
+    function notation_at(this: Dtd, i: size_t) returns ref[Notation]?
+        notation_table[i]
+
+    ; ---- notations (NamedResourceTable<Notation>) ------------------------
+    function lookup_notation(this: Dtd, name: StringC) returns ref[Notation]?
+    {
+        let n notation_table.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let p notation_table[i]
+            if p <> null
+            {
+                if p.get_name().equals(name)
+                    return p
+            }
+            i := i + 1
+        }
+        null
+    }
+
+    procedure insert_notation(mutable this: ref[Dtd], nt: ref[Notation]) returns ref[Notation]
+    {
+        let existing this.lookup_notation(nt.get_name())
+        if existing <> null
+            return existing as ref[Notation]
+        this.notation_table.add(nt)
+        nt
+    }
+
+    procedure remove_notation(mutable this: ref[Dtd], name: StringC) returns ref[Notation]?
+    {
+        let n this.notation_table.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let p this.notation_table[i]
+            if p <> null
+            {
+                if p.get_name().equals(name)
+                {
+                    this.notation_table.put(i, null)
+                    return p
+                }
+            }
+            i := i + 1
+        }
+        null
+    }
+
+    ; ---- rank stems (NamedTable<RankStem>) -------------------------------
+    function lookup_rank_stem(this: Dtd, name: StringC) returns ref[RankStem]?
+    {
+        let n rank_stem_table.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let p rank_stem_table[i]
+            if p <> null
+            {
+                if p.get_name().equals(name)
+                    return p
+            }
+            i := i + 1
+        }
+        null
+    }
+
+    procedure insert_rank_stem(mutable this: ref[Dtd], e: ref[RankStem]) returns ref[RankStem]
+    {
+        let existing this.lookup_rank_stem(e.get_name())
+        if existing <> null
+            return existing as ref[RankStem]
+        this.rank_stem_table.add(e)
+        e
+    }
+
+    function n_rank_stem(this: Dtd) returns size_t
+        rank_stem_table.get_length()
+
+    ; ---- shortref maps (NamedTable<ShortReferenceMap>) -------------------
+    function lookup_short_reference_map(this: Dtd, name: StringC) returns ref[ShortReferenceMap]?
+    {
+        let n short_reference_map_table.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let p short_reference_map_table[i]
+            if p <> null
+            {
+                if p.get_name().equals(name)
+                    return p
+            }
+            i := i + 1
+        }
+        null
+    }
+
+    procedure insert_short_reference_map(mutable this: ref[Dtd], map: ref[ShortReferenceMap]) returns ref[ShortReferenceMap]
+    {
+        let existing this.lookup_short_reference_map(map.get_name())
+        if existing <> null
+            return existing as ref[ShortReferenceMap]
+        this.short_reference_map_table.add(map)
+        map
+    }
+
+    function n_short_reference_maps(this: Dtd) returns size_t
+        short_reference_map_table.get_length()
+
+    function short_reference_map_at(this: Dtd, i: size_t) returns ref[ShortReferenceMap]?
+        short_reference_map_table[i]
+
+    ; ---- shortref string table -------------------------------------------
+    ; find_shortref — index of an interned shortref string, or -1.
+    function find_shortref(this: Dtd, str: StringC) returns int
+    {
+        let n shortrefs.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            if (shortrefs[i]).equals(str)
+                return i as int
+            i := i + 1
+        }
+        -1
+    }
+
+    ; addNeededShortref / the interning half of shortrefIndex: append-if-absent,
+    ; return the index. (Syntax::isValidShortref validation is driven by the
+    ; parser and lands with it; this is the pure table op.)
+    procedure intern_shortref(mutable this: ref[Dtd], str: StringC) returns size_t
+    {
+        let found this.find_shortref(str)
+        if found >= 0
+            return found as size_t
+        let idx this.shortrefs.get_length()
+        this.shortrefs.add(str)
+        idx
+    }
+
+    ; Dtd::shortrefIndex (Dtd.cxx:30): the FULL reference op — an already
+    ; interned string returns its index; a new one is interned only if the
+    ; syntax admits it as a shortref delimiter (else false, and the caller
+    ; reports unknownShortrefDelim).
+    procedure shortref_index(mutable this: ref[Dtd], str: StringC, syn: Syntax, mutable out_index: ref[size_t]) returns bool
+    {
+        let found this.find_shortref(str)
+        if found >= 0
+        {
+            out_index := found as size_t
+            return true
+        }
+        if syn.is_valid_shortref(str) = false
+            return false
+        let idx this.shortrefs.get_length()
+        this.shortrefs.add(str)
+        out_index := idx
+        true
+    }
+
+    function n_shortref(this: Dtd) returns size_t
+        shortrefs.get_length()
+
+    function shortref(this: Dtd, i: size_t) returns StringC
+        shortrefs[i]
+
+    ; ---- index allocators -------------------------------------------------
+    procedure alloc_current_attribute_index(mutable this: ref[Dtd]) returns size_t
+    {
+        let idx this.n_current_attribute
+        this.n_current_attribute := this.n_current_attribute + 1
+        idx
+    }
+
+    function get_n_current_attribute(this: Dtd) returns size_t
+        n_current_attribute
+
+    procedure alloc_element_definition_index(mutable this: ref[Dtd]) returns size_t
+    {
+        let idx this.n_element_definition
+        this.n_element_definition := this.n_element_definition + 1
+        idx
+    }
+
+    function get_n_element_definition(this: Dtd) returns size_t
+        n_element_definition
+
+    procedure alloc_attribute_definition_list_index(mutable this: ref[Dtd]) returns size_t
+    {
+        let idx this.n_attribute_definition_list
+        this.n_attribute_definition_list := this.n_attribute_definition_list + 1
+        idx
+    }
+
+    function get_n_attribute_definition_list(this: Dtd) returns size_t
+        n_attribute_definition_list
+
+    ; ---- base / instantiation / implicit attribute defs ------------------
+    function get_is_base(this: Dtd) returns bool
+        is_base
+
+    function get_is_instantiated(this: Dtd) returns bool
+        is_instantiated
+
+    procedure instantiate(mutable this: ref[Dtd])
+        this.is_instantiated := true
+
+    function get_implicit_element_attribute_def(this: Dtd) returns ref[AttributeDefinitionList]?
+        implicit_element_attribute_def
+
+    procedure set_implicit_element_attribute_def(mutable this: ref[Dtd], def: ref[AttributeDefinitionList]?)
+        this.implicit_element_attribute_def := def
+
+    function get_implicit_notation_attribute_def(this: Dtd) returns ref[AttributeDefinitionList]?
+        implicit_notation_attribute_def
+
+    procedure set_implicit_notation_attribute_def(mutable this: ref[Dtd], def: ref[AttributeDefinitionList]?)
+        this.implicit_notation_attribute_def := def
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+
+        ; --- construction: the document element type is auto-inserted ------
+        let dtd Dtd.make(host, StringC("doc"), true)
+        if dtd.get_name().equals(StringC("doc")) = false
+            return -1
+        if dtd.get_is_base() = false
+            return -2
+        if dtd.get_is_instantiated()
+            return -3
+        let doc dtd.get_document_element_type()
+        if doc.get_name().equals(StringC("doc")) = false
+            return -4
+        if doc.get_index() <> 1
+            return -5
+        ; index 0 reserved for #PCDATA, doc took 1 -> next index is 2.
+        if dtd.n_element_type_index() <> 2
+            return -6
+        if dtd.lookup_element_type(StringC("doc")) <> doc
+            return -7
+
+        ; --- element types: alloc + insert + lookup + remove ---------------
+        let pIdx dtd.alloc_element_type_index()
+        if pIdx <> 2
+            return -8
+        let para ElementType^host(StringC("p"), pIdx)
+        if dtd.insert_element_type(para) <> null
+            return -9
+        if dtd.lookup_element_type(StringC("p")) <> para
+            return -10
+        if dtd.lookup_element_type(StringC("nope")) <> null
+            return -11
+        ; re-inserting the same name returns the old entry.
+        let para2 ElementType^host(StringC("p"), pIdx)
+        if dtd.insert_element_type(para2) <> para
+            return -12
+        if dtd.lookup_element_type(StringC("p")) <> para2
+            return -13
+        if dtd.remove_element_type(StringC("p")) <> para2
+            return -14
+        if dtd.lookup_element_type(StringC("p")) <> null
+            return -15
+
+        ; --- entities: general + parameter tables, default entity ----------
+        let amp_v Entity.Internal^host(InternalEntity(StringC("amp"), StringC("&"), DT_SGML))
+        let amp &amp_v
+        if dtd.insert_entity(amp, false, false) <> amp
+            return -16
+        if dtd.lookup_entity(false, StringC("amp")) <> amp
+            return -17
+        ; not in the parameter table.
+        if dtd.lookup_entity(true, StringC("amp")) <> null
+            return -18
+
+        let pe_v Entity.Internal^host(InternalEntity(StringC("pe"), StringC("x"), DT_SGML))
+        let pe &pe_v
+        if dtd.insert_entity(pe, true, false) <> pe
+            return -19
+        if dtd.lookup_entity(true, StringC("pe")) <> pe
+            return -20
+
+        ; insert without replace: existing wins.
+        let amp2_v Entity.Internal^host(InternalEntity(StringC("amp"), StringC("Y"), DT_SGML))
+        let amp2 &amp2_v
+        if dtd.insert_entity(amp2, false, false) <> amp
+            return -21
+        ; insert WITH replace: overwrite.
+        if dtd.insert_entity(amp2, false, true) <> amp2
+            return -22
+        if dtd.lookup_entity(false, StringC("amp")) <> amp2
+            return -23
+
+        if dtd.get_default_entity() <> null
+            return -24
+        dtd.set_default_entity(amp2)
+        if dtd.get_default_entity() <> amp2
+            return -25
+        if dtd.remove_entity(false, StringC("amp")) <> amp2
+            return -26
+        if dtd.lookup_entity(false, StringC("amp")) <> null
+            return -27
+
+        ; --- notations -----------------------------------------------------
+        let gif Notation.make(host, StringC("gif"), StringC("doc"), true)
+        if dtd.insert_notation(gif) <> gif
+            return -28
+        if dtd.lookup_notation(StringC("gif")) <> gif
+            return -29
+        ; duplicate insert returns the existing one.
+        let gif2 Notation.make(host, StringC("gif"), StringC("doc"), true)
+        if dtd.insert_notation(gif2) <> gif
+            return -30
+        if dtd.remove_notation(StringC("gif")) <> gif
+            return -31
+        if dtd.lookup_notation(StringC("gif")) <> null
+            return -32
+
+        ; --- rank stems ----------------------------------------------------
+        let rs RankStem^host(StringC("chap"), 0)
+        if dtd.insert_rank_stem(rs) <> rs
+            return -33
+        if dtd.lookup_rank_stem(StringC("chap")) <> rs
+            return -34
+        if dtd.n_rank_stem() <> 1
+            return -35
+
+        ; --- shortref maps -------------------------------------------------
+        let srm ShortReferenceMap.make(host, StringC("m"))
+        if dtd.insert_short_reference_map(srm) <> srm
+            return -36
+        if dtd.lookup_short_reference_map(StringC("m")) <> srm
+            return -37
+
+        ; --- shortref string table -----------------------------------------
+        if dtd.n_shortref() <> 0
+            return -38
+        let s0 dtd.intern_shortref(StringC("B"))
+        if s0 <> 0
+            return -39
+        let s1 dtd.intern_shortref(StringC("#"))
+        if s1 <> 1
+            return -40
+        ; interning an existing string returns its index (no growth).
+        if dtd.intern_shortref(StringC("B")) <> 0
+            return -41
+        if dtd.n_shortref() <> 2
+            return -42
+        if dtd.shortref(1).equals(StringC("#")) = false
+            return -43
+        if dtd.find_shortref(StringC("nope")) <> -1
+            return -44
+
+        ; --- index allocators ----------------------------------------------
+        if dtd.alloc_current_attribute_index() <> 0
+            return -45
+        if dtd.alloc_current_attribute_index() <> 1
+            return -46
+        if dtd.get_n_current_attribute() <> 2
+            return -47
+        if dtd.alloc_element_definition_index() <> 0
+            return -48
+        if dtd.get_n_element_definition() <> 1
+            return -49
+        if dtd.alloc_attribute_definition_list_index() <> 0
+            return -50
+
+        ; --- instantiation + implicit attribute defs -----------------------
+        dtd.instantiate()
+        if dtd.get_is_instantiated() = false
+            return -51
+        let adl AttributeDefinitionList.make(host, 0)
+        dtd.set_implicit_element_attribute_def(adl)
+        if dtd.get_implicit_element_attribute_def() <> adl
+            return -52
+        if dtd.get_implicit_notation_attribute_def() <> null
+            return -53
+
+        0
+    }
+}

@@ -1,0 +1,2820 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.Location.Location
+use opensp.StringC.StringC
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
+use dazzle.ELObj.FlowObj
+use dazzle.ELObj.MacroDef
+use dazzle.ELObj.OutputCharStream
+use dazzle.Insn.Insn
+use dazzle.Insn.Signature
+use dazzle.Interpreter.Interpreter
+use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.Style.InheritedC
+use dazzle.Style.Convert
+use dazzle.Style.DisplayNIC
+use dazzle.ProcessingMode.ProcessingMode
+
+; Expression — the compiled-form AST (Style/Expression.cxx). Each Expression
+; compiles to an Insn chain against a compilation Environment that resolves
+; lexical variables to frame / closure-display slots and tracks which need
+; boxing (assigned or captured-and-is_shared). The C++ optimize() constant-folding
+; pass is a pure performance/IR transform — the interpreter yields *values*,
+; so folding never changes a result; it is a no-op here and joins later if
+; byte-identical IR is ever needed. markBoundVars (the box/unbox analysis) and
+; compile are ported faithfully — they are correctness-bearing. Style / make /
+; with-mode expressions join with the FOT machinery in a later increment.
+
+; BoundVar flags (Expression.cs BoundVar).
+define BV_USED: u32 0x1
+define BV_ASSIGNED: u32 0x2
+define BV_UNINIT: u32 0x4
+define BV_SHARED: u32 0x8
+define BV_NOT_USED_MASK: u32 0xFFFFFFFE
+
+define BoundVar (ident: ref[Identifier]?, var flags: u32, var rebound_count: u32)
+{
+    init(ident: ref[Identifier]?, flags: u32)
+    {
+        this.ident := ident
+        this.flags := flags
+        this.rebound_count := 0
+    }
+
+    function boxed(this: BoundVar) returns bool
+        BoundVar.flags_boxed(flags)
+
+    function flags_boxed(flags: u32) returns bool
+        (flags & (BV_ASSIGNED | BV_SHARED)) <> 0
+}
+
+; A growable BoundVar list (Expression.cs BoundVarList) with the compile-time
+; mutation ops (mark/rebind/unbind/removeUnused/resize).
+define BoundVarList (host: ref[Page], var buf: Slice[BoundVar], var n: int, var cap: int)
+{
+    function make(host: ref[Page]) returns ref[BoundVarList]
+    {
+        let l &BoundVarList^host(host, null, 0, 0)
+        l
+    }
+
+    function make_from_idents(host: ref[Page], idents: ref[Array[ref[Identifier]?]]) returns ref[BoundVarList]
+    {
+        let l BoundVarList.make(host)
+        let m idents.get_length() as int
+        var i 0
+        while i < m
+        {
+            l.append(idents[i], 0)
+            i := i + 1
+        }
+        l
+    }
+
+    ; BoundVarList(idents, n, flags): first n idents, flags & ~usedFlag.
+    function make_from_idents_n(host: ref[Page], idents: ref[Array[ref[Identifier]?]], n: int, flags: u32) returns ref[BoundVarList]
+    {
+        let l BoundVarList.make(host)
+        let m idents.get_length() as int
+        var i 0
+        while (i < n) and (i < m)
+        {
+            l.append(idents[i], flags & BV_NOT_USED_MASK)
+            i := i + 1
+        }
+        l
+    }
+
+    function copy(host: ref[Page], other: ref[BoundVarList]) returns ref[BoundVarList]
+    {
+        let l BoundVarList.make(host)
+        var i 0
+        while i < other.n
+        {
+            let bv other.at(i)
+            l.append_raw(bv.ident, bv.flags, bv.rebound_count)
+            i := i + 1
+        }
+        l
+    }
+
+    function count(this: BoundVarList) returns int
+        n
+
+    function get_host(this: BoundVarList) returns ref[Page]
+        host
+
+    function at(this: BoundVarList, i: int) returns ref[BoundVar]
+        this.buf.at(i as size_t)
+
+    procedure ensure_cap(mutable this: ref[BoundVarList], need: int)
+    {
+        if need <= this.cap
+            return
+        var nc this.cap
+        if nc < 4
+            nc := 4
+        while nc < need
+            nc := nc * 2
+        let h this.host
+        let nb allocate_slice[BoundVar]^h(h, nc as size_t)
+        var i 0
+        while i < this.n
+        {
+            nb.put(i, this.buf[i])
+            i := i + 1
+        }
+        this.buf := nb
+        this.cap := nc
+    }
+
+    procedure append(mutable this: ref[BoundVarList], ident: ref[Identifier]?, flags: u32)
+    {
+        this.ensure_cap(this.n + 1)
+        let nbv BoundVar(ident, flags & BV_NOT_USED_MASK)
+        this.buf.put(this.n, nbv)
+        this.n := this.n + 1
+    }
+
+    procedure append_raw(mutable this: ref[BoundVarList], ident: ref[Identifier]?, flags: u32, rebound: u32)
+    {
+        this.ensure_cap(this.n + 1)
+        let nbv BoundVar(ident, flags, rebound)
+        this.buf.put(this.n, nbv)
+        this.n := this.n + 1
+    }
+
+    procedure resize(mutable this: ref[BoundVarList], m: int)
+    {
+        if m < this.n
+            this.n := m
+        else
+        {
+            while this.n < m
+                this.append_raw(null, 0, 0)
+        }
+    }
+
+    function find_index(this: BoundVarList, ident: ref[Identifier]?) returns int
+    {
+        var i 0
+        while i < n
+        {
+            if this.buf.at(i as size_t).ident = ident
+                return i
+            i := i + 1
+        }
+        0 - 1
+    }
+
+    function find(this: BoundVarList, ident: ref[Identifier]) returns ref[BoundVar]?
+    {
+        let idx this.find_index(ident)
+        if idx < 0
+            return null
+        this.buf.at(idx as size_t)
+    }
+
+    procedure mark(mutable this: ref[BoundVarList], ident: ref[Identifier]?, flags: u32)
+    {
+        let idx this.find_index(ident)
+        if idx >= 0
+        {
+            let bv this.buf.at(idx as size_t)
+            if bv.rebound_count = 0
+                bv.flags := bv.flags | flags
+        }
+    }
+
+    procedure rebind(mutable this: ref[BoundVarList], idents: ref[Array[ref[Identifier]?]])
+    {
+        let m idents.get_length() as int
+        var i 0
+        while i < m
+        {
+            let idx this.find_index(idents[i])
+            if idx >= 0
+            {
+                let bv this.buf.at(idx as size_t)
+                bv.rebound_count := bv.rebound_count + 1
+            }
+            i := i + 1
+        }
+    }
+
+    procedure unbind(mutable this: ref[BoundVarList], idents: ref[Array[ref[Identifier]?]])
+    {
+        let m idents.get_length() as int
+        var i 0
+        while i < m
+        {
+            let idx this.find_index(idents[i])
+            if idx >= 0
+            {
+                let bv this.buf.at(idx as size_t)
+                bv.rebound_count := bv.rebound_count - 1
+            }
+            i := i + 1
+        }
+    }
+
+    procedure remove_unused(mutable this: ref[BoundVarList])
+    {
+        var j 0
+        var i 0
+        while i < this.n
+        {
+            if (this.buf.at(i as size_t).flags & BV_USED) <> 0
+            {
+                if j <> i
+                    this.buf.put(j, this.buf[i])
+                j := j + 1
+            }
+            i := i + 1
+        }
+        this.n := j
+    }
+}
+
+define FrameVarList (vars: ref[BoundVarList]?, stack_pos: int, next: ref[FrameVarList]?)
+
+; Compilation environment (Expression.cs Environment): a chain of frame-var
+; scopes plus the enclosing closure's captured vars.
+define Environment (closure_vars: ref[BoundVarList]?, var frame_var_list: ref[FrameVarList]?)
+{
+    function make(host: ref[Page]) returns ref[Environment]
+    {
+        let e &Environment^host(null, null)
+        e
+    }
+
+    function copy(host: ref[Page], other: ref[Environment]) returns ref[Environment]
+    {
+        let e &Environment^host(other.closure_vars, other.frame_var_list)
+        e
+    }
+
+    function make_with(host: ref[Page], frame_vars: ref[BoundVarList], closure_vars: ref[BoundVarList]?) returns ref[Environment]
+    {
+        let f &FrameVarList^host(frame_vars, 0, null)
+        let e &Environment^host(closure_vars, f)
+        e
+    }
+
+    procedure lookup(this: Environment, ident: ref[Identifier]?, mutable is_frame: ref[bool], mutable index: ref[int], mutable flags: ref[u32]) returns bool
+    {
+        var p frame_var_list
+        while p <> null
+        {
+            if p.vars <> null
+            {
+                let idx p.vars.find_index(ident)
+                if idx >= 0
+                {
+                    is_frame := true
+                    index := idx + p.stack_pos
+                    flags := (p.vars.at(idx)).flags
+                    return true
+                }
+            }
+            p := p.next
+        }
+        if closure_vars <> null
+        {
+            let idx closure_vars.find_index(ident)
+            if idx >= 0
+            {
+                is_frame := false
+                index := idx
+                flags := (closure_vars.at(idx)).flags
+                return true
+            }
+        }
+        false
+    }
+
+    procedure bound_vars(this: Environment, mutable result: ref[BoundVarList])
+    {
+        if closure_vars <> null
+        {
+            var i 0
+            while i < closure_vars.count()
+            {
+                let bv closure_vars.at(i)
+                result.append(bv.ident, bv.flags)
+                i := i + 1
+            }
+        }
+        var f frame_var_list
+        while f <> null
+        {
+            if f.vars <> null
+            {
+                var i 0
+                while i < f.vars.count()
+                {
+                    let bv f.vars.at(i)
+                    result.append(bv.ident, bv.flags)
+                    i := i + 1
+                }
+            }
+            f := f.next
+        }
+    }
+
+    procedure augment_frame(mutable this: ref[Environment], host: ref[Page], vars: ref[BoundVarList]?, stack_pos: int)
+    {
+        let f &FrameVarList^host(vars, stack_pos, this.frame_var_list)
+        this.frame_var_list := f
+    }
+}
+
+; --- expression arm records ------------------------------------------------
+define ConstantExpr (obj: ref[ELObj]?, loc: Location)
+define ResolvedConstantExpr (obj: ref[ELObj]?, loc: Location)
+; is_top mirrors VariableExpression::isTop_ — stamped when a compile/fold
+; resolves the reference to the TOP level (no frame binding); canEval reads it.
+define VariableExpr (ident: ref[Identifier]?, loc: Location, is_top: bool)
+define IfExpr (test: ref[Expression], consequent: ref[Expression], alternate: ref[Expression]?, loc: Location)
+define OrExpr (test1: ref[Expression], test2: ref[Expression], loc: Location)
+define AndExpr (test1: ref[Expression], test2: ref[Expression], loc: Location)
+define CallExpr (op: ref[Expression], args: ref[Array[ref[Expression]?]], loc: Location)
+define SequenceExpr (seq: ref[Array[ref[Expression]?]], loc: Location)
+define LetExpr (vars: ref[Array[ref[Identifier]?]]?, inits: ref[Array[ref[Expression]?]], body: ref[Expression], loc: Location)
+define LetStarExpr (vars: ref[Array[ref[Identifier]?]]?, inits: ref[Array[ref[Expression]?]], body: ref[Expression], loc: Location)
+define LetrecExpr (vars: ref[Array[ref[Identifier]?]]?, inits: ref[Array[ref[Expression]?]], body: ref[Expression], loc: Location)
+define CondFailExpr (loc: Location)
+; datums / results are parallel arrays; each case's datums begin at
+; case_starts[i] and run to case_starts[i+1] in the flat datums array.
+define CaseExpr (key: ref[Expression], datums: ref[Array[ref[ELObj]?]], case_starts: ref[Array[int]], results: ref[Array[ref[Expression]?]], else_expr: ref[Expression]?, loc: Location)
+define QuasiquoteExpr (members: ref[Array[ref[Expression]?]], spliced: ref[Array[bool]], qq_type: int, loc: Location)
+define AssignmentExpr (var_ident: ref[Identifier], value: ref[Expression], loc: Location)
+define LambdaExpr (formals: ref[Array[ref[Identifier]?]], inits: ref[Array[ref[Expression]?]], sig: Signature, loc: Location, body: ref[Expression])
+; MakeExpr — a transform `make FOC key: val … content…` (MakeExpression). `keys`
+; parallels the first `keys.length` entries of `exprs` (the characteristic
+; values); the remaining exprs are content. `foc_ident` is the FO-class
+; IDENTIFIER, not a resolved kind: the reference resolves foc_->flowObj() in
+; MakeExpression::compile, AFTER the whole part is parsed, so a
+; declare-flow-object-class LATER in the part reaches back (cql.dsl loads
+; fodeclare.scm last). Unknown class at compile = message + sequence fallback.
+define MakeExpr (foc_ident: ref[Identifier], keys: ref[Array[ref[Identifier]?]], exprs: ref[Array[ref[Expression]?]]?, loc: Location)
+define StyleExpr (keys: ref[Array[ref[Identifier]?]], exprs: ref[Array[ref[Expression]?]]?, loc: Location)
+
+; WithModeExpr — `(with-mode NAME expr)` (WithModeExpression): eval `content`
+; with the VM's EvalContext processingMode switched to `mode`. ProcessingMode
+; uses Expression and Expression uses ProcessingMode; that mutual `use` is
+; legal and is why this field names its type (see VM.processing_mode).
+define WithModeExpr (mode: ref[ProcessingMode]?, content: ref[Expression], loc: Location)
+
+; QuasiquoteExpression.Type
+define QQ_LIST: int 0
+define QQ_IMPROPER: int 1
+define QQ_VECTOR: int 2
+
+define Expression union
+(
+    Constant: ConstantExpr
+    ResolvedConstant: ResolvedConstantExpr
+    Variable: VariableExpr
+    If: IfExpr
+    Or: OrExpr
+    And: AndExpr
+    Call: CallExpr
+    Sequence: SequenceExpr
+    Let: LetExpr
+    LetStar: LetStarExpr
+    Letrec: LetrecExpr
+    CondFail: CondFailExpr
+    Case: CaseExpr
+    Quasiquote: QuasiquoteExpr
+    Assignment: AssignmentExpr
+    Lambda: LambdaExpr
+    Make: MakeExpr
+    StyleE: StyleExpr
+    WithMode: WithModeExpr
+)
+{
+    ; --- constructors ------------------------------------------------------
+    function alloc(host: ref[Page]) returns ref[Expression]
+        host.allocate(sizeof Expression, alignof Expression) as pointer[Expression]
+
+    function make_constant(host: ref[Page], obj: ref[ELObj]?, loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.Constant(ConstantExpr(obj, loc))
+        p
+    }
+
+    function make_variable(host: ref[Page], ident: ref[Identifier], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.Variable(VariableExpr(ident, loc, false))
+        p
+    }
+
+    function make_if(host: ref[Page], test: ref[Expression], consequent: ref[Expression], alternate: ref[Expression]?, loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.If(IfExpr(test, consequent, alternate, loc))
+        p
+    }
+
+    function make_or(host: ref[Page], test1: ref[Expression], test2: ref[Expression], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.Or(OrExpr(test1, test2, loc))
+        p
+    }
+
+    function make_and(host: ref[Page], test1: ref[Expression], test2: ref[Expression], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.And(AndExpr(test1, test2, loc))
+        p
+    }
+
+    function make_call(host: ref[Page], op: ref[Expression], args: ref[Array[ref[Expression]?]], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.Call(CallExpr(op, args, loc))
+        p
+    }
+
+    function make_sequence(host: ref[Page], seq: ref[Array[ref[Expression]?]], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.Sequence(SequenceExpr(seq, loc))
+        p
+    }
+
+    function make_let(host: ref[Page], vars: ref[Array[ref[Identifier]?]], inits: ref[Array[ref[Expression]?]], body: ref[Expression], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.Let(LetExpr(vars, inits, body, loc))
+        p
+    }
+
+    function make_let_star(host: ref[Page], vars: ref[Array[ref[Identifier]?]], inits: ref[Array[ref[Expression]?]], body: ref[Expression], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.LetStar(LetStarExpr(vars, inits, body, loc))
+        p
+    }
+
+    function make_letrec(host: ref[Page], vars: ref[Array[ref[Identifier]?]], inits: ref[Array[ref[Expression]?]], body: ref[Expression], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.Letrec(LetrecExpr(vars, inits, body, loc))
+        p
+    }
+
+    function make_cond_fail(host: ref[Page], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.CondFail(CondFailExpr(loc))
+        p
+    }
+
+    function make_case(host: ref[Page], key: ref[Expression], datums: ref[Array[ref[ELObj]?]], case_starts: ref[Array[int]], results: ref[Array[ref[Expression]?]], else_expr: ref[Expression]?, loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.Case(CaseExpr(key, datums, case_starts, results, else_expr, loc))
+        p
+    }
+
+    function make_quasiquote(host: ref[Page], members: ref[Array[ref[Expression]?]], spliced: ref[Array[bool]], qq_type: int, loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.Quasiquote(QuasiquoteExpr(members, spliced, qq_type, loc))
+        p
+    }
+
+    function make_assignment(host: ref[Page], var_ident: ref[Identifier], value: ref[Expression], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.Assignment(AssignmentExpr(var_ident, value, loc))
+        p
+    }
+
+    function make_lambda(host: ref[Page], formals: ref[Array[ref[Identifier]?]], inits: ref[Array[ref[Expression]?]], sig: Signature, body: ref[Expression], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.Lambda(LambdaExpr(formals, inits, sig, loc, body))
+        p
+    }
+
+    function make_make(host: ref[Page], foc_ident: ref[Identifier], keys: ref[Array[ref[Identifier]?]], exprs: ref[Array[ref[Expression]?]], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.Make(MakeExpr(foc_ident, keys, exprs, loc))
+        p
+    }
+
+    function make_style_expr(host: ref[Page], keys: ref[Array[ref[Identifier]?]], exprs: ref[Array[ref[Expression]?]], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.StyleE(StyleExpr(keys, exprs, loc))
+        p
+    }
+
+    function make_with_mode(host: ref[Page], mode: ref[ProcessingMode]?, content: ref[Expression], loc: Location) returns ref[Expression]
+    {
+        let p Expression.alloc(host)
+        p := Expression.WithMode(WithModeExpr(mode, content, loc))
+        p
+    }
+
+    ; --- location ----------------------------------------------------------
+    function location(this: ref[Expression]) returns Location
+    {
+        choose this
+            when e: Constant
+                return e.loc
+            when e: ResolvedConstant
+                return e.loc
+            when e: Variable
+                return e.loc
+            when e: If
+                return e.loc
+            when e: Or
+                return e.loc
+            when e: And
+                return e.loc
+            when e: Call
+                return e.loc
+            when e: Sequence
+                return e.loc
+            when e: Let
+                return e.loc
+            when e: LetStar
+                return e.loc
+            when e: Letrec
+                return e.loc
+            when e: CondFail
+                return e.loc
+            when e: Case
+                return e.loc
+            when e: Quasiquote
+                return e.loc
+            when e: Assignment
+                return e.loc
+            when e: Lambda
+                return e.loc
+            when e: Make
+                return e.loc
+            when e: StyleE
+                return e.loc
+            when e: WithMode
+                return e.loc
+            else
+                return Location()
+        Location()
+    }
+
+    ; --- constantValue (minimal; only resolved constants report a value) ---
+    function constant_value(this: ref[Expression]) returns ref[ELObj]?
+    {
+        choose this
+            when e: ResolvedConstant
+                return e.obj
+            else
+                return null
+        null
+    }
+
+    ; the datum of either constant arm — the make-IC compile split uses it
+    ; (a parsed literal like 12pt or a quoted symbol is a Constant carrying
+    ; its ELObj; evaluation would be pure, so folding it here is safe).
+    function constant_datum(this: ref[Expression]) returns ref[ELObj]?
+    {
+        choose this
+            when e: Constant
+                return e.obj
+            when e: ResolvedConstant
+                return e.obj
+            else
+                return null
+        null
+    }
+
+    ; --- canEval (Expression.cxx, faithful) ---------------------------------
+    ; Whether the expression can be EAGERLY evaluated at compile time
+    ; (Identifier::computeValue's force-0 gate). Runs on a compiled tree:
+    ; Variable is_top stamps come from compile_variable/fold_variable; a
+    ; Constant stands in for the reference's post-optimize state via a silent
+    ; resolve probe (resolved -> ResolvedConstantExpression, canEval 1).
+    procedure can_eval(mutable this: ref[Expression], maybe_call: bool, mutable interp: ref[Interpreter]) returns bool
+    {
+        choose this
+            when e: ResolvedConstant
+                return true
+            when e: Constant
+            {
+                let r e.obj.resolve_quantities(false, interp, e.loc)
+                return r <> null
+            }
+            when e: Variable
+            {
+                if e.is_top = false
+                    return true
+                return e.ident.get_value_raw() <> null
+            }
+            when e: If
+            {
+                if e.test.can_eval(maybe_call, interp) = false
+                    return false
+                if e.consequent.can_eval(maybe_call, interp) = false
+                    return false
+                ; a null alternate is the parser's constant #f (resolved).
+                if e.alternate <> null
+                {
+                    if e.alternate.can_eval(maybe_call, interp) = false
+                        return false
+                }
+                return true
+            }
+            when e: Or
+            {
+                if e.test1.can_eval(maybe_call, interp) = false
+                    return false
+                return e.test2.can_eval(maybe_call, interp)
+            }
+            when e: And
+            {
+                if e.test1.can_eval(maybe_call, interp) = false
+                    return false
+                return e.test2.can_eval(maybe_call, interp)
+            }
+            when e: Call
+            {
+                if e.op.can_eval(true, interp) = false
+                    return false
+                let n e.args.get_length() as int
+                var i 0
+                while i < n
+                {
+                    let a e.args[i]
+                    if a.can_eval(true, interp) = false
+                        return false
+                    i := i + 1
+                }
+                return true
+            }
+            when e: Sequence
+            {
+                let n e.seq.get_length() as int
+                var i 0
+                while i < n
+                {
+                    let se e.seq[i]
+                    if se.can_eval(maybe_call, interp) = false
+                        return false
+                    i := i + 1
+                }
+                return true
+            }
+            when e: Let
+            {
+                if e.body.can_eval(maybe_call, interp) = false
+                    return false
+                return Expression.can_eval_inits(e.inits, interp)
+            }
+            when e: LetStar
+            {
+                if e.body.can_eval(maybe_call, interp) = false
+                    return false
+                return Expression.can_eval_inits(e.inits, interp)
+            }
+            when e: Letrec
+            {
+                if e.body.can_eval(maybe_call, interp) = false
+                    return false
+                return Expression.can_eval_inits(e.inits, interp)
+            }
+            when e: CondFail
+                return true
+            when e: Case
+            {
+                if e.key.can_eval(maybe_call, interp) = false
+                    return false
+                if e.else_expr <> null
+                {
+                    if e.else_expr.can_eval(maybe_call, interp) = false
+                        return false
+                }
+                let n_cases e.results.get_length() as int
+                let n_datums e.datums.get_length() as int
+                var ci 0
+                while ci < n_cases
+                {
+                    let rp e.results.get(ci as size_t)
+                    if rp <> null
+                    {
+                        let re *rp
+                        if re.can_eval(maybe_call, interp) = false
+                            return false
+                    }
+                    ; the reference nResolved_ check: a case whose datums all
+                    ; resolved blocks eager evaluation.
+                    var lo 0
+                    let sp e.case_starts.get(ci as size_t)
+                    if sp <> null
+                        lo := *sp
+                    var hi n_datums
+                    if (ci + 1) < n_cases
+                    {
+                        let sp2 e.case_starts.get((ci + 1) as size_t)
+                        if sp2 <> null
+                            hi := *sp2
+                    }
+                    var all_resolved true
+                    var j lo
+                    while j < hi
+                    {
+                        let dp e.datums.get(j as size_t)
+                        var r: ref[ELObj]? null
+                        if dp <> null
+                        {
+                            ; ★bind the deref: an inline `(*dp).method()`
+                            ; receiver passes dp — the SLOT address — where the
+                            ; element value belongs (deref-receiver trap).
+                            let d *dp
+                            if d <> null
+                                r := d.resolve_quantities(false, interp, e.loc)
+                        }
+                        if r = null
+                            all_resolved := false
+                        j := j + 1
+                    }
+                    if all_resolved
+                        return false
+                    ci := ci + 1
+                }
+                return true
+            }
+            when e: Lambda
+            {
+                if maybe_call = false
+                    return true
+                if e.body.can_eval(true, interp) = false
+                    return false
+                return Expression.can_eval_inits(e.inits, interp)
+            }
+            when e: Quasiquote
+            {
+                let n e.members.get_length() as int
+                let b e.members.as_slice()
+                var i 0
+                while i < n
+                {
+                    let me b[i]
+                    if me.can_eval(maybe_call, interp) = false
+                        return false
+                    i := i + 1
+                }
+                return true
+            }
+            when e: Assignment
+                return e.value.can_eval(maybe_call, interp)
+            when e: WithMode
+                return e.content.can_eval(maybe_call, interp)
+            when e: Make
+                return Expression.can_eval_exprs(e.exprs, maybe_call, interp)
+            when e: StyleE
+                return Expression.can_eval_exprs(e.exprs, maybe_call, interp)
+            else
+                return false
+        false
+    }
+
+    ; Let/Letrec/Lambda init lists: every (non-null) init must canEval(1).
+    procedure can_eval_inits(mutable inits: ref[Array[ref[Expression]?]]?, mutable interp: ref[Interpreter]) returns bool
+    {
+        if inits = null
+            return true
+        let n inits.get_length() as int
+        var i 0
+        while i < n
+        {
+            let ie inits[i]
+            if ie <> null
+            {
+                if ie.can_eval(true, interp) = false
+                    return false
+            }
+            i := i + 1
+        }
+        true
+    }
+
+    procedure can_eval_exprs(mutable exprs: ref[Array[ref[Expression]?]]?, maybe_call: bool, mutable interp: ref[Interpreter]) returns bool
+    {
+        if exprs = null
+            return true
+        let n exprs.get_length() as int
+        var i 0
+        while i < n
+        {
+            let ee exprs[i]
+            if ee <> null
+            {
+                if ee.can_eval(maybe_call, interp) = false
+                    return false
+            }
+            i := i + 1
+        }
+        true
+    }
+
+    ; VariableExpression::optimize — fold a TOP-LEVEL reference to a defined
+    ; identifier whose value computes eagerly (canEval-gated inside
+    ; compute_value) into a resolved constant, stamping is_top either way.
+    ; The classification loops call this where the reference calls
+    ; expr->optimize before constantValue().
+    procedure fold_variable(mutable this: ref[Expression], mutable interp: ref[Interpreter], env: ref[Environment])
+    {
+        var ident: ref[Identifier]? null
+        var loc Location()
+        choose this
+            when e: Variable
+            {
+                ident := e.ident
+                loc := e.loc
+            }
+            else
+                return
+        if ident = null
+            return
+        var is_frame false
+        var index 0
+        var flags: u32 0
+        if env.lookup(ident, &is_frame, &index, &flags)
+            return
+        this := Expression.Variable(VariableExpr(ident, loc, true))
+        if ident.is_def() = false
+            return
+        let val ident.compute_value(false, interp)
+        if val = null
+            return
+        if interp.is_error(val)
+            return
+        this := Expression.ResolvedConstant(ResolvedConstantExpr(val, loc))
+    }
+
+    ; keyword(): the keyword identifier of a constant keyword (make/style).
+    function keyword(this: ref[Expression]) returns ref[Identifier]?
+    {
+        choose this
+            when e: Constant
+                return e.obj.keyword_ident()
+            else
+                return null
+        null
+    }
+
+    ; optimize(): the constant-folding pass — a no-op here (see header).
+    function optimize(this: ref[Expression], interp: ref[Interpreter], env: ref[Environment]) returns ref[Expression]
+        this
+
+    ; optimizeCompile: optimize then compile (Expression.cs).
+    procedure optimize_compile(mutable expr: ref[Expression]?, mutable interp: ref[Interpreter], mutable env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        if expr = null
+            return next
+        let e expr.optimize(interp, env)
+        e.compile(interp, env, stack_pos, next)
+    }
+
+    ; compilePushVars: push captured vars (frame/closure refs) for a closure's
+    ; display, recursively.
+    procedure compile_push_vars(mutable interp: ref[Interpreter], env: ref[Environment], stack_pos: int, vars: ref[BoundVarList]?, var_index: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        if var_index >= vars.count()
+            return next
+        let host interp.get_host()
+        var is_frame false
+        var index 0
+        var flags: u32 0
+        let found env.lookup((vars.at(var_index)).ident, &is_frame, &index, &flags)
+        let rest Expression.compile_push_vars(interp, env, stack_pos + 1, vars, var_index + 1, next)
+        if is_frame
+            return Insn.make_frame_ref(host, index, rest)
+        Insn.make_closure_ref(host, index, rest)
+    }
+
+    ; --- markBoundVars -----------------------------------------------------
+    procedure mark_bound_vars(this: ref[Expression], mutable vars: ref[BoundVarList]?, is_shared: bool)
+    {
+        choose this
+            when e: Variable
+            {
+                var f BV_USED
+                if is_shared
+                    f := f | BV_SHARED
+                vars.mark(e.ident, f)
+            }
+            when e: If
+            {
+                e.test.mark_bound_vars(vars, is_shared)
+                e.consequent.mark_bound_vars(vars, is_shared)
+                if e.alternate <> null
+                    e.alternate.mark_bound_vars(vars, is_shared)
+            }
+            when e: Or
+            {
+                e.test1.mark_bound_vars(vars, is_shared)
+                e.test2.mark_bound_vars(vars, is_shared)
+            }
+            when e: And
+            {
+                e.test1.mark_bound_vars(vars, is_shared)
+                e.test2.mark_bound_vars(vars, is_shared)
+            }
+            when e: Call
+            {
+                e.op.mark_bound_vars(vars, is_shared)
+                let n e.args.get_length() as int
+                var i 0
+                while i < n
+                {
+                    ; bind the element to a local — an inline
+                    ; e.args[i].method() receiver mis-emits (deref-receiver
+                    ; trap).
+                    let ce e.args[i]
+                    ce.mark_bound_vars(vars, is_shared)
+                    i := i + 1
+                }
+            }
+            when e: Sequence
+            {
+                let n e.seq.get_length() as int
+                let b e.seq.as_slice()
+                var i 0
+                while i < n
+                {
+                    let se b[i]
+                    se.mark_bound_vars(vars, is_shared)
+                    i := i + 1
+                }
+            }
+            when e: Let
+            {
+                Expression.mark_list(e.inits, vars, is_shared)
+                vars.rebind(e.vars as ref[Array[Option[ref[Identifier]]]])
+                e.body.mark_bound_vars(vars, is_shared)
+                vars.unbind(e.vars as ref[Array[Option[ref[Identifier]]]])
+            }
+            when e: LetStar
+            {
+                Expression.mark_list(e.inits, vars, is_shared)
+                vars.rebind(e.vars as ref[Array[Option[ref[Identifier]]]])
+                e.body.mark_bound_vars(vars, is_shared)
+                vars.unbind(e.vars as ref[Array[Option[ref[Identifier]]]])
+            }
+            when e: Letrec
+            {
+                vars.rebind(e.vars as ref[Array[Option[ref[Identifier]]]])
+                Expression.mark_list(e.inits, vars, is_shared)
+                e.body.mark_bound_vars(vars, is_shared)
+                vars.unbind(e.vars as ref[Array[Option[ref[Identifier]]]])
+            }
+            when e: Case
+            {
+                e.key.mark_bound_vars(vars, is_shared)
+                Expression.mark_list(e.results, vars, is_shared)
+                if e.else_expr <> null
+                    e.else_expr.mark_bound_vars(vars, is_shared)
+            }
+            when e: Quasiquote
+                Expression.mark_list(e.members, vars, is_shared)
+            when e: Assignment
+            {
+                var f BV_USED | BV_ASSIGNED
+                if is_shared
+                    f := f | BV_SHARED
+                vars.mark(e.var_ident, f)
+                e.value.mark_bound_vars(vars, is_shared)
+            }
+            when e: Lambda
+            {
+                ; optional/key inits (rebound over their preceding formals)
+                let sig e.sig
+                let n_init sig.n_optional + sig.n_key
+                let ib e.inits.as_slice()
+                var i 0
+                while i < n_init
+                {
+                    let init_e ib[i]
+                    if init_e <> null
+                    {
+                        let sub Expression.ident_prefix(e.formals, interp_host_of(vars), sig.n_required + i)
+                        vars.rebind(sub)
+                        init_e.mark_bound_vars(vars, true)
+                        vars.unbind(sub)
+                    }
+                    i := i + 1
+                }
+                vars.rebind(e.formals)
+                e.body.mark_bound_vars(vars, true)
+                vars.unbind(e.formals)
+            }
+            when e: Make
+                ; characteristic values AND content — a missing arm made
+                ; outer-binding uses inside `(make …)` invisible, so the
+                ; enclosing let/lambda pruned them as unused (sf map.dsl:
+                ; closures over let* bindings in make content came up
+                ; "reference to undefined variable" or silently empty).
+                Expression.mark_list(e.exprs as ref[Array[Option[ref[Expression]]]], vars, is_shared)
+            when e: StyleE
+                Expression.mark_list(e.exprs as ref[Array[Option[ref[Expression]]]], vars, is_shared)
+            when e: WithMode
+                e.content.mark_bound_vars(vars, is_shared)
+            else
+            {
+            }
+    }
+
+    procedure mark_list(list: ref[Array[ref[Expression]?]], mutable vars: ref[BoundVarList]?, is_shared: bool)
+    {
+        let n list.get_length() as int
+        var i 0
+        while i < n
+        {
+            let e list[i]
+            if e <> null
+                e.mark_bound_vars(vars, is_shared)
+            i := i + 1
+        }
+    }
+
+    ; a fresh Array of the first n idents (Lambda.markBoundVars sub-lists).
+    function ident_prefix(idents: ref[Array[ref[Identifier]?]], host: ref[Page], n: int) returns ref[Array[ref[Identifier]?]]
+    {
+        let a Array[ref[Identifier]?]^host()
+        var i 0
+        while i < n
+        {
+            a.add(idents[i])
+            i := i + 1
+        }
+        a
+    }
+
+    ; --- compile -----------------------------------------------------------
+    procedure compile(mutable this: ref[Expression], mutable interp: ref[Interpreter], mutable env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host interp.get_host()
+        choose this
+            when e: Constant
+                return Insn.make_constant(host, e.obj, Insn.make_resolve_quantities(host, e.loc, next))
+            when e: ResolvedConstant
+                return Insn.make_constant(host, e.obj, next)
+            when e: Variable
+                return this.compile_variable(e.ident as ref[Identifier], e.loc, interp, env, stack_pos, next)
+            when e: If
+            {
+                ; IfExpression::optimize — a constant test compiles ONLY the
+                ; taken branch; the dead branch is never classified (a
+                ; #f-guarded make with an invalid constant NIC stays silent).
+                e.test.fold_variable(interp, env)
+                let tv e.test.constant_datum()
+                if tv <> null
+                {
+                    if tv.is_false()
+                    {
+                        if e.alternate <> null
+                            return Expression.optimize_compile(e.alternate, interp, env, stack_pos, next)
+                        return Insn.make_constant(host, interp.make_false(), next)
+                    }
+                    return Expression.optimize_compile(e.consequent, interp, env, stack_pos, next)
+                }
+                if e.alternate <> null
+                    return e.test.compile(interp, env, stack_pos,
+                        Insn.make_test(host, Expression.optimize_compile(e.consequent, interp, env, stack_pos, next),
+                            e.alternate.compile(interp, env, stack_pos, next)))
+                return e.test.compile(interp, env, stack_pos,
+                    Insn.make_and(host, Expression.optimize_compile(e.consequent, interp, env, stack_pos, next), next))
+            }
+            when e: Or
+                return e.test1.compile(interp, env, stack_pos,
+                    Insn.make_or(host, Expression.optimize_compile(e.test2, interp, env, stack_pos, next), next))
+            when e: And
+                return e.test1.compile(interp, env, stack_pos,
+                    Insn.make_and(host, Expression.optimize_compile(e.test2, interp, env, stack_pos, next), next))
+            when e: Call
+                return this.compile_call(interp, env, stack_pos, next)
+            when e: Sequence
+            {
+                let n e.seq.get_length() as int
+                let b e.seq.as_slice()
+                let last b[(n - 1)]
+                var result last.compile(interp, env, stack_pos, next)
+                var i n - 2
+                while i >= 0
+                {
+                    let se b[i]
+                    result := se.compile(interp, env, stack_pos, Insn.make_pop(host, result))
+                    i := i - 1
+                }
+                return result
+            }
+            when e: Let
+                return this.compile_let(e.vars as ref[Array[Option[ref[Identifier]]]], e.inits, e.body, interp, env, stack_pos, next)
+            when e: LetStar
+                return this.compile_let_star(e.vars as ref[Array[Option[ref[Identifier]]]], e.inits, e.body, interp, env, stack_pos, next)
+            when e: Letrec
+                return this.compile_letrec(e.vars as ref[Array[Option[ref[Identifier]]]], e.inits, e.body, interp, env, stack_pos, next)
+            when e: CondFail
+                return Insn.make_cond_fail(host, e.loc)
+            when e: Case
+                return this.compile_case(interp, env, stack_pos, next)
+            when e: Quasiquote
+                return this.compile_quasiquote(interp, env, stack_pos, next)
+            when e: Assignment
+                return this.compile_assignment(e.var_ident, e.value, e.loc, interp, env, stack_pos, next)
+            when e: Lambda
+                return this.compile_lambda(interp, env, stack_pos, next)
+            when e: Make
+                return this.compile_make(e.foc_ident, e.keys, e.exprs as ref[Array[Option[ref[Expression]]]], e.loc, interp, env, stack_pos, next)
+            when e: StyleE
+                return this.compile_style(e.keys, e.exprs as ref[Array[Option[ref[Expression]]]], e.loc, interp, env, stack_pos, next)
+            when e: WithMode
+            {
+                ; WithModeExpression::compile — an undefined mode messages
+                ; (undefinedMode via the Interpreter seam, which owns the
+                ; ProcessingMode type) but still compiles the bracket.
+                let host2 interp.get_host()
+                interp.check_mode_defined(e.mode, e.loc)
+                return Insn.make_push_mode(host2, e.mode,
+                    Expression.optimize_compile(e.content, interp, env, stack_pos,
+                        Insn.make_pop_mode(host2, next)))
+            }
+            else
+                return next
+        next
+    }
+
+    ; MakeExpression::compile, collapsed for extension flow objects (the whole
+    ; transform surface): no inherited characteristics, no style stack, no
+    ; content-map / label — those are the print path (Inc 9). Push each
+    ; characteristic value then each content sosofo on the stack, then a
+    ; MakeFlowObjInsn folds them into a SOSO_FLOWOBJ. exprs[0..nKey-1] are the
+    ; characteristic values (parallel to keys); exprs[nKey..] the content.
+    procedure compile_make(this: ref[Expression], foc_ident: ref[Identifier], keys: ref[Array[ref[Identifier]?]]?, mutable exprs: ref[Array[ref[Expression]?]], loc: Location, mutable interp: ref[Interpreter], mutable env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host interp.get_host()
+        ; MakeExpression::compile resolves the class NOW (post-parse):
+        ; declare-flow-object-class bound the identifier's VALUE to a
+        ; FlowObjBox. Unknown = unknownFlowObjectClass + sequence fallback.
+        var foc FOC_SEQUENCE
+        var fo: ref[FlowObj]? null
+        let fv foc_ident.get_value_raw()
+        if fv <> null
+            fo := fv.flowobj_box_ref()
+        let class_known fo <> null
+        if fo <> null
+            foc := fo.get_foc()
+        else
+        {
+            interp.set_next_location(loc)
+            interp.message1(InterpreterMessages.unknownFlowObjectClass(), foc_ident.get_name())
+        }
+        var n_key 0
+        if keys <> null
+            n_key := keys.get_length() as int
+        let total exprs.get_length() as int
+        var n_content total - n_key
+        ; the atomic flow object classes (no asCompoundFlowObj in the
+        ; reference): content is rejected with atomicContent — messaged AFTER
+        ; the constant NIC conversions (reference order: applyConstNonInherited-
+        ; Cs, then the check). An unknown class fell back to sequence above
+        ; (compound).
+        var is_atomic FlowObj.is_atomic_class(foc)
+        ; a flow-object MACRO is compound exactly when it declared
+        ; `#!contents` (MacroFlowObj::asCompoundFlowObj); its definition also
+        ; owns the characteristic names the keyword split below asks about.
+        var macro_def: ref[MacroDef]? null
+        if foc = FOC_MACRO
+        {
+            macro_def := fo.get_macro_def()
+            if macro_def <> null
+                is_atomic := macro_def.is_compound() = false
+        }
+        ; content-map: — the LAST occurrence wins (the reference loop
+        ; overwrites contentMapExpr); -1 = none.
+        var cm_index 0 - 1
+        ; the styled classes (StyleExpression::compile split): classify each
+        ; keyword as NIC / IC / use: / ignored. IC keys are fully handled at
+        ; compile: a constant value converts to a constant spec, anything else
+        ; compiles to a VarInheritedC (its code evaluated at style-push against
+        ; the captured display vars — the reference laziness inherited-*/
+        ; actual-* require). The SGML-transformation classes are styled too:
+        ; the reference runs StyleExpression::compile for EVERY make, and an
+        ; ExtensionFlowObj claims only the handful of names its hasNIC lists
+        ; (Convert.is_transform_nic_name) — every other keyword on `(make
+        ; element …)` is an ordinary inherited characteristic. FOC_UNKNOWN
+        ; swallows every keyword (UnknownFlowObj::hasNonInheritedC).
+        var key_class: ref[Array[int]]? null
+        var key_slot: ref[Array[int]]? null
+        var force_specs: ref[Array[ref[InheritedC]?]]? null
+        var specs: ref[Array[ref[InheritedC]?]]? null
+        var bound_vars: ref[BoundVarList]? null
+        var n_slots 0
+        var styled false
+        if foc = FOC_SEQUENCE
+            styled := true
+        if (foc >= FOC_PARAGRAPH) and (foc <= FOC_COLUMN_SET_SEQUENCE)
+            styled := true
+        ; a macro make is styled too — the reference runs
+        ; StyleExpression::compile for EVERY make, and a macro's own
+        ; characteristics are the only keywords it takes off the style path.
+        if foc = FOC_MACRO
+            styled := true
+        if Convert.is_transform_foc(foc)
+            styled := true
+        var nic_proto: NICRef null
+        ; the macro prototype an applyConstNonInheritedCs copy writes into
+        ; (null until the first constant characteristic); it travels to the
+        ; make insn in the nic slot, where every make copies it.
+        var macro_proto: ref[FlowObj]? null
+        var dnic_proto: ref[DisplayNIC]? null
+        var hf_proto: ref[Array[ref[ELObj]?]]? null
+        ; the header/footer part index per key (>= 0 only for the spseq sosofo
+        ; NICs) — the SetNic insns carry it into the lazy chain.
+        var nic_part: ref[Array[int]]? null
+        ; the lazy NIC chain (SetNonInheritedCsSosofo code) and the post-make
+        ; construction chain (cell pseudo NICs prepended onto `next`).
+        var nic_code: ref[Insn]? null
+        var post_make: ref[Insn]? next
+        if styled and (n_key > 0)
+        {
+            key_class := Array[int]^host()
+            key_slot := Array[int]^host()
+            nic_part := Array[int]^host()
+            let ic_proto Array[ref[InheritedC]?]^host()
+            let ic_force Array[int]()
+            var display_foc false
+            if foc = FOC_PARAGRAPH
+                display_foc := true
+            if foc = FOC_PARAGRAPH_BREAK
+                display_foc := true
+            if foc = FOC_DISPLAY_GROUP
+                display_foc := true
+            if foc = FOC_TABLE
+                display_foc := true
+            if foc = FOC_TABLE_PART
+                display_foc := true
+            if foc = FOC_RULE
+                display_foc := true
+            if foc = FOC_EXTERNAL_GRAPHIC
+                display_foc := true
+            if foc = FOC_BOX
+                display_foc := true
+            ; the LAYOUT-COMPOSITE classes with a display NIC: `side-by-side`
+            ; and `aligned-column` carry a bare DisplayNIC, `included-container-
+            ; area`'s NIC derives from it (its own ten keys ride the fo-NIC
+            ; record above).
+            if foc = FOC_SIDE_BY_SIDE
+                display_foc := true
+            if foc = FOC_ALIGNED_COLUMN
+                display_foc := true
+            if foc = FOC_INCLUDED_CONTAINER_AREA
+                display_foc := true
+            ; `column-set-sequence` — a bare DisplayNIC and nothing else
+            ; (ColumnSetSequenceFlowObj::hasNonInheritedC IS isDisplayNIC).
+            ; `page-sequence` is deliberately NOT here: it has no
+            ; hasNonInheritedC at all, so a display keyword on it is unknown.
+            if foc = FOC_COLUMN_SET_SEQUENCE
+                display_foc := true
+            var has_use false
+            var i 0
+            while i < n_key
+            {
+                var cls KEY_DROP
+                var part 0 - 1
+                var proto: ref[InheritedC]? null
+                var is_force 0
+                let kp keys.get(i as size_t)
+                if kp <> null
+                {
+                    let ident *kp
+                    let sk ident.syntactic_key()
+                    let ei exprs[i]
+                    ; the reference optimizes every characteristic value
+                    ; before probing constantValue (applyConstNonInheritedCs /
+                    ; StyleExpression::compile) — fold top-level defines here.
+                    ei.fold_variable(interp, env)
+                    var handled false
+                    ; a macro's own characteristics come FIRST — the
+                    ; reference asks hasNonInheritedC before it looks at
+                    ; label:/content-map: or at the inherited characteristics,
+                    ; so a macro may declare a characteristic named `label`
+                    ; or `font-size` and shadow both. A CONSTANT value is
+                    ; stored in the compile-time prototype
+                    ; (applyConstNonInheritedCs); anything else joins the lazy
+                    ; chain, whose SetNic insn writes the slot per make.
+                    if macro_def <> null
+                    {
+                        if macro_def.nic_index(ident) >= 0
+                        {
+                            let cv0 ei.constant_datum()
+                            if cv0 <> null
+                            {
+                                if macro_proto = null
+                                    macro_proto := fo.macro_copy(host)
+                                macro_proto.set_charic(ident, cv0)
+                                cls := KEY_TABLE_CONST
+                            }
+                            else
+                                cls := KEY_NIC
+                            handled := true
+                        }
+                    }
+                    ; the SGML-transformation classes claim their own names the
+                    ; same way (hasNIC by string, TransformFOTBuilder.cxx).
+                    ; Unlike a macro they need no compile-time prototype: every
+                    ; value, constant or not, joins the lazy chain, whose
+                    ; SetNic insn writes the slot per make — the reference
+                    ; converts these in setNIC at construction as well.
+                    if handled = false
+                    {
+                        if Convert.is_transform_nic_name(foc, ident.get_name())
+                        {
+                            cls := KEY_NIC
+                            handled := true
+                        }
+                    }
+                    var disp_key Convert.is_display_nic_key(sk)
+                    ; TablePartFlowObj::hasNonInheritedC excludes
+                    ; position-preference (it falls through to the unknown-
+                    ; keyword message).
+                    if (foc = FOC_TABLE_PART) and (sk = SK_POSITION_PREFERENCE)
+                        disp_key := false
+                    var coalesce_key false
+                    if (foc = FOC_DISPLAY_GROUP) and (sk = SK_COALESCE_ID)
+                        coalesce_key := true
+                    if (display_foc and disp_key) or coalesce_key
+                    {
+                        ; applyConstNonInheritedCs: a CONSTANT display NIC
+                        ; converts right here into the insn's DisplayNIC
+                        ; prototype (message once, anchored at the value);
+                        ; non-constants join the lazy nic_code chain.
+                        let cv ei.constant_datum()
+                        if cv <> null
+                        {
+                            var cvr cv
+                            let res cv.resolve_quantities(true, interp, ei.location())
+                            if res <> null
+                                cvr := res
+                            if dnic_proto = null
+                                dnic_proto := DisplayNIC.make(host)
+                            if coalesce_key
+                            {
+                                var s StringC()
+                                if Convert.convert_string(host, cvr as ref[ELObj], &s)
+                                {
+                                    dnic_proto.has_coalesce_id := true
+                                    dnic_proto.coalesce_id := s
+                                }
+                                else
+                                    Convert.invalid_value(interp, ident, ei.location())
+                            }
+                            else
+                                Convert.set_display_nic(dnic_proto as ref[DisplayNIC], sk, cvr as ref[ELObj], ident, ei.location(), interp, host)
+                            cls := KEY_TABLE_CONST
+                        }
+                        else
+                            cls := KEY_NIC
+                        handled := true
+                    }
+                    if handled = false
+                    {
+                        ; the table-family NICs: constants convert into the
+                        ; prototype record; the table-cell PSEUDO NICs
+                        ; (column-number / spans / starts-row? / ends-row? —
+                        ; the cell's pushStyle reads them) evaluate at
+                        ; CONSTRUCTION on the main chain; everything else
+                        ; joins the lazy chain.
+                        if Convert.is_table_nic_key(foc, sk)
+                        {
+                            let cv ei.constant_datum()
+                            if cv <> null
+                            {
+                                var cvr cv
+                                let res cv.resolve_quantities(true, interp, ei.location())
+                                if res <> null
+                                    cvr := res
+                                nic_proto := Convert.apply_table_nic(foc, nic_proto, sk, cvr, ident, ei.location(), interp, host)
+                                cls := KEY_TABLE_CONST
+                            }
+                            else
+                            {
+                                cls := KEY_NIC
+                                if foc = FOC_TABLE_CELL
+                                {
+                                    if sk <> SK_N_ROWS_SPANNED
+                                        cls := KEY_PSEUDO_NIC
+                                }
+                            }
+                            handled := true
+                        }
+                    }
+                    if handled = false
+                    {
+                        ; the rule extras (orientation/length/priorities):
+                        ; constants convert into the RuleNIC prototype,
+                        ; non-constants join the lazy chain.
+                        if Convert.is_rule_nic_key(foc, sk)
+                        {
+                            let cv ei.constant_datum()
+                            if cv <> null
+                            {
+                                var cvr cv
+                                let res cv.resolve_quantities(true, interp, ei.location())
+                                if res <> null
+                                    cvr := res
+                                nic_proto := Convert.apply_rule_nic(nic_proto, sk, cvr, ident, ei.location(), interp, host)
+                                cls := KEY_TABLE_CONST
+                            }
+                            else
+                                cls := KEY_NIC
+                            handled := true
+                        }
+                    }
+                    if handled = false
+                    {
+                        ; the link/external-graphic/leader/box/score NICs:
+                        ; constants convert into the class's prototype
+                        ; record, non-constants join the lazy chain.
+                        if Convert.is_fo_nic_ident(foc, sk, ident)
+                        {
+                            let cv ei.constant_datum()
+                            if cv <> null
+                            {
+                                var cvr cv
+                                let res cv.resolve_quantities(true, interp, ei.location())
+                                if res <> null
+                                    cvr := res
+                                nic_proto := Convert.apply_fo_nic(foc, nic_proto, sk, cvr as ref[ELObj], ident, ei.location(), interp, host)
+                                cls := KEY_TABLE_CONST
+                            }
+                            else
+                                cls := KEY_NIC
+                            handled := true
+                        }
+                    }
+                    if handled = false
+                    {
+                        ; simple-page-sequence's sosofo NICs (SimplePageSequence-
+                        ; FlowObj::hasNonInheritedC — the six header/footer
+                        ; parts). Constants convert at compile like every NIC.
+                        if foc = FOC_SIMPLE_PAGE_SEQUENCE
+                        {
+                            let hf_part Expression.hf_part_index(sk)
+                            if hf_part >= 0
+                            {
+                                let cv ei.constant_datum()
+                                if cv <> null
+                                {
+                                    if cv.is_sosofo_p()
+                                    {
+                                        if hf_proto = null
+                                        {
+                                            hf_proto := Array[ref[ELObj]?]^host()
+                                            var hz 0
+                                            while hz < 6
+                                            {
+                                                hf_proto.add(null)
+                                                hz := hz + 1
+                                            }
+                                        }
+                                        hf_proto.put(hf_part as size_t, cv)
+                                    }
+                                    else
+                                        Convert.invalid_value(interp, ident, ei.location())
+                                    cls := KEY_TABLE_CONST
+                                }
+                                else
+                                {
+                                    cls := KEY_NIC
+                                    part := hf_part
+                                }
+                                handled := true
+                            }
+                        }
+                    }
+                    if handled = false
+                    {
+                        if sk = SK_KEY_USE
+                        {
+                            ; only the FIRST use: counts; later ones are
+                            ; dropped uncompiled (reference falls through its
+                            ; branch without touching the expr).
+                            if has_use = false
+                            {
+                                cls := KEY_USE
+                                has_use := true
+                            }
+                            handled := true
+                        }
+                    }
+                    if handled = false
+                    {
+                        ; force!<name>: the force-spec variant of an inherited
+                        ; characteristic (StyleExpression::compile).
+                        let base_ident Expression.force_key_target(ident as ref[Identifier], interp)
+                        if base_ident <> null
+                        {
+                            cls := KEY_IC_CONST
+                            proto := base_ident.get_inherited_c() as ref[InheritedC]
+                            is_force := 1
+                            handled := true
+                        }
+                    }
+                    if handled = false
+                    {
+                        let icraw ident.get_inherited_c()
+                        if icraw <> null
+                        {
+                            cls := KEY_IC_CONST
+                            proto := icraw as ref[InheritedC]
+                            handled := true
+                        }
+                    }
+                    if handled = false
+                    {
+                        ; label: — the value expr compiles onto the post-make
+                        ; chain (LabelSosofoInsn wraps the finished flow
+                        ; object); content-map: — the value evaluates after
+                        ; the content, the make insn wraps (see below).
+                        ; Anything else stays KEY_DROP: messaged in the
+                        ; spec-build loop below (key order — the reference
+                        ; interleaves unknownStyleKeyword with the constant
+                        ; conversions) and never compiled.
+                        if sk = SK_KEY_LABEL
+                        {
+                            cls := KEY_LABEL
+                            handled := true
+                        }
+                        if handled = false
+                        {
+                            if sk = SK_KEY_CONTENT_MAP
+                            {
+                                cls := KEY_CONTENT_MAP
+                                cm_index := i
+                            }
+                        }
+                    }
+                }
+                key_class.add(cls)
+                nic_part.add(part)
+                ic_proto.add(proto)
+                ic_force.add(is_force)
+                if Insn.key_has_slot(cls)
+                {
+                    key_slot.add(n_slots)
+                    n_slots := n_slots + 1
+                }
+                else
+                    key_slot.add(0 - 1)
+                i := i + 1
+            }
+            ; atomicContent — between the constant NIC conversions above and
+            ; the IC/unknown-keyword messages below, like the reference.
+            if is_atomic and (n_content > 0)
+            {
+                interp.set_next_location(loc)
+                interp.message1(InterpreterMessages.atomicContent(), foc_ident.get_name())
+                n_content := 0
+            }
+            ; label: — each occurrence wraps the finished flow object
+            ; (LabelSosofoInsn), prepended onto the post-make chain in key
+            ; order like the reference (so the label evals run AFTER the
+            ; pseudo NICs, first key wrapping outermost).
+            var li 0
+            while li < n_key
+            {
+                let lcp key_class.get(li as size_t)
+                if lcp <> null
+                {
+                    if *lcp = KEY_LABEL
+                    {
+                        let lei exprs[li]
+                        let lwrap Insn.make_label_sosofo_insn(host, lei.location(), post_make)
+                        post_make := Expression.optimize_compile(lei, interp, env, stack_pos + 1, lwrap)
+                    }
+                }
+                li := li + 1
+            }
+            ; the bound-vars capture env for the lazy IC codes AND the lazy
+            ; NIC value codes (reference: env.boundVars + markBoundVars over
+            ; the participating exprs + removeUnused; the reference keeps two
+            ; separate captures — one merged display serves both here, the
+            ; codes compile against the same env).
+            bound_vars := BoundVarList.make(host)
+            env.bound_vars(bound_vars as ref[BoundVarList])
+            i := 0
+            while i < n_key
+            {
+                var participates false
+                let pp ic_proto.get(i as size_t)
+                if pp <> null
+                {
+                    if *pp <> null
+                        participates := true
+                }
+                let ccp key_class.get(i as size_t)
+                if ccp <> null
+                {
+                    if *ccp = KEY_NIC
+                        participates := true
+                }
+                if participates
+                {
+                    let ei exprs[i]
+                    ei.mark_bound_vars(bound_vars, false)
+                }
+                i := i + 1
+            }
+            bound_vars.remove_unused()
+            let no_vars BoundVarList.make(host)
+            let new_env Environment.make_with(host, no_vars, bound_vars)
+            ; build the spec arrays (key order; force specs separately);
+            ; unknown keys message HERE so diagnostics interleave with the
+            ; constant conversions in key order like the reference.
+            i := 0
+            while i < n_key
+            {
+                var proto2: ref[InheritedC]? null
+                let pp2 ic_proto.get(i as size_t)
+                if pp2 <> null
+                    proto2 := *pp2
+                if proto2 = null
+                {
+                    var cls2 KEY_IGNORE
+                    let cp2 key_class.get(i as size_t)
+                    if cp2 <> null
+                        cls2 := *cp2
+                    if cls2 = KEY_DROP
+                    {
+                        ; ★an UNKNOWN flow object class reports no unknown
+                        ; keyword at all: MakeExpression::unknownStyleKeyword
+                        ; re-reads foc_->flowObj() and returns at once when it
+                        ; is null (the SequenceFlowObj it fell back on is a
+                        ; local, never bound to the name). Only its IC keys
+                        ; still convert, since those hang off the KEYWORD.
+                        ; This port used to message for every non-IC keyword
+                        ; of an undeclared class.
+                        if class_known
+                        {
+                            let kp2 keys.get(i as size_t)
+                            if kp2 <> null
+                                this.unknown_make_keyword(*kp2, foc_ident, interp, loc)
+                        }
+                    }
+                }
+                if proto2 <> null
+                {
+                    let ei exprs[i]
+                    var entry: ref[InheritedC]? null
+                    let cv ei.constant_datum()
+                    if cv <> null
+                        entry := Convert.ic_from_value(host, proto2, cv, ei.location(), interp)
+                    else
+                    {
+                        let code Expression.optimize_compile(ei, interp, new_env, 0, null)
+                        entry := InheritedC.make_var(host, proto2, code, ei.location())
+                    }
+                    if entry <> null
+                    {
+                        var is_force2 0
+                        let fp ic_force.get(i as size_t)
+                        if fp <> null
+                            is_force2 := *fp
+                        if is_force2 <> 0
+                        {
+                            if force_specs = null
+                                force_specs := Array[ref[InheritedC]?]^host()
+                            force_specs.add(entry)
+                        }
+                        else
+                        {
+                            if specs = null
+                                specs := Array[ref[InheritedC]?]^host()
+                            specs.add(entry)
+                        }
+                    }
+                }
+                i := i + 1
+            }
+            ; the lazy NIC chain (compileNonInheritedCs): each non-constant
+            ; NIC value compiles against the capture env, prepending onto the
+            ; chain — forward loop = REVERSE execution order (faithful; the
+            ; resolve aborts at the first error value). The seed flow object
+            ; sits at stack 0, each value at 1.
+            i := 0
+            while i < n_key
+            {
+                let ccp2 key_class.get(i as size_t)
+                if ccp2 <> null
+                {
+                    if *ccp2 = KEY_NIC
+                    {
+                        let kp3 keys.get(i as size_t)
+                        if kp3 <> null
+                        {
+                            let ei exprs[i]
+                            var part2 0 - 1
+                            let ptp nic_part.get(i as size_t)
+                            if ptp <> null
+                                part2 := *ptp
+                            let sni Insn.make_set_nic(host, *kp3, part2, true, ei.location(), nic_code)
+                            nic_code := Expression.optimize_compile(ei, interp, new_env, 1, sni)
+                        }
+                    }
+                }
+                i := i + 1
+            }
+            ; the cell pseudo NICs (SetPseudoNonInheritedCInsn): evaluated at
+            ; CONSTRUCTION right after the make insn (outer env), reverse key
+            ; order like the reference prepend loop.
+            i := 0
+            while i < n_key
+            {
+                let ccp3 key_class.get(i as size_t)
+                if ccp3 <> null
+                {
+                    if *ccp3 = KEY_PSEUDO_NIC
+                    {
+                        let kp4 keys.get(i as size_t)
+                        if kp4 <> null
+                        {
+                            let ei exprs[i]
+                            let pni Insn.make_set_nic(host, *kp4, 0 - 1, false, ei.location(), post_make)
+                            post_make := Expression.optimize_compile(ei, interp, env, stack_pos + 1, pni)
+                        }
+                    }
+                }
+                i := i + 1
+            }
+        }
+        ; the collapsed / keyless paths never entered the block above — the
+        ; atomicContent check still applies (no other messages to order
+        ; against).
+        if (styled = false) or (n_key = 0)
+        {
+            if is_atomic and (n_content > 0)
+            {
+                interp.set_next_location(loc)
+                interp.message1(InterpreterMessages.atomicContent(), foc_ident.get_name())
+                n_content := 0
+            }
+        }
+        var n_bound 0
+        if bound_vars <> null
+            n_bound := bound_vars.count()
+        ; content-map on an atomic class has no content to wrap (the reference
+        ; shape there is degenerate) — drop it.
+        if is_atomic
+            cm_index := 0 - 1
+        var has_cm false
+        var n_cm 0
+        var cm_loc loc
+        if cm_index >= 0
+        {
+            has_cm := true
+            n_cm := 1
+            let cme exprs[cm_index]
+            cm_loc := cme.location()
+        }
+        ; the macro prototype IS this class's characteristic record (upstream
+        ; keeps the prototype FlowObj). With no constant characteristic at all
+        ; the declaration's own seed serves as the prototype.
+        if foc = FOC_MACRO and macro_proto = null
+            macro_proto := fo
+        var result: ref[Insn]? Insn.make_flow_obj(host, foc, keys, key_class, nic_code, nic_proto, macro_proto, dnic_proto, hf_proto, force_specs, specs, n_bound, n_content, has_cm, cm_loc, loc, post_make)
+        if n_bound > 0
+            result := Expression.compile_push_vars(interp, env, stack_pos + n_slots + n_content + n_cm, bound_vars, 0, result)
+        ; the content-map value evaluates right after the content sosofos
+        ; (reference: between the append and SetContent), above them on the
+        ; stack.
+        if has_cm
+        {
+            let cme2 exprs[cm_index]
+            result := Expression.optimize_compile(cme2, interp, env, stack_pos + n_slots + n_content, result)
+        }
+        if key_class = null
+        {
+            ; collapsed path: every key expr has a slot.
+            n_slots := n_key
+        }
+        ; content exprs — (n_key + n_content) excludes content dropped by the
+        ; atomicContent check (the reference never compiles it).
+        var i (n_key + n_content) - 1
+        while i >= n_key
+        {
+            let ei exprs[i]
+            ; ★every content expression is guarded by a CheckSosofoInsn in the
+            ; reference (both the single-content shape and the append shape) —
+            ; a non-sosofo there is `this context requires a sosofo` at the
+            ; VALUE's location and unwinds the whole rule, which then falls
+            ; back to process-children. This port used to build the flow
+            ; object with the stray value silently dropped.
+            let cwrap Insn.make_check_sosofo(host, ei.location(), result)
+            result := Expression.optimize_compile(ei, interp, env, stack_pos + n_slots + (i - n_key), cwrap)
+            i := i - 1
+        }
+        while i >= 0
+        {
+            var slot i
+            if key_slot <> null
+            {
+                slot := 0 - 1
+                let sp key_slot.get(i as size_t)
+                if sp <> null
+                    slot := *sp
+            }
+            if slot >= 0
+            {
+                let ei exprs[i]
+                result := Expression.optimize_compile(ei, interp, env, stack_pos + slot, result)
+            }
+            i := i - 1
+        }
+        result
+    }
+
+    ; MacroFlowObj::Definition::compile — the body of a flow-object macro,
+    ; compiled LAZILY on its first process (the whole part must be read first;
+    ; the reference calls this from Definition::process when code_ is null).
+    ;
+    ; The frame is: one slot per declared characteristic, then the
+    ; `#!contents` variable. UnpackMacroFlowObjInsn fills it from the flow
+    ; object; a slot left NULL (the characteristic was not given in the make)
+    ; is filled by its declared default — or by #f when it has none. Only the
+    ; frame is in scope: a macro is a top-level declaration, so there are no
+    ; closure variables.
+    procedure compile_macro(mutable def: ref[MacroDef], mutable interp: ref[Interpreter]) returns ref[Insn]
+    {
+        ; ★the compiled body is CACHED on the definition and read by every
+        ; later make, so it must be built on the run arena — never on the
+        ; per-node eval scratch region this compile is running under (the
+        ; first make happens inside a construction rule's eval bracket).
+        ; Same rule as Identifier.compute_value's cached insn: with the
+        ; scratch region left in place the chain dangles as soon as the node
+        ; is done, and the SECOND make of the macro silently does nothing.
+        let saved_region interp.get_eval_region()
+        interp.set_eval_region(null)
+        let code Expression.compile_macro_on_arena(def, interp)
+        interp.set_eval_region(saved_region)
+        code as ref[Insn]
+    }
+
+    procedure compile_macro_on_arena(mutable def: ref[MacroDef], mutable interp: ref[Interpreter]) returns ref[Insn]?
+    {
+        let host interp.get_host()
+        let body def.get_body()
+        if body = null
+            return null
+        let nics def.get_nics()
+        let inits def.get_inits()
+        let contents_id def.get_contents_id()
+        let n def.n_nics()
+        var n_push n
+        if def.is_compound()
+            n_push := n_push + 1
+
+        var result: ref[Insn]? Insn.make_check_sosofo(host, body.location(), null)
+        result := Insn.make_pop_bindings(host, n_push, result)
+
+        let frame_vars BoundVarList.make(host)
+        var i 0
+        while i < n
+        {
+            ; the reference marks an init's variable uses in the frame built
+            ; SO FAR — i.e. a default may read the characteristics declared
+            ; before it (and index 0 is skipped, the list being empty).
+            if i > 0
+            {
+                let ip inits.get(i as size_t)
+                if ip <> null
+                {
+                    ; ★bind the deref: `(*ip).mark_bound_vars(…)` hands the
+                    ; method the SLOT address instead of the element — the
+                    ; deref-receiver trap, and here it walked the inits buffer
+                    ; as if it were an Expression (measured 2026-08-01: a
+                    ; SIGSEGV in the second macro of tests/dazzle/engine
+                    ; macro1, latent until an unrelated allocation shifted the
+                    ; arena under it).
+                    let ie *ip
+                    if ie <> null
+                        ie.mark_bound_vars(frame_vars, false)
+                }
+            }
+            let np nics.get(i as size_t)
+            if np <> null
+                frame_vars.append(*np, 0)
+            i := i + 1
+        }
+        if contents_id <> null
+            frame_vars.append(contents_id, 0)
+        body.mark_bound_vars(frame_vars, false)
+
+        let no_vars BoundVarList.make(host)
+        let env Environment.make_with(host, frame_vars, no_vars)
+        result := Expression.optimize_compile(body, interp, env, n_push, result)
+
+        var j n
+        while j > 0
+        {
+            let offset (j - n_push) - 1
+            if (frame_vars.at(j - 1)).boxed()
+                result := Insn.make_box_stack(host, offset, result)
+            var if_null: ref[Insn]? Insn.make_set_key_arg(host, offset, result)
+            var init_e: ref[Expression]? null
+            let ip2 inits.get((j - 1) as size_t)
+            if ip2 <> null
+                init_e := *ip2
+            if init_e <> null
+            {
+                let f BoundVarList.copy(host, frame_vars)
+                f.resize(j - 1)
+                let ev Environment.make_with(host, f, no_vars)
+                if_null := Expression.optimize_compile(init_e, interp, ev, n_push, if_null)
+            }
+            else
+                if_null := Insn.make_constant(host, interp.make_false(), if_null)
+            result := Insn.make_test_null(host, offset, if_null, result)
+            j := j - 1
+        }
+        Insn.make_unpack_macro(host, result)
+    }
+
+    ; the compiled body, compiling it on first demand.
+    procedure macro_code(mutable def: ref[MacroDef], mutable interp: ref[Interpreter]) returns ref[Insn]?
+    {
+        if def.get_code() <> null
+            return def.get_code()
+        let code Expression.compile_macro(def, interp)
+        def.set_code(code)
+        code
+    }
+
+    ; a key of the form force!<name> where <name> names an inherited
+    ; characteristic (StyleExpression::compile's forceKeys scan).
+    procedure force_key_target(ident: ref[Identifier], mutable interp: ref[Interpreter]) returns ref[Identifier]?
+    {
+        let nm ident.get_name()
+        if nm.get_size() <= 6
+            return null
+        let pre StringC(nm.data_ptr(), 6)
+        if pre.equals(StringC("force!")) = false
+            return null
+        let base interp.lookup(StringC(nm.as_slice().slice_from(6)))
+        if base.get_inherited_c() = null
+            return null
+        base
+    }
+
+    ; StyleExpression::compile — the pure style form `(style key: val …)`:
+    ; the same keyword split as the styled make, minus NICs and content.
+    procedure compile_style(this: ref[Expression], keys: ref[Array[ref[Identifier]?]]?, mutable exprs: ref[Array[ref[Expression]?]], loc: Location, mutable interp: ref[Interpreter], mutable env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host interp.get_host()
+        var n_key 0
+        if keys <> null
+            n_key := keys.get_length() as int
+        let key_class Array[int]^host()
+        let key_slot Array[int]()
+        let ic_proto Array[ref[InheritedC]?]^host()
+        let ic_force Array[int]()
+        var force_specs: ref[Array[ref[InheritedC]?]]? null
+        var specs: ref[Array[ref[InheritedC]?]]? null
+        var n_slots 0
+        var has_use false
+        var i 0
+        while i < n_key
+        {
+            var cls KEY_DROP
+            var proto: ref[InheritedC]? null
+            var is_force 0
+            let kp keys.get(i as size_t)
+            if kp <> null
+            {
+                let ident *kp
+                let sk ident.syntactic_key()
+                let ei0 exprs[i]
+                ; see the make classifier — fold top-level defines first.
+                ei0.fold_variable(interp, env)
+                var handled false
+                if sk = SK_KEY_USE
+                {
+                    ; only the FIRST use: counts (see the make classifier).
+                    if has_use = false
+                    {
+                        cls := KEY_USE
+                        has_use := true
+                    }
+                    handled := true
+                }
+                if handled = false
+                {
+                    let base_ident Expression.force_key_target(ident as ref[Identifier], interp)
+                    if base_ident <> null
+                    {
+                        cls := KEY_IC_CONST
+                        proto := base_ident.get_inherited_c() as ref[InheritedC]
+                        is_force := 1
+                        handled := true
+                    }
+                }
+                if handled = false
+                {
+                    let icraw ident.get_inherited_c()
+                    if icraw <> null
+                    {
+                        cls := KEY_IC_CONST
+                        proto := icraw as ref[InheritedC]
+                        handled := true
+                    }
+                }
+                ; unknown keys message in the spec-build loop (key order).
+            }
+            key_class.add(cls)
+            ic_proto.add(proto)
+            ic_force.add(is_force)
+            if Insn.key_has_slot(cls)
+            {
+                key_slot.add(n_slots)
+                n_slots := n_slots + 1
+            }
+            else
+                key_slot.add(0 - 1)
+            i := i + 1
+        }
+        let bound_vars BoundVarList.make(host)
+        env.bound_vars(bound_vars)
+        i := 0
+        while i < n_key
+        {
+            let pp ic_proto.get(i as size_t)
+            if pp <> null
+            {
+                if *pp <> null
+                {
+                    let ei exprs[i]
+                    ei.mark_bound_vars(bound_vars, false)
+                }
+            }
+            i := i + 1
+        }
+        bound_vars.remove_unused()
+        let no_vars BoundVarList.make(host)
+        let new_env Environment.make_with(host, no_vars, bound_vars)
+        i := 0
+        while i < n_key
+        {
+            var proto2: ref[InheritedC]? null
+            let pp2 ic_proto.get(i as size_t)
+            if pp2 <> null
+                proto2 := *pp2
+            if proto2 = null
+            {
+                var cls2 KEY_IGNORE
+                let cp2 key_class.get(i as size_t)
+                if cp2 <> null
+                    cls2 := *cp2
+                if cls2 = KEY_DROP
+                {
+                    let kp2 keys.get(i as size_t)
+                    if kp2 <> null
+                        this.unknown_style_keyword(*kp2, interp, loc)
+                }
+            }
+            if proto2 <> null
+            {
+                let ei exprs[i]
+                var entry: ref[InheritedC]? null
+                let cv ei.constant_datum()
+                if cv <> null
+                    entry := Convert.ic_from_value(host, proto2, cv, ei.location(), interp)
+                else
+                {
+                    let code Expression.optimize_compile(ei, interp, new_env, 0, null)
+                    entry := InheritedC.make_var(host, proto2, code, ei.location())
+                }
+                if entry <> null
+                {
+                    var is_force2 0
+                    let fp ic_force.get(i as size_t)
+                    if fp <> null
+                        is_force2 := *fp
+                    if is_force2 <> 0
+                    {
+                        if force_specs = null
+                            force_specs := Array[ref[InheritedC]?]^host()
+                        force_specs.add(entry)
+                    }
+                    else
+                    {
+                        if specs = null
+                            specs := Array[ref[InheritedC]?]^host()
+                        specs.add(entry)
+                    }
+                }
+            }
+            i := i + 1
+        }
+        let n_bound bound_vars.count()
+        var result: ref[Insn]? Insn.make_style_insn(host, keys, key_class, force_specs, specs, n_bound, loc, next)
+        if n_bound > 0
+            result := Expression.compile_push_vars(interp, env, stack_pos + n_slots, bound_vars, 0, result)
+        var j n_key - 1
+        while j >= 0
+        {
+            var slot 0 - 1
+            let sp key_slot.get(j as size_t)
+            if sp <> null
+                slot := *sp
+            if slot >= 0
+            {
+                let ej exprs[j]
+                result := Expression.optimize_compile(ej, interp, env, stack_pos + slot, result)
+            }
+            j := j - 1
+        }
+        result
+    }
+
+    ; StyleExpression::unknownStyleKeyword — "<name>:" is not a style keyword.
+    procedure unknown_style_keyword(this: ref[Expression], ident: ref[Identifier]?, mutable interp: ref[Interpreter], loc: Location)
+    {
+        let host interp.get_host()
+        interp.set_next_location(loc)
+        interp.message1(InterpreterMessages.invalidStyleKeyword(), Expression.keyword_arg(host, ident as ref[Identifier]))
+    }
+
+    ; the header/footer part slot for a simple-page-sequence NIC key
+    ; (FOTBuilder HF bits >> 2): left-footer 0, left-header 1, center-footer 2,
+    ; center-header 3, right-footer 4, right-header 5; -1 = not an HF key.
+    function hf_part_index(sk: int) returns int
+    {
+        if sk = SK_LEFT_FOOTER
+            return 0
+        if sk = SK_LEFT_HEADER
+            return 1
+        if sk = SK_CENTER_FOOTER
+            return 2
+        if sk = SK_CENTER_HEADER
+            return 3
+        if sk = SK_RIGHT_FOOTER
+            return 4
+        if sk = SK_RIGHT_HEADER
+            return 5
+        0 - 1
+    }
+
+    ; MakeExpression::unknownStyleKeyword — "<name>:" is not valid for this
+    ; flow object class.
+    procedure unknown_make_keyword(this: ref[Expression], ident: ref[Identifier]?, foc_ident: ref[Identifier], mutable interp: ref[Interpreter], loc: Location)
+    {
+        let host interp.get_host()
+        interp.set_next_location(loc)
+        interp.message2(InterpreterMessages.invalidMakeKeyword(), Expression.keyword_arg(host, ident as ref[Identifier]), foc_ident.get_name())
+    }
+
+    ; "<name>:" — the keyword-shaped message argument.
+    function keyword_arg(host: ref[Page], ident: ref[Identifier]) returns StringC
+    {
+        let nm ident.get_name()
+        let n nm.get_size()
+        let buf allocate_slice[u32](host, n + 1)
+        var i: size_t 0
+        while i < n
+        {
+            buf.put(i, nm.get(i))
+            i := i + 1
+        }
+        buf.put(n, 0x3A)
+        ; ^host, not a by-value return: the copying init would allocate through
+        ; Page.get(<sret slot>) and land the characters on the caller's frame
+        ; page (see ArcEngine.fold_sc for what that costs when the result is
+        ; kept). Consumed immediately here, so this is hygiene, not a live bug.
+        let scp StringC^host(buf)
+        *scp
+    }
+
+    ; VariableExpression::compile.
+    procedure compile_variable(mutable this: ref[Expression], mutable ident: ref[Identifier], loc: Location, mutable interp: ref[Interpreter], env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let host interp.get_host()
+        var is_frame false
+        var index 0
+        var flags: u32 0
+        let found env.lookup(ident, &is_frame, &index, &flags)
+        if found
+        {
+            let boxed BoundVar.flags_boxed(flags)
+            ; peephole: a boxed/plain ref that is the sole binding being popped.
+            if is_frame and (next <> null) and next.is_pop_bindings()
+            {
+                if (next.pop_bindings_n() = 1) and ((index - stack_pos) = (0 - 1))
+                {
+                    let nn next.pop_bindings_next()
+                    var tem nn
+                    if (flags & BV_UNINIT) <> 0
+                        tem := Insn.make_check_init(host, ident, loc, nn)
+                    if boxed
+                        return Insn.make_unbox(host, tem)
+                    return tem as ref[Insn]
+                }
+            }
+            var tem next
+            if (flags & BV_UNINIT) <> 0
+                tem := Insn.make_check_init(host, ident, loc, next)
+            if boxed
+                tem := Insn.make_unbox(host, tem)
+            if is_frame
+                return Insn.make_stack_ref(host, index - stack_pos, index, tem)
+            return Insn.make_closure_ref(host, index, tem)
+        }
+        ; top-level reference (VariableExpression::compile: isTop_ stamped,
+        ; the value computed eagerly when canEval allows, the node memoized
+        ; as a resolved constant like the reference's optimize replacement).
+        this := Expression.Variable(VariableExpr(ident, loc, true))
+        if ident.is_def() = false
+        {
+            interp.set_next_location(loc)
+            interp.message1(InterpreterMessages.undefinedVariableReference(), ident.get_name())
+            return Insn.make_error(host)
+        }
+        let val ident.compute_value(false, interp)
+        if val = null
+            return Insn.make_top_ref(host, ident, next)
+        if interp.is_error(val)
+            return Insn.make_error(host)
+        this := Expression.ResolvedConstant(ResolvedConstantExpr(val, loc))
+        Insn.make_constant(host, val, next)
+    }
+
+    ; CallExpression::compile.
+    procedure compile_call(mutable this: ref[Expression], mutable interp: ref[Interpreter], mutable env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host interp.get_host()
+        choose this
+            when e: Call
+            {
+                let op e.op
+                let args e.args
+                var n args.get_length() as int
+                ; CallExpression::compile: op_->optimize BEFORE constantValue —
+                ; a top-level define folds to its (eagerly computed) function
+                ; value here, so calls take the constant FunctionCall path and
+                ; the arity diagnostics fire at COMPILE (reference behavior).
+                op.fold_variable(interp, env)
+                let value op.constant_value()
+                var result: ref[Insn]? null
+                ; -G disables the tail-call replacement (`!interp.debugMode()`
+                ; in the reference): every call keeps its control-stack frame
+                ; so the `called from here` trace is complete.
+                let debug interp.get_debug_mode()
+                if value <> null
+                {
+                    ; CallExpression::compile constant-op arity checks: a
+                    ; non-function or missing arg is an ErrorInsn; excess args
+                    ; (no rest) and odd key args are reported here and the
+                    ; arg list truncated (reference args_.resize).
+                    let eff Expression.check_call_arity(interp, value, n, e.loc)
+                    if eff < 0
+                        return Insn.make_error(host)
+                    n := eff
+                    var caller_args 0
+                    if ((next <> null) and next.is_return()) and (debug = false)
+                    {
+                        caller_args := next.return_n()
+                        result := value.make_tail_call_insn(n, interp, e.loc, caller_args)
+                    }
+                    else
+                        result := value.make_call_insn(n, interp, e.loc, next)
+                }
+                else
+                {
+                    var caller_args 0
+                    if ((next <> null) and next.is_return()) and (debug = false)
+                    {
+                        caller_args := next.return_n()
+                        result := Insn.make_tail_apply(host, caller_args, n, e.loc)
+                    }
+                    else
+                        result := Insn.make_apply(host, n, e.loc, next)
+                    result := op.compile(interp, env, stack_pos + n, result)
+                }
+                var i n - 1
+                while i >= 0
+                {
+                    let arg_i args[i]
+                    result := Expression.optimize_compile(arg_i, interp, env, stack_pos + i, result)
+                    i := i - 1
+                }
+                return result
+            }
+            else
+                return next
+        next
+    }
+
+    ; CallExpression::compile constant-op arity check: returns the effective
+    ; arg count (truncated on tooManyArgs/oddKeyArgs like args_.resize), or
+    ; -1 when the call must compile to an ErrorInsn (non-function/missingArg).
+    procedure check_call_arity(mutable interp: ref[Interpreter], mutable value: ref[ELObj], n: int, loc: Location) returns int
+    {
+        if value.is_function() = false
+        {
+            interp.set_next_location(loc)
+            let host interp.get_host()
+            let os OutputCharStream.make(host)
+            value.print(os, interp.get_units_per_inch())
+            interp.message1(InterpreterMessages.callNonFunction(), os.to_string_c(host))
+            return 0 - 1
+        }
+        let n_req value.n_required_args()
+        if n < n_req
+        {
+            interp.set_next_location(loc)
+            interp.message0(InterpreterMessages.missingArg())
+            return 0 - 1
+        }
+        let n_opt value.n_optional_args()
+        if n - n_req > n_opt
+        {
+            if value.n_key_args() > 0
+            {
+                if ((n - n_req - n_opt) % 2) = 1
+                {
+                    interp.set_next_location(loc)
+                    interp.message0(InterpreterMessages.oddKeyArgs())
+                    return n_req + n_opt
+                }
+            }
+            else if value.has_rest_arg() = false
+            {
+                interp.set_next_location(loc)
+                interp.message0(InterpreterMessages.tooManyArgs())
+                return n_req + n_opt
+            }
+        }
+        n
+    }
+
+    ; LetExpression::compile.
+    procedure compile_let(this: ref[Expression], mutable var_names: ref[Array[ref[Identifier]?]], mutable inits: ref[Array[ref[Expression]?]], mutable body: ref[Expression], mutable interp: ref[Interpreter], mutable env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host interp.get_host()
+        let n_vars var_names.get_length() as int
+        let body_env Environment.copy(host, env)
+        let bound_vars BoundVarList.make_from_idents(host, var_names)
+        body.mark_bound_vars(bound_vars, false)
+        body_env.augment_frame(host, bound_vars, stack_pos)
+        let body_code Expression.optimize_compile(body, interp, body_env, stack_pos + n_vars, Insn.make_pop_bindings(host, n_vars, next))
+        Expression.compile_let_inits(interp, env, inits, bound_vars, 0, stack_pos, body_code)
+    }
+
+    procedure compile_let_inits(mutable interp: ref[Interpreter], mutable env: ref[Environment], mutable inits: ref[Array[ref[Expression]?]], init_vars: ref[BoundVarList], init_index: int, stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let n inits.get_length() as int
+        if init_index >= n
+            return next
+        let host interp.get_host()
+        var tem Expression.compile_let_inits(interp, env, inits, init_vars, init_index + 1, stack_pos + 1, next)
+        if (init_vars.at(init_index)).boxed()
+            tem := Insn.make_box(host, tem)
+        Expression.optimize_compile(inits[init_index], interp, env, stack_pos, tem)
+    }
+
+    ; LetStarExpression::compile.
+    procedure compile_let_star(this: ref[Expression], var_names: ref[Array[ref[Identifier]?]], mutable inits: ref[Array[ref[Expression]?]], mutable body: ref[Expression], mutable interp: ref[Interpreter], mutable env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host interp.get_host()
+        let n_vars var_names.get_length() as int
+        let body_env Environment.copy(host, env)
+        let vars BoundVarList.make(host)
+        var i 0
+        while i < n_vars
+        {
+            if i > 0
+            {
+                let init_e inits[i]
+                init_e.mark_bound_vars(vars, false)
+            }
+            vars.append(var_names[i], 0)
+            i := i + 1
+        }
+        body.mark_bound_vars(vars, false)
+        body_env.augment_frame(host, vars, stack_pos)
+        let body_code Expression.optimize_compile(body, interp, body_env, stack_pos + n_vars, Insn.make_pop_bindings(host, n_vars, next))
+        Expression.compile_let_star_inits(interp, env, inits, vars, 0, stack_pos, body_code)
+    }
+
+    procedure compile_let_star_inits(mutable interp: ref[Interpreter], mutable env: ref[Environment], mutable inits: ref[Array[ref[Expression]?]], init_vars: ref[BoundVarList], init_index: int, stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let n inits.get_length() as int
+        if init_index >= n
+            return next
+        let host interp.get_host()
+        let next_env Environment.copy(host, env)
+        let vars BoundVarList.make(host)
+        let iv init_vars.at(init_index)
+        vars.append(iv.ident, iv.flags)
+        next_env.augment_frame(host, vars, stack_pos)
+        var tem Expression.compile_let_star_inits(interp, next_env, inits, init_vars, init_index + 1, stack_pos + 1, next)
+        if iv.boxed()
+            tem := Insn.make_box(host, tem)
+        Expression.optimize_compile(inits[init_index], interp, env, stack_pos, tem)
+    }
+
+    ; LetrecExpression::compile.
+    procedure compile_letrec(this: ref[Expression], mutable var_names: ref[Array[ref[Identifier]?]], mutable inits: ref[Array[ref[Expression]?]], mutable body: ref[Expression], mutable interp: ref[Interpreter], mutable env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host interp.get_host()
+        let n_vars var_names.get_length() as int
+        let vars BoundVarList.make_from_idents_n(host, var_names, n_vars, BV_ASSIGNED)
+        let body_env Environment.copy(host, env)
+        Expression.mark_list(inits, vars, false)
+        body.mark_bound_vars(vars, false)
+        body_env.augment_frame(host, vars, stack_pos)
+        var tem Expression.optimize_compile(body, interp, body_env, stack_pos + n_vars, Insn.make_pop_bindings(host, n_vars, next))
+        var i 0
+        while i < n_vars
+        {
+            let bv vars.at(i)
+            bv.flags := bv.flags | BV_UNINIT
+            i := i + 1
+        }
+        i := 0
+        while i < n_vars
+        {
+            if (vars.at(i)).boxed()
+                tem := Insn.make_set_box(host, n_vars, tem)
+            else
+                tem := Insn.make_set_immediate(host, n_vars, tem)
+            i := i + 1
+        }
+        tem := Expression.compile_letrec_inits(interp, body_env, inits, 0, stack_pos + n_vars, tem)
+        i := n_vars - 1
+        while i >= 0
+        {
+            if (vars.at(i)).boxed()
+                tem := Insn.make_box(host, tem)
+            tem := Insn.make_constant(host, null, tem)
+            i := i - 1
+        }
+        tem
+    }
+
+    procedure compile_letrec_inits(mutable interp: ref[Interpreter], mutable env: ref[Environment], mutable inits: ref[Array[ref[Expression]?]], init_index: int, stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let n inits.get_length() as int
+        if init_index >= n
+            return next
+        Expression.optimize_compile(inits[init_index], interp, env, stack_pos,
+            Expression.compile_letrec_inits(interp, env, inits, init_index + 1, stack_pos + 1, next))
+    }
+
+    ; CaseExpression::compile — datums are resolved inline (the optimize pass'
+    ; job in the reference; done here so no optimize is needed).
+    procedure compile_case(mutable this: ref[Expression], mutable interp: ref[Interpreter], mutable env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host interp.get_host()
+        choose this
+            when e: Case
+            {
+                var finish: ref[Insn]? null
+                if e.else_expr <> null
+                    finish := Insn.make_pop(host, e.else_expr.compile(interp, env, stack_pos, next))
+                else
+                    finish := Insn.make_case_fail(host, e.loc)
+                let n_cases e.results.get_length() as int
+                let rb e.results.as_slice()
+                let db e.datums.as_slice()
+                let sb e.case_starts.as_slice()
+                let total_datums e.datums.get_length() as int
+                ; caseUnresolvedQuantities (Expression.cxx:488): a datum whose
+                ; quantity cannot be resolved is DROPPED from the dispatch —
+                ; the reference says so once per case expression rather than
+                ; silently narrowing the match set. It reports regardless of
+                ; whether there is an `else`.
+                var any_unresolved false
+                var i 0
+                while i < n_cases
+                {
+                    let re rb[i]
+                    let match_code re.compile(interp, env, stack_pos, next)
+                    let start sb[i]
+                    var stop total_datums
+                    if (i + 1) < n_cases
+                        stop := sb[(i + 1)]
+                    var j start
+                    while j < stop
+                    {
+                        let de db[j]
+                        let datum de.resolve_quantities(false, interp, e.loc)
+                        if datum <> null
+                            finish := Insn.make_case(host, datum, match_code, finish)
+                        else
+                            any_unresolved := true
+                        j := j + 1
+                    }
+                    i := i + 1
+                }
+                if any_unresolved
+                {
+                    interp.set_next_location(e.loc)
+                    interp.message0(InterpreterMessages.caseUnresolvedQuantities())
+                }
+                return e.key.compile(interp, env, stack_pos, finish) as ref[Insn]
+            }
+            else
+                return next
+        next
+    }
+
+    ; QuasiquoteExpression::compile.
+    procedure compile_quasiquote(mutable this: ref[Expression], mutable interp: ref[Interpreter], mutable env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host interp.get_host()
+        choose this
+            when e: Quasiquote
+            {
+                let members e.members
+                let spliced e.spliced
+                var tem next
+                var n members.get_length() as int
+                if e.qq_type = QQ_VECTOR
+                {
+                    var splicy false
+                    var i 0
+                    while i < n
+                    {
+                        if spliced[i]
+                            splicy := true
+                        i := i + 1
+                    }
+                    if splicy = false
+                    {
+                        tem := Insn.make_vector(host, n, tem)
+                        var k n
+                        while k > 0
+                        {
+                            let me_k members[(k - 1)]
+                            tem := me_k.compile(interp, env, stack_pos + (k - 1), tem) as ref[Insn]
+                            k := k - 1
+                        }
+                        return tem
+                    }
+                    tem := Insn.make_list_to_vector(host, tem)
+                }
+                else if e.qq_type = QQ_IMPROPER
+                    n := n - 1
+                var i 0
+                while i < n
+                {
+                    if spliced[i]
+                        tem := Insn.make_append(host, e.loc, tem)
+                    else
+                        tem := Insn.make_cons(host, tem)
+                    let me_i members[i]
+                    tem := me_i.compile(interp, env, stack_pos + 1, tem) as ref[Insn]
+                    i := i + 1
+                }
+                if e.qq_type = QQ_IMPROPER
+                {
+                    let me_last members[(members.get_length() as int - 1)]
+                    tem := me_last.compile(interp, env, stack_pos, tem) as ref[Insn]
+                }
+                else
+                    tem := Insn.make_constant(host, interp.make_nil(), tem)
+                return tem
+            }
+            else
+                return next
+        next
+    }
+
+    ; AssignmentExpression::compile.
+    procedure compile_assignment(this: ref[Expression], var_ident: ref[Identifier], mutable value: ref[Expression], loc: Location, mutable interp: ref[Interpreter], mutable env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host interp.get_host()
+        var is_frame false
+        var index 0
+        var flags: u32 0
+        let found env.lookup(var_ident, &is_frame, &index, &flags)
+        if found = false
+        {
+            interp.set_next_location(loc)
+            if var_ident.is_def()
+                interp.message1(InterpreterMessages.topLevelAssignment(), var_ident.get_name())
+            else
+                interp.message1(InterpreterMessages.undefinedVariableReference(), var_ident.get_name())
+            return Insn.make_error(host)
+        }
+        var result next
+        if (flags & BV_UNINIT) <> 0
+            result := Insn.make_check_init(host, var_ident, loc, next)
+        if is_frame
+        {
+            if BoundVar.flags_boxed(flags)
+                result := Insn.make_stack_set_box(host, index - (stack_pos + 1), index, loc, result)
+            else
+                result := Insn.make_stack_set(host, index - (stack_pos + 1), index, result)
+        }
+        else
+            result := Insn.make_closure_set_box(host, index, loc, result)
+        Expression.optimize_compile(value, interp, env, stack_pos, result)
+    }
+
+    ; LambdaExpression::compile — the closure builder with the optional/rest/key
+    ; varargs entry-point machinery (Expression.cs).
+    procedure compile_lambda(mutable this: ref[Expression], mutable interp: ref[Interpreter], env: ref[Environment], stack_pos: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host interp.get_host()
+        choose this
+            when e: Lambda
+            {
+                let sig e.sig
+                let formals e.formals
+                let inits e.inits
+                let n_formals formals.get_length() as int
+                let n_inits inits.get_length() as int
+
+                let bound_vars BoundVarList.make(host)
+                env.bound_vars(bound_vars)
+                this.mark_bound_vars(bound_vars, false)
+                bound_vars.remove_unused()
+
+                let formal_vars BoundVarList.make_from_idents_n(host, formals, sig.n_required, 0)
+                var i 0
+                while i < sig.n_optional + sig.n_key
+                {
+                    if i < n_inits
+                    {
+                        let init_e inits[i]
+                        if init_e <> null
+                            init_e.mark_bound_vars(formal_vars, false)
+                    }
+                    formal_vars.append(formals[(sig.n_required + i)], 0)
+                    i := i + 1
+                }
+                if sig.rest_arg
+                    formal_vars.append(formals[(n_formals - 1)], 0)
+                e.body.mark_bound_vars(formal_vars, false)
+
+                let lambda_env Environment.make_with(host, formal_vars, bound_vars)
+                var code Expression.optimize_compile(e.body, interp, lambda_env, n_formals, Insn.make_return(host, n_formals))
+
+                if (sig.n_optional > 0) or sig.rest_arg or (sig.n_key > 0)
+                    code := Expression.compile_lambda_varargs(interp, sig, formals, inits, formal_vars, bound_vars, code, host, e.loc)
+
+                i := 0
+                while i < sig.n_required
+                {
+                    if (formal_vars.at(i)).boxed()
+                        code := Insn.make_box_arg(host, i, code)
+                    i := i + 1
+                }
+                return Expression.compile_push_vars(interp, env, stack_pos, bound_vars, 0,
+                    Insn.make_closure_insn(host, sig, code, bound_vars.count(), next))
+            }
+            else
+                return next
+        next
+    }
+
+    ; the optional/rest/key entry-point construction (LambdaExpression.compile).
+    procedure compile_lambda_varargs(mutable interp: ref[Interpreter], sig: Signature, formals: ref[Array[ref[Identifier]?]], mutable inits: ref[Array[ref[Expression]?]], mutable formal_vars: ref[BoundVarList], mutable bound_vars: ref[BoundVarList], code: ref[Insn]?, host: ref[Page], lambda_loc: Location) returns ref[Insn]
+    {
+        var extra 0
+        if sig.rest_arg or (sig.n_key > 0)
+            extra := 1
+        ; init-env resizes use the REST slot only (reference: nRequiredArgs +
+        ; i + restArg) — keys are NOT in scope for their own inits, and the
+        ; sp-relative StackRef offsets derive from this size: one too many
+        ; reads a slot below the frame.
+        var rest_slot 0
+        if sig.rest_arg
+            rest_slot := 1
+        let ep_count sig.n_optional + extra + 1
+        let entry host.allocate((ep_count as size_t) * sizeof pointer[Insn], alignof pointer[Insn]) as pointer[ref[Insn]?]
+        var z 0
+        while z < ep_count
+        {
+            *(entry + z) := null
+            z := z + 1
+        }
+        let n_formals formals.get_length() as int
+        let n_inits inits.get_length() as int
+
+        ; last entry point: all optional args supplied
+        *(entry + (ep_count - 1)) := code
+        if sig.rest_arg and (formal_vars.at(formal_vars.count() - 1)).boxed()
+            *(entry + (ep_count - 1)) := Insn.make_box_stack(host, (0 - 1) - sig.n_key, *(entry + (ep_count - 1)))
+
+        if sig.n_key > 0
+        {
+            var i sig.n_optional + sig.n_key - 1
+            while i >= sig.n_optional
+            {
+                let offset i - (sig.n_optional + sig.n_key)
+                var set_insn: ref[Insn]? Insn.make_set_key_arg(host, offset, *(entry + (ep_count - 1)))
+                if (formal_vars.at(sig.n_required + i)).boxed()
+                    set_insn := Insn.make_box(host, set_insn)
+                if (i < n_inits) and (inits[i] <> null)
+                {
+                    let f BoundVarList.copy(host, formal_vars)
+                    f.resize(sig.n_required + i + rest_slot)
+                    let ev Environment.make_with(host, f, bound_vars)
+                    set_insn := Expression.optimize_compile(inits[i], interp, ev, n_formals, set_insn)
+                }
+                else
+                    set_insn := Insn.make_constant(host, interp.make_false(), set_insn)
+                *(entry + (ep_count - 1)) := Insn.make_test_null(host, offset, set_insn, *(entry + (ep_count - 1)))
+                i := i - 1
+            }
+        }
+
+        if sig.rest_arg or (sig.n_key > 0)
+        {
+            var code_no_rest: ref[Insn]? code
+            var i sig.n_optional + sig.n_key - 1
+            while i >= sig.n_optional
+            {
+                if (formal_vars.at(sig.n_required + i)).boxed()
+                    code_no_rest := Insn.make_box(host, code_no_rest)
+                if (i < n_inits) and (inits[i] <> null)
+                {
+                    let f BoundVarList.copy(host, formal_vars)
+                    f.resize(sig.n_required + i + rest_slot)
+                    let ev Environment.make_with(host, f, bound_vars)
+                    code_no_rest := Expression.optimize_compile(inits[i], interp, ev, f.count(), code_no_rest)
+                }
+                else
+                    code_no_rest := Insn.make_constant(host, interp.make_false(), code_no_rest)
+                i := i - 1
+            }
+            if sig.rest_arg
+            {
+                if (formal_vars.at(formal_vars.count() - 1)).boxed()
+                    code_no_rest := Insn.make_box(host, code_no_rest)
+                code_no_rest := Insn.make_constant(host, interp.make_nil(), code_no_rest)
+            }
+            *(entry + sig.n_optional) := code_no_rest
+        }
+
+        var i sig.n_optional - 1
+        while i >= 0
+        {
+            var tem *(entry + (i + 1))
+            if (formal_vars.at(sig.n_required + i)).boxed()
+                tem := Insn.make_box(host, tem)
+            if (i < n_inits) and (inits[i] <> null)
+            {
+                let f BoundVarList.copy(host, formal_vars)
+                f.resize(sig.n_required + i)
+                let ev Environment.make_with(host, f, bound_vars)
+                *(entry + i) := Expression.optimize_compile(inits[i], interp, ev, f.count(), tem)
+            }
+            else
+                *(entry + i) := Insn.make_constant(host, interp.make_false(), tem)
+            i := i - 1
+        }
+
+        i := 0
+        while i < sig.n_optional
+        {
+            if (formal_vars.at(sig.n_required + i)).boxed()
+            {
+                var j i
+                while j < sig.n_optional
+                {
+                    *(entry + (j + 1)) := Insn.make_box_arg(host, i + sig.n_required, *(entry + (j + 1)))
+                    j := j + 1
+                }
+                if (sig.n_key > 0) or sig.rest_arg
+                {
+                    var re 0
+                    if sig.rest_arg
+                        re := 1
+                    *(entry + (ep_count - 1)) := Insn.make_box_stack(host, i - sig.n_key - re - sig.n_optional, *(entry + (ep_count - 1)))
+                }
+            }
+            i := i + 1
+        }
+
+        Insn.make_varargs(host, sig, entry, ep_count, lambda_loc)
+    }
+}
+
+; the host page reachable from a BoundVarList (used by markBoundVars' Lambda
+; sub-list construction).
+function interp_host_of(vars: ref[BoundVarList]?) returns ref[Page]
+    vars.get_host()

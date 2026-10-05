@@ -1,0 +1,881 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.Vector
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.Location.Origin
+use opensp.XcharMap.XcharMap
+use opensp.Message.MessageType
+use opensp.Message.MessageFragment
+use opensp.Message.MessageArg
+use opensp.Message.MessageFormatter
+use opensp.ParserState.ParserState
+use dazzle.FrameMark.FrameMark
+use dazzle.NameTable.NamedTable
+use dazzle.NumberCache.NumberCache
+use dazzle.Grove.GroveNode
+use dazzle.Grove.IdEntry
+use dazzle.Grove.ComponentName
+use dazzle.Grove.SiblingHint
+use dazzle.GroveManager.GroveManager
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
+use dazzle.ELObj.FlowObj
+use dazzle.ELObj.MacroDef
+use dazzle.ELObj.GlyphSubstTableRec
+use dazzle.ELObj.OutputCharStream
+use dazzle.Style.InheritedC
+use dazzle.Style.LengthSpec
+use dazzle.Style.FotSym
+use dazzle.Style.VarStyleRec
+use dazzle.Style.InlineSpace
+use dazzle.Style.Convert
+use dazzle.Expression.Expression
+use dazzle.Expression.Environment
+use dazzle.VM.VM
+use dazzle.Insn.Signature
+use dazzle.Insn.Insn
+use dazzle.ELObj.QuantityValue
+use dazzle.ELObj.QT_NONE
+use dazzle.ELObj.QT_LONG
+use dazzle.ProcessingMode.ProcessingMode
+use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.CharNames.CharNames
+use dazzle.Sdata.Sdata
+
+; Interpreter — the style-language interpreter (style/Interpreter.cxx).
+; Inc-2 scope: the READER seam the SchemeParser datum reader needs — the
+; lexical-category table, symbol/keyword/identifier interning, number
+; conversion (convertNumber family incl. quantities and units), character
+; names (charNames.h table + U-XXXX), sdata entity mapping, and the
+; standard-chars / add-name-chars / add-separator-chars / map-sdata-entity
+; declaration hooks. The evaluation half (syntactic keys, primitives,
+; processing modes, Insn/VM) lands with Inc 3 per DESIGN.md.
+;
+; Messages: text/severity sourced from the generated InterpreterMessages
+; table (InterpreterMessages.msg). Rendering here is the package-level seam
+; (`dazzle:<severity>: <text>` on stderr + error count); the full
+; file:line:col MessageReporter prefix is the CLI driver's job and lands
+; with Inc 7 (DssslApp/CmdLineApp port), like the reference where the app
+; object IS the Messenger.
+
+; argv0 for the MessageReporter prefix (`<argv0>:<file>:<line>:<col>:<sev>: …`,
+; exactly the reference where the app object IS the Messenger). The CLI driver
+; sets this once before processing; unset (unit tests, --jit suite) the prefix
+; stays the historical package name `dazzle`. A `shared` module global, not an
+; Interpreter field — growing a heap-hosted struct in the dazzle run region
+; trips the page-boundary RBMM fragility (S62), and `mutable` (TLS) in a dep
+; package aborts under --jit.
+shared msg_prog: pointer[const_char] linked
+
+; whether the active backend provides the transform extension flow-object
+; classes (jade.cxx passes an extension table only for -t sgml/xml); the CLI
+; clears it for -t fot. A `shared` module global by the S62 rule (no
+; Interpreter field growth); single-threaded CLI setup writes it once.
+shared xt_extensions_on: bool linked
+
+; MessageReporter's column-omission sentinel (opensp.Location COL_OMITTED —
+; module-level consts are not cross-package-visible; mirrored here).
+define MSG_COL_OMITTED: u32 0xFFFFFFFF
+
+; Interpreter::LexCategory
+define LEX_LETTER: int 0            ; a-z A-Z
+define LEX_OTHER_NAME_START: int 1  ; !$%&*/<=>?~_^:
+define LEX_ADD_NAME_START: int 2
+define LEX_DIGIT: int 3             ; 0-9
+define LEX_OTHER_NUMBER_START: int 4 ; -+.
+define LEX_OTHER: int 5
+define LEX_DELIMITER: int 6         ; ();"
+define LEX_WHITESPACE: int 7
+define LEX_ADD_WHITESPACE: int 8
+
+; the printer's replacement char for unknown character names
+define DEFAULT_CHAR: int 0xFFFD
+
+; Unit::computed_ states
+define UNIT_NOT_COMPUTED: int 0
+define UNIT_BEING_COMPUTED: int 1
+define UNIT_COMPUTED_EXACT: int 2
+define UNIT_COMPUTED_INEXACT: int 3
+define UNIT_COMPUTED_ERROR: int 4
+
+; strtod(3) — fixed-prototype, non-variadic, errno-free use: direct extern
+; per the containment rule.
+function strtod(s: pointer[const_char], endp: pointer[pointer[u8]]) returns double extern
+
+; the memo-host seam's one switch (DZ_MEMO_PERM)
+function getenv(name: pointer[const_char]) returns pointer[const_char] extern
+
+; A named-character-table entry (Interpreter::CharPart): the char plus the
+; index of the defining part (unsigned(-1) = predefined).
+define CharPart (name: StringC, var c: u32, var def_part: u32)
+{
+    init(name: StringC, c: u32, def_part: u32) linked
+}
+
+; CharProp (Interpreter.h) — one character property: a DEFAULT value plus a
+; per-character map. The reference's map is a full CharMap<ELObjPart> whose
+; unset slot is a null object; here it is an ordered list of
+; [first, last] -> value entries searched BACKWARD, so a later
+; add-char-properties overrides an earlier install exactly as setChar over
+; setRange does. `def_part` carries the spec part that supplied the default,
+; which is what the duplicate-declaration rule compares.
+; ★`part` is the ELObjPart half of the reference's CharMap<ELObjPart>
+; (Interpreter.cxx:2347): a per-character value remembers WHICH PART set it,
+; because that is what decides between overwrite, silence and a duplicate
+; diagnostic.
+define CharPropRange (first: u32, last: u32, obj: ref[ELObj]?, part: u32)
+{
+    init(first: u32, last: u32, obj: ref[ELObj], part: u32) linked
+}
+
+define CharProp (name: StringC, var def: ref[ELObj], var def_part: u32, var loc: Location, ranges: ref[Array[CharPropRange]])
+{
+    function make(host: ref[Page], name: StringC, def: ref[ELObj], def_part: u32) @ret_explicit_0 true @deep true returns ref[CharProp] linked
+
+    ; CharMap::setRange — a later entry wins, so the lookup walks BACKWARD.
+    procedure set_range(mutable this: ref[CharProp], first: u32, last: u32, obj: ref[ELObj], part: u32) @persists true @ret_nonlocal true @deep true @deep_this_8 true @deep_whole_8 true linked
+
+    ; the part that last set this character's own value; 0xFFFFFFFF when it
+    ; has none (the reference's ELObjPart(0, unsigned(-1)) default).
+    function lookup_part(this: CharProp, c: u32) @ret_param_0 true @deep true returns u32 linked
+
+    ; (*cp->map)[c].obj — null when the character has no value of its own.
+    function lookup(this: CharProp, c: u32) @ret_param_0 true @deep true returns ref[ELObj]? linked
+}
+
+; Unit — a named measurement unit (Interpreter.h class Unit : Named).
+; Builtin units get their value from unitsPerInch in installUnits (setValue
+; marks them computedExact/Inexact); define-unit bodies arrive via
+; setDefinition and compute lazily in tryCompute (canEval-gated without
+; force, exactly the reference's eager-top-level shape).
+define Unit (name: StringC, var computed: int, var exact: int, var inexact: double, var dim: int, var def_part: u32, var def_expr: ref[Expression]?, var def_insn: ref[Insn]?, var def_loc: Location)
+{
+    function make(host: ref[Page], name: StringC) @ret_explicit_0 true @deep true returns ref[Unit] linked
+
+    ; void setDefinition(Owner<Expression> &, unsigned part, const Location &)
+    ; — the define-unit body; computed resets so the next resolve recomputes.
+    procedure set_definition(mutable this: ref[Unit], expr: ref[Expression]?, part: u32, loc: Location) @deep true @deep_this_10 true @deep_whole_10 true linked
+
+    ; bool defined(unsigned &part, Location &loc)
+    procedure defined(this: ref[Unit], mutable part_out: ref[u32], mutable loc_out: ref[Location]) @ret_nonlocal true @deep true returns bool linked
+
+    function get_name(this: Unit) @page true @direct true @ret_param_0 true @deep true returns StringC linked
+
+    ; void setValue(long)
+    procedure set_value_long(mutable this: ref[Unit], n: int) @deep true linked
+
+    ; void setValue(double)
+    procedure set_value_double(mutable this: ref[Unit], n: double) @deep true linked
+
+    ; bool defined(unsigned &part, Location &loc) — Inc-2 subset: no def_
+    ; expression yet, so defined <=> a computed value exists (the out-params
+    ; feed doDefineUnit's duplicate diagnostics, Inc 3).
+    function is_defined(this: Unit) @ret_param_0 true @deep true returns bool linked
+
+    ; static bool scale(long val, int valExp, long factor, long &result):
+    ; result = val * 10^valExp * factor, 0 on overflow.
+    procedure scale(val: int, val_exp_in: int, factor_in: int, mutable result: ref[int]) @ret_nonlocal true @deep true returns bool linked
+
+    ; ELObj *resolveQuantity(bool force, Interpreter &, long val, int valExp)
+    ; (val * 10^valExp of this unit; the unit's own exponent is 1).
+    procedure resolve_quantity_long(mutable this: ref[Unit], force: bool, mutable interp: ref[Interpreter], val: int, val_exp_in: int) @ret_param_2 true @deep true @deep_this_4 true @deep_whole_4 true returns ref[ELObj]? io reads msg_prog linked
+
+    ; ELObj *resolveQuantity(bool force, Interpreter &, double val, int unitExp)
+    procedure resolve_quantity_double(mutable this: ref[Unit], force: bool, mutable interp: ref[Interpreter], val: double, unit_exp_in: int) @ret_param_2 true @deep true @deep_this_4 true @deep_whole_4 true returns ref[ELObj]? io reads msg_prog linked
+
+    ; void tryCompute(bool force, Interpreter &) — evaluate the define-unit
+    ; body (compiled once); without force only a canEval body computes (the
+    ; reference's lazy top-level shape); a recursive resolve is the unitLoop
+    ; error; a non-quantity result is badUnitDefinition at the definition.
+    procedure try_compute(mutable this: ref[Unit], force: bool, mutable interp: ref[Interpreter]) @deep true @deep_this_4 true @deep_whole_4 true io reads msg_prog linked
+}
+
+; externalProcTable_ entry: a public identifier -> primitive value binding
+; (Interpreter::installPrimitive / installXPrimitive; external-procedure
+; resolves against it). Linear array, insertion order.
+define ExternalProc (pubid: StringC, value: ref[ELObj]?)
+{
+    function make(host: ref[Page], pubid: StringC, value: ref[ELObj]) @ret_explicit_0 true @deep true returns ref[ExternalProc] linked
+}
+
+define Interpreter
+(
+    var host: ref[Page]
+    var units_per_inch: int
+    var debug_mode: bool
+    var dsssl2: bool
+    var strict_mode: bool
+    var part_index: u32
+    var d_part_index: u32
+    ; the permanent singletons (one per run; eqv? = identity)
+    var nil_obj: ref[ELObj]
+    var true_obj: ref[ELObj]
+    var false_obj: ref[ELObj]
+    var error_obj: ref[ELObj]
+    var unspecified_obj: ref[ELObj]
+    ; interning tables. The Array holds the objects in insertion order (the
+    ; reference's NamedTable owns its entries the same way); the NameTable
+    ; beside it is the hash index that answers a lookup — see the module
+    ; header there for why the linear scan had to go.
+    var symbol_table: ref[Array[ref[ELObj]?]]
+    var ident_table: ref[Array[ref[Identifier]?]]
+    var symbol_index: ref[NamedTable[ELObj]]
+    var ident_index: ref[NamedTable[Identifier]]
+    var unit_table: ref[Array[ref[Unit]?]]
+    var named_char_table: ref[Array[ref[CharPart]?]]
+    var sdata_entity_name_table: ref[Array[ref[CharPart]?]]
+    var sdata_entity_text_table: ref[Array[ref[CharPart]?]]
+    var lex_category_table: ref[XcharMap]
+    ; Messenger seam (see header note): counts + prints; the driver owns
+    ; the full location-prefixed rendering (Inc 7).
+    var error_count: int
+    var next_loc: Location
+    ; processing modes (Style/Interpreter.cxx): the unnamed initial mode plus
+    ; every named mode (mode NAME …). Rules register here; compile() finalises.
+    var initial_mode: ref[ProcessingMode]
+    var processing_mode_table: ref[Array[ref[ProcessingMode]?]]?
+    ; declare-default-language: the declaration expression (evaluated by
+    ; compile(), like the reference compileDefaultLanguage) and the resulting
+    ; language value char-upcase/downcase consult.
+    var default_language_def: ref[Expression]?
+    var default_language_part: int
+    var default_language_loc: Location
+    var default_language: ref[ELObj]?
+    ; NumberCache — the reference DERIVES Interpreter from it
+    ; (style/Interpreter.h:303), so `element-number` reaches it as a method on
+    ; the interpreter. One per run; the grove-order vector it steps along hangs
+    ; off the grove, not off this.
+    var number_cache: ref[NumberCache]
+    ; charProperties_ — the character-property table (installCharProperties +
+    ; declare-char-property + add-char-properties).
+    var char_property_table: ref[Array[ref[CharProp]?]]
+    ; externalProcTable_ — public id -> FunctionObj (external-procedure).
+    var external_proc_table: ref[Array[ref[ExternalProc]?]]
+    ; the canned border styles (a single border-present? spec; table borders
+    ; specified as booleans resolve to these).
+    var border_true_style_obj: ref[ELObj]?
+    var border_false_style_obj: ref[ELObj]?
+    ; nextGlyphSubstTableUniqueId_ — the fot dump's gst<n> ids.
+    var next_gst_unique_id: int
+    ; nInheritedC_ — the next fresh IC index (registry entries end at 164;
+    ; declare-characteristic extensions allocate from here).
+    var next_ic_index: int
+    ; the backend extension characteristic table selector: true under -t rtf
+    ; (jade.cxx passes the RtfFOTBuilder extension table; fot/transform have
+    ; none in this port — the IgnoredC fallback).
+    var rtf_extensions: bool
+    var tex_extensions: bool
+    var html_extensions: bool
+    var mif_extensions: bool
+    ; declared initial values (declare-initial-value / declare-characteristic):
+    ; parallel ident/expr arrays, compiled into initialStyle_ by compile().
+    var initial_value_names: ref[Array[ref[Identifier]?]]
+    var initial_value_exprs: ref[Array[ref[Expression]?]]
+    var current_part_first_initial_value: int
+    var initial_style_obj: ref[ELObj]?
+    ; nodePropertyTable_ — the grove ComponentName metamodel (both the RCS and
+    ; the SDQL spelling of all 107 component names).
+    var component_names: ref[ComponentName]
+    ; Pattern::MatchContext — the reference's Interpreter IS the match context,
+    ; and these are its two vectors: the attribute names that carry a CLASS and
+    ; an ID, filled by declare-class-attribute / declare-id-attribute (both
+    ; dsssl2-only forms). The class qualifier can match NOTHING while the class
+    ; list is empty; the id qualifier still has the grove's own ID attribute.
+    var class_attribute_names: ref[Array[ref[StringC]?]]
+    var id_attribute_names: ref[Array[ref[StringC]?]]
+    ; Interpreter::groveManager_ — the driver's (DssslApp IS one); null under
+    ; the unit paths, where no document is parsed and nothing folds.
+    var grove_mgr: ref[GroveManager]?
+    ; the sibling-position memo GroveNode.group_index reads and refreshes
+    var sib_hint: ref[SiblingHint]
+    ; The eval scratch region (Collector seam, RBMM shape): while ProcessContext
+    ; evaluates a construction rule, get_host() returns this region instead of
+    ; the run page, so every eval-transient (intermediate ELObjs, sosofo trees,
+    ; per-call insns, fresh VMs) dies with the node's bracket instead of
+    ; retaining until run end — the reference reclaims the same objects with
+    ; Clark's GC. null outside processing (load/compile allocate on the run
+    ; page as before). Interning (symbols/identifiers/units) and Identifier
+    ; value forcing go to the PERM host explicitly (makePermanent semantics).
+    var eval_region: ref[Page]?
+    ; the frame mark's state block (FrameMark.create; null: the mark is off)
+    var frame_mark: pointer[i64]
+)
+{
+    procedure make(host: ref[Page], units_per_inch: int, debug_mode: bool, dsssl2: bool, strict_mode: bool) @deep true @deep_beyond_1 true @deep_whole_1 true returns ref[Interpreter] io reads msg_prog linked
+
+    procedure set_lex_ascii(mutable lex: ref[XcharMap], s: Slice[char], cat: u8) @deep true linked
+
+    ; LexCategory lexCategory(Xchar c)
+    function lex_category(this: Interpreter, c: i32) @ret_param_0 true @deep true returns int linked
+
+    ; the allocation page (Collector seam) — cross-module allocation sites
+    ; reach it through this accessor: the eval scratch region while a
+    ; construction rule evaluates, the run arena page otherwise.
+    function get_host(this: Interpreter) @ret_param_0 true @deep true returns ref[Page] linked
+
+    ; the run arena page unconditionally — for allocations that must outlive
+    ; the eval bracket (interning, forced Identifier values).
+    function get_perm_host(this: Interpreter) @ret_param_0 true @deep true returns ref[Page] linked
+
+    ; --- the LAZY MEMO host (DZ_MEMO_PERM) ----------------------------------
+    ;
+    ; ★★★Where a lazy MEMOISATION puts its storage: the array a node-list view
+    ; fills on demand, the flattened buffer of a string rope. Until now that was
+    ; `Page.get(the object)` — the END of the object's own region — with the
+    ; documented reason that the memo must live exactly as long as the object,
+    ; and a caller's host can be shorter-lived. Right against BRACKET
+    ; granularity, and the class that shaped both the frame mark's store sweep
+    ; and the escape audit: within ONE region the region's end is above every
+    ; live frame mark, so the memo of an outer frame's object is younger than the
+    ; object. Two consequences, both measured: memoisation PUBLISHES under the
+    ; mark (10.5 M frames blocked), and every node-list and string-rope primitive
+    ; has to stay conservative in the escape analysis (its 8.8x gate).
+    ;
+    ; This makes the choice a seam instead of an idiom: on the RUN arena the memo
+    ; is older than every frame and every bracket, so neither problem can arise —
+    ; at the price of memo storage that outlives the bracket it was filled in.
+    ; The elements stored are grove nodes (permanent) or the rope's own flattened
+    ; buffer, so nothing here can create a pointer from the run arena into a
+    ; shorter-lived region.
+    ;
+    ; ★★★It FOLLOWS THE MARK (see memo_host), because the two only make sense
+    ; together. With the mark it is a large win, because memoisation stops
+    ; PUBLISHING: 18.9 M publications become 1.4 M, 4.1 M more frames are
+    ; rewound, 10.03 -> 17.22 GB reclaimed, peak footprint 3911 -> 3463 MB
+    ; (-11.5 %). Without the mark the same change is pure retention and costs
+    ; +18 % peak (5966 -> 7047 MB), so alone it is never right.
+    ;
+    ; ★★★And the reason this stood OFF for a day is the most valuable thing the
+    ; seam produced: with the mark it made 3 of the 48 real-world codegens write
+    ; garbage. It was not this placement — mark + memo on the object's region was
+    ; identical, and memo on the run arena WITHOUT the mark was identical too. It
+    ; was the extra REWINDS: removing 17.5 M publications took away a blanket
+    ; protection nobody had meant as one, and exposed a hole in the mark's rule.
+    ; The hole is condition 6 (BACKFILL) in `FrameMark.scaly`, and it was not a
+    ; missing store hook at all — `Page.allocate` serves from the page it is
+    ; CALLED ON, so the region head kept handing out small objects BELOW every
+    ; live mark. With that condition in place this configuration is 48/48
+    ; byte-identical, which is why the seam is armed.
+    ;
+    ; ★The seam FOLLOWS THE MARK. On its own the run-arena host is pure
+    ; retention (+18 % peak, measured); together with the mark it is a large
+    ; win, because memoisation stops publishing — so it is on exactly when the
+    ; mark is, and `DAZZLE_FRAME_MARK=0` turns both off.
+    ;
+    ; The run arena is kept in the mark's own state block (FrameMark.set_perm,
+    ; from `make`): the lazy flatten deep in ELObj that asks has the object and
+    ; a transient host, not the interpreter.
+    function memo_host(this: Interpreter, own: ref[Page]) @deep true returns ref[Page] linked
+
+    ; The CLI's `--no-frame-mark`: the mark and the memo seam that follows it
+    ; go off together. Runs before the first VM is made, since every VM copies
+    ; the block.
+    procedure disable_frame_mark(mutable this: ref[Interpreter]) @deep true linked
+
+    function get_eval_region(this: Interpreter) @ret_param_0 true @deep true returns ref[Page]? linked
+
+    ; `p` is the NULLABLE form because clearing the region is the documented
+    ; operation: Identifier.compute_value and Expression.make_macro both pass
+    ; null to take the eval scratch region out of play, and the field starts
+    ; null too.
+    procedure set_eval_region(mutable this: ref[Interpreter], p: ref[Page]?) @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    function is_dsssl2(this: Interpreter) @ret_param_0 true @deep true returns bool linked
+
+    ; Interpreter::addClassAttributeName / addIdAttributeName (Interpreter.h:742)
+    ; — the MatchContext vectors the class and id pattern qualifiers read. The
+    ; name is stored as declared; matchAttribute normalizes on the way in.
+    procedure add_class_attribute_name(mutable this: ref[Interpreter], name: ref[StringC]) @persists true @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    procedure add_id_attribute_name(mutable this: ref[Interpreter], name: ref[StringC]) @persists true @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    function get_class_attribute_names(this: Interpreter) @ret_param_0 true @deep true returns ref[Array[ref[StringC]?]]? linked
+
+    function get_id_attribute_names(this: Interpreter) @ret_param_0 true @deep true returns ref[Array[ref[StringC]?]]? linked
+
+    ; ★The grove ID index, the governing DTD and the fold table used to live
+    ; here as interpreter state — right only while exactly one grove could
+    ; exist. They are GroveInfo fields now, one record per grove, and every
+    ; consumer reaches its own through Node::getGroveRoot (dazzle/Grove.scaly).
+
+    function get_units_per_inch(this: Interpreter) @ret_param_0 true @deep true returns int linked
+
+    ; --- singletons --------------------------------------------------------
+    function make_nil(this: Interpreter) @ret_param_0 true @deep true returns ref[ELObj] linked
+
+    function make_true(this: Interpreter) @ret_param_0 true @deep true returns ref[ELObj] linked
+
+    function make_false(this: Interpreter) @ret_param_0 true @deep true returns ref[ELObj] linked
+
+    ; #t / #f from a Scaly bool (Primitive predicate results).
+    function make_bool(this: Interpreter, b: bool) @ret_param_0 true @deep true returns ref[ELObj] linked
+
+    function make_error(this: Interpreter) @ret_param_0 true @deep true returns ref[ELObj] linked
+
+    function make_unspecified(this: Interpreter) @ret_param_0 true @deep true returns ref[ELObj] linked
+
+    function is_error(this: Interpreter, obj: ref[ELObj]?) @ret_param_1 true @deep true returns bool linked
+
+    ; endPart(): the next specification part (later parts' defines lose to
+    ; earlier ones — doDefine's defPart gate).
+    ; Interpreter::dEndPart (Interpreter.cxx:755) — the DECLARATION phase has
+    ; its own part counter, separate from end_part's: declarations of all
+    ; parts are processed before any body element, so the two numbering
+    ; schemes cannot share a counter. `d_part_index` is what
+    ; `def_char`/`add_sdata_entity` arbitrate on (earlier part wins, same part
+    ; with a different value is a duplicate diagnostic).
+    procedure d_end_part(mutable this: ref[Interpreter]) @deep true linked
+
+    procedure end_part(mutable this: ref[Interpreter]) @deep true linked
+
+    ; installBuiltins brackets the builtins parse with part index -1 (so any
+    ; user define overrides a builtin), then endPart wraps back to 0.
+    procedure set_part_index(mutable this: ref[Interpreter], n: u32) @deep true linked
+
+    ; --- processing modes --------------------------------------------------
+    function current_part_index(this: Interpreter) @ret_param_0 true @deep true returns u32 linked
+
+    function initial_processing_mode(this: Interpreter) @ret_param_0 true @deep true returns ref[ProcessingMode] linked
+
+    ; lookupProcessingMode(name): the named mode, created (with the initial mode
+    ; as fall-through parent) on first reference.
+    procedure lookup_processing_mode(mutable this: ref[Interpreter], str: StringC) @ret_param_0 true @deep true @deep_this_2 true @deep_whole_2 true returns ref[ProcessingMode] linked
+
+    ; WithModeExpression::compile's defined() gate — the check + undefinedMode
+    ; message live on this seam because the message table does, not because
+    ; Expression could not name ProcessingMode (see VM.processing_mode).
+    procedure check_mode_defined(mutable this: ref[Interpreter], mode: ref[ProcessingMode]?, loc: Location) @deep true @deep_this_4 true @deep_whole_4 true io reads msg_prog linked
+
+    ; compile(): finalise every mode's rules (Interpreter::compile). Top-level
+    ; definitions used by rule bodies compute lazily via TopRefInsn at eval.
+    ; The sorted element-rule scan order is built HERE (not lazily on the
+    ; first find_match): during processing get_host() is the eval scratch
+    ; region, and a lazily-built sorted array would dangle after the bracket.
+    procedure compile(mutable this: ref[Interpreter]) @deep true io reads msg_prog linked
+
+    ; --- declare-default-language (Interpreter::compileDefaultLanguage) -----
+    ; --- character properties (Interpreter.cxx:2064-2380) -------------------
+
+    function lookup_char_property(this: ref[Interpreter], nm: StringC) @deep true returns ref[CharProp]? linked
+
+    ; the installCharProperties helper: a fresh property with `def` as its
+    ; default and defPart -1 (predefined).
+    ;
+    ; ★The name is widened onto the HOST page, not built with `StringC(nm)`:
+    ; that init allocates its buffer through `Page.get(this)`, and for a
+    ; temporary the compiler may place on the stack the resulting `data`
+    ; pointer is garbage. The name then compares unequal to everything and
+    ; every property reads back as unknown — measured, and invisible until
+    ; the first lookup.
+    procedure new_char_property(mutable this: ref[Interpreter], nm: Slice[char], def: ref[ELObj]) @ret_param_0 true @deep true @deep_this_4 true @deep_whole_4 true returns ref[CharProp] linked
+
+    ; widen an ASCII literal onto `host` — the safe replacement for a bound
+    ; or passed `StringC(<cstring>)` (see new_char_property).
+    function ascii_string_c(host: ref[Page], s: Slice[char]) @page true @direct true @ret_explicit_0 true @deep true returns StringC linked
+
+    ; Interpreter::charProperty — the `char-property` primitive's engine.
+    ; An unknown NAME is a hard diagnostic; a character with no value of its
+    ; own falls back to the caller's default argument if there is one, else
+    ; to the property's own default.
+    procedure char_property(mutable this: ref[Interpreter], prop: StringC, c: u32, loc: Location, def: ref[ELObj]?) @deep true @deep_this_8 true @deep_whole_8 true returns ref[ELObj]? io reads msg_prog linked
+
+    ; Interpreter::addCharProperty — declare-char-property. The default must
+    ; be a CONSTANT (a variable expression is varCharPropertyExprUnsupported);
+    ; re-declaring in the SAME spec part with a different value is
+    ; duplicateCharPropertyDecl, while an EARLIER part simply wins.
+    procedure add_char_property(mutable this: ref[Interpreter], mutable ident: ref[Identifier], mutable val: ref[ELObj]?, loc: Location) @deep true @deep_this_12 true @deep_whole_12 true io reads msg_prog linked
+
+    ; Interpreter::setCharProperty — one (property, character) cell from
+    ; add-char-properties. An unknown property name is the same diagnostic
+    ; the primitive gives.
+    procedure set_char_property(mutable this: ref[Interpreter], mutable ident: ref[Identifier], c: u32, mutable val: ref[ELObj]?, loc: Location) @deep true @deep_this_16 true @deep_whole_16 true io reads msg_prog linked
+
+    ; ★the PART matters: the reference keeps the FIRST declaration seen in
+    ; this part or an earlier one and refuses to overwrite it
+    ; (SchemeParser.cxx:2101), so the part index is state, not a formality.
+    procedure set_default_language_def(mutable this: ref[Interpreter], expr: ref[Expression]?, part: int, loc: Location) @deep true @deep_this_10 true @deep_whole_10 true linked
+
+    function default_language_is_set(this: Interpreter) @ret_param_0 true @deep true returns bool linked
+
+    function get_default_language_part(this: Interpreter) @ret_param_0 true @deep true returns int linked
+
+    function get_default_language_loc(this: Interpreter) @page true @direct true @ret_param_0 true @deep true returns Location linked
+
+    function get_default_language(this: Interpreter) @ret_param_0 true @deep true returns ref[ELObj]? linked
+
+    procedure compile_default_language(mutable this: ref[Interpreter]) @deep true io reads msg_prog linked
+
+    ; --- interning ---------------------------------------------------------
+    ; Identifier *lookup(const StringC &): one Identifier per name.
+    procedure lookup(mutable this: ref[Interpreter], str: StringC) @deep true returns ref[Identifier] linked
+
+    ; SymbolObj *makeSymbol(const StringC &): one SymbolObj per name.
+    procedure make_symbol(mutable this: ref[Interpreter], str: StringC) @deep true returns ref[ELObj] linked
+
+    ; --- NumberCache seam --------------------------------------------------
+    ; The reference DERIVES Interpreter from NumberCache (style/Interpreter.h:303),
+    ; so the numbering primitives call `interp.elementNumber(node, gi)`. Same
+    ; seam here, one cache per run.
+    procedure element_number(mutable this: ref[Interpreter], mutable node: ref[GroveNode]?, mutable gi: StringC) @deep true returns int linked
+
+    procedure element_number_after(mutable this: ref[Interpreter], mutable node: ref[GroveNode]?, gi: StringC, mutable reset_gi: StringC) @ret_nonlocal true @deep true returns int linked
+
+    procedure child_number(mutable this: ref[Interpreter], mutable node: ref[GroveNode]?, gi: StringC) @deep true returns int linked
+
+    ; KeywordObj *makeKeyword(const StringC &): a fresh KeywordObj whose
+    ; identity is the interned Identifier.
+    procedure make_keyword(mutable this: ref[Interpreter], str: StringC) @ret_param_0 true @deep true returns ref[ELObj] linked
+
+    ; --- grove component names ---------------------------------------------
+    ; bool lookupNodeProperty(const StringC &, ComponentName::Id &) — either
+    ; spelling, case-insensitively; CN_NO_ID when the name is not a component.
+    function lookup_node_property(this: ref[Interpreter], name: StringC) @deep true returns int linked
+
+    ; the name a component-name VALUE renders as (ELObjPropertyValue::set —
+    ; rcs? picks the short RCS name, otherwise the SDQL name).
+    function component_name(this: ref[Interpreter], id: int, want_rcs: bool) @page true @direct true @ret_param_0 true @deep true returns StringC linked
+
+    ; --- units -------------------------------------------------------------
+    ; Unit *lookupUnit(const StringC &): create on demand.
+    procedure lookup_unit(mutable this: ref[Interpreter], name: StringC) @ret_param_0 true @deep true returns ref[Unit] linked
+
+    ; void installUnits(): builtin units valued from unitsPerInch; "pc" is
+    ; the DSSSL2 addition.
+    procedure install_units(mutable this: ref[Interpreter]) @ret_nonlocal true @deep true linked
+
+    procedure install_unit(mutable this: ref[Interpreter], mutable name: Slice[char], numer: int, denom: int) @ret_nonlocal true @deep true linked
+
+    ; --- syntactic keys ----------------------------------------------------
+    procedure install_syntactic_key(mutable this: ref[Interpreter], mutable name: Slice[char], key: int) @ret_nonlocal true @deep true linked
+
+    ; the `keys2[]` table (Interpreter.cxx:377) — installed ONLY under -2.
+    ; Without the flag `begin` and `set!` are undefined variables and
+    ; `or-element` an unknown top-level form; all three measured.
+    procedure install_syntactic_key2(mutable this: ref[Interpreter], mutable name: Slice[char], key: int) @ret_nonlocal true @deep true linked
+
+    ; installSyntacticKey batch (Interpreter ctor). Inc-3 subset: the eval-core
+    ; forms; the style/grove top-level keys (element/root/mode/declare-*) join
+    ; with those increments, though the tags are reserved here.
+    procedure install_syntactic_keys(mutable this: ref[Interpreter]) @ret_nonlocal true @deep true linked
+
+
+    ; --- Inc 8: FOT symbols, inherited characteristics, standard flow objects --
+    ; installCValueSymbols — the 120-code FOTBuilder::Symbol table (codes 0/1
+    ; are #f/#t; 2.. follow the enum order; faithful quirk: symbolBevel's name
+    ; is "join"). Symbols are interned with their c-value so convert_enum can
+    ; validate any characteristic symbol value.
+    procedure install_c_value_symbols(mutable this: ref[Interpreter]) @deep true linked
+
+    ; one inherited-characteristic registry entry: intern the identifier and
+    ; hang the prototype IC off it (Identifier::setInheritedC). `print_name`
+    ; is the exact fot attribute name (reference quirks preserved). The
+    ; prototype carries the characteristic's INITIAL value (the inherited-*
+    ; fallback when nothing is pushed). iic = all-zero defaults (#f / 0 /
+    ; empty); iicn / iicsym / iicstr / iicobj set non-zero initials.
+    procedure iic(mutable this: ref[Interpreter], mutable name: Slice[char], kind: int, mutable print_name: Slice[char], index: int) @ret_nonlocal true @deep true linked
+
+    ; numeric initial: length/length-spec/integer/maybe-integer/bool kinds.
+    procedure iicn(mutable this: ref[Interpreter], mutable name: Slice[char], kind: int, mutable print_name: Slice[char], index: int, n: int) @ret_nonlocal true @deep true linked
+
+    ; symbol initial (GenericSymbolInheritedC's non-default entries); the
+    ; symbol table (install_c_value_symbols) runs first, so the interned
+    ; symbol already carries its c-value code.
+    procedure iicsym(mutable this: ref[Interpreter], mutable name: Slice[char], mutable print_name: Slice[char], index: int, sym_name: Slice[char]) @ret_nonlocal true @deep true linked
+
+    procedure iicstr(mutable this: ref[Interpreter], mutable name: Slice[char], mutable print_name: Slice[char], index: int, s: Slice[char]) @ret_nonlocal true @deep true linked
+
+    ; an ignored characteristic (IgnoredC): initial value is an arbitrary
+    ; ELObj; set() renders nothing.
+    procedure iicobj(mutable this: ref[Interpreter], mutable name: Slice[char], mutable print_name: Slice[char], index: int, val: ref[ELObj]) @ret_nonlocal true @deep true @deep_this_16 true @deep_whole_16 true linked
+
+    procedure make_proto_ic(mutable this: ref[Interpreter], name: Slice[char], kind: int, print_name: Slice[char], index: int) @ret_param_0 true @deep true returns ref[InheritedC] linked
+
+    ; installInheritedC's tail: bind the prototype and install the
+    ; inherited-*/actual-* primitives. (The reference's trailing-'?' alias is
+    ; gated on dsssl2(), which is default-OFF — the `-2` flag is not ported.)
+    procedure finish_ic(mutable this: ref[Interpreter], mutable ic: ref[InheritedC]) @ret_nonlocal true @deep true linked
+
+    ; installInheritedCProc — bind `inherited-<name>` / `actual-<name>` to
+    ; zero-arg primitives reading the style stack (NOT registered as external
+    ; procedures — the reference binds the value only).
+    procedure install_inherited_c_proc(mutable this: ref[Interpreter], ident: ref[Identifier]?) @ret_nonlocal true @deep true linked
+
+    procedure install_prefixed_prim(mutable this: ref[Interpreter], prefix: Slice[char], base: ref[Identifier], prim_id: int) @ret_nonlocal true @deep true linked
+
+    ; installInheritedCs — the generic entries of the reference registry
+    ; (InheritedC.cxx) incl. the ignored characteristics (IgnoredC) and the
+    ; maybe-integers; initial values transcribed at upi=72000. The full
+    ; reference registry is installed (incl. color/background-color, the
+    ; border and rule specials, glyph-subst-table, the opt-length-spec and
+    ; inline-space entries).
+    procedure install_inherited_cs(mutable this: ref[Interpreter]) @deep true linked
+
+    ; Identifier::setInheritedC(ic, part, loc) — the definition record the
+    ; duplicate gates of declare-characteristic / declare-flow-object-class /
+    ; declare-flow-object-macro consult. Only a declare-characteristic writes
+    ; it; a BUILT-IN characteristic keeps the -1 part its prototype was made
+    ; with, which is what keeps `(declare-flow-object-macro font-size …)`
+    ; legal.
+    procedure stamp_inherited_c_def(this: ref[Interpreter], mutable ident: ref[Identifier], part: u32, loc: Location) @deep true @deep_into_1_8 true linked
+
+    ; inheritedCDefined(part, loc) — true when the name carries a
+    ; characteristic prototype; the part/loc come back through the pointers.
+    procedure inherited_c_defined(this: ref[Interpreter], ident: ref[Identifier], mutable part: ref[u32], mutable loc: ref[Location]) @ret_nonlocal true @deep true returns bool linked
+
+    ; Interpreter::installExtensionCharNIC (Interpreter.cxx:2381) — the whole
+    ; body is `ident->setCharNIC(currentPartIndex(), loc)`. ★The public
+    ; identifier is PARSED and then DROPPED: unlike declare-characteristic
+    ; (which resolves the pubid against the backend's extension table) a char
+    ; NIC is never handed to a backend — the `character` flow object reads it
+    ; off the Identifier by name. The parameter stays for the reference's
+    ; shape.
+    procedure install_extension_char_nic(this: ref[Interpreter], mutable ident: ref[Identifier], pubid: StringC, loc: Location) @ret_nonlocal true @deep true @deep_into_1_8 true linked
+
+    ; Interpreter::installExtensionInheritedC — resolve the public id against
+    ; the backend's extension table. Under -t rtf the 12-entry RtfFOTBuilder
+    ; table applies (typed ICs carrying an ext-setter id, dispatched in
+    ; RtfFOTBuilder.set_extension_ic); fot/transform have no table, so every
+    ; declared characteristic takes the reference's fallback: an IgnoredC —
+    ; accepted anywhere, renders nothing, value slot #f.
+    procedure install_extension_inherited_c(mutable this: ref[Interpreter], mutable ident: ref[Identifier], pubid: StringC, loc: Location) @deep true linked
+
+    ; the jade.cxx RtfFOTBuilder extension table: pubid suffix after
+    ; "UNREGISTERED::James Clark//Characteristic::" -> (value kind, setter id)
+    procedure match_rtf_extension(this: ref[Interpreter], pubid: StringC, mutable kind: ref[int], mutable ext: ref[int]) @deep true linked
+
+    ; the jade.cxx TeXFOTBuilder extension table (makeTeXFOTBuilder): the 15
+    ; characteristics it registers. Ids 1-12 share the RTF numbering where the
+    ; characteristics coincide; 13-15 are TeX-only (page-two-side?,
+    ; two-side-start-on-right?, preserve-sdata?) — note the OpenJade-prefixed
+    ; public ids for the two-side pair.
+    procedure match_tex_extension(this: ref[Interpreter], pubid: StringC, mutable kind: ref[int], mutable ext: ref[int]) @deep true linked
+
+    procedure set_rtf_extensions(mutable this: ref[Interpreter], b: bool) @deep true linked
+
+    procedure set_tex_extensions(mutable this: ref[Interpreter], b: bool) @deep true linked
+
+    procedure set_html_extensions(mutable this: ref[Interpreter], b: bool) @deep true linked
+
+    procedure set_mif_extensions(mutable this: ref[Interpreter], b: bool) @deep true linked
+
+    ; Interpreter::installInitialValue — collect (ident, expr); a same-part
+    ; re-declaration is duplicateInitialValue with the first one as aux line.
+    procedure install_initial_value(mutable this: ref[Interpreter], ident: ref[Identifier], expr: ref[Expression]) @persists true @deep true @deep_this_6 true @deep_whole_6 true io reads msg_prog linked
+
+    ; Interpreter::compileInitialValues — each declared value becomes a
+    ; constant IC (via the per-kind conversion) or a VarInheritedC; together
+    ; they form the initial style ProcessContext::process pushes around the
+    ; whole run.
+    procedure compile_initial_values(mutable this: ref[Interpreter]) @deep true io reads msg_prog linked
+
+    function initial_style(this: Interpreter) @ret_param_0 true @deep true returns ref[ELObj]? linked
+
+    procedure make_border_style(mutable this: ref[Interpreter], b: bool) @ret_param_0 true @deep true returns ref[ELObj] linked
+
+    function border_true_style(this: ref[Interpreter]) @ret_param_0 true @deep true returns ref[ELObj]? linked
+
+    function border_false_style(this: ref[Interpreter]) @ret_param_0 true @deep true returns ref[ELObj]? linked
+
+    ; a BorderC registry entry (initial value #f; print name unused — set()
+    ; renders nothing).
+    procedure iicborder(mutable this: ref[Interpreter], mutable name: Slice[char], index: int) @ret_nonlocal true @deep true linked
+
+    procedure set_extensions_on(on: bool) @deep true mutable xt_extensions_on reads xt_extensions_on linked
+
+    ; installFlowObjs — the standard flow-object classes of this slice
+    ; (reference installs all ~45 unconditionally; the rest land with their
+    ; SgmlFOTBuilder methods).
+    procedure install_flow_objs(mutable this: ref[Interpreter]) @ret_nonlocal true @deep true linked
+
+    ; allocGlyphSubstTableUniqueId — the fot dump's gst<n> id counter.
+    procedure alloc_gst_unique_id(mutable this: ref[Interpreter]) @ret_param_0 true @deep true returns int linked
+
+    ; bind an identifier's VALUE to a FlowObjBox carrying `foc` (the DSSSL flow-
+    ; object-class binding; NOT a new Identifier field — see ELObj FOC note).
+    procedure bind_flow_object_class(mutable this: ref[Interpreter], mutable ident: ref[Identifier], foc: int) @ret_nonlocal true @deep true linked
+
+    ; declare-flow-object-macro's binding: a FlowObjBox carrying the macro
+    ; seed (FOC_MACRO + the shared definition + one empty characteristic slot
+    ; per declared name). Every `make` of the name copies that seed.
+    procedure bind_flow_object_macro(mutable this: ref[Interpreter], mutable ident: ref[Identifier], def: ref[MacroDef]) @ret_nonlocal true @deep true @deep_into_1_4 true linked
+
+    ; installExtensionFlowObjectClass — bind an identifier to a transform flow
+    ; object class keyed on its public id (the jade/dazzle-net extension table).
+    ; The active backend decides whether the extension table is present
+    ; (jade.cxx: only the transform backends pass extensions): with extensions
+    ; off (-t fot), every id except the always-available formatting-instruction
+    ; binds the reference's UnknownFlowObj (key-swallowing, content-
+    ; transparent). An unrecognised id under the transform backends keeps the
+    ; historical FOC_SEQUENCE fallback (corpus-validated).
+    procedure install_extension_flow_object_class(mutable this: ref[Interpreter], mutable ident: ref[Identifier], public_id: StringC) @deep true reads xt_extensions_on linked
+
+    ; --- primitives --------------------------------------------------------
+    procedure install_primitive(mutable this: ref[Interpreter], mutable name: Slice[char], prim_id: int, mutable sig: Signature) @ret_nonlocal true @deep true @deep_this_8 true @deep_whole_8 true linked
+
+    ; The PRIMITIVE2 macro (primitive.cxx:5333): `if (dsssl2())
+    ; installPrimitive(...)`. Without the `-2` flag these eleven names are
+    ; UNDEFINED VARIABLES in the reference, not procedures — measured against
+    ; the reference binary, which reports `reference to undefined variable
+    ; "vector?"` and friends. This port used to install them unconditionally.
+    procedure install_primitive2(mutable this: ref[Interpreter], mutable name: Slice[char], prim_id: int, mutable sig: Signature) @ret_nonlocal true @deep true @deep_this_8 true @deep_whole_8 true linked
+
+    ; installXPrimitive — an extension primitive: NOT bound to its identifier
+    ; (only external-procedure reaches it), registered under prefix+name.
+    procedure install_x_primitive(mutable this: ref[Interpreter], prefix: Slice[char], name: Slice[char], prim_id: int, mutable sig: Signature) @ret_nonlocal true @deep true @deep_this_16 true @deep_whole_16 true linked
+
+    procedure register_external_proc(mutable this: ref[Interpreter], prefix: Slice[char], name: Slice[char], value: ref[ELObj]) @persists true @ret_nonlocal true @deep true @deep_this_8 true @deep_whole_8 true linked
+
+    ; lookupExternalProc — external-procedure's table probe; null = unknown.
+    function lookup_external_proc(this: ref[Interpreter], pubid: StringC) @ret_param_0 true @deep true returns ref[ELObj]? linked
+
+    ; installPrimitives (Interpreter.cs). Inc-3 starter batch: the pure-ELObj
+    ; primitives. String/char/vector and grove/sosofo/style primitives join
+    ; with their machinery.
+    procedure install_primitives(mutable this: ref[Interpreter]) @ret_nonlocal true @deep true io reads msg_prog linked
+
+    ; ApplyPrimitiveObj / CallWithCurrentContinuationPrimitiveObj — bound as
+    ; the ApplyFn / CallCCFn ELObj arms whose call() reshuffles / captures.
+    procedure install_apply(mutable this: ref[Interpreter]) @ret_nonlocal true @deep true linked
+
+    ; ★Only the long name: the reference installs no `call/cc` abbreviation
+    ; (this port used to bind one), and this whole procedure is dsssl2-only.
+    procedure install_call_cc(mutable this: ref[Interpreter]) @ret_nonlocal true @deep true linked
+
+    ; --- named characters --------------------------------------------------
+    function lookup_char_entry(t: ref[Array[ref[CharPart]?]], name: StringC) @ret_param_0 true @deep true returns ref[CharPart]? linked
+
+    procedure insert_char_entry(mutable this: ref[Interpreter], mutable t: ref[Array[ref[CharPart]?]], mutable name: StringC, c: u32, def_part: u32) @page true @direct true @deep true linked
+
+    ; the generated CharNames/Sdata tables install through these (defPart -1)
+    procedure def_char(mutable this: ref[Interpreter], mutable name: Slice[char], c: u32) @ret_nonlocal true @deep true linked
+
+    procedure def_sdata_char(mutable this: ref[Interpreter], mutable name: Slice[char], c: u32) @ret_nonlocal true @deep true linked
+
+    ; bool convertCharName(const StringC &str, Char &c)
+    procedure convert_char_name(this: Interpreter, str: StringC, mutable c: ref[u32]) @ret_nonlocal true @deep true returns bool linked
+
+    ; Interpreter::sdataMap (style/Interpreter.cxx:590) — the SdataMapper the
+    ; grove's SdataNode::charChunk consults, and therefore the ONE character an
+    ; SDATA entity reference contributes to any backend. Four steps, in order:
+    ; the entity NAME table (the built-in sdata.h names plus map-sdata-entity
+    ; declarations), the entity TEXT table (map-sdata-entity only), a U-XXXX
+    ; name, and finally defaultChar. ★It NEVER fails — the reference returns 1
+    ; on the fallback too, deliberately ("at least it makes preserve-sdata work
+    ; with unknown SDATA entities"), so an sdata node's `char` is always
+    ; accessOK.
+    function sdata_map(this: Interpreter, name: StringC, text: StringC) @deep true returns u32 linked
+
+    ; static bool convertUnicodeCharName(const StringC &str, Char &c): U-XXXX
+    procedure convert_unicode_char_name(str: StringC, mutable c: ref[u32]) @ret_nonlocal true @deep true returns bool linked
+
+    ; --- declaration hooks (style-specification declaration elements) ------
+    ; void setCharRepertoire(const StringC &pubid)
+    procedure set_char_repertoire(mutable this: ref[Interpreter], pubid: StringC) @ret_nonlocal true @deep true io reads msg_prog linked
+
+    ; void addStandardChar(const StringC &name, const StringC &num)
+    procedure add_standard_char(mutable this: ref[Interpreter], mutable name: StringC, num: StringC) @deep true io reads msg_prog linked
+
+    ; void addNameChar(const StringC &name)
+    procedure add_name_char(mutable this: ref[Interpreter], name: StringC) @deep true io reads msg_prog linked
+
+    ; void addSeparatorChar(const StringC &name)
+    procedure add_separator_char(mutable this: ref[Interpreter], name: StringC) @deep true io reads msg_prog linked
+
+    ; void addSdataEntity(const StringC &ename, const StringC &etext, const StringC &name)
+    procedure add_sdata_entity(mutable this: ref[Interpreter], mutable ename: StringC, mutable etext: StringC, name: StringC) @deep true io reads msg_prog linked
+
+    ; --- the `-2` string leniency ------------------------------------------
+    ; ELObj *convertFromString(ELObj *, unsigned hints, const Location &)
+    ; (Interpreter.cxx:1095). Under `-2` EVERY characteristic value passes
+    ; through here before its converter, so a STRING may stand in for the
+    ; number, symbol or boolean the converter wants. Without `-2` — and for
+    ; anything that is not a string — it returns the object unchanged.
+    ;
+    ; ★The hints belong to the CONVERTER, not to the key: convertLengthC
+    ; allows a number only, convertEnumC a symbol or a boolean. A union over
+    ; all three would be wrong, because it would reinterpret the value of a
+    ; genuine STRING characteristic (`entity-system-id: "5"` is the string
+    ; "5", never the number 5).
+    ;
+    ; ★The number arm resolves quantities: convertNumber answers an
+    ; UnresolvedLengthObj for "3pt", which is only a length once its unit is
+    ; resolved — and an undefined unit messages at `loc`.
+    procedure convert_from_string(mutable this: ref[Interpreter], mutable obj: ref[ELObj], hints: int, loc: Location) @page true @returnpage true @deep true returns ref[ELObj] io reads msg_prog linked
+
+    ; static bool equal(const Char *s1, const char *s2, size_t n)
+    ; (Interpreter.cxx:1086) — the byte compare of the boolean arm.
+    function equals_ascii(str: StringC, lit: Slice[char]) @ret_nonlocal true @deep true returns bool linked
+
+    ; SymbolObj *symbolTable_.lookup(const StringC &) — the lookup half of
+    ; makeSymbol, WITHOUT the interning: convertFromString may not create a
+    ; symbol for a string that names none.
+    function lookup_symbol(this: ref[Interpreter], str: StringC) @deep true returns ref[ELObj]? linked
+
+    ; --- number conversion -------------------------------------------------
+    ; static bool scanSignDigits(const StringC &, size_t &i, int &n)
+    procedure scan_sign_digits(str: StringC, mutable i: ref[size_t], mutable n: ref[int]) @ret_param_1 true @deep true returns bool linked
+
+    ; ELObj *convertNumber(const StringC &str, int radix = 10)
+    procedure convert_number(mutable this: ref[Interpreter], str: StringC) @page true @returnpage true @ret_param_0 true @deep true returns ref[ELObj]? linked
+
+    procedure convert_number_radix(mutable this: ref[Interpreter], str: StringC, radix_in: int) @page true @returnpage true @ret_param_0 true @deep true returns ref[ELObj]? linked
+
+    ; ELObj *convertNumberFloat(const StringC &str)
+    procedure convert_number_float(mutable this: ref[Interpreter], str: StringC) @page true @direct true @ret_param_0 true @deep true returns ref[ELObj]? linked
+
+    ; Unit *scanUnit(const StringC &str, size_t i, int &unitExp) — null on error.
+    procedure scan_unit(mutable this: ref[Interpreter], str: StringC, i_in: size_t, mutable unit_exp: ref[int]) @page true @direct true @ret_param_0 true @deep true returns ref[Unit]? linked
+
+    ; --- Messenger seam ----------------------------------------------------
+    procedure set_next_location(mutable this: ref[Interpreter], loc: Location) @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    function get_error_count(this: Interpreter) @ret_param_0 true @deep true returns int linked
+
+    procedure message0(mutable this: ref[Interpreter], mt: MessageType) @ret_nonlocal true @deep true io reads msg_prog linked
+
+    procedure message1(mutable this: ref[Interpreter], mt: MessageType, a1: StringC) @ret_nonlocal true @deep true io reads msg_prog linked
+
+    procedure message2(mutable this: ref[Interpreter], mt: MessageType, a1: StringC, a2: StringC) @ret_nonlocal true @deep true io reads msg_prog linked
+
+    ; NumberMessageArg shape (stackTraceEllipsis's omitted-call count): %1
+    ; renders unquoted.
+    procedure message_num(mutable this: ref[Interpreter], mt: MessageType, n: u64) @ret_nonlocal true @deep true io reads msg_prog linked
+
+    function get_debug_mode(this: Interpreter) @ret_param_0 true @deep true returns bool linked
+
+    ; MessageType3 shape of PrimitiveObj::argError: %1 primitive name,
+    ; %2 ordinal, %3 printed object.
+    procedure message3(mutable this: ref[Interpreter], mt: MessageType, a1: StringC, ord2: u64, a3: StringC) @ret_nonlocal true @deep true io reads msg_prog linked
+
+    ; --- self-test ---------------------------------------------------------
+    procedure test() @ret_nonlocal true @deep true returns int io reads msg_prog linked
+
+    ; the CLI driver's argv0 — the MessageReporter prefix. Unset, messages keep
+    ; the historical package prefix `dazzle` (unit tests / --jit suite).
+    procedure set_msg_prog(prog: pointer[const_char]) @deep true @deep_beyond_1 true @deep_whole_1 true mutable msg_prog reads msg_prog linked
+
+    ; render one diagnostic line to stderr, byte-identical to the reference
+    ; MessageReporter::dispatchMessage the style Interpreter reports through:
+    ;   <prog>:[<file>:<line>[:<col>]:]<sev>: <formatted text>\n
+    ; The location is the Messenger's next-location (setNextLocation), CONSUMED
+    ; by this message (initMessage clears it). A null-origin location renders
+    ; no location segment at all (`<prog>:I: called from here`); a non-null
+    ; origin whose chain names no real backing source renders the reference's
+    ; "(invalid location)". Errors count; Info (stack traces) does not.
+    procedure emit(mutable this: ref[Interpreter], mt: MessageType, args: Vector[MessageArg]) @deep true io reads msg_prog linked
+
+    ; an auxiliary message line (`<prog>:<file>:<line>:<col>: <text>` — no
+    ; severity char; the reference MessageReporter's auxiliary fragment, e.g.
+    ; duplicateDefinition's "first definition was here").
+    ; ★The parameter is a MessageFragment, not a MessageType, and said so in
+    ; the wrong place until 2026-08-23: every caller hands over an `*_aux()`
+    ; accessor, all of which return MessageFragment, and the body only ever
+    ; wants the template text. It ran correctly because MessageType's FIRST
+    ; field IS a MessageFragment, so MessageType.get_text() read `fragment.text`
+    ; at exactly the offset the argument's own `text` sits at — right by
+    ; layout coincidence. Caught by lookup_method#'s type gate the day it
+    ; landed; nothing else could see it, since emit_call builds the callee's
+    ; type from the argument VALUES.
+    procedure emit_aux(this: ref[Interpreter], mt: MessageFragment, loc: Location) @deep true io reads msg_prog linked
+}

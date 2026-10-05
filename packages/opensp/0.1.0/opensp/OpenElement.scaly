@@ -1,0 +1,289 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.ElementType.ElementType
+use opensp.ElementType.ElementDefinition
+use opensp.ShortReferenceMap.ShortReferenceMap
+use opensp.ContentToken.ContentToken
+use opensp.ContentToken.MatchState
+use opensp.ContentToken.CompiledModelGroup
+use opensp.ContentToken.CmNode
+
+; OpenElement — OpenElement.cs (160 LOC). One entry on the parser's open-element
+; stack: the element type, whether its start-tag was net-enabling, whether it is
+; included, its content-model cursor (`MatchState`), the declared content (cached
+; so the empty/cdata/rcdata fast paths dodge the model group), its active
+; shortref map, its start location, and its serial index.
+;
+; PORT SHAPE: page-hosted flat struct (referenced by pointer from the open-element
+; stack). C++ `OpenElement : Link` (intrusive list node) — the ContentState port
+; threads the stack itself (an Array + live depth), so the Link base drops; an
+; OpenElement is just the payload. Mutated through a pointer via plain `.`.
+;
+; impliedStartTag / doRequiredTransition landed with the OMITTAG increment
+; (Stage 4 Inc 4). DEFERRED still: `invalidExclusion` / `transitionToken` (the
+; exclusion-recovery automaton), which arrive with exclusion diagnostics.
+
+define OpenElement
+(
+    var element_type: ref[ElementType]?
+    var net_enabling: bool
+    var included: bool
+    var match_state: ref[MatchState]?
+    var declared_content: int
+    var map: ref[ShortReferenceMap]?
+    var start_location: Location
+    var index: u64
+)
+{
+    function make(host: ref[Page], type: ref[ElementType]?, net: bool, included: bool, map: ref[ShortReferenceMap]?, start_location: Location) returns ref[OpenElement]
+    {
+        var def: ref[ElementDefinition]? null
+        if type <> null
+            def := type.get_definition()
+        var match_state: ref[MatchState]? null
+        var declared_content DC_MODEL_GROUP
+        if def <> null
+        {
+            match_state := ContentToken.make_match_state(host, def.compiled_model_group())
+            declared_content := def.get_declared_content()
+        }
+        else
+            match_state := ContentToken.make_match_state(host, null)
+        &OpenElement^host(type, net, included, match_state, declared_content, map, start_location, 0)
+    }
+
+    ; Re-arm a recycled element in place (ContentState.acquire_element). Same
+    ; field set as `make`, but the MatchState struct rides along and only its
+    ; AndState is re-armed — see ContentToken.reset_match_state. Every field is
+    ; written, so a recycled element carries nothing of its previous life.
+    procedure reinit(mutable this: ref[OpenElement], host: ref[Page], type: ref[ElementType]?, net: bool, included: bool, map: ref[ShortReferenceMap]?, start_location: Location)
+    {
+        this.element_type := type
+        this.net_enabling := net
+        this.included := included
+        this.map := map
+        this.start_location := start_location
+        this.index := 0
+
+        var def: ref[ElementDefinition]? null
+        if type <> null
+            def := type.get_definition()
+        if def <> null
+        {
+            ContentToken.reset_match_state(host, this.match_state as ref[MatchState], def.compiled_model_group())
+            this.declared_content := def.get_declared_content()
+        }
+        else
+        {
+            ContentToken.reset_match_state(host, this.match_state as ref[MatchState], null)
+            this.declared_content := DC_MODEL_GROUP
+        }
+    }
+
+    function get_type(this: OpenElement) returns ref[ElementType]?
+        element_type
+
+    function get_net_enabling(this: OpenElement) returns bool
+        net_enabling
+
+    function get_included(this: OpenElement) returns bool
+        included
+
+    function get_match_state(this: OpenElement) returns ref[MatchState]?
+        match_state
+
+    procedure set_match_state(mutable this: ref[OpenElement], state: ref[MatchState]?)
+        this.match_state := state
+
+    function is_finished(this: OpenElement) returns bool
+    {
+        if declared_content <> DC_MODEL_GROUP
+            return true
+        ContentToken.ms_is_finished(match_state as ref[MatchState])
+    }
+
+    ; upstream takes `const ElementType *` (a caller may hand the null the
+    ; document type's lookup answers): nullable, and dereferenced only where it
+    ; equals this element's type
+    procedure try_transition(mutable this: OpenElement, e: ref[ElementType]?) returns bool
+    {
+        if declared_content = DC_MODEL_GROUP
+            return ContentToken.ms_try_transition(match_state as ref[MatchState], e)
+        if declared_content = DC_ANY
+        {
+            if e <> element_type
+                return true
+            let et e as ref[ElementType]
+            return et.get_definition().get_allow_immediate_recursion()
+        }
+        false
+    }
+
+    procedure try_transition_pcdata(mutable this: OpenElement) returns bool
+    {
+        if declared_content = DC_MODEL_GROUP
+            return ContentToken.ms_try_transition_pcdata(match_state as ref[MatchState])
+        ; CDATA, RCDATA, ANY all admit PCDATA.
+        true
+    }
+
+    ; MatchState::impliedStartTag — the uniquely-required next element (OMITTAG
+    ; start-tag omission), or null. Only model-group content implies tags.
+    function implied_start_tag(this: OpenElement) returns ref[ElementType]?
+    {
+        if declared_content <> DC_MODEL_GROUP
+            return null
+        ContentToken.ms_implied_start_tag(match_state as ref[MatchState])
+    }
+
+    ; the required token itself — its type_index feeds requiredElementExcluded.
+    function implied_start_token(this: OpenElement) returns ref[CmNode]?
+    {
+        if declared_content <> DC_MODEL_GROUP
+            return null
+        ContentToken.ms_implied_start_token(match_state as ref[MatchState])
+    }
+
+    ; MatchState::possibleTransitions — the element types reachable by one
+    ; transition (null = the #PCDATA leaf); findMissingTag's candidate set.
+    procedure possible_transitions(this: OpenElement, mutable v: ref[Array[ref[ElementType]?]])
+    {
+        if declared_content = DC_MODEL_GROUP
+            ContentToken.ms_possible_transitions(match_state as ref[MatchState], v)
+    }
+
+    ; MatchState::invalidExclusion — the transition token for e that may not be
+    ; excluded (neither inherently optional nor an OR-group member), or null.
+    function invalid_exclusion(this: OpenElement, e: ref[ElementType]) returns ref[CmNode]?
+    {
+        if declared_content <> DC_MODEL_GROUP
+            return null
+        ContentToken.ms_invalid_exclusion(match_state as ref[MatchState], e)
+    }
+
+    ; a deep copy of the content-model cursor (undo snapshot).
+    function copy_match_state(this: OpenElement, host: ref[Page]) returns ref[MatchState]
+        ContentToken.ms_copy(host, match_state as ref[MatchState])
+
+    ; MatchState::doRequiredTransition — advance past the implied required element.
+    procedure do_required_transition(mutable this: ref[OpenElement])
+    {
+        if declared_content = DC_MODEL_GROUP
+            ContentToken.ms_do_required_transition(this.match_state as ref[MatchState])
+    }
+
+    function get_map(this: OpenElement) returns ref[ShortReferenceMap]?
+        map
+
+    procedure set_map(mutable this: ref[OpenElement], map: ref[ShortReferenceMap]?)
+        this.map := map
+
+    ; declaredContent == cdata || rcdata — the special (verbatim) parse.
+    function requires_special_parse(this: OpenElement) returns bool
+        (declared_content = DC_CDATA) || (declared_content = DC_RCDATA)
+
+    function mode(this: OpenElement, net_enabled: bool) returns int
+    {
+        ; An element whose declaration never resolved (e.g. a model group that
+        ; referenced a parameter entity we could not expand) has a null
+        ; definition; treat it like ANY rather than dereferencing null. The
+        ; OpenElement was built with declared_content = DC_MODEL_GROUP + a null
+        ; match state, so is_finished/try_transition already degrade gracefully.
+        var def: ref[ElementDefinition]? null
+        if element_type <> null
+            def := element_type.get_definition()
+        if def = null
+        {
+            if net_enabled
+                return mconnetMode
+            return mconMode
+        }
+        def.mode(net_enabled)
+    }
+
+    function get_start_location(this: OpenElement) returns Location
+        start_location
+
+    function current_position(this: OpenElement) returns ref[CmNode]?
+    {
+        if declared_content = DC_MODEL_GROUP
+            return ContentToken.ms_current_position(match_state as ref[MatchState])
+        null
+    }
+
+    function declared_empty(this: OpenElement) returns bool
+        declared_content = DC_EMPTY
+
+    ; setConref — a CONREF attribute makes the element behave as EMPTY.
+    procedure set_conref(mutable this: ref[OpenElement])
+        this.declared_content := DC_EMPTY
+
+    function get_index(this: OpenElement) returns u64
+        index
+
+    procedure set_index(mutable this: ref[OpenElement], index: u64)
+        this.index := index
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+
+        ; --- an EMPTY element: finished immediately, no model group ---
+        let img ElementType^host(StringC("img"), 1)
+        let emptyDef ElementDefinition.make(host, Location(), 0, 0, DC_EMPTY, true)
+        img.set_element_definition(emptyDef, 0)
+        let oeImg OpenElement.make(host, img, false, false, null, Location(null, 4))
+        if oeImg.get_type() <> img
+            return -1
+        if oeImg.is_finished() = false
+            return -2
+        if oeImg.declared_empty() = false
+            return -3
+        if oeImg.requires_special_parse()
+            return -4
+        if oeImg.get_start_location().get_index() <> 4
+            return -5
+        ; a model-group cursor is absent -> no current position.
+        if oeImg.current_position() <> null
+            return -6
+
+        ; index bookkeeping.
+        oeImg.set_index(7)
+        if oeImg.get_index() <> 7
+            return -7
+
+        ; --- a CDATA element: special parse, PCDATA admitted, "finished" ---
+        let scriptType ElementType^host(StringC("script"), 2)
+        let cdataDef ElementDefinition.make(host, Location(), 1, 0, DC_CDATA, true)
+        scriptType.set_element_definition(cdataDef, 0)
+        let oeScript OpenElement.make(host, scriptType, false, false, null, Location())
+        if oeScript.requires_special_parse() = false
+            return -8
+        if oeScript.is_finished() = false
+            return -9
+        if oeScript.try_transition_pcdata() = false
+            return -10
+
+        ; --- an ANY element: immediate-recursion policy on tryTransition ---
+        let div ElementType^host(StringC("div"), 3)
+        let anyDef ElementDefinition.make(host, Location(), 2, 0, DC_ANY, true)
+        div.set_element_definition(anyDef, 0)
+        let oeDiv OpenElement.make(host, div, false, false, null, Location())
+        ; a different element type always transitions in ANY content.
+        if oeDiv.try_transition(img) = false
+            return -11
+        ; the same type transitions only if immediate recursion is allowed (it is).
+        if oeDiv.try_transition(div) = false
+            return -12
+
+        ; setConref collapses to EMPTY.
+        oeDiv.set_conref()
+        if oeDiv.declared_empty() = false
+            return -13
+
+        0
+    }
+}

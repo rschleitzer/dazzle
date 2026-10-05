@@ -1,0 +1,2098 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.Location.Location
+use opensp.StringC.StringC
+use dazzle.FrameMark.FrameMark
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
+use dazzle.ELObj.FlowObj
+use dazzle.ELObj.MacroDef
+use dazzle.ELObj.OutputCharStream
+use dazzle.VM.VM
+use dazzle.Interpreter.Interpreter
+use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.Style.InheritedC
+use dazzle.Style.Convert
+use dazzle.Style.DisplayNIC
+use dazzle.Style.VarStyleRec
+use dazzle.Style.TableNIC
+use dazzle.Style.TableColumnNIC
+use dazzle.Style.TableCellNIC
+use dazzle.Style.RuleNIC
+use dazzle.Style.CharacterNIC
+use dazzle.Grove.GroveNode
+use dazzle.Primitive.Primitive
+use dazzle.Grove.CN_CHAR
+use dazzle.ProcessingMode.ProcessingMode
+
+; Insn — the threaded-code instruction set (Style/Insn.cxx, Insn2.cxx). Each
+; instruction's execute(vm) mutates the VM stacks and returns its successor
+; (null ends the run). The C++ single-inheritance Insn hierarchy is flattened
+; into one union per the opensp pattern; dispatch is `choose`. InsnPtr's
+; ref-counting is dropped — everything lives on the run arena. The style /
+; sosofo / mode instructions (Insn2.cxx: PushMode, SetStyle, SosofoAppend, ...)
+; join in later increments; this is the pure-eval core.
+;
+; Cross-module rule: VM state is reached only through VM's accessors.
+
+; Signature — a callable's argument shape (Insn.cs). keys is the keyword-arg
+; Identifier table (null unless nKey > 0).
+define Signature
+(
+    n_required: int
+    n_optional: int
+    rest_arg: bool
+    n_key: int
+    keys: pointer[pointer[Identifier]]
+)
+{
+    init(n_required: int, n_optional: int, rest_arg: bool)
+    {
+        this.n_required := n_required
+        this.n_optional := n_optional
+        this.rest_arg := rest_arg
+        this.n_key := 0
+        this.keys := null
+    }
+}
+
+; --- instruction arm records -----------------------------------------------
+define ErrorInsn ()
+define CondFailInsn (loc: Location)
+define CaseFailInsn (loc: Location)
+define ConstantInsn (value: ref[ELObj]?, next: ref[Insn]?)
+define ResolveQuantitiesInsn (loc: Location, next: ref[Insn]?)
+define TestInsn (consequent: ref[Insn]?, alternative: ref[Insn]?)
+define OrInsn (next_test: ref[Insn]?, next: ref[Insn]?)
+define AndInsn (next_test: ref[Insn]?, next: ref[Insn]?)
+define CaseInsn (obj: ref[ELObj]?, matched: ref[Insn]?, fail: ref[Insn]?)
+define PopInsn (next: ref[Insn]?)
+define ConsInsn (next: ref[Insn]?)
+define AppendInsn (loc: Location, next: ref[Insn]?)
+define ApplyInsn (n_args: int, loc: Location, next: ref[Insn]?)
+define TailApplyInsn (n_caller_args: int, n_args: int, loc: Location)
+define FrameRefInsn (index: int, next: ref[Insn]?)
+define StackRefInsn (index: int, frame_index: int, next: ref[Insn]?)
+define ClosureRefInsn (index: int, next: ref[Insn]?)
+define TopRefInsn (ident: ref[Identifier]?, next: ref[Insn]?)
+define PopBindingsInsn (n: int, next: ref[Insn]?)
+define ReturnInsn (total_args: int)
+define PrimitiveCallInsn (n_args: int, prim: ref[ELObj], loc: Location, next: ref[Insn]?)
+define ClosureInsn (sig: Signature, code: ref[Insn]?, display_length: int, next: ref[Insn]?)
+define FunctionCallInsn (n_args: int, func: ref[ELObj], loc: Location, next: ref[Insn]?)
+define FunctionTailCallInsn (n_args: int, func: ref[ELObj], loc: Location, n_caller_args: int)
+define VarargsInsn (sig: Signature, entry_points: pointer[ref[Insn]?], n_entry: int, loc: Location)
+define SetKeyArgInsn (offset: int, next: ref[Insn]?)
+define TestNullInsn (offset: int, if_null: ref[Insn]?, if_not_null: ref[Insn]?)
+define BoxInsn (next: ref[Insn]?)
+define BoxArgInsn (n: int, next: ref[Insn]?)
+define BoxStackInsn (n: int, next: ref[Insn]?)
+define UnboxInsn (next: ref[Insn]?)
+define SetBoxInsn (n: int, next: ref[Insn]?)
+define SetImmediateInsn (n: int, next: ref[Insn]?)
+define CheckInitInsn (ident: ref[Identifier]?, loc: Location, next: ref[Insn]?)
+define StackSetBoxInsn (index: int, frame_index: int, loc: Location, next: ref[Insn]?)
+define StackSetInsn (index: int, frame_index: int, next: ref[Insn]?)
+define ClosureSetBoxInsn (index: int, loc: Location, next: ref[Insn]?)
+define VectorInsn (n: int, next: ref[Insn]?)
+define ListToVectorInsn (next: ref[Insn]?)
+; MakeFlowObjInsn — the collapsed `make` (MakeExpression::compile). The value
+; stack holds one value per SLOTTED key (KEY_USE/KEY_IGNORE),
+; then n_content content sosofos, then n_bound captured display vars (the
+; VarStyleInsn capture for lazy IC codes); execute pops them, builds a FlowObj
+; + content array, and pushes the SOSO_FLOWOBJ result. Transform classes keep
+; the original collapsed shape (key_class null: keys map to the flat FlowObj
+; fields). For styled classes (Inc 8) key_class/key_ic carry the compile-time
+; keyword classification (Style.KEY_*): NICs convert into the DisplayNIC;
+; IC entries live in the prebuilt force_specs/specs arrays (constants +
+; VarInheritedC codes, StyleExpression::compile) — KEY_IC_CONST keys have no
+; slot; use: chains a style value (CheckStyleInsn semantics inline).
+define MakeFlowObjInsn (foc: int, keys: ref[Array[ref[Identifier]?]]?, key_class: ref[Array[int]]?, nic_code: ref[Insn]?, nic: NICRef, macro_proto: ref[FlowObj]?, dnic: ref[DisplayNIC]?, hf_proto: ref[Array[ref[ELObj]?]]?, force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, n_bound: int, n_content: int, has_cm: bool, cm_loc: Location, loc: Location, next: ref[Insn]?)
+; LabelSosofoInsn (Insn.cxx): stack = [flow-obj sosofo, label value]; a
+; non-symbol label is a hard labelNotASymbol error, else the sosofo is
+; wrapped in a SOSO_LABEL.
+define LabelSosofoInsn (loc: Location, next: ref[Insn]?)
+; SetNicInsn / SetPseudoNonInheritedCInsn (Insn.cxx): pop a value and set it
+; as non-inherited characteristic `ident` on the flow object at the stack top
+; (a FlowObjBox during the lazy resolve, the SOSO_FLOWOBJ result on the main
+; chain for the cell pseudo NICs). `part` >= 0 = a header/footer sosofo slot;
+; `reset_deps` = the SetNonInheritedCInsn actual-deps reset (pseudo skips it).
+define SetNicInsn (ident: ref[Identifier]?, part: int, reset_deps: bool, loc: Location, next: ref[Insn]?)
+; MakeStyleInsn — the pure `(style key: val …)` form (VarStyleInsn): stack =
+; [use value if any][n_bound display vars]; specs prebuilt like the make.
+define MakeStyleInsn (keys: ref[Array[ref[Identifier]?]]?, key_class: ref[Array[int]]?, force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, n_bound: int, loc: Location, next: ref[Insn]?)
+; PushModeInsn / PopModeInsn — with-mode brackets (Insn.cxx): save the VM's
+; EvalContext processingMode, switch to `mode`, restore on pop. The mode is a
+; plain ref[ProcessingMode]? — see VM.processing_mode for why the former
+; pointer[void] spelling was not a module-cycle requirement.
+define PushModeInsn (mode: ref[ProcessingMode]?, next: ref[Insn]?)
+define PopModeInsn (next: ref[Insn]?)
+; CheckSosofoInsn (Insn.cxx:1132): the value on top of the stack must be a
+; sosofo — otherwise `this context requires a sosofo` at `loc` and the whole
+; eval unwinds (sp = 0, no successor), which makes the enclosing construction
+; rule an error and hands the node to process-children. The reference wraps
+; EVERY content expression of a make in one, and the body of a flow-object
+; macro.
+define CheckSosofoInsn (loc: Location, next: ref[Insn]?)
+; UnpackMacroFlowObjInsn (MacroFlowObj.cxx:146) — the entry point of a
+; macro's compiled body: pop the macro flow object and push its characteristic
+; values as frame slots, then (for a compound macro) its content sosofo. A
+; characteristic never set stays NULL, which is what the TestNullInsn chain
+; behind this insn reads to substitute the declared default.
+define UnpackMacroFlowObjInsn (next: ref[Insn]?)
+
+define Insn union
+(
+    ; ★THE ORDER IS LOAD-BEARING, and it is the other half of the thin
+    ; `Insn.execute` (see the comment there). The tag is the union's declaration
+    ; index, and `execute` handles exactly the twelve arms below — so keeping
+    ; them CONTIGUOUS and FIRST is what lets the optimizer emit a range check
+    ; plus a jump table for them. Measured with them scattered over 0..34: the
+    ; same twelve arms came out as a chain of `cmp`/`b.eq` instead, which ate
+    ; the whole prologue saving (4.205 → 4.186 G, i.e. nothing). The rest keep
+    ; their old relative order and get their own table one call deeper.
+    ; `Jit.arm_index` numbers arms for its histogram and is source-level, so it
+    ; is unaffected by this order.
+    StackRef: StackRefInsn
+    Test: TestInsn
+    Unbox: UnboxInsn
+    ClosureRef: ClosureRefInsn
+    Constant: ConstantInsn
+    And: AndInsn
+    Or: OrInsn
+    ; ★`Error` sits in the hot tier because it is CALL-FREE, not because it is
+    ; hot — it is the cheapest filler that keeps the twelve real arms plus
+    ; StackRef/Test at FOURTEEN contiguous tags (AArch64 emits a jump table only
+    ; from thirteen cases up). `Case` used to hold this slot and had to leave:
+    ; its `ELObj.eqv` is recursive, so it cannot be inlined, and one call
+    ; anywhere in `execute` gives EVERY interpreted step a stack frame.
+    Error: ErrorInsn
+    FrameRef: FrameRefInsn
+    Pop: PopInsn
+    PopBindings: PopBindingsInsn
+    SetImmediate: SetImmediateInsn
+    TestNull: TestNullInsn
+    StackSet: StackSetInsn
+    PrimitiveCall: PrimitiveCallInsn
+    Return: ReturnInsn
+    FunctionCall: FunctionCallInsn
+    ResolveQuantities: ResolveQuantitiesInsn
+    Apply: ApplyInsn
+    CheckInit: CheckInitInsn
+    Cons: ConsInsn
+    TopRef: TopRefInsn
+    Box: BoxInsn
+    BoxArg: BoxArgInsn
+    BoxStack: BoxStackInsn
+    SetBox: SetBoxInsn
+    StackSetBox: StackSetBoxInsn
+    ClosureSetBox: ClosureSetBoxInsn
+    ; the last tag of the SECOND tier — `Case` calls out (ELObj.eqv), so it
+    ; belongs here and not in the leaf tier; see the note at `Error` above.
+    Case: CaseInsn
+    CondFail: CondFailInsn
+    CaseFail: CaseFailInsn
+    Append: AppendInsn
+    TailApply: TailApplyInsn
+    ClosureMk: ClosureInsn
+    FunctionTailCall: FunctionTailCallInsn
+    Varargs: VarargsInsn
+    SetKeyArg: SetKeyArgInsn
+    Vector: VectorInsn
+    ListToVector: ListToVectorInsn
+    ; ★BY POINTER, and that is a decision about the whole interpreter loop, not
+    ; about `make`. `Insn` is a flat union, so every instruction node is as wide
+    ; as its widest arm. This arm has 15 fields = 136 bytes and set that width
+    ; alone; the next widest is 72. It is built at ONE site, at stylesheet
+    ; compile time, so the indirection costs nothing a run can measure.
+    ; ★The width used to cost twice over: `execute` destructured with
+    ; `choose *this`, and the DEREF materialises a copy of the whole union in a
+    ; stack temp before the tag is even read — which the optimizer lowered to
+    ; nine unconditional payload loads before the jump table, on every
+    ; interpreted step (read out of the arm64 disassembly, 2026-08-06).
+    ; `choose this` over the pointer emits the same dispatch without the copy
+    ; and each arm loads only its own variant.
+    MakeFlowObj: ref[MakeFlowObjInsn]
+    LabelSosofo: LabelSosofoInsn
+    SetNic: SetNicInsn
+    MakeStyle: MakeStyleInsn
+    PushMode: PushModeInsn
+    PopMode: PopModeInsn
+    CheckSosofo: CheckSosofoInsn
+    UnpackMacroFlowObj: UnpackMacroFlowObjInsn
+)
+{
+    ; --- isReturn / isPopBindings peephole predicates ----------------------
+    function is_return(this: ref[Insn]) returns bool
+    {
+        choose this
+            when r: Return
+                return true
+            else
+                return false
+        false
+    }
+
+    function return_n(this: ref[Insn]) returns int
+    {
+        choose this
+            when r: Return
+                return r.total_args
+            else
+                return 0
+        0
+    }
+
+    function is_pop_bindings(this: ref[Insn]) returns bool
+    {
+        choose this
+            when p: PopBindings
+                return true
+            else
+                return false
+        false
+    }
+
+    function pop_bindings_n(this: ref[Insn]) returns int
+    {
+        choose this
+            when p: PopBindings
+                return p.n
+            else
+                return 0
+        0
+    }
+
+    function pop_bindings_next(this: ref[Insn]) returns ref[Insn]?
+    {
+        choose this
+            when p: PopBindings
+                return p.next
+            else
+                return null
+        null
+    }
+
+    ; --- constructors (arena-hosted) ---------------------------------------
+    function alloc(host: ref[Page]) returns ref[Insn]
+        host.allocate(sizeof Insn, alignof Insn) as pointer[Insn]
+
+    function make_error(host: ref[Page]) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Error(ErrorInsn())
+        p
+    }
+
+    function make_cond_fail(host: ref[Page], loc: Location) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.CondFail(CondFailInsn(loc))
+        p
+    }
+
+    function make_case_fail(host: ref[Page], loc: Location) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.CaseFail(CaseFailInsn(loc))
+        p
+    }
+
+    function make_constant(host: ref[Page], value: ref[ELObj]?, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Constant(ConstantInsn(value, next))
+        p
+    }
+
+    function make_resolve_quantities(host: ref[Page], loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.ResolveQuantities(ResolveQuantitiesInsn(loc, next))
+        p
+    }
+
+    function make_test(host: ref[Page], consequent: ref[Insn]?, alternative: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Test(TestInsn(consequent, alternative))
+        p
+    }
+
+    function make_or(host: ref[Page], next_test: ref[Insn]?, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Or(OrInsn(next_test, next))
+        p
+    }
+
+    function make_and(host: ref[Page], next_test: ref[Insn]?, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.And(AndInsn(next_test, next))
+        p
+    }
+
+    function make_case(host: ref[Page], obj: ref[ELObj], matched: ref[Insn]?, fail: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Case(CaseInsn(obj, matched, fail))
+        p
+    }
+
+    function make_pop(host: ref[Page], next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Pop(PopInsn(next))
+        p
+    }
+
+    function make_cons(host: ref[Page], next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Cons(ConsInsn(next))
+        p
+    }
+
+    function make_append(host: ref[Page], loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Append(AppendInsn(loc, next))
+        p
+    }
+
+    function make_apply(host: ref[Page], n_args: int, loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Apply(ApplyInsn(n_args, loc, next))
+        p
+    }
+
+    function make_tail_apply(host: ref[Page], n_caller_args: int, n_args: int, loc: Location) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.TailApply(TailApplyInsn(n_caller_args, n_args, loc))
+        p
+    }
+
+    function make_frame_ref(host: ref[Page], index: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.FrameRef(FrameRefInsn(index, next))
+        p
+    }
+
+    function make_stack_ref(host: ref[Page], index: int, frame_index: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.StackRef(StackRefInsn(index, frame_index, next))
+        p
+    }
+
+    function make_closure_ref(host: ref[Page], index: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.ClosureRef(ClosureRefInsn(index, next))
+        p
+    }
+
+    function make_top_ref(host: ref[Page], ident: ref[Identifier], next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.TopRef(TopRefInsn(ident, next))
+        p
+    }
+
+    function make_return(host: ref[Page], total_args: int) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Return(ReturnInsn(total_args))
+        p
+    }
+
+    function raw_pop_bindings(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.PopBindings(PopBindingsInsn(n, next))
+        p
+    }
+
+    ; PopBindingsInsn::make — the peephole: fold into a following Return or
+    ; PopBindings so the two never chain.
+    function make_pop_bindings(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        if next <> null
+        {
+            if next.is_return()
+                return Insn.make_return(host, n + next.return_n())
+            if next.is_pop_bindings()
+                return Insn.make_pop_bindings(host, n + next.pop_bindings_n(), next.pop_bindings_next())
+        }
+        Insn.raw_pop_bindings(host, n, next)
+    }
+
+    function make_primitive_call(host: ref[Page], n_args: int, prim: ref[ELObj], loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.PrimitiveCall(PrimitiveCallInsn(n_args, prim, loc, next))
+        p
+    }
+
+    function make_closure_insn(host: ref[Page], sig: Signature, code: ref[Insn]?, display_length: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.ClosureMk(ClosureInsn(sig, code, display_length, next))
+        p
+    }
+
+    function make_function_call(host: ref[Page], n_args: int, func: ref[ELObj], loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.FunctionCall(FunctionCallInsn(n_args, func, loc, next))
+        p
+    }
+
+    function make_function_tail_call(host: ref[Page], n_args: int, func: ref[ELObj], loc: Location, n_caller_args: int) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.FunctionTailCall(FunctionTailCallInsn(n_args, func, loc, n_caller_args))
+        p
+    }
+
+    function make_varargs(host: ref[Page], sig: Signature, entry_points: pointer[ref[Insn]?], n_entry: int, loc: Location) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Varargs(VarargsInsn(sig, entry_points, n_entry, loc))
+        p
+    }
+
+    function make_set_key_arg(host: ref[Page], offset: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.SetKeyArg(SetKeyArgInsn(offset, next))
+        p
+    }
+
+    function make_test_null(host: ref[Page], offset: int, if_null: ref[Insn]?, if_not_null: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.TestNull(TestNullInsn(offset, if_null, if_not_null))
+        p
+    }
+
+    function make_box(host: ref[Page], next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Box(BoxInsn(next))
+        p
+    }
+
+    function make_box_arg(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.BoxArg(BoxArgInsn(n, next))
+        p
+    }
+
+    function make_box_stack(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.BoxStack(BoxStackInsn(n, next))
+        p
+    }
+
+    function make_unbox(host: ref[Page], next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Unbox(UnboxInsn(next))
+        p
+    }
+
+    function make_set_box(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.SetBox(SetBoxInsn(n, next))
+        p
+    }
+
+    function make_set_immediate(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.SetImmediate(SetImmediateInsn(n, next))
+        p
+    }
+
+    function make_check_init(host: ref[Page], ident: ref[Identifier], loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.CheckInit(CheckInitInsn(ident, loc, next))
+        p
+    }
+
+    function make_stack_set_box(host: ref[Page], index: int, frame_index: int, loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.StackSetBox(StackSetBoxInsn(index, frame_index, loc, next))
+        p
+    }
+
+    function make_stack_set(host: ref[Page], index: int, frame_index: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.StackSet(StackSetInsn(index, frame_index, next))
+        p
+    }
+
+    function make_closure_set_box(host: ref[Page], index: int, loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.ClosureSetBox(ClosureSetBoxInsn(index, loc, next))
+        p
+    }
+
+    function make_vector(host: ref[Page], n: int, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.Vector(VectorInsn(n, next))
+        p
+    }
+
+    function make_list_to_vector(host: ref[Page], next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.ListToVector(ListToVectorInsn(next))
+        p
+    }
+
+    function make_flow_obj(host: ref[Page], foc: int, keys: ref[Array[ref[Identifier]?]]?, key_class: ref[Array[int]]?, nic_code: ref[Insn]?, nic: NICRef, macro_proto: ref[FlowObj]?, dnic: ref[DisplayNIC]?, hf_proto: ref[Array[ref[ELObj]?]]?, force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, n_bound: int, n_content: int, has_cm: bool, cm_loc: Location, loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let r &MakeFlowObjInsn^host(foc, keys, key_class, nic_code, nic, macro_proto, dnic, hf_proto, force_specs, specs, n_bound, n_content, has_cm, cm_loc, loc, next)
+        let p Insn.alloc(host)
+        p := Insn.MakeFlowObj(r)
+        p
+    }
+
+    function make_check_sosofo(host: ref[Page], loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.CheckSosofo(CheckSosofoInsn(loc, next))
+        p
+    }
+
+    function make_unpack_macro(host: ref[Page], next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.UnpackMacroFlowObj(UnpackMacroFlowObjInsn(next))
+        p
+    }
+
+    function make_label_sosofo_insn(host: ref[Page], loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.LabelSosofo(LabelSosofoInsn(loc, next))
+        p
+    }
+
+    function make_set_nic(host: ref[Page], ident: ref[Identifier]?, part: int, reset_deps: bool, loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.SetNic(SetNicInsn(ident, part, reset_deps, loc, next))
+        p
+    }
+
+    function make_style_insn(host: ref[Page], keys: ref[Array[ref[Identifier]?]]?, key_class: ref[Array[int]], force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, n_bound: int, loc: Location, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.MakeStyle(MakeStyleInsn(keys, key_class, force_specs, specs, n_bound, loc, next))
+        p
+    }
+
+    function make_push_mode(host: ref[Page], mode: ref[ProcessingMode]?, next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.PushMode(PushModeInsn(mode, next))
+        p
+    }
+
+    function make_pop_mode(host: ref[Page], next: ref[Insn]?) returns ref[Insn]
+    {
+        let p Insn.alloc(host)
+        p := Insn.PopMode(PopModeInsn(next))
+        p
+    }
+
+    ; --- ApplyBaseInsn::decodeArgs -----------------------------------------
+    ; Pop the function off the top, validate the arg count against its
+    ; signature, and return the function (null on error, having set sp = -1).
+    procedure decode_args(mutable vm: ref[VM], n_args: int, loc: Location) returns ref[ELObj]?
+    {
+        let func vm.stack_ref(vm.get_sp() - 1)
+        vm.set_sp(vm.get_sp() - 1)
+        let itp vm.get_interp()
+        if (func = null) or (func.is_function() = false)
+        {
+            itp.set_next_location(loc)
+            if func <> null
+            {
+                ; callNonFunction with the object printed (ELObjMessageArg)
+                let host itp.get_host()
+                let os OutputCharStream.make(host)
+                func.print(os, itp.get_units_per_inch())
+                itp.message1(InterpreterMessages.callNonFunction(), os.to_string_c(host))
+            }
+            ; fail() answers ref[Insn]? while decode_args answers ref[ELObj]?.
+            ; The value is null either way -- take the sp side effect and
+            ; answer this routine's OWN null rather than borrowing its type.
+            vm.fail()
+            return null
+        }
+        let n_req func.n_required_args()
+        if n_args < n_req
+        {
+            itp.set_next_location(loc)
+            itp.message0(InterpreterMessages.missingArg())
+            ; fail() answers ref[Insn]? while decode_args answers ref[ELObj]?.
+            ; The value is null either way -- take the sp side effect and
+            ; answer this routine's OWN null rather than borrowing its type.
+            vm.fail()
+            return null
+        }
+        if n_args - n_req > func.n_optional_args()
+        {
+            if func.n_key_args() > 0
+            {
+                if ((n_args - n_req - func.n_optional_args()) % 2) = 1
+                {
+                    itp.set_next_location(loc)
+                    itp.message0(InterpreterMessages.oddKeyArgs())
+                    vm.set_sp(vm.get_sp() - ((n_args - n_req) - func.n_optional_args()))
+                }
+            }
+            else if func.has_rest_arg() = false
+            {
+                itp.set_next_location(loc)
+                itp.message0(InterpreterMessages.tooManyArgs())
+                vm.set_sp(vm.get_sp() - ((n_args - n_req) - func.n_optional_args()))
+            }
+        }
+        func
+    }
+
+    ; ApplyInsn::execute / TailApplyInsn::execute, factored so ApplyFn can
+    ; reuse them.
+    procedure exec_apply(mutable vm: ref[VM], n_args: int, mutable loc: Location, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let func Insn.decode_args(vm, n_args, loc)
+        vm.set_n_actual_args(n_args)
+        if func <> null
+            return func.call(vm, loc, next)
+        null
+    }
+
+    procedure exec_tail_apply(mutable vm: ref[VM], n_caller_args: int, n_args: int, mutable loc: Location) returns ref[Insn]?
+    {
+        let func Insn.decode_args(vm, n_args, loc)
+        vm.set_n_actual_args(n_args)
+        if func <> null
+            return func.tail_call(vm, loc, n_caller_args)
+        null
+    }
+
+    ; --- the execution loop body -------------------------------------------
+    ; ★TWO functions on purpose, and the split is the union lesson applied to
+    ; CODE. One `choose` over all 47 arms is ONE stack frame, sized by the
+    ; WIDEST arm: the shipped build entered `Insn.execute` with `sub sp, sp,
+    ; #0x1b0` plus six `stp` pairs (twelve callee-saved registers) plus a
+    ; region-frame descriptor, on EVERY interpreted step — 21.97 million of them
+    ; on a single-file real-world codegen. The arms that need any of that are
+    ; the ones that call out (PrimitiveCall, Return, MakeFlowObj, the message
+    ; paths); the arms that carry the step count need nothing but the value
+    ; stack.
+    ;
+    ; So the arms sit in THREE tiers, each one call deeper and each with its own
+    ; frame: the call-free ones here, the ones that call out but stage nothing
+    ; wide in `execute_rest`, and the frame-sizing ones in `execute_cold`. That
+    ; is the reference's shape by another road — openjade gives every Insn
+    ; subclass its own virtual `execute`, so StackRefInsn::execute has
+    ; StackRef's frame and nobody else's. Nothing is duplicated: an arm lives in
+    ; exactly one of the three functions.
+    ;
+    ; ★★★And this tier is a LEAF, which is a stronger condition than "cheap
+    ; arms" and has to be maintained deliberately: a function that calls ANYTHING
+    ; on ANY path gets a stack frame, and every step through the jump table then
+    ; pays its entry and exit. Two calls hid here until 2026-08-07 — `ELObj.eqv`
+    ; in the `Case` arm (recursive, so never inlinable ⇒ Case moved down a tier)
+    ; and the `grow_stack` half of `need_stack`, which the optimizer inlined into
+    ; all four pushing arms (⇒ `execute_grow`, below). The check is one line of
+    ; disassembly: `Insn::execute` must contain no `bl` and no `stp`/`ldp` pair.
+    ;
+    ; ★★★It also RUNS the tier rather than stepping it: as long as the successor
+    ; is another arm of this tier, the loop keeps going, and only a cold-tier
+    ; insn (a tail call to `execute_rest`) or a stack growth hands control back.
+    ; What that buys is the ENTRY, not the arm: the jump table's base address is
+    ; loop-invariant (three instructions of `adrp`/`add`/`adr` that used to be
+    ; recomputed on every step), and with it go the `bl`/`ret` of the call from
+    ; `VM.eval` and that loop's own per-iteration tests. The mean run length is a
+    ; MEASURED number, not an estimate — a call consumes exactly one cold-tier
+    ; step, so it is `steps / cold steps`: 2.61 on a single-file codegen, 2.32 on
+    ; the 1804-file one, 2.16 on a styling run (2026-08-07, `--jit --jit-stats`
+    ; with `DAZZLE_JIT_THRESHOLD=2000000000`, before the JIT was removed).
+    procedure execute(mutable this: ref[Insn], mutable vm: ref[VM]) returns ref[Insn]?
+    {
+        ; `cur` really does hold null -- every arm's `set cur: <arm>.next`
+        ; assigns a `ref[Insn]?`, which is what the `cur = null` at the foot
+        ; of the loop tests. The Option may NOT reach the `choose` subject,
+        ; though: a `choose` over the s113 wrapper stops resolving the arms
+        ; (`unknown variant: StackRef`, re-measured 2026-08-26), so the
+        ; unwrap is spelled at the subject. It is sound by the loop's own
+        ; shape -- the first iteration has `this`, and every later one has
+        ; passed the null test -- and it costs NOTHING: the whole dazzle root
+        ; emits BYTE-IDENTICALLY with and without this change, which is the
+        ; only evidence that matters for the engine's hottest dispatch.
+        var cur: ref[Insn]? this
+        repeat
+        {
+            choose cur as ref[Insn]
+                when sr: StackRef
+                {
+                    let sp vm.get_sp()
+                    if vm.needs_grow(1)
+                        return cur.execute_grow(vm)
+                    vm.stack_set(sp, vm.stack_ref(sp + sr.index))
+                    vm.set_sp(sp + 1)
+                    cur := sr.next
+                }
+                when ti: Test
+                {
+                    let was_true vm.stack_ref(vm.get_sp() - 1).is_true()
+                    vm.set_sp(vm.get_sp() - 1)
+                    var nx ti.alternative
+                    if was_true
+                        nx := ti.consequent
+                    cur := nx
+                }
+                when ub: Unbox
+                {
+                    vm.stack_set(vm.get_sp() - 1, vm.stack_ref(vm.get_sp() - 1).box_value())
+                    cur := ub.next
+                }
+                when cr: ClosureRef
+                {
+                    let sp vm.get_sp()
+                    if vm.needs_grow(1)
+                        return cur.execute_grow(vm)
+                    vm.stack_set(sp, vm.closure_ref(cr.index))
+                    vm.set_sp(sp + 1)
+                    cur := cr.next
+                }
+                when co: Constant
+                {
+                    let sp vm.get_sp()
+                    if vm.needs_grow(1)
+                        return cur.execute_grow(vm)
+                    vm.stack_set(sp, co.value)
+                    vm.set_sp(sp + 1)
+                    cur := co.next
+                }
+                when an: And
+                {
+                    var nx an.next
+                    if vm.stack_ref(vm.get_sp() - 1).is_true()
+                    {
+                        vm.set_sp(vm.get_sp() - 1)
+                        nx := an.next_test
+                    }
+                    cur := nx
+                }
+                when oi: Or
+                {
+                    var nx oi.next
+                    if vm.stack_ref(vm.get_sp() - 1).is_true() = false
+                    {
+                        vm.set_sp(vm.get_sp() - 1)
+                        nx := oi.next_test
+                    }
+                    cur := nx
+                }
+                when er: Error
+                {
+                    return vm.fail()
+                }
+                when fr: FrameRef
+                {
+                    let sp vm.get_sp()
+                    if vm.needs_grow(1)
+                        return cur.execute_grow(vm)
+                    vm.stack_set(sp, vm.stack_ref(vm.get_frame_start() + fr.index))
+                    vm.set_sp(sp + 1)
+                    cur := fr.next
+                }
+                when po: Pop
+                {
+                    vm.set_sp(vm.get_sp() - 1)
+                    cur := po.next
+                }
+                when pb: PopBindings
+                {
+                    vm.set_sp(vm.get_sp() - pb.n)
+                    vm.stack_set(vm.get_sp() - 1, vm.stack_ref(vm.get_sp() + pb.n - 1))
+                    cur := pb.next
+                }
+                when si: SetImmediate
+                {
+                    vm.set_sp(vm.get_sp() - 1)
+                    vm.stack_set(vm.get_sp() - si.n, vm.stack_ref(vm.get_sp()))
+                    cur := si.next
+                }
+                when tn: TestNull
+                {
+                    var nx tn.if_not_null
+                    if vm.stack_ref(vm.get_sp() + tn.offset) = null
+                        nx := tn.if_null
+                    cur := nx
+                }
+                when ss: StackSet
+                {
+                    let tem vm.stack_ref(vm.get_sp() + ss.index)
+                    vm.stack_set(vm.get_sp() + ss.index, vm.stack_ref(vm.get_sp() - 1))
+                    vm.stack_set(vm.get_sp() - 1, tem)
+                    cur := ss.next
+                }
+                else
+                    return cur.execute_rest(vm)
+            if cur = null
+                return null
+        }
+        null
+    }
+
+    procedure execute_rest(mutable this: ref[Insn], mutable vm: ref[VM]) returns ref[Insn]?
+    {
+        choose this
+            when rq: ResolveQuantities
+            {
+                let sp vm.get_sp()
+                let top vm.stack_ref(sp - 1)
+                let itp vm.get_interp()
+                let tem top.resolve_quantities(true, itp, rq.loc)
+                if itp.is_error(tem)
+                {
+                    return vm.fail()
+                }
+                vm.stack_set(sp - 1, tem)
+                return rq.next
+            }
+            when cn: Cons
+            {
+                let sp vm.get_sp()
+                let a vm.stack_ref(sp - 1)
+                let d vm.stack_ref(sp - 2)
+                let hp vm.get_host()
+                let pr ELObj.make_pair(hp, a, d)
+                vm.stack_set(sp - 2, pr)
+                vm.set_sp(sp - 1)
+                return cn.next
+            }
+            when ai: Apply
+                return Insn.exec_apply(vm, ai.n_args, ai.loc, ai.next)
+            when tr: TopRef
+            {
+                let tem tr.ident.compute_value(true, vm.get_interp())
+                let itp vm.get_interp()
+                if (tem = null) or itp.is_error(tem)
+                {
+                    return vm.fail()
+                }
+                vm.need_stack(1)
+                vm.stack_set(vm.get_sp(), tem)
+                vm.set_sp(vm.get_sp() + 1)
+                return tr.next
+            }
+            when ri: Return
+            {
+                let result vm.stack_ref(vm.get_sp() - 1)
+                vm.set_sp(vm.get_sp() - 1 - ri.total_args)
+                FrameMark.pop(vm.frame_mark, vm.get_csp(), result as pointer[void])
+                let nxt vm.pop_frame()
+                vm.stack_set(vm.get_sp(), result)
+                vm.set_sp(vm.get_sp() + 1)
+                return nxt
+            }
+            when pc: PrimitiveCall
+            {
+                if pc.n_args = 0
+                    vm.need_stack(1)
+                let argp vm.get_sp() - pc.n_args
+                let result pc.prim.prim_call(pc.n_args, vm.sbase_at(argp), vm, vm.get_interp(), pc.loc)
+                vm.stack_set(argp, result)
+                vm.set_sp(argp + 1)
+                if vm.get_interp().is_error(result)
+                {
+                    return vm.fail()
+                }
+                return pc.next
+            }
+            when fc: FunctionCall
+            {
+                vm.set_n_actual_args(fc.n_args)
+                return fc.func.call(vm, fc.loc, fc.next)
+            }
+            when bx: Box
+            {
+                vm.stack_set(vm.get_sp() - 1, ELObj.make_box(vm.get_host(), vm.stack_ref(vm.get_sp() - 1)))
+                return bx.next
+            }
+            when ba: BoxArg
+            {
+                let idx vm.get_sp() + ba.n - vm.get_n_actual_args()
+                vm.stack_set(idx, ELObj.make_box(vm.get_host(), vm.stack_ref(idx)))
+                return ba.next
+            }
+            when bs: BoxStack
+            {
+                let idx vm.get_sp() + bs.n
+                vm.stack_set(idx, ELObj.make_box(vm.get_host(), vm.stack_ref(idx)))
+                return bs.next
+            }
+            when sbx: SetBox
+            {
+                vm.set_sp(vm.get_sp() - 1)
+                let box vm.stack_ref(vm.get_sp() - sbx.n)
+                ; a box can belong to any enclosing frame
+                FrameMark.publish(vm.frame_mark)
+                box.box_set_value(vm.stack_ref(vm.get_sp()))
+                return sbx.next
+            }
+            when ck: CheckInit
+            {
+                if vm.stack_ref(vm.get_sp() - 1) = null
+                {
+                    Insn.check_init_report(vm, ck.ident, ck.loc)
+                    return vm.fail()
+                }
+                return ck.next
+            }
+            when ssb: StackSetBox
+            {
+                let box vm.stack_ref(vm.get_sp() + ssb.index)
+                if box.box_is_read_only()
+                    return Insn.read_only_fail(vm, ssb.loc)
+                let tem box.box_value()
+                FrameMark.publish(vm.frame_mark)
+                box.box_set_value(vm.stack_ref(vm.get_sp() - 1))
+                vm.stack_set(vm.get_sp() - 1, tem)
+                return ssb.next
+            }
+            when cs: ClosureSetBox
+            {
+                let box vm.closure_ref(cs.index)
+                if box.box_is_read_only()
+                    return Insn.read_only_fail(vm, cs.loc)
+                let tem box.box_value()
+                FrameMark.publish(vm.frame_mark)
+                box.box_set_value(vm.stack_ref(vm.get_sp() - 1))
+                vm.stack_set(vm.get_sp() - 1, tem)
+                return cs.next
+            }
+            when ca: Case
+            {
+                if ELObj.eqv(vm.stack_ref(vm.get_sp() - 1), ca.obj)
+                {
+                    vm.set_sp(vm.get_sp() - 1)
+                    return ca.matched
+                }
+                return ca.fail
+            }
+            else
+                return this.execute_cold(vm)
+        null
+    }
+
+    ; ★The GROWTH half of the four PUSHING arms, out of line — and it is what
+    ; keeps `execute` a LEAF. `need_stack` is two loads and a branch, but its
+    ; slow half calls `Page.allocate`, and the optimizer inlined that into all
+    ; four arms: ONE call anywhere in a function gives the WHOLE function a
+    ; frame, so every interpreted step paid three `stp` on entry and three `ldp`
+    ; on exit — read out of the shipped build's disassembly 2026-08-07, 60 % of
+    ; 21.97 M steps on a single-file real-world codegen. Same mechanic as the
+    ; region frame one tier down,
+    ; only with a plain call instead of a region frame.
+    ;
+    ; The four arms are REPEATED here rather than re-entered through `execute`:
+    ; a mutual recursion would let the inliner fold this function back into the
+    ; caller and undo the whole point. Whoever edits an arm above edits it here.
+    procedure execute_grow(this: ref[Insn], mutable vm: ref[VM]) returns ref[Insn]?
+    {
+        vm.grow_stack(1)
+        choose this
+            when sr: StackRef
+            {
+                let sp vm.get_sp()
+                vm.stack_set(sp, vm.stack_ref(sp + sr.index))
+                vm.set_sp(sp + 1)
+                return sr.next
+            }
+            when cr: ClosureRef
+            {
+                let sp vm.get_sp()
+                vm.stack_set(sp, vm.closure_ref(cr.index))
+                vm.set_sp(sp + 1)
+                return cr.next
+            }
+            when co: Constant
+            {
+                let sp vm.get_sp()
+                vm.stack_set(sp, co.value)
+                vm.set_sp(sp + 1)
+                return co.next
+            }
+            when fr: FrameRef
+            {
+                let sp vm.get_sp()
+                vm.stack_set(sp, vm.stack_ref(vm.get_frame_start() + fr.index))
+                vm.set_sp(sp + 1)
+                return fr.next
+            }
+            else
+                return null
+        null
+    }
+
+    ; --- the cold halves of the tier-2 error arms ---------------------------
+    ; ★These exist so the ARM stays a branch. Every one of them reports a
+    ; diagnostic, and reporting allocates (the message's argument vector, a
+    ; printed object) — inlined into `execute_rest` that allocation would be a
+    ; caller-side one, and a region frame is contagious across the whole
+    ; function (the 2026-08-07 measurement: 40 % of all steps enter tier 2 and
+    ; would pay two stores plus a load/branch/release test each). Same standing
+    ; rule as the four `*_error` helpers of `Primitive.dispatch`: no arm of a
+    ; thin shell may demand the caller's side.
+    ;
+    ; CheckInitInsn::execute (Insn.cxx:1036).
+    ; ★A `jit_check_init_fail` mirrors this function for the JIT's pinned
+    ; (void*, void*) C ABI, referenced only by ADDRESS. Changing this
+    ; declaration drops that helper from emission SILENTLY -- rc 0, no
+    ; diagnostic, and `ld: symbol(s) not found` is the only evidence.
+    ; ★★★It REPORTS and nothing else, and that is what the pin costs. It
+    ; used to end `vm.fail() as ref[Insn]` -- an unwrap of a function that
+    ; returns null ALWAYS, so every uninitialized-variable diagnostic exited
+    ; 21 right after printing itself (engine `diag1b`, once the optional
+    ; defaults were repaired and the path became reachable at all). The honest
+    ; `returns ref[Insn]?` is exactly what the warning above forbids, so the
+    ; fail moves to the two CALL SITES, where the return type already is one.
+    procedure check_init_report(mutable vm: ref[VM], ident: ref[Identifier]?, loc: Location)
+    {
+        let itp vm.get_interp()
+        itp.set_next_location(loc)
+        var nm StringC()
+        if ident <> null
+            nm := ident.get_name()
+        itp.message1(InterpreterMessages.uninitializedVariableReference(), nm)
+    }
+
+    ; StackSetBoxInsn/ClosureSetBoxInsn::execute (Insn.cxx:946/923) — assigning
+    ; through a read-only box.
+    ; ★This one CANNOT fire in this port today, and the reason is the same one
+    ; `Primitive.vector_fill` already carries: `readOnly` is a COLLECTOR bit
+    ; (Collector.h:20, set by makePermanent and the tracing pass) and this port
+    ; has no collector, so `BoxObj.read_only` is initialised false and never
+    ; set. It is ported anyway because the arm that reads the bit IS ported —
+    ; a check whose failure branch says nothing is exactly the class this
+    ; file's audit was about. Measured 2026-08-08: no expression reaches it.
+    procedure read_only_fail(mutable vm: ref[VM], loc: Location) returns ref[Insn]?
+    {
+        let itp vm.get_interp()
+        itp.set_next_location(loc)
+        itp.message0(InterpreterMessages.readOnly())
+        vm.fail()
+    }
+
+    ; AppendInsn::execute (Insn.cxx:352/363) — the spliced value is not a list.
+    procedure splice_not_list_fail(mutable vm: ref[VM], loc: Location) returns ref[Insn]?
+    {
+        let itp vm.get_interp()
+        itp.set_next_location(loc)
+        itp.message0(InterpreterMessages.spliceNotList())
+        vm.fail()
+    }
+
+    ; The third tier: the arms nobody's step count depends on, and the ones that
+    ; make `Insn.execute_rest` expensive to ENTER. What sizes a frame is not how
+    ; much an arm does but what it STAGES for a call: `Signature` by value in
+    ; exec_varargs, nine parameters plus a stack argument in exec_make_style,
+    ; the fifteen of exec_make_styled_flow_obj, an OutputCharStream in CaseFail.
+    ; Together they made every step that entered execute_rest pay `sub sp, sp,
+    ; #0x1b0`, twelve callee-saved registers and a region frame — measured
+    ; 2026-08-07 as 16.1 % of a single-file real-world codegen, with 40 % of the
+    ; steps going in. See the comment on `execute` for the jump-table rule the
+    ; tag layout has to keep.
+    procedure execute_cold(mutable this: ref[Insn], mutable vm: ref[VM]) returns ref[Insn]?
+    {
+        choose this
+            when cf: CondFail
+            {
+                ; CondFailInsn::execute: report at the cond expression, then die.
+                let itp vm.get_interp()
+                itp.set_next_location(cf.loc)
+                itp.message0(InterpreterMessages.condFail())
+                return vm.fail()
+            }
+            when csf: CaseFail
+            {
+                ; CaseFailInsn::execute: report the unmatched key (printed via
+                ; ELObjMessageArg — a string key renders with its own quotes
+                ; inside the formatter's, `""addhistory""`).
+                let itp vm.get_interp()
+                itp.set_next_location(csf.loc)
+                let sp vm.get_sp()
+                let k vm.stack_ref(sp - 1)
+                let host itp.get_host()
+                let os OutputCharStream.make(host)
+                k.print(os, itp.get_units_per_inch())
+                let ks os.to_string_c(host)
+                itp.message1(InterpreterMessages.caseFail(), ks)
+                return vm.fail()
+            }
+            when ap: Append
+                return this.exec_append(vm, ap.loc, ap.next)
+            when ta: TailApply
+                return Insn.exec_tail_apply(vm, ta.n_caller_args, ta.n_args, ta.loc)
+            when ci: ClosureMk
+                return this.exec_closure(vm, ci.sig, ci.code, ci.display_length, ci.next)
+            when ft: FunctionTailCall
+            {
+                vm.set_n_actual_args(ft.n_args)
+                return ft.func.tail_call(vm, ft.loc, ft.n_caller_args)
+            }
+            when va: Varargs
+                return this.exec_varargs(vm, va.sig, va.entry_points, va.n_entry, va.loc)
+            when sk: SetKeyArg
+            {
+                let val vm.stack_ref(vm.get_sp() - 1)
+                vm.set_sp(vm.get_sp() - 1)
+                vm.stack_set(vm.get_sp() + sk.offset, val)
+                return sk.next
+            }
+            when ve: Vector
+                return this.exec_vector(vm, ve.n, ve.next)
+            when lv: ListToVector
+                return this.exec_list_to_vector(vm, lv.next)
+            when mf: MakeFlowObj
+            {
+                if mf.key_class <> null
+                    return this.exec_make_styled_flow_obj(vm, mf.foc, mf.keys, mf.key_class, mf.nic_code, mf.nic, mf.macro_proto, mf.dnic, mf.hf_proto, mf.force_specs, mf.specs, mf.n_bound, mf.n_content, mf.has_cm, mf.cm_loc, mf.loc, mf.next)
+                if (mf.foc >= FOC_PARAGRAPH) and (mf.foc <= FOC_COLUMN_SET_SEQUENCE)
+                    return this.exec_make_styled_flow_obj(vm, mf.foc, mf.keys, mf.key_class, mf.nic_code, mf.nic, mf.macro_proto, mf.dnic, mf.hf_proto, mf.force_specs, mf.specs, mf.n_bound, mf.n_content, mf.has_cm, mf.cm_loc, mf.loc, mf.next)
+                ; a keyless macro make still needs the styled path — that is
+                ; where the definition and the characteristic slots are copied
+                ; off the compile-time prototype.
+                if mf.foc = FOC_MACRO
+                    return this.exec_make_styled_flow_obj(vm, mf.foc, mf.keys, mf.key_class, mf.nic_code, mf.nic, mf.macro_proto, mf.dnic, mf.hf_proto, mf.force_specs, mf.specs, mf.n_bound, mf.n_content, mf.has_cm, mf.cm_loc, mf.loc, mf.next)
+                return this.exec_make_flow_obj(vm, mf.foc, mf.keys, mf.n_content, mf.loc, mf.next)
+            }
+            when lsi: LabelSosofo
+                return this.exec_label_sosofo(vm, lsi.loc, lsi.next)
+            when sn: SetNic
+                return this.exec_set_nic(vm, sn.ident as ref[Identifier], sn.part, sn.reset_deps, sn.loc, sn.next)
+            when ms: MakeStyle
+                return this.exec_make_style(vm, ms.keys, ms.key_class as ref[Array[int]], ms.force_specs, ms.specs, ms.n_bound, ms.loc, ms.next)
+            when pm: PushMode
+            {
+                vm.push_mode(pm.mode)
+                return pm.next
+            }
+            when qm: PopMode
+            {
+                vm.pop_mode()
+                return qm.next
+            }
+            when cs2: CheckSosofo
+            {
+                let top vm.stack_ref(vm.get_sp() - 1)
+                var ok false
+                if top <> null
+                {
+                    if top.is_sosofo_p()
+                        ok := true
+                }
+                if ok = false
+                {
+                    let interp vm.get_interp()
+                    interp.set_next_location(cs2.loc)
+                    interp.message0(InterpreterMessages.sosofoContext())
+                    return vm.fail()
+                }
+                return cs2.next
+            }
+            when um: UnpackMacroFlowObj
+                return this.exec_unpack_macro(vm, um.next)
+            else
+                return null
+        null
+    }
+
+    ; MakeFlowObjInsn::execute — the transform `make`. The value stack holds the
+    ; n_key characteristic values followed by n_content content sosofos; build a
+    ; FlowObj from the characteristics, collect the content into an array, and
+    ; push a SOSO_FLOWOBJ result. (No inherited-C / style machinery — extension
+    ; flow objects only, the transform backend's whole surface.)
+    procedure exec_make_flow_obj(this: ref[Insn], mutable vm: ref[VM], foc: int, keys: ref[Array[ref[Identifier]?]]?, n_content: int, loc: Location, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host vm.get_host()
+        var n_key 0
+        if keys <> null
+            n_key := keys.get_length() as int
+        let total n_key + n_content
+        if total = 0
+            vm.need_stack(1)
+        let base vm.get_sp() - total
+
+        ; characteristics: base .. base+n_key-1
+        let fo: ref[FlowObj] FlowObj.make(host, foc)
+        var i 0
+        while i < n_key
+        {
+            let kp keys.get(i as size_t)
+            let val vm.stack_ref(base + i)
+            if kp <> null
+            {
+                let ki *kp
+                let key ki.get_name()
+                if key.equals(StringC("attributes"))
+                {
+                    let al Insn.flow_obj_atts(host, val)
+                    fo.set_atts(al)
+                }
+                else
+                {
+                    if val <> null
+                    {
+                        let vs val.string_data(host)
+                        fo.set_char(host, key, vs)
+                    }
+                }
+            }
+            i := i + 1
+        }
+
+        ; content sosofos: base+n_key .. base+total-1
+        var content: ref[Array[ref[ELObj]?]]? null
+        if n_content > 0
+        {
+            content := Array[ref[ELObj]?]^host()
+            var j 0
+            while j < n_content
+            {
+                content.add(vm.stack_ref(base + n_key + j))
+                j := j + 1
+            }
+        }
+        else
+        {
+            ; SetDefaultContentInsn — a compound flow object with no content
+            ; defaults to (process-children) in the current processing mode;
+            ; outside processing that is a hard error.
+            if FlowObj.is_atomic_class(foc) = false
+            {
+                let interp vm.get_interp()
+                let pmode vm.get_processing_mode()
+                if pmode = null
+                {
+                    interp.set_next_location(loc)
+                    interp.message0(InterpreterMessages.noCurrentProcessingMode())
+                    return vm.fail()
+                }
+                content := Array[ref[ELObj]?]^host()
+                content.add(ELObj.make_process_children_sosofo(host, false, pmode))
+            }
+        }
+
+        vm.stack_set(base, ELObj.make_flowobj_sosofo(host, fo, content))
+        vm.set_sp(base + 1)
+        next
+    }
+
+    ; the styled `make` (Inc 8): keywords were classified at compile
+    ; (Style.KEY_*). Stack = one slot per use:/ignored key (key order),
+    ; n_content sosofos, then n_bound captured display vars (the VarStyleInsn
+    ; capture, shared by the lazy VarInheritedC codes AND the lazy NIC code).
+    ; Constant NIC values were baked into the dnic/tnic/hf prototypes at
+    ; compile (applyConstNonInheritedCs); non-constant ones live in nic_code,
+    ; evaluated per process by ProcessContext.resolve_nics on a fresh copy.
+    ; use: attaches a style chain (CheckStyleInsn: a non-style value is a hard
+    ; styleContext error).
+    procedure exec_make_styled_flow_obj(this: ref[Insn], mutable vm: ref[VM], foc: int, keys: ref[Array[ref[Identifier]?]]?, key_class: ref[Array[int]]?, nic_code: ref[Insn]?, nic_proto: NICRef, macro_proto: ref[FlowObj]?, dnic_proto: ref[DisplayNIC]?, hf_proto: ref[Array[ref[ELObj]?]]?, force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, n_bound: int, n_content: int, has_cm: bool, cm_loc: Location, mutable loc: Location, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host vm.get_host()
+        let interp vm.get_interp()
+        var n_key 0
+        if keys <> null
+            n_key := keys.get_length() as int
+        var n_slots 0
+        var k 0
+        while k < n_key
+        {
+            if key_class <> null
+            {
+                let cp0 key_class.get(k as size_t)
+                if cp0 <> null
+                {
+                    if Insn.key_has_slot(*cp0)
+                        n_slots := n_slots + 1
+                }
+            }
+            k := k + 1
+        }
+        ; stack layout: [slots][content][content-map value][bound vars].
+        var n_cm 0
+        if has_cm
+            n_cm := 1
+        let total n_slots + n_content + n_cm + n_bound
+        if total = 0
+            vm.need_stack(1)
+        let base vm.get_sp() - total
+        let display Insn.capture_display(vm, host, base + n_slots + n_content + n_cm, n_bound)
+
+        ; a macro make COPIES the compile-time prototype (MacroFlowObj's copy
+        ; constructor: shared definition, copied characteristic slots — the
+        ; constant values were baked into the prototype by
+        ; applyConstNonInheritedCs). For FOC_MACRO the insn carries that
+        ; prototype in macro_proto (upstream: the prototype IS the FlowObj).
+        var fo: ref[FlowObj]? null
+        if foc = FOC_MACRO
+        {
+            let proto macro_proto
+            if proto <> null
+                fo := proto.macro_copy(host)
+            else
+                fo := FlowObj.make(host, foc)
+        }
+        else
+            fo := FlowObj.make(host, foc)
+        ; the table-family NIC record: a fresh per-exec copy of the compile
+        ; prototype (constant keys baked in), or defaults — exec/resolve-time
+        ; sets must never mutate the shared insn state.
+        if foc = FOC_TABLE
+        {
+            if nic_proto <> null
+            {
+                let tp nic_proto as ref[TableNIC]
+                fo.set_nic(tp.copy(host) as NICRef)
+            }
+            else
+                fo.set_nic(TableNIC.make(host) as NICRef)
+        }
+        if foc = FOC_TABLE_COLUMN
+        {
+            if nic_proto <> null
+            {
+                let cp2 nic_proto as ref[TableColumnNIC]
+                fo.set_nic(cp2.copy(host) as NICRef)
+            }
+            else
+                fo.set_nic(TableColumnNIC.make(host) as NICRef)
+        }
+        if foc = FOC_TABLE_CELL
+        {
+            if nic_proto <> null
+            {
+                let ep nic_proto as ref[TableCellNIC]
+                fo.set_nic(ep.copy(host) as NICRef)
+            }
+            else
+                fo.set_nic(TableCellNIC.make(host) as NICRef)
+        }
+        if foc = FOC_RULE
+        {
+            if nic_proto <> null
+            {
+                let rp2 nic_proto as ref[RuleNIC]
+                fo.set_nic(rp2.copy(host) as NICRef)
+            }
+            else
+                fo.set_nic(RuleNIC.make(host) as NICRef)
+        }
+        if ((foc >= FOC_LINK) and (foc <= FOC_COLUMN_SET_SEQUENCE)) or (foc = FOC_LINE_FIELD)
+            fo.set_nic(Convert.copy_fo_nic(foc, nic_proto, host))
+        ; SetImplicitCharInsn (Insn.cxx:1318) — a `character` make takes its
+        ; char from the CURRENT NODE's `char` property when no `char:`
+        ; characteristic specified one. The reference emits this insn for every
+        ; character make (compileNonInheritedCs: gotOne = isCharacter()), right
+        ; before the deferred NIC chain. ★No reachable construction rule has a
+        ; data-char node as its current node — ProcessContext::processNode
+        ; answers charChunk BEFORE it looks for a rule — so this fires only if
+        ; some future axis puts one there; it is ported because the class's
+        ; whole default behaviour hangs off it.
+        if foc = FOC_CHARACTER
+        {
+            let cnode vm.get_current_node()
+            if cnode <> null
+            {
+                ; (accessOK is the only outcome that yields a value here —
+                ; the nonsgml class answers accessNull with a null object.)
+                var access 0
+                let cv Primitive.node_property_value(host, interp, cnode, CN_CHAR, false, &access)
+                if cv <> null
+                {
+                    let cn fo.get_nic() as ref[CharacterNIC]?
+                    if cn <> null
+                    {
+                        let cident interp.lookup(StringC("char"))
+                        Convert.set_implicit_char(cn, cv, cident, loc, interp, host)
+                    }
+                }
+            }
+        }
+        if dnic_proto <> null
+        {
+            let dp dnic_proto as ref[DisplayNIC]
+            fo.set_dnic(dp.copy(host))
+        }
+        if hf_proto <> null
+        {
+            var hi 0
+            while hi < 6
+            {
+                let hp hf_proto.get(hi as size_t)
+                if hp <> null
+                {
+                    if *hp <> null
+                        fo.set_hf(host, hi, *hp)
+                }
+                hi := hi + 1
+            }
+        }
+        fo.set_nic_code(nic_code)
+        var use_style: ref[ELObj]? null
+        var slot 0
+        var i 0
+        while i < n_key
+        {
+            var cls KEY_IC_CONST
+            if key_class <> null
+            {
+                let cp key_class.get(i as size_t)
+                if cp <> null
+                    cls := *cp
+            }
+            var val: ref[ELObj]? null
+            if Insn.key_has_slot(cls)
+            {
+                val := vm.stack_ref(base + slot)
+                slot := slot + 1
+            }
+            if cls = KEY_USE
+            {
+                if (val <> null) and val.is_style_p()
+                    use_style := val
+                else
+                {
+                    interp.set_next_location(loc)
+                    interp.message0(InterpreterMessages.styleContext())
+                    return vm.fail()
+                }
+            }
+            i := i + 1
+        }
+        ; the reference make ALWAYS attaches a style (StyleExpression::compile
+        ; + SetStyleInsn run unconditionally) — table row/column styles rely
+        ; on the non-nullness (a covered cell wraps in <sequence> even for an
+        ; empty style).
+        let rec VarStyleRec.make(host, force_specs, specs, display, vm.get_current_node())
+        fo.set_style(ELObj.make_style(host, rec, use_style))
+
+        var content: ref[Array[ref[ELObj]?]]? null
+        if n_content > 0
+        {
+            content := Array[ref[ELObj]?]^host()
+            var j 0
+            while j < n_content
+            {
+                content.add(vm.stack_ref(base + n_slots + j))
+                j := j + 1
+            }
+        }
+        else
+        {
+            ; SetDefaultContentInsn / MakeDefaultContentInsn — a compound flow
+            ; object with no content defaults to (process-children) in the
+            ; current processing mode; outside processing that is a hard error.
+            ; A macro is compound exactly when it declared `#!contents`
+            ; (MacroFlowObj::asCompoundFlowObj).
+            var compound FlowObj.is_atomic_class(foc) = false
+            if foc = FOC_MACRO
+            {
+                compound := false
+                let mdef fo.get_macro_def()
+                if mdef <> null
+                    compound := mdef.is_compound()
+            }
+            if compound
+            {
+                let pmode vm.get_processing_mode()
+                if pmode = null
+                {
+                    interp.set_next_location(loc)
+                    interp.message0(InterpreterMessages.noCurrentProcessingMode())
+                    return vm.fail()
+                }
+                content := Array[ref[ELObj]?]^host()
+                content.add(ELObj.make_process_children_sosofo(host, false, pmode))
+            }
+        }
+        ; content-map: wraps the (single) content sosofo in a SOSO_CONTENT_MAP
+        ; (ContentMapSosofoInsn; the map value evaluated right after the
+        ; content, sitting above it on the stack).
+        if has_cm
+        {
+            if content <> null
+            {
+                let map_val vm.stack_ref(base + n_slots + n_content)
+                var inner: ref[ELObj]? null
+                if content.get_length() = 1
+                {
+                    let ip content.get(0)
+                    if ip <> null
+                        inner := *ip
+                }
+                if inner = null
+                    inner := ELObj.make_sosofo(host, content)
+                let wrapped ELObj.make_content_map_sosofo(host, map_val, cm_loc, inner)
+                content := Array[ref[ELObj]?]^host()
+                content.add(wrapped)
+            }
+        }
+
+        vm.stack_set(base, ELObj.make_flowobj_sosofo(host, fo, content))
+        vm.set_sp(base + 1)
+        next
+    }
+
+    function key_has_slot(cls: int) returns bool
+    {
+        if cls = KEY_USE or cls = KEY_IGNORE
+            return true
+        false
+    }
+
+    ; SetNicInsn::execute — pop the value, set it as non-inherited
+    ; characteristic on the flow object below it (a FlowObjBox seed during the
+    ; lazy resolve; the SOSO_FLOWOBJ make result for the cell pseudo NICs).
+    ; Conversion failures message (at the value location) and continue; only
+    ; an error VALUE (already unwound by the value code) aborts.
+    procedure exec_set_nic(this: ref[Insn], mutable vm: ref[VM], ident: ref[Identifier], part: int, reset_deps: bool, mutable loc: Location, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host vm.get_host()
+        let interp vm.get_interp()
+        let sp vm.get_sp()
+        let val vm.stack_ref(sp - 1)
+        let target vm.stack_ref(sp - 2)
+        var fo target.flowobj_box_ref()
+        if fo = null
+            fo := target.sosofo_flowobj()
+        if reset_deps
+            ; SetNonInheritedCInsn resets the actual-* dependency record
+            ; before each characteristic.
+            vm.reset_actual_deps()
+        if fo <> null
+        {
+            if part >= 0
+            {
+                ; a header/footer sosofo NIC (SimplePageSequenceFlowObj).
+                var ok false
+                if val <> null
+                {
+                    if val.is_sosofo_p()
+                        ok := true
+                }
+                if ok
+                    fo.set_hf(host, part, val)
+                else
+                    Convert.invalid_value(interp, ident, loc)
+            }
+            else if fo.get_foc() = FOC_MACRO
+            {
+                ; MacroFlowObj::setNonInheritedC — straight into the named
+                ; characteristic's slot, no conversion and no diagnostic.
+                fo.set_charic(ident, val)
+            }
+            else
+            {
+                let foc fo.get_foc()
+                let sk ident.syntactic_key()
+                if Convert.is_transform_nic_name(foc, ident.get_name())
+                {
+                    ; the SGML-transformation classes' setNIC: `attributes`
+                    ; converts a list of ("name" "value") pairs, every other
+                    ; name a plain string, straight into its slot. Neither
+                    ; conversion diagnoses in the reference
+                    ; (value.convertString / convertStringPairList discard
+                    ; their result).
+                    if ident.get_name().equals(StringC("attributes"))
+                        fo.set_atts(Insn.flow_obj_atts(host, val))
+                    else
+                    {
+                        if val <> null
+                            fo.set_char(host, ident.get_name(), val.string_data(host))
+                    }
+                }
+                else if Convert.is_table_nic_key(foc, sk)
+                {
+                    var t fo.get_nic()
+                    Convert.apply_table_nic(foc, &t, sk, val, ident, loc, interp, host)
+                    fo.set_nic(t)
+                }
+                else if Convert.is_rule_nic_key(foc, sk)
+                {
+                    var rt fo.get_nic()
+                    Convert.apply_rule_nic(&rt, sk, val, ident, loc, interp, host)
+                    fo.set_nic(rt)
+                }
+                else if Convert.is_fo_nic_ident(foc, sk, ident)
+                {
+                    var ft fo.get_nic()
+                    Convert.apply_fo_nic(foc, &ft, sk, val as ref[ELObj], ident, loc, interp, host)
+                    fo.set_nic(ft)
+                }
+                else if sk = SK_COALESCE_ID
+                {
+                    var dn fo.get_dnic()
+                    if dn = null
+                    {
+                        dn := DisplayNIC.make(host)
+                        fo.set_dnic(dn)
+                    }
+                    var s StringC()
+                    if Convert.convert_string(host, val as ref[ELObj], &s)
+                    {
+                        dn.has_coalesce_id := true
+                        dn.coalesce_id := s
+                    }
+                    else
+                        Convert.invalid_value(interp, ident, loc)
+                }
+                else
+                {
+                    var dn2 fo.get_dnic()
+                    if dn2 = null
+                    {
+                        dn2 := DisplayNIC.make(host)
+                        fo.set_dnic(dn2)
+                    }
+                    Convert.set_display_nic(dn2 as ref[DisplayNIC], sk, val as ref[ELObj], ident, loc, interp, host)
+                }
+            }
+        }
+        vm.set_sp(sp - 1)
+        next
+    }
+
+    ; LabelSosofoInsn::execute — stack = [flow-obj sosofo, label value]; a
+    ; non-symbol label is a hard labelNotASymbol error (unwind), else the
+    ; sosofo is wrapped in a SOSO_LABEL carrying the symbol + location.
+    procedure exec_label_sosofo(this: ref[Insn], mutable vm: ref[VM], loc: Location, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host vm.get_host()
+        let interp vm.get_interp()
+        let sp vm.get_sp()
+        let val vm.stack_ref(sp - 1)
+        var ok false
+        if val <> null
+        {
+            if val.is_symbol_p()
+                ok := true
+        }
+        if ok = false
+        {
+            interp.set_next_location(loc)
+            interp.message0(InterpreterMessages.labelNotASymbol())
+            return vm.fail()
+        }
+        let target vm.stack_ref(sp - 2)
+        let wrapped ELObj.make_label_sosofo(host, val, loc, target)
+        vm.stack_set(sp - 2, wrapped)
+        vm.set_sp(sp - 1)
+        next
+    }
+
+    ; VarStyleInsn's display capture: the top n_bound stack values into a
+    ; null-terminated array (same shape as a closure display).
+    function capture_display(vm: ref[VM], host: ref[Page], from: int, n_bound: int) returns pointer[pointer[ELObj]]
+    {
+        if n_bound <= 0
+            return null
+        let disp host.allocate(((n_bound + 1) as size_t) * sizeof pointer[ELObj], alignof pointer[ELObj]) as pointer[pointer[ELObj]]
+        var i 0
+        while i < n_bound
+        {
+            *(disp + i) := vm.stack_ref(from + i)
+            i := i + 1
+        }
+        *(disp + n_bound) := null
+        disp
+    }
+
+    ; MakeStyleInsn::execute — build the style value (VarStyleInsn): stack =
+    ; [use value if any][n_bound display vars]; specs prebuilt at compile.
+    procedure exec_make_style(this: ref[Insn], mutable vm: ref[VM], keys: ref[Array[ref[Identifier]?]]?, key_class: ref[Array[int]], force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, n_bound: int, loc: Location, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host vm.get_host()
+        let interp vm.get_interp()
+        var n_key 0
+        if keys <> null
+            n_key := keys.get_length() as int
+        var n_slots 0
+        var k 0
+        while k < n_key
+        {
+            let cp0 key_class.get(k as size_t)
+            if cp0 <> null
+            {
+                if Insn.key_has_slot(*cp0)
+                    n_slots := n_slots + 1
+            }
+            k := k + 1
+        }
+        let total n_slots + n_bound
+        if total = 0
+            vm.need_stack(1)
+        let base vm.get_sp() - total
+        let display Insn.capture_display(vm, host, base + n_slots, n_bound)
+        var use_style: ref[ELObj]? null
+        var slot 0
+        var i 0
+        while i < n_key
+        {
+            var cls KEY_IC_CONST
+            let cp key_class.get(i as size_t)
+            if cp <> null
+                cls := *cp
+            var val: ref[ELObj]? null
+            if Insn.key_has_slot(cls)
+            {
+                val := vm.stack_ref(base + slot)
+                slot := slot + 1
+            }
+            if cls = KEY_USE
+            {
+                if (val <> null) and val.is_style_p()
+                    use_style := val
+                else
+                {
+                    interp.set_next_location(loc)
+                    interp.message0(InterpreterMessages.styleContext())
+                    return vm.fail()
+                }
+            }
+            i := i + 1
+        }
+        var rec: ref[VarStyleRec]? null
+        if (specs <> null) or (force_specs <> null)
+            rec := VarStyleRec.make(host, force_specs, specs, display, vm.get_current_node())
+        vm.stack_set(base, ELObj.make_style(host, rec, use_style))
+        vm.set_sp(base + 1)
+        next
+    }
+
+    ; convertStringPairList: a list of ("name" "value") pairs -> a flat StringC
+    ; list [name, value, name, value, …] (output_attributes' pairwise walk).
+    procedure flow_obj_atts(host: ref[Page], mutable val: ref[ELObj]?) returns ref[Array[StringC]]
+    {
+        let atts Array[StringC]^host()
+        if val = null
+            return atts
+        var cur val
+        while (cur <> null) and (cur.is_nil() = false)
+        {
+            if cur.is_pair() = false
+                break
+            let pair cur.get_car()
+            if (pair <> null) and pair.is_pair()
+            {
+                let name_obj pair.get_car()
+                var val_obj: ref[ELObj]? null
+                let rest pair.get_cdr()
+                if (rest <> null) and rest.is_pair()
+                    val_obj := rest.get_car()
+                if name_obj <> null
+                {
+                    let ns name_obj.string_data(host)
+                    atts.add(StringC^host(ns.as_slice()))
+                }
+                else
+                    atts.add(StringC())
+                if val_obj <> null
+                {
+                    let vs val_obj.string_data(host)
+                    atts.add(StringC^host(vs.as_slice()))
+                }
+                else
+                    atts.add(StringC())
+            }
+            cur := cur.get_cdr()
+        }
+        atts
+    }
+
+    ; AppendInsn::execute — splice the list at [sp-1] onto [sp-2].
+    procedure exec_append(this: ref[Insn], mutable vm: ref[VM], loc: Location, next: ref[Insn]?) returns ref[Insn]?
+    {
+        var source vm.stack_ref(vm.get_sp() - 1)
+        if (source <> null) and (source.is_nil() = false)
+        {
+            if source.is_pair() = false
+                return Insn.splice_not_list_fail(vm, loc)
+            let host vm.get_host()
+            let car0 source.get_car()
+            let head ELObj.make_pair(host, car0, null)
+            var tail head
+            source := source.get_cdr()
+            while (source <> null) and (source.is_nil() = false)
+            {
+                if source.is_pair() = false
+                    return Insn.splice_not_list_fail(vm, loc)
+                let carn source.get_car()
+                let new_tail ELObj.make_pair(host, carn, null)
+                tail.set_cdr(new_tail)
+                tail := new_tail
+                source := source.get_cdr()
+            }
+            let rest vm.stack_ref(vm.get_sp() - 2)
+            tail.set_cdr(rest)
+            vm.stack_set(vm.get_sp() - 2, head)
+        }
+        vm.set_sp(vm.get_sp() - 1)
+        next
+    }
+
+    ; ClosureInsn::execute — capture the display and build a closure.
+    procedure exec_closure(this: ref[Insn], mutable vm: ref[VM], sig: Signature, code: ref[Insn]?, display_length: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host vm.get_host()
+        var disp: pointer[pointer[ELObj]] null
+        var tem vm.get_sp() - display_length
+        if display_length > 0
+        {
+            disp := host.allocate(((display_length + 1) as size_t) * sizeof pointer[ELObj], alignof pointer[ELObj]) as pointer[pointer[ELObj]]
+            var i 0
+            while i < display_length
+            {
+                *(disp + i) := vm.stack_ref(tem + i)
+                i := i + 1
+            }
+            *(disp + display_length) := null
+        }
+        else
+        {
+            vm.need_stack(1)
+            tem := vm.get_sp()
+        }
+        vm.stack_set(tem, ELObj.make_closure(host, sig, code, disp))
+        vm.set_sp(tem + 1)
+        next
+    }
+
+    ; UnpackMacroFlowObjInsn::execute + MacroFlowObj::unpack. The seed on the
+    ; stack is the macro's SOSO_FLOWOBJ sosofo (this port keeps a flow
+    ; object's content in the sosofo, not on the FlowObj, so the seed carries
+    ; both halves); it is POPPED and replaced by one frame slot per declared
+    ; characteristic plus, for a compound macro, the content sosofo. Several
+    ; content sosofos fold into one SOSO_APPEND (the reference's SetContentInsn
+    ; already appended them into a single SosofoObj).
+    procedure exec_unpack_macro(this: ref[Insn], mutable vm: ref[VM], next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host vm.get_host()
+        let base vm.get_sp() - 1
+        let seed vm.stack_ref(base)
+        vm.set_sp(base)
+        if seed = null
+            return next
+        let fo seed.sosofo_flowobj()
+        if fo = null
+            return next
+        let def fo.get_macro_def()
+        if def = null
+            return next
+        let n def.n_nics()
+        var extra 0
+        if def.is_compound()
+            extra := 1
+        vm.need_stack(n + extra)
+        let vals fo.get_charic_vals()
+        var i 0
+        while i < n
+        {
+            var v: ref[ELObj]? null
+            if vals <> null
+            {
+                let vp vals.get(i as size_t)
+                if vp <> null
+                    v := *vp
+            }
+            vm.stack_set(vm.get_sp(), v)
+            vm.set_sp(vm.get_sp() + 1)
+            i := i + 1
+        }
+        if def.is_compound()
+        {
+            var content: ref[ELObj]? null
+            let parts seed.sosofo_parts()
+            if parts <> null
+            {
+                let np parts.get_length()
+                if np = 1
+                {
+                    let p0 parts.get(0)
+                    if p0 <> null
+                        content := *p0
+                }
+                else if np > 1
+                    content := ELObj.make_sosofo(host, parts)
+            }
+            ; MacroFlowObj::unpack's own fallback — unreachable through a
+            ; make (SetDefaultContentInsn already substituted process-children
+            ; in the CURRENT mode), kept because the reference has it: the
+            ; INITIAL mode, not the current one.
+            if content = null
+                content := ELObj.make_process_children_sosofo(host, false, vm.get_interp().initial_processing_mode())
+            vm.stack_set(vm.get_sp(), content)
+            vm.set_sp(vm.get_sp() + 1)
+        }
+        next
+    }
+
+    ; VectorInsn::execute — build a vector from the top n stack slots.
+    procedure exec_vector(this: ref[Insn], mutable vm: ref[VM], n: int, next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host vm.get_host()
+        if n = 0
+        {
+            vm.need_stack(1)
+            vm.stack_set(vm.get_sp(), ELObj.make_vector_of(host, null, 0))
+            vm.set_sp(vm.get_sp() + 1)
+            return next
+        }
+        let buf host.allocate((n as size_t) * sizeof pointer[ELObj], alignof pointer[ELObj]) as pointer[pointer[ELObj]]
+        let base vm.get_sp() - n
+        var i 0
+        while i < n
+        {
+            *(buf + i) := vm.stack_ref(base + i)
+            i := i + 1
+        }
+        vm.stack_set(base, ELObj.make_vector_of(host, buf, n as size_t))
+        vm.set_sp(base + 1)
+        next
+    }
+
+    ; ListToVectorInsn::execute — collect a proper list into a vector.
+    procedure exec_list_to_vector(this: ref[Insn], mutable vm: ref[VM], next: ref[Insn]?) returns ref[Insn]?
+    {
+        let host vm.get_host()
+        var count 0
+        var p vm.stack_ref(vm.get_sp() - 1)
+        while (p <> null) and (p.is_nil() = false)
+        {
+            count := count + 1
+            p := p.get_cdr()
+        }
+        var buf: pointer[pointer[ELObj]] null
+        if count > 0
+            buf := host.allocate((count as size_t) * sizeof pointer[ELObj], alignof pointer[ELObj]) as pointer[pointer[ELObj]]
+        var i 0
+        p := vm.stack_ref(vm.get_sp() - 1)
+        while (p <> null) and (p.is_nil() = false)
+        {
+            *(buf + i) := p.get_car()
+            i := i + 1
+            p := p.get_cdr()
+        }
+        vm.stack_set(vm.get_sp() - 1, ELObj.make_vector_of(host, buf, count as size_t))
+        next
+    }
+
+    ; VarargsInsn::execute — dispatch to the entry point for the actual arg
+    ; count, consing rest args and matching keywords when the signature has
+    ; a rest or key tail.
+    ; Answers the entry point for the actual arity -- an Option, because the
+    ; table holds null for arities the signature cannot take (Expression
+    ; writes them), and `execute` hands the result on as its own `ref[Insn]?`.
+    procedure exec_varargs(this: ref[Insn], mutable vm: ref[VM], sig: Signature, entry_points: pointer[ref[Insn]?], n_entry: int, loc: Location) returns ref[Insn]?
+    {
+        let host vm.get_host()
+        let n vm.get_n_actual_args() - sig.n_required
+        if (sig.rest_arg or (sig.n_key > 0)) and (n > n_entry - 2)
+        {
+            var rest vm.get_interp().make_nil()
+            var i n - (n_entry - 2)
+            while i > 0
+            {
+                vm.set_sp(vm.get_sp() - 1)
+                rest := ELObj.make_pair(host, vm.stack_ref(vm.get_sp()), rest)
+                i := i - 1
+            }
+            var extra 0
+            if sig.rest_arg
+                extra := 1
+            vm.need_stack(sig.n_key + extra)
+            if sig.rest_arg
+            {
+                vm.stack_set(vm.get_sp(), rest)
+                vm.set_sp(vm.get_sp() + 1)
+            }
+            if sig.n_key > 0
+            {
+                var j 0
+                while j < sig.n_key
+                {
+                    vm.stack_set(vm.get_sp() + j, null)
+                    j := j + 1
+                }
+                var tem rest
+                var m n - (n_entry - 2)
+                while m > 0
+                {
+                    let k tem.get_car().keyword_ident()
+                    tem := tem.get_cdr() as ref[ELObj]
+                    if k <> null
+                    {
+                        var jj 0
+                        var matched false
+                        while jj < sig.n_key
+                        {
+                            if matched = false
+                            {
+                                if *(sig.keys + jj) = k
+                                {
+                                    if vm.stack_ref(vm.get_sp() + jj) = null
+                                        vm.stack_set(vm.get_sp() + jj, tem.get_car())
+                                    matched := true
+                                }
+                            }
+                            jj := jj + 1
+                        }
+                        ; a keyword the signature doesn't declare is an error
+                        ; unless a rest arg swallows it (reference VarargsInsn)
+                        if (matched = false) and (sig.rest_arg = false)
+                        {
+                            let itp vm.get_interp()
+                            itp.set_next_location(loc)
+                            itp.message1(InterpreterMessages.invalidKeyArg(), k.get_name())
+                        }
+                    }
+                    else
+                    {
+                        let itp vm.get_interp()
+                        itp.set_next_location(loc)
+                        itp.message0(InterpreterMessages.keyArgsNotKey())
+                    }
+                    tem := tem.get_cdr() as ref[ELObj]
+                    m := m - 2
+                }
+                vm.set_sp(vm.get_sp() + sig.n_key)
+            }
+            return *(entry_points + (n_entry - 1))
+        }
+        *(entry_points + n)
+    }
+}

@@ -1,0 +1,249 @@
+use scaly.memory.Page
+
+; StringC — OpenSP's string of Char (Char = u32 codepoint). In C++ it is a
+; String<Char> value type over a resizable buffer; here it is a small value
+; { data, size } whose Char buffer is region-allocated on the value's own
+; page (Page.get(this)), mirroring scaly.containers.String's residency but
+; over u32 elements. Copies are shallow (fine inside one parse region); the
+; byte<->Char boundary is handled by CodingSystems, never here.
+;
+; Char is u32 throughout; CHAR_BYTES is its element size for allocation.
+define CHAR_BYTES: size_t 4
+
+define StringC (var data: pointer[u32](null), var size: size_t(0))
+{
+    ; Empty string — no allocation.
+    init()
+    {
+        data := null
+        size := 0
+    }
+
+    ; Copy n Chars from a raw buffer onto this value's page.
+    init(chars: pointer[u32], n: size_t)
+    {
+        size := n
+        if n = 0
+        {
+            data := null
+            return
+        }
+
+        let own_page Page.get(this)
+        data := own_page.allocate(n * CHAR_BYTES, CHAR_BYTES) as pointer[u32]
+        memcpy(data as pointer[void], chars as pointer[void], n * CHAR_BYTES)
+    }
+
+    ; Copy the Chars a borrowed view names onto this value's page.  The twin of
+    ; the (chars, n) init above, and the one the call sites want: opensp hands a
+    ; buffer and its length around as two arguments at 125 sites, of which only
+    ; four ever reach a C function -- see `as_slice` below.
+    ;
+    ; ★The two 1-argument inits are told apart by TYPE, which the rule
+    ; "selection is by argument COUNT" is too coarse to promise: probed before
+    ; this was written, `Box^host("xy")` and `Box^host(<Slice[u32]>)` each
+    ; reached their own init.  With `init(other: StringC)` there would be a
+    ; THIRD, and it is deliberately absent: a copy has a spelling already
+    ; (`StringC^host(x.as_slice())`), and a second one would be a second way to
+    ; say the same thing.
+    init(chars: Slice[u32])
+    {
+        let n chars.length
+        size := n
+        if n = 0
+        {
+            data := null
+            return
+        }
+
+        let own_page Page.get(this)
+        data := own_page.allocate(n * CHAR_BYTES, CHAR_BYTES) as pointer[u32]
+        memcpy(data as pointer[void], chars.data as pointer[void], n * CHAR_BYTES)
+    }
+
+    ; The same widening for a BORROWED VIEW: the ports' ASCII-literal parameters are
+    ; `Slice[char]` since 2026-09-06. Both one-argument inits stay: a LITERAL at a
+    ; call site still resolves to the pointer init below, a Slice variable to this
+    ; one (probed with all three one-argument inits declared, `Slice[u32]` included).
+    init(ascii: Slice[char])
+    {
+        let n ascii.length
+        size := n
+        if n = 0
+        {
+            data := null
+            return
+        }
+
+        let own_page Page.get(this)
+        data := own_page.allocate(n * CHAR_BYTES, CHAR_BYTES) as pointer[u32]
+        var i: size_t 0
+        while i < n
+        {
+            *(data + i) := ascii[i] as u32
+            i := i + 1
+        }
+    }
+
+    ; Widen an ASCII/Latin-1 C string to Char (StringC.cs's string ctor:
+    ; per-char zero-extend). The byte<->Char boundary otherwise lives in
+    ; CodingSystems; this is only for building literal message/diagnostic text.
+    init(ascii: pointer[const_char])
+    {
+        let n strlen ascii
+        size := n
+        if n = 0
+        {
+            data := null
+            return
+        }
+
+        let own_page Page.get(this)
+        data := own_page.allocate(n * CHAR_BYTES, CHAR_BYTES) as pointer[u32]
+        var i: size_t 0
+        while i < n
+        {
+            *(data + i) := (*((ascii as pointer[u8]) + i)) as u32
+            i := i + 1
+        }
+    }
+
+    function get_size(this: StringC) returns size_t
+        size
+
+    ; Raw Char buffer (region-resident) — for handing content to an InputSource.
+    ;
+    ; ★★★THIS ACCESSOR IS THE C BOUNDARY AND NOTHING ELSE.  Measured 2026-09-04:
+    ; of its 201 call sites exactly FOUR reach a C function; the rest handed the
+    ; pointer straight back into Scaly code, almost always as the pair
+    ; `StringC^host(x.data_ptr(), x.get_size())`.  A `StringC` IS `{data, size}`
+    ; -- a `Slice[u32]` under another name -- so that pair was a slice taken
+    ; apart and put back together.  `as_slice` is the form for everything that
+    ; does not cross into C; reach for `data_ptr` only when a C prototype is on
+    ; the other side.
+    function data_ptr(this: StringC) returns pointer[u32]
+        data
+
+    ; The Chars as a borrowed view.  Allocates nothing and copies nothing: the
+    ; buffer stays where it is and the view names it.
+    ;
+    ; ★`Slice` is `{length, data}` in that order, and the field-order check
+    ; (`report_component_type_mismatch#`) is what makes writing it out safe.
+    ;
+    ; ★★★AND IT COSTS NOTHING, WHICH IS NOT OBVIOUS AND HAD TO BE MEASURED: a
+    ; `Slice` is a 16-byte value, so the RAW emission returns it through an
+    ; `sret` slot where the pair `data_ptr()`/`get_size()` was two register
+    ; returns -- exactly the memory round-trip charged against
+    ; `Primitive.args`.  In the SHIPPED binary it is gone: after whole-program
+    ; `opt -O2` on the opensp root, ZERO of the 48 `as_slice` calls survive and
+    ; the `Slice[u32]` allocas fall 197 -> 38.  Wall clock over the tree's own
+    ; grammar (60 parses of `scaly.sgm`) is 0.63 s either way and the binary
+    ; grows 168 bytes.  ★The difference to `Primitive.args` is inlining: this
+    ; accessor is two loads, `dispatch` is far too large to inline into
+    ; `prim_call`.  A Slice-by-value is expensive across a call that STAYS a
+    ; call, not across one that folds.
+    function as_slice(this: StringC) returns Slice[u32]
+        Slice[u32](size, data)
+
+    function get(this: StringC, index: size_t) returns u32
+    {
+        if index >= size
+            return 0
+
+        *(data + index)
+    }
+
+    ; A copy of the [start, start+len) Char slice as a fresh StringC (buffer on
+    ; the returned value's own page). Out-of-range slices clamp to empty.
+    function substr(this: StringC, start: size_t, len: size_t) returns StringC
+    {
+        if start >= size
+            return StringC()
+
+        var n len
+        if (start + n) > size
+            n := size - start
+
+        StringC(data + start, n)
+    }
+
+    function equals(this: StringC, other: StringC) returns bool
+    {
+        if size <> other.size
+            return false
+
+        if size = 0
+            return true
+
+        memcmp(data as pointer[void], other.data as pointer[void], size * CHAR_BYTES) = 0
+    }
+
+    function test() returns int
+    {
+        ; empty
+        var empty StringC()
+        if empty.get_size() <> 0
+            return -1
+
+        ; build "AB" (0x41, 0x42) via a stack buffer
+        var buf u32[2]
+        *(buf as pointer[u32]) := 0x41
+        buf[1] := 0x42
+        var s StringC(buf as pointer[u32], 2)
+        if s.get_size() <> 2
+            return -2
+
+        if s.get(0) <> 0x41
+            return -3
+
+        if s.get(1) <> 0x42
+            return -4
+
+        ; equality
+        var s2 StringC(buf as pointer[u32], 2)
+        if s.equals(s2) = false
+            return -5
+
+        if empty.equals(s)
+            return -6
+
+        ; ASCII widen ctor produces the same "AB"
+        var s3 StringC("AB")
+        if s3.get_size() <> 2
+            return -7
+
+        if s3.equals(s) = false
+            return -8
+
+        if s3.get(0) <> 0x41
+            return -9
+
+        ; as_slice names the same buffer -- no copy -- and the Slice init copies
+        ; it back.  ★Worth a test of its own because `StringC` declares a field
+        ; called `data` and `Slice` declares one too: the field-capture
+        ; trap answers ZERO at rc 0, so nothing but a read-back proves this.
+        let sl s.as_slice()
+        if sl.length <> 2
+            return -10
+
+        if sl[0 as size_t] <> 0x41
+            return -11
+
+        if sl[1 as size_t] <> 0x42
+            return -12
+
+        var s4 StringC(sl)
+        if s4.get_size() <> 2
+            return -13
+
+        if s4.equals(s) = false
+            return -14
+
+        ; the empty view round-trips too
+        var s5 StringC(empty.as_slice())
+        if s5.get_size() <> 0
+            return -15
+
+        0
+    }
+}

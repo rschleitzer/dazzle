@@ -1,0 +1,1642 @@
+; dazzle — the DSSSL transform CLI (the `jade -t sgml|xml -d spec.dsl doc`
+; drop-in). Wires the full Stage-6a pipeline end to end: SGML/XML document ->
+; opensp parse -> Grove; DSSSL stylesheet -> Interpreter; ProcessContext drives
+; the grove through the construction rules into the transform FOTBuilder; the
+; top-level output stream goes to stdout (-o is IGNORED for sgml/xml, exactly
+; like the reference), while entity/directory flow objects write their own
+; files (the codegen use case). fot/rtf/tex write <docbase>.<type> next to the
+; document (-o overrides; the file is created BEFORE the document parse, and
+; a failed create reports cannotOpenOutputError and skips style processing —
+; the reference makeFOTBuilder order).
+;
+; This is a program, not part of the `define dazzle` package module — it is
+; compiled standalone and linked against libdazzle.a + libopensp.a (see
+; tests/dazzle/build-cli.sh), exactly as onsgmls.scaly is for opensp.
+;
+; The CLI is the reference option surface (JadeApp -> DssslApp -> GroveApp ->
+; ParserApp -> EntityApp -> CmdLineApp), scanned by the ported getopt clone
+; (opensp Options.scaly: clustered shorts, unique-prefix --long names, `--`
+; terminator, the ?/-/= signal chars rendered as invalid/ambiguous/erroneous-
+; argument errors + the "--help" info line, exit 1). The -b long name is
+; always --encoding (GroveApp fixes the internal charset to unicode, so
+; internalCharsetIsDocCharset_ is false regardless of SP_CHARSET_FIXED).
+;
+;   -t TYPE               output type, PREFIX-matched against the reference
+;                         table {fot rtf html tex mif sgml xml} (default fot;
+;                         empty prefix matches fot; unknown -> unknownType E,
+;                         type unchanged). `-t sgml-raw`-style suffixes split
+;                         at '-' into backend output options ("raw" wires the
+;                         transform RE_/SP_ swap; rtf "95" is unported and
+;                         traps LOUDLY, exit 17).
+;   -d SYSID[#ID]         the DSSSL spec; #ID selects the style-specification
+;                         with that ID (reference splitOffId)
+;   -o FILE               output file for fot/rtf/tex/mif (sgml/xml ignore it and
+;                         write stdout, like the reference); empty ->
+;                         emptyOutputFilename E and the default name applies
+;   -V name[=value]       runtime variable define, earliest part wins
+;   -G                    debug mode (stack traces, no tail-call replacement)
+;   -2                    dsssl2 extensions   -s  strict (RCS) mode
+;   -E/--max-errors N     document error limit (0 = unlimited, default 200)
+;   -c/--catalog SYSID    must-exist catalog (repeatable; also consulted by
+;                         the stylesheet parse, before the bundled DSSSL
+;                         catalog); SGML_CATALOG_FILES appends more
+;   -C/--catalogs         file arguments are catalogs (DOCUMENT entry)
+;   -D/--directory DIR    search DIR for relative sysids; SGML_SEARCH_PATH
+;                         appends more
+;   -R/--restricted       restricted file reading
+;   -w/--warning TYPE     enable warning/validation TYPE (unknownWarning E)
+;   -i/--include NAME     define parameter entity NAME as "INCLUDE"
+;   -e/-g/-n/-x           reporter options for DOCUMENT diagnostics (open
+;                         entities/elements, message numbers, clauses); the
+;                         interpreter's own diagnostics don't consult them
+;                         (deviation, unused in practice)
+;   -a/--activate NAME    activate link type NAME (document parse)
+;   -A/--architecture N   parse the document with respect to architecture N
+;                         (the ArcEngine transform replaces the event stream
+;                         the grove builds from)
+;   -b/--encoding NAME    validated (unknownEncoding E); a VALID non-default
+;                         encoding does not switch the output encoder yet
+;                         (port emits UTF-8, the usual default)
+;   -f/--error-file FILE  write diagnostics to FILE (created/truncated)
+;   -v/--version          "openjade"/"OpenSP" version banners (run continues)
+;   -h/--help             usage text, exit 0 (after a failing -f aborts)
+;   SYSID...              document files, merged into ONE document entity
+;                         ("-" = stdin <OSFD>0; none = stdin). The default
+;                         fot/rtf output name derives from the LAST file
+;                         argument (extension replaced when it is at most 4
+;                         chars, reference 5-char rule), "jade-out" for pure
+;                         stdin.
+;
+; Without -d the document still parses (exit code = its errors), then
+; noSpec ("no DSSSL specification: use -d to specify") reports and style
+; processing is skipped. (The reference additionally derives <docbase>.dsl
+; for FILE documents, but that path SIGSEGVs in the reference binary —
+; probed 2026-07-30 — so the port keeps the sane no-spec behavior there;
+; deviation documented.)
+;
+; Known deviations from the reference binary, all outside ordinary use:
+; --long=value with a NON-exact prefix ("--max-err=5") crashes the reference
+; (Options::searchLong clobbers sp_ scanning later table entries — att_getopt
+; heritage bug); the port parses it correctly. -n message numbers render the
+; module as the port's stand-in 0 where the reference prints a raw pointer
+; value. -c catalog-open failure counts/ordering may differ (error path).
+
+package scaly 0.1.0
+package opensp 0.1.0
+package dazzle 0.1.0
+
+use opensp.Parser.Parser
+use opensp.ParserState.ParserState
+use opensp.ParserOptions.ParserOptions
+; ★load-bearing beyond visibility: without the concept in THIS root, a method
+; call on a pointer[Syntax] silently answers garbage (the S86 footgun) — that
+; cost a debugging round on `general_subst`.
+use opensp.Syntax.Syntax
+use opensp.Location.InputSource
+use opensp.StringC.StringC
+use opensp.Options.Options
+use opensp.Options.LongOpt
+use opensp.EntityManager.EmConfig
+use opensp.Message.MessageType
+use opensp.Message.MessageFragment
+use opensp.Message.MessageArg
+use opensp.Message.MessageFormatter
+use opensp.Message.Severity
+use opensp.CmdLineAppMessages.CmdLineAppMessages
+use opensp.EntityAppMessages.EntityAppMessages
+use opensp.ParserAppMessages.ParserAppMessages
+use opensp.CodingSystemKit.CodingSystemKit
+use opensp.CodingSystemKit.OutputEncoder
+use opensp.CodingSystem.CodingSystem
+use dazzle.Grove.GroveNode
+use dazzle.Grove.GroveBuilder
+use dazzle.Grove.GroveBuildState
+use dazzle.GroveManager.GroveManager
+use dazzle.Interpreter.Interpreter
+use dazzle.FrameMark.FrameMark
+; ★CharProp must be visible in the ROOT: a field/method access on a record
+; whose concept the root does not `use` silently answers 0 (the S86 footgun).
+use dazzle.Interpreter.CharProp
+use dazzle.SchemeParser.SchemeParser
+use dazzle.DssslSpecEventHandler.DssslSpecEventHandler
+use dazzle.DssslSpecEventHandler.Part
+use dazzle.TransformFOTBuilder.TransformFOTBuilder
+use dazzle.SgmlFOTBuilder.SgmlFOTBuilder
+use dazzle.RtfFOTBuilder.RtfFOTBuilder
+use dazzle.ProcessContext.ProcessContext
+use dazzle.TeXFOTBuilder.TeXFOTBuilder
+use dazzle.TeXFOTBuilder.TexBuf
+use dazzle.HtmlFOTBuilder.HtmlFOTBuilder
+use dazzle.MifFOTBuilder.MifFOTBuilder
+use scaly.memory.Page
+use scaly.containers.String
+use scaly.containers.Array
+use scaly.containers.Vector
+use scaly.os.File
+use scaly.os.Console
+use scaly.fiber.Io
+
+; creat(2): open write-only, create + TRUNCATE — the reference's
+; FileOutputByteStream::open. Non-variadic, so a direct extern is fine.
+function creat(path: pointer[const_char], mode: u32) returns i32 extern
+; strerror(3) + the eio shim's errno accessor — the %2 of the open errors.
+function strerror(code: i32) returns pointer[const_char] extern
+function scaly_eio_errno() returns i32 extern
+function close(fd: int) returns i32 extern
+
+; MessageReporter::options_ bits — keep in sync with ParserState.scaly REP_*.
+define DZ_REP_OPEN_ENTITIES: u32 1
+define DZ_REP_OPEN_ELEMENTS: u32 2
+define DZ_REP_MESSAGE_NUMBERS: u32 4
+define DZ_REP_CLAUSES: u32 8
+
+; JadeApp's output types, in outputTypeNames[] order (prefix matching walks
+; this order, so `-t f` is fot and `-t s` is sgml, like the reference).
+define DZ_TYPE_FOT: int 0
+define DZ_TYPE_RTF: int 1
+define DZ_TYPE_HTML: int 2
+define DZ_TYPE_TEX: int 3
+define DZ_TYPE_MIF: int 4
+define DZ_TYPE_SGML: int 5
+define DZ_TYPE_XML: int 6
+
+; JadeMessages (jade/JadeMessages.msg, base 1000).
+function jade_unknown_type() returns MessageType
+    MessageType(MessageFragment(1000, "unknown output type %1"), Severity.Error)
+
+function jade_empty_output_filename() returns MessageType
+    MessageType(MessageFragment(1001, "empty output filename"), Severity.Error)
+
+function jade_cannot_open_output() returns MessageType
+    MessageType(MessageFragment(1002, "cannot open output file %1 (%2)"), Severity.Error)
+
+; DssslAppMessages (style/DssslAppMessages.msg, base 2000).
+function dsssl_version_info() returns MessageType
+    MessageType(MessageFragment(2000, "%1 version %2"), Severity.Info)
+
+function dsssl_no_spec() returns MessageType
+    MessageType(MessageFragment(2001, "no DSSSL specification: use -d to specify"), Severity.Error)
+
+; case-insensitive exact match of a NUL-terminated env value against an ASCII
+; key (CmdLineApp::stringMatches).
+function env_matches(v: pointer[const_char], key: String) returns bool
+{
+    let n key.get_length()
+    var i: size_t 0
+    while i < n
+    {
+        let c (*(v + i)) as u32
+        if c = 0
+            return false
+        var k (key.get(i)) as u32
+        var cu c
+        if (cu >= 0x61) and (cu <= 0x7A)
+            cu := cu - 0x20
+        if (k >= 0x61) and (k <= 0x7A)
+            k := k - 0x20
+        if cu <> k
+            return false
+        i := i + 1
+    }
+    ((*(v + n)) as u32) = 0
+}
+
+; whether app-level stderr messages encode as UTF-8 — the fallback path of
+; write_stderr, used only until the driver installs the real stderr encoder
+; below. ★A DssslApp is a GroveApp("unicode"), i.e. it passes a
+; requiredInternalCode, so `internalCharsetIsDocCharset_` is 0 whatever
+; SP_CHARSET_FIXED says: the name consulted is ALWAYS SP_ENCODING, never
+; SP_BCTF (CmdLineApp::initCodingSystem).
+procedure output_is_utf8() returns bool
+{
+    let enc getenv("SP_ENCODING")
+    if enc <> null
+    {
+        if env_matches(enc, String("XML")) or env_matches(enc, String("UTF-8"))
+            return true
+    }
+    false
+}
+
+; codingSystem() as an OUTPUT encoder — the app's coding system, which is both
+; the default for `outputCodingSystem_` (processOptions' epilogue) and the
+; message stream's encoder (makeStdErr). SP_ENCODING names it; anything else
+; (unknown name, or a system wider than one byte per char, which the reference
+; rejects for the APP coding system) falls back to SP_DEFAULT_ENCODING =
+; IS8859-1 = the identity system.
+procedure dz_coding_system(host: ref[Page], mutable e: ref[OutputEncoder])
+{
+    let name getenv("SP_ENCODING")
+    if name <> null
+    {
+        var kind 0
+        var which 0
+        if CodingSystemKit.lookup(String(name), false, &kind, &which)
+        {
+            var probe CodingSystem.identity()
+            if CodingSystemKit.lookup_input_name(host, String(name), false, &probe)
+            {
+                if probe.fixed_bytes_per_char() > 1
+                {
+                    CodingSystemKit.make_default(host, false, e)
+                    return
+                }
+            }
+            CodingSystemKit.make_encoder(host, kind, which, e)
+            return
+        }
+    }
+    CodingSystemKit.make_default(host, false, e)
+}
+
+; split a colon-separated env value into path segments (EntityApp).
+procedure split_path_env(mutable arr: ref[Array[String]], v: pointer[const_char], hp: ref[Page])
+{
+    if v = null
+        return
+    if ((*v) as u32) = 0
+        return
+    var start: size_t 0
+    var i: size_t 0
+    var scanning true
+    while scanning
+    {
+        let ch (*(v + i)) as u32
+        if (ch = 0) or (ch = 0x3A)
+        {
+            let seg String^hp(v + start, i - start)
+            arr.add(*seg)
+            if ch = 0
+                scanning := false
+            else
+            {
+                i := i + 1
+                start := i
+            }
+        }
+        else
+            i := i + 1
+    }
+}
+
+procedure read_stdin_to_string() returns String
+{
+    let bytes Array[u8]()
+    var buf u8[65536]
+    let bp buf as pointer[void]
+    var reading true
+    while reading
+    {
+        let r Io.read(0 as i32, bp, 65536 as size_t)
+        if r <= 0
+            reading := false
+        else
+        {
+            let n r as size_t
+            var i: size_t 0
+            while i < n
+            {
+                bytes.add(buf[i])
+                i := i + 1
+            }
+        }
+    }
+    String(bytes.get_buffer() as pointer[const_char], bytes.get_length())
+}
+
+; One app-level diagnostic line — a CmdLineApp message with no location
+; segment: `<prog>:[0.<number>:]<sev>: <formatted text>` (see onsgmls.scaly).
+procedure app_msg(prog: String, utf8: bool, rep_numbers: bool, fd: int, mt: MessageType, args: Vector[MessageArg])
+{
+    var buf u32[2048]
+    let bp buf as pointer[u32]
+    let cap: size_t 2048
+    var p: size_t 0
+    var pi: size_t 0
+    while pi < prog.get_length()
+    {
+        p := ParserState.put_char(Slice[u32](cap, bp), p, (*(prog.get_buffer() + pi)) as u32)
+        pi := pi + 1
+    }
+    p := ParserState.put_char(Slice[u32](cap, bp), p, 0x3A)
+    if rep_numbers
+    {
+        p := ParserState.put_char(Slice[u32](cap, bp), p, 0x30)
+        p := ParserState.put_char(Slice[u32](cap, bp), p, 0x2E)
+        p := ParserState.put_dec(Slice[u32](cap, bp), p, mt.get_number() as u64)
+        p := ParserState.put_char(Slice[u32](cap, bp), p, 0x3A)
+    }
+    p := ParserState.put_char(Slice[u32](cap, bp), p, mt.severity_char())
+    p := ParserState.put_char(Slice[u32](cap, bp), p, 0x3A)
+    p := ParserState.put_char(Slice[u32](cap, bp), p, 0x20)
+    let fmt MessageFormatter()
+    ; get_text() is the raw literal template now (opensp.Message.MessageFragment)
+    let added fmt.format(StringC(mt.get_text()), args, Slice[u32](cap - p, bp + p), false)
+    p := p + added
+    p := ParserState.put_char(Slice[u32](cap, bp), p, 0x0A)
+    ParserState.write_stderr(Slice[u32](p, bp), utf8, fd)
+}
+
+procedure app_msg0(prog: String, utf8: bool, rep_numbers: bool, fd: int, mt: MessageType)
+{
+    let args Vector[MessageArg]()
+    app_msg(prog, utf8, rep_numbers, fd, mt, args)
+}
+
+procedure app_msg1(prog: String, utf8: bool, rep_numbers: bool, fd: int, mt: MessageType, arg: StringC)
+{
+    var args Vector[MessageArg](1)
+    *(args.get(0)) := MessageArg.Str(arg)
+    app_msg(prog, utf8, rep_numbers, fd, mt, args)
+}
+
+; ---- -h / --help usage text (CmdLineApp::usage; see onsgmls.scaly) ---------
+define UsageRow (key: u32, has_name: bool, name: StringC, has_arg: bool, arg: pointer[const_char], help: pointer[const_char])
+
+procedure usage_put_stringc(mutable bp: Slice[u32], pos: size_t, s: StringC) returns size_t
+{
+    var p pos
+    var i: size_t 0
+    while i < s.get_size()
+    {
+        p := ParserState.put_char(bp, p, s.get(i))
+        i := i + 1
+    }
+    p
+}
+
+procedure add_usage_row(mutable rows: ref[Array[UsageRow]], key: u32, has_name: bool, name: StringC, has_arg: bool, argf: MessageFragment, help: MessageType)
+{
+    var arg: pointer[const_char] null
+    if has_arg
+        arg := argf.text
+    rows.add(UsageRow(key, has_name, name, has_arg, arg, help.get_text()))
+}
+
+procedure usage_emit_left(mutable bp: Slice[u32], row: UsageRow) returns size_t
+{
+    var p: size_t 0
+    p := ParserState.put_char(bp, p, 0x20)
+    p := ParserState.put_char(bp, p, 0x20)
+    p := ParserState.put_char(bp, p, 0x2D)
+    p := ParserState.put_char(bp, p, row.key)
+    if row.has_name
+    {
+        p := ParserState.put_char(bp, p, 0x2C)
+        p := ParserState.put_char(bp, p, 0x20)
+    }
+    else if row.has_arg
+        p := ParserState.put_char(bp, p, 0x20)
+    if row.has_name
+    {
+        p := ParserState.put_char(bp, p, 0x2D)
+        p := ParserState.put_char(bp, p, 0x2D)
+        p := usage_put_stringc(bp, p, row.name)
+        if row.has_arg
+            p := ParserState.put_char(bp, p, 0x3D)
+    }
+    if row.has_arg
+        p := usage_put_stringc(bp, p, StringC(row.arg))
+    p
+}
+
+procedure usage_emit_msg(template_lit: pointer[const_char], arg: StringC, utf8: bool)
+{
+    var buf u32[2048]
+    let bp buf as pointer[u32]
+    let cap: size_t 2048
+    var args Vector[MessageArg](1)
+    *(args.get(0)) := MessageArg.Str(arg)
+    let fmt MessageFormatter()
+    var p fmt.format(StringC(template_lit), args, Slice[u32](cap, bp), true)
+    p := ParserState.put_char(Slice[u32](cap, bp), p, 0x0A)
+    ParserState.write_stderr(Slice[u32](p, bp), utf8, 1)
+}
+
+; Print the usage text to stdout (caller exits 0). Rows mirror the reference
+; registration order (CmdLineApp, EntityApp, ParserApp, DssslApp, JadeApp);
+; the -b long name is always --encoding (see the header comment); the
+; DssslApp/JadeApp short-only options render the undocOption row, argument
+; options with the someArg "ARG" fragment — byte-identical to the reference
+; dazzle --help (probed 2026-07-30).
+procedure print_usage(prog: String, utf8: bool)
+{
+    let progc StringC(prog.to_c_string())
+
+    var b1 u32[2048]
+    let bp1 b1 as pointer[u32]
+    let cap1: size_t 2048
+    var a1 Vector[MessageArg](1)
+    *(a1.get(0)) := MessageArg.Str(progc)
+    let fmt1 MessageFormatter()
+    let inner_len fmt1.format(StringC(CmdLineAppMessages.defaultUsage().get_text()), a1, Slice[u32](cap1, bp1), true)
+    let inner StringC(bp1, inner_len)
+    usage_emit_msg(CmdLineAppMessages.usage().get_text(), inner, utf8)
+    usage_emit_msg(CmdLineAppMessages.usageStart().get_text(), progc, utf8)
+
+    let rows Array[UsageRow]()
+    add_usage_row(&rows, 0x62, true, StringC("encoding"), true, CmdLineAppMessages.name(), CmdLineAppMessages.eHelp())
+    add_usage_row(&rows, 0x66, true, StringC("error-file"), true, CmdLineAppMessages.file(), CmdLineAppMessages.fHelp())
+    add_usage_row(&rows, 0x76, true, StringC("version"), false, MessageFragment(), CmdLineAppMessages.vHelp())
+    add_usage_row(&rows, 0x68, true, StringC("help"), false, MessageFragment(), CmdLineAppMessages.hHelp())
+    add_usage_row(&rows, 0x63, true, StringC("catalog"), true, EntityAppMessages.sysid(), EntityAppMessages.cHelp())
+    add_usage_row(&rows, 0x43, true, StringC("catalogs"), false, MessageFragment(), EntityAppMessages.CHelp())
+    add_usage_row(&rows, 0x44, true, StringC("directory"), true, EntityAppMessages.directory(), EntityAppMessages.DHelp())
+    add_usage_row(&rows, 0x52, true, StringC("restricted"), false, MessageFragment(), EntityAppMessages.RHelp())
+    add_usage_row(&rows, 0x61, true, StringC("activate"), true, ParserAppMessages.name(), ParserAppMessages.aHelp())
+    add_usage_row(&rows, 0x41, true, StringC("architecture"), true, ParserAppMessages.name(), ParserAppMessages.AHelp())
+    add_usage_row(&rows, 0x45, true, StringC("max-errors"), true, ParserAppMessages.number(), ParserAppMessages.EHelp())
+    add_usage_row(&rows, 0x65, true, StringC("open-entities"), false, MessageFragment(), ParserAppMessages.eHelp())
+    add_usage_row(&rows, 0x67, true, StringC("open-elements"), false, MessageFragment(), ParserAppMessages.gHelp())
+    add_usage_row(&rows, 0x6E, true, StringC("error-numbers"), false, MessageFragment(), ParserAppMessages.nHelp())
+    add_usage_row(&rows, 0x78, true, StringC("references"), false, MessageFragment(), ParserAppMessages.xHelp())
+    add_usage_row(&rows, 0x69, true, StringC("include"), true, ParserAppMessages.name(), ParserAppMessages.iHelp())
+    add_usage_row(&rows, 0x77, true, StringC("warning"), true, ParserAppMessages.type(), ParserAppMessages.wHelp())
+    add_usage_row(&rows, 0x47, false, StringC(), false, MessageFragment(), CmdLineAppMessages.undocOption())
+    add_usage_row(&rows, 0x32, false, StringC(), false, MessageFragment(), CmdLineAppMessages.undocOption())
+    add_usage_row(&rows, 0x64, false, StringC(), true, CmdLineAppMessages.someArg(), CmdLineAppMessages.undocOption())
+    add_usage_row(&rows, 0x56, false, StringC(), true, CmdLineAppMessages.someArg(), CmdLineAppMessages.undocOption())
+    add_usage_row(&rows, 0x73, false, StringC(), false, MessageFragment(), CmdLineAppMessages.undocOption())
+    add_usage_row(&rows, 0x74, false, StringC(), true, CmdLineAppMessages.someArg(), CmdLineAppMessages.undocOption())
+    add_usage_row(&rows, 0x6F, false, StringC(), true, CmdLineAppMessages.someArg(), CmdLineAppMessages.undocOption())
+
+    var maxw: size_t 0
+    var scratch u32[256]
+    let sp Slice[u32](256, scratch as pointer[u32])
+    var i: size_t 0
+    while i < rows.get_length()
+    {
+        let l usage_emit_left(sp, rows[i])
+        if l > maxw
+            maxw := l
+        i := i + 1
+    }
+
+    i := 0
+    while i < rows.get_length()
+    {
+        let row rows[i]
+        var lb u32[2048]
+        let lbp lb as pointer[u32]
+        let lcap: size_t 2048
+        let lbuf Slice[u32](lcap, lbp)
+        var p usage_emit_left(lbuf, row)
+        while p <= (maxw + 2)
+            p := ParserState.put_char(Slice[u32](lcap, lbp), p, 0x20)
+        var ah Vector[MessageArg](1)
+        ; arg/help are literal templates from the catalog (see MessageFragment)
+        var arg_sc StringC()
+        if row.arg <> null
+            arg_sc := StringC(row.arg)
+        *(ah.get(0)) := MessageArg.Str(arg_sc)
+        let hf MessageFormatter()
+        let added hf.format(StringC(row.help), ah, Slice[u32](lcap - p, lbp + p), true)
+        p := p + added
+        p := ParserState.put_char(Slice[u32](lcap, lbp), p, 0x0A)
+        ParserState.write_stderr(Slice[u32](p, lbp), utf8, 1)
+        i := i + 1
+    }
+}
+
+; Normalize file bytes into a u32 record buffer: LF and CRLF collapse to a
+; single RE (0x0D) — the OpenSP record convention the SchemeParser lexer
+; expects (skip_comment ends a `;` comment at RE, never at LF; a raw LF file
+; would otherwise swallow the rest of the stylesheet after the first comment).
+; Bytes map 1:1 to codepoints (ASCII/Latin-1; a UTF-8 decode for non-ASCII
+; stylesheets is a later refinement).
+function normalize_records(host: ref[Page], src: String) returns ref[InputSource]
+{
+    let out Array[u32]^host()
+    let n src.get_length()
+    var i: size_t 0
+    while i < n
+    {
+        let b src.get(i)
+        if b = 0x0D
+        {
+            out.add(0x0D)
+            ; CRLF -> single RE: swallow a following LF.
+            if (i + 1) < n
+            {
+                if src.get(i + 1) = 0x0A
+                    i := i + 1
+            }
+        }
+        else if b = 0x0A
+            out.add(0x0D)
+        else
+            out.add(b as u32)
+        i := i + 1
+    }
+    InputSource.make(host, null, out.as_slice())
+}
+
+; Load the DSSSL Scheme prolog (dsssl/builtins.dsl: map, node-list->list,
+; reduce, node-list-* …) into `interp` BEFORE the user stylesheet, mirroring
+; the reference Interpreter::installBuiltins() (which reads the builtins entity
+; and runs SchemeParser::parse over it). The file is resolved under SCALY_HOME
+; (fallback cwd-relative, matching the package-resolution base). Records are
+; normalized like any stylesheet — a raw-LF prolog would otherwise have its
+; first `;` comment swallow the whole file. Absent file = silent no-op (the
+; reference guards the same way with readEntity's boolean).
+procedure install_builtins(host: ref[Page], mutable interp: ref[Interpreter])
+{
+    var path String("packages/dazzle/0.1.0/dsssl/builtins.dsl")
+    let home getenv("SCALY_HOME")
+    if home <> null
+        path := String("`home`/packages/dazzle/0.1.0/dsssl/builtins.dsl")
+    if File.exists(path) = false
+        return
+    let src File.read_to_string(path)
+    if src.get_length() = 0
+        return
+    ; Interpreter::installBuiltins brackets the builtins parse with part
+    ; index -1 (any user define overrides a builtin), then resets to 0.
+    interp.set_part_index(0xFFFFFFFF)
+    let src_in normalize_records(host, src)
+    let sp SchemeParser.make(host, interp, src_in)
+    sp.parse()
+    interp.set_part_index(0)
+}
+
+; A `.dsl` is SGML (the DSSSL style-sheet document openjade requires) iff its
+; first non-whitespace byte is `<` (a markup declaration / element). Otherwise
+; it is dazzle's raw-Scheme convenience form (the smoke-test stylesheets).
+function is_sgml_stylesheet(src: String) returns bool
+{
+    let n src.get_length()
+    var i: size_t 0
+    while i < n
+    {
+        let b src.get(i)
+        if (b <> 0x20) and (b <> 0x09) and (b <> 0x0A) and (b <> 0x0D)
+            return b = 0x3C
+        i := i + 1
+    }
+    false
+}
+
+; tcstoul semantics for the -E argument (ParserApp.cxx:110; local copy of the
+; onsgmls helper — cross-package free functions with pointer params don't
+; resolve): skip leading whitespace, one optional sign, decimal digits; the
+; WHOLE argument must be consumed, and the unsigned-long value must fit
+; UINT_MAX. A negated nonzero value wraps past UINT_MAX (rejected); "-0" is 0
+; and valid (limit off).
+procedure parse_error_limit(a: pointer[char], mutable out_ok: ref[bool]) returns u32
+{
+    out_ok := false
+    var i: size_t 0
+    var scanning true
+    while scanning
+    {
+        let c (*(a + i)) as u32
+        if (c = 0x20) or ((c >= 0x09) and (c <= 0x0D))
+            i := i + 1
+        else
+            scanning := false
+    }
+    var minus false
+    let sc (*(a + i)) as u32
+    if sc = 0x2B
+        i := i + 1
+    else if sc = 0x2D
+    {
+        minus := true
+        i := i + 1
+    }
+    var n: u64 0
+    var digits: size_t 0
+    var overflow false
+    var reading true
+    while reading
+    {
+        let c (*(a + i)) as u32
+        if (c >= 0x30) and (c <= 0x39)
+        {
+            if n > 1844674407370955161
+                overflow := true
+            n := (n * 10) + ((c - 0x30) as u64)
+            digits := digits + 1
+            i := i + 1
+        }
+        else
+            reading := false
+    }
+    if digits = 0
+        return 0 as u32
+    if ((*(a + i)) as u32) <> 0
+        return 0 as u32
+    if overflow
+        return 0 as u32
+    if minus and (n <> 0)
+        return 0 as u32
+    if n > 4294967295
+        return 0 as u32
+    out_ok := true
+    n as u32
+}
+
+; StyleEngine::defineVariable — one -V argument to its cmdline define form:
+;   "(..."       -> verbatim (a raw Scheme form)
+;   "name"       -> (define name #t)
+;   "name=value" -> (define name "value")  (value unescaped, like the reference)
+function define_var_form(v: String) returns String
+{
+    let n v.get_length()
+    if n > 0
+    {
+        if v.get(0) = 0x28
+            return v
+    }
+    var eq: size_t 0
+    while (eq < n) and (v.get(eq) <> 0x3D)
+        eq := eq + 1
+    let sb StringBuilder()
+    sb.append("(define ")
+    if (eq = 0) or (eq >= n)
+    {
+        sb.append(v)
+        sb.append(" #t)")
+    }
+    else
+    {
+        var i: size_t 0
+        while i < eq
+        {
+            sb.append(v.get(i) as char)
+            i := i + 1
+        }
+        sb.append(" \"")
+        i := eq + 1
+        while i < n
+        {
+            sb.append(v.get(i) as char)
+            i := i + 1
+        }
+        sb.append("\")")
+    }
+    sb.to_string()
+}
+
+; StyleEngine::parseSpec's cmdline block: the accumulated -V define forms parse
+; as their OWN part with their own endPart, BEFORE the spec's parts — earlier
+; parts win, so a -V define overrides the stylesheet's. No-op without -V.
+procedure parse_cmdline_part(host: ref[Page], mutable interp: ref[Interpreter], mutable cmdline: String)
+{
+    if cmdline.get_length() = 0
+        return
+    let cin normalize_records(host, cmdline)
+    let csp SchemeParser.make(host, interp, cin)
+    csp.parse()
+    interp.end_part()
+}
+
+; Load a `.dsl` stylesheet into `interp`. Raw Scheme parses directly (records
+; normalized). A full DSSSL style-sheet SGML document routes through the
+; DssslSpecEventHandler (StyleEngine::parseSpec): parse the document, gate on
+; the DSSSL architecture notation, assemble the resolved part + its USE closure,
+; then feed each part's body text to the SchemeParser in order. Returns false on
+; a hard load failure (unparseable document / not a DSSSL spec). `dsl_id` is
+; the -d #ID fragment (empty = first part); extra_cats/search_dirs/restrict
+; thread the CLI's -c/-D/-R into the spec parse (before the bundled catalog).
+procedure load_stylesheet(host: ref[Page], mutable interp: ref[Interpreter], mutable dsl_path: String, mutable dsl_id: StringC, mutable prog_name: String, mutable cmdline: String, mutable extra_cats: ref[Array[String]]?, mutable search_dirs: ref[Array[String]]?, restrict_reading: bool, spec_stats: bool) returns bool
+{
+    let dsl_src File.read_to_string(dsl_path)
+    if is_sgml_stylesheet(dsl_src) = false
+    {
+        parse_cmdline_part(host, interp, cmdline)
+        let src_in normalize_records(host, dsl_src)
+        let sp SchemeParser.make(host, interp, src_in)
+        sp.parse()
+        return true
+    }
+    ; the shipped DSSSL catalog (maps the style-sheet DTD's PUBLIC id -> the
+    ; bundled style-sheet.dtd, which declares the DSSSL architecture the gate
+    ; needs — the `IS10744 ArcBase DSSSL` PI *and* the DSSSL notation) —
+    ; resolved under SCALY_HOME, fallback cwd-relative.
+    var catalog_path String("packages/dazzle/0.1.0/dsssl/catalog")
+    let home getenv("SCALY_HOME")
+    if home <> null
+        catalog_path := String("`home`/packages/dazzle/0.1.0/dsssl/catalog")
+    if File.exists(catalog_path) = false
+        catalog_path := String("")
+    ; the top `.dsl`'s own parse arena (DssslSpecEventHandler, condition (a)/(b)):
+    ; `ps` is dead once eh.load returns — it walks it and then resolves the USE
+    ; closure out of the assembled, pinned structures — and the run's peak stands
+    ; at the END (startbytes: phase `style`), so this release is the one that
+    ; counts even though it is not the earliest possible one.
+    let arena DssslSpecEventHandler.spec_arena(host)
+    let ps Parser.parse_simple_cat(arena, dsl_path, prog_name, catalog_path, extra_cats, search_dirs, restrict_reading)
+    let eh DssslSpecEventHandler.make(host, interp, prog_name, catalog_path)
+    let parts eh.load(ps, dsl_id)
+    eh.release_spec_arena(host, arena, eh.keeps_parse)
+    if spec_stats
+        eh.report_spec_arena()
+    if parts = null
+        return false
+    ; StyleEngine::parseSpec's DECLARATION phase (StyleEngine.cxx:40-80), which
+    ; runs BEFORE the -V cmdline and before any body element.
+    DssslSpecEventHandler.parse_declarations(host, interp, parts)
+    ; StyleEngine::parseSpec: the -V cmdline parses first (its own part).
+    parse_cmdline_part(host, interp, cmdline)
+    ; StyleEngine::parseSpec: one SchemeParser per body element, each over its
+    ; own InputSource — an immediate body's text origin carries the per-chunk
+    ; location table, so a runtime diagnostic (`no clause in case expression
+    ; matched …`) resolves into the original `.scm` source.
+    let n parts.get_length()
+    var i: size_t 0
+    while i < n
+    {
+        let part parts[i]
+        let bes part.get_body_elements()
+        let bn bes.get_length()
+        var j: size_t 0
+        while j < bn
+        {
+            let be bes[j]
+            let bsrc DssslSpecEventHandler.make_input_source(host, be)
+            if bsrc <> null
+            {
+                let bsp SchemeParser.make(host, interp, bsrc)
+                bsp.parse()
+            }
+            j := j + 1
+        }
+        ; StyleEngine::parseSpec: endPart after each part — earlier parts'
+        ; defines and rules take precedence over later (USEd) ones.
+        interp.end_part()
+        i := i + 1
+    }
+    true
+}
+
+; the streaming-drain sink (opensp's do_content pump invokes this via
+; scaly_call_ptr with the ParserState as arg — the C-shaped fn(ptr)->ptr
+; convention the fiber entries use): feed the queued event chunk into the
+; grove builder; the caller then resets the event scratch region.
+procedure grove_stream_drain(mutable arg: pointer[void]) returns pointer[void]
+{
+    let ps arg as ref[ParserState]
+    let st ps.get_stream_w() as ref[GroveBuildState]
+    GroveBuilder.feed(st, ps)
+    null
+}
+
+; JadeApp's default output name (makeFOTBuilder): defaultOutputBasename_ —
+; the LAST file argument with an up-to-4-char extension stripped (the
+; reference scans the last 5 chars for '.'), directory KEPT — or "jade-out"
+; when the document came from stdin; then "." + the type name.
+function default_output_name(last_file: String, ext: String) returns String
+{
+    let sb StringBuilder()
+    if last_file.get_length() = 0
+        sb.append("jade-out")
+    else
+    {
+        let n last_file.get_length()
+        var dot n
+        ; DssslApp::processSysid: replace an up to 5 character extension
+        ; (j = 0..4 checks s[size-1-j] for '.').
+        var j: size_t 0
+        while j < 5
+        {
+            if n < (j + 1)
+                j := 5
+            else
+            {
+                let idx n - j - 1
+                if last_file.get(idx) = 0x2E
+                {
+                    dot := idx
+                    j := 5
+                }
+                else
+                    j := j + 1
+            }
+        }
+        var i: size_t 0
+        while i < dot
+        {
+            sb.append(last_file.get(i) as char)
+            i := i + 1
+        }
+    }
+    sb.append(".")
+    sb.append(ext)
+    sb.to_string()
+}
+
+; JadeApp::processOption 't': PREFIX match against outputTypeNames up to the
+; first '-'; the '-'-separated tail splits into backend output options.
+; Unknown prefix -> unknownType (type unchanged). Returns the new type or -1.
+procedure parse_type_arg(a: pointer[char], mutable out_opts: ref[Array[String]]) returns int
+{
+    ; length up to the first '-' (or NUL)
+    var len: size_t 0
+    var scanning true
+    while scanning
+    {
+        let c (*(a + len)) as u32
+        if (c = 0) or (c = 0x2D)
+            scanning := false
+        else
+            len := len + 1
+    }
+    var found: int 0 - 1
+    var ti 0
+    while ti < 7
+    {
+        var name String("fot")
+        if ti = DZ_TYPE_RTF
+            name := String("rtf")
+        if ti = DZ_TYPE_HTML
+            name := String("html")
+        if ti = DZ_TYPE_TEX
+            name := String("tex")
+        if ti = DZ_TYPE_MIF
+            name := String("mif")
+        if ti = DZ_TYPE_SGML
+            name := String("sgml")
+        if ti = DZ_TYPE_XML
+            name := String("xml")
+        if found < 0
+        {
+            ; tcsncmp(arg, name, len) == 0 — arg's first len chars must match
+            ; the table entry (len may exceed the name; then the NUL differs).
+            var ok true
+            var k: size_t 0
+            while k < len
+            {
+                var nc: u32 0
+                if k < name.get_length()
+                    nc := (name.get(k)) as u32
+                if ((*(a + k)) as u32) <> nc
+                {
+                    ok := false
+                    k := len
+                }
+                else
+                    k := k + 1
+            }
+            if ok
+                found := ti
+        }
+        ti := ti + 1
+    }
+    ; the '-'-separated suffix -> output options (empty segments skipped)
+    if ((*(a + len)) as u32) = 0x2D
+    {
+        var start len + 1
+        var i start
+        var walking true
+        while walking
+        {
+            let c (*(a + i)) as u32
+            if (c = 0) or (c = 0x2D)
+            {
+                if i > start
+                    out_opts.add(String((a + start) as pointer[const_char], i - start))
+                if c = 0
+                    walking := false
+                else
+                {
+                    i := i + 1
+                    start := i
+                }
+            }
+            else
+                i := i + 1
+        }
+    }
+    found
+}
+
+; `--frame-mark-stats`: the rewind count, printed after the run whatever path
+; it left by — the gate's proof that the mark engages.
+procedure main(argc: int, mutable argv: pointer[pointer[char]]) returns int mutable APP_INPUT_CS, OUTPUT_ENC, STDERR_ENC, html_prog, mif_prog, msg_prog, tex_prog, tfb_prog, xt_extensions_on
+{
+    ; SCALY_POISON=1: every released page is overwritten first (Page.scaly)
+    if getenv("SCALY_POISON") <> null
+        Page.enable_poison()
+    var want_fm_stats false
+    var ai 1
+    while ai < argc
+    {
+        let a String(*(argv + ai) as pointer[const_char])
+        if a = "--frame-mark-stats"
+            want_fm_stats := true
+        ai := ai + 1
+    }
+    var fm: pointer[i64] null
+    let rc run_main(argc, argv, &fm)
+    if want_fm_stats
+    {
+        scaly_eputs "frame-mark: "
+        scaly_eputi(FrameMark.rewound(fm))
+        scaly_eputs " rewound"
+        scaly_eputnl()
+    }
+    rc
+}
+
+procedure run_main(argc: int, mutable argv: pointer[pointer[char]], mutable frame_mark_out: ref[pointer[i64]]) returns int mutable APP_INPUT_CS, OUTPUT_ENC, STDERR_ENC, html_prog, mif_prog, msg_prog, tex_prog, tfb_prog, xt_extensions_on
+{
+    let prog_name String(*argv)
+    ; bootstrap the run region (one arena page for the whole run).
+    let anchor0 String("x")
+    let host Page.get(anchor0.get_buffer())
+
+    let out_utf8 output_is_utf8()
+
+    ; ---- initCodingSystem, which the reference runs BEFORE processOptions:
+    ;      the message stream (makeStdErr) encodes through codingSystem(), so
+    ;      even an option-time diagnostic is already encoded. `-b` never
+    ;      touches this half — it selects outputCodingSystem_ only. ----
+    let err_enc CodingSystemKit.new_encoder(host)
+    dz_coding_system(host, err_enc)
+    ParserState.set_stderr_encoder(err_enc)
+    ; outputCodingSystem_: `-b` overrides it, otherwise it IS codingSystem()
+    ; (the processOptions epilogue). Every char-stream backend of this run
+    ; shares it: the fot sink, the transform sink and the HTML files.
+    let out_enc CodingSystemKit.new_encoder(host)
+    var have_b false
+
+    ; ---- the option registry, in reference registration order (CmdLineApp,
+    ;      EntityApp, ParserApp, DssslApp, JadeApp). ----
+    let reg Array[LongOpt]^host()
+    reg.add(LongOpt(String("encoding"), 0x62, true))
+    reg.add(LongOpt(String("error-file"), 0x66, true))
+    reg.add(LongOpt(String("version"), 0x76, false))
+    reg.add(LongOpt(String("help"), 0x68, false))
+    reg.add(LongOpt(String("catalog"), 0x63, true))
+    reg.add(LongOpt(String("catalogs"), 0x43, false))
+    reg.add(LongOpt(String("directory"), 0x44, true))
+    reg.add(LongOpt(String("restricted"), 0x52, false))
+    reg.add(LongOpt(String("activate"), 0x61, true))
+    reg.add(LongOpt(String("architecture"), 0x41, true))
+    reg.add(LongOpt(String("max-errors"), 0x45, true))
+    reg.add(LongOpt(String("open-entities"), 0x65, false))
+    reg.add(LongOpt(String("open-elements"), 0x67, false))
+    reg.add(LongOpt(String("error-numbers"), 0x6E, false))
+    reg.add(LongOpt(String("references"), 0x78, false))
+    reg.add(LongOpt(String("include"), 0x69, true))
+    reg.add(LongOpt(String("warning"), 0x77, true))
+    reg.add(LongOpt(String(), 0x47, false))
+    reg.add(LongOpt(String(), 0x32, false))
+    reg.add(LongOpt(String(), 0x64, true))
+    reg.add(LongOpt(String(), 0x56, true))
+    reg.add(LongOpt(String(), 0x73, false))
+    reg.add(LongOpt(String(), 0x74, true))
+    reg.add(LongOpt(String(), 0x6F, true))
+    ; ★The frame mark's OPT-OUT. The mark is on by default and its condition 5
+    ; is empirically gated rather than proven (see FrameMark.scaly), so the way
+    ; out has to be reachable without an environment variable — and using it is
+    ; also the first half of the diagnosis, because the difference it makes on a
+    ; wrong tree names the mechanism.
+    reg.add(LongOpt(String("no-frame-mark"), 0x105, false))
+    ; ★The gates' proofs that the frame mark and the spec arena ENGAGE — both
+    ; are invisible in the output. Ours, not jade's, so not in the usage rows.
+    ; `--frame-mark-stats` is read by `main` itself, around this procedure.
+    reg.add(LongOpt(String("spec-arena-stats"), 0x106, false))
+    reg.add(LongOpt(String("frame-mark-stats"), 0x107, false))
+
+    var out_type DZ_TYPE_FOT
+    let out_opts Array[String]^host()
+    var dsl_path String("")
+    var dsl_id StringC()
+    var have_dsl false
+    var out_path String("")
+    var debug false
+    var dsssl2 false
+    var strict false
+    ; ParserApp::errorLimit_ (-E; DEFAULT_ERROR_LIMIT 200, 0 = unlimited)
+    var error_limit: u32 200
+    ; StyleEngine::cmdline — the concatenated -V define forms
+    let vsb StringBuilder()
+    var reporter_options: u32 0
+    var popts: ref[ParserOptions]? null
+    var active_links: ref[Array[String]]? null
+    var arc_names: ref[Array[String]]? null
+    let catalog_sysids Array[String]^host()
+    let search_dirs Array[String]^host()
+    var map_catalog_document false
+    var restrict_reading false
+    var error_file: pointer[char] null
+    var want_usage false
+    var want_spec_stats false
+    var no_frame_mark false
+
+    let os Options.make(host, argc, argv, &reg)
+    var c: u32 0
+    var scanning os.get(&c)
+    while scanning
+    {
+        if (c = 0x3F) or (c = 0x2D) or (c = 0x3D)
+        {
+            ; CmdLineApp::processOptions error rendering: a long option's
+            ; name comes from the raw argv cell (up to '=', 79 chars); a
+            ; short option is its single char. A short option with a MISSING
+            ; argument also lands here as '?' ("invalid option").
+            var nbuf u32[80]
+            let nb nbuf as pointer[u32]
+            var nlen: size_t 0
+            if os.get_opt() = 0
+            {
+                let cell *(argv + (os.get_ind() - 1))
+                var ti: size_t 2
+                var copying true
+                while copying
+                {
+                    let tc (*(cell + ti)) as u32
+                    if (tc = 0) or (tc = 0x3D) or (nlen >= 79)
+                        copying := false
+                    else
+                    {
+                        nbuf[nlen] := tc
+                        nlen := nlen + 1
+                        ti := ti + 1
+                    }
+                }
+            }
+            else
+            {
+                *nb := os.get_opt()
+                nlen := 1
+            }
+            let oname StringC(nb, nlen)
+            var emt CmdLineAppMessages.invalidOptionError()
+            if c = 0x2D
+                emt := CmdLineAppMessages.ambiguousOptionError()
+            if c = 0x3D
+                emt := CmdLineAppMessages.erroneousOptionArgError()
+            let repn (reporter_options & DZ_REP_MESSAGE_NUMBERS) <> 0
+            app_msg1(prog_name, out_utf8, repn, 2, emt, oname)
+            app_msg0(prog_name, out_utf8, repn, 2, CmdLineAppMessages.tryHelpOptionForInfo())
+            return 1
+        }
+        else if c = 0x62
+        {
+            ; processOption 'b' (CmdLineApp.cxx:432): the name selects
+            ; outputCodingSystem_ — the ENCODING table, because a GroveApp has
+            ; the fixed unicode internal charset (`internalCharsetIsDocCharset_`
+            ; is 0, which also picks the unknownEncoding wording over
+            ; unknownBctf). An unknown name leaves outputCodingSystem_ null, so
+            ; the epilogue below still falls back to codingSystem().
+            ; ★NOT rejected here for being wider than one byte per char: that
+            ; test guards the APP coding system only, so `-b UNICODE` really
+            ; does write UTF-16 (measured).
+            var bkind 0
+            var bwhich 0
+            let barg String(os.get_arg() as pointer[const_char])
+            if CodingSystemKit.lookup(barg, false, &bkind, &bwhich)
+            {
+                CodingSystemKit.make_encoder(host, bkind, bwhich, out_enc)
+                have_b := true
+            }
+            else
+            {
+                let repn (reporter_options & DZ_REP_MESSAGE_NUMBERS) <> 0
+                app_msg1(prog_name, out_utf8, repn, 2, CmdLineAppMessages.unknownEncoding(), StringC(os.get_arg() as pointer[const_char]))
+            }
+        }
+        else if c = 0x66
+            error_file := os.get_arg()
+        else if c = 0x76
+        {
+            ; DssslApp 'v' (jade banner), then the CmdLineApp OpenSP banner.
+            let repn (reporter_options & DZ_REP_MESSAGE_NUMBERS) <> 0
+            var vargs Vector[MessageArg](2)
+            *(vargs.get(0)) := MessageArg.Str(StringC("openjade"))
+            *(vargs.get(1)) := MessageArg.Str(StringC("1.3.3-pre1"))
+            app_msg(prog_name, out_utf8, repn, 2, dsssl_version_info(), vargs)
+            var vargs2 Vector[MessageArg](2)
+            *(vargs2.get(0)) := MessageArg.Str(StringC("OpenSP"))
+            *(vargs2.get(1)) := MessageArg.Str(StringC("1.5.2"))
+            app_msg(prog_name, out_utf8, repn, 2, CmdLineAppMessages.versionInfo(), vargs2)
+        }
+        else if c = 0x68
+            want_usage := true
+        else if c = 0x63
+        {
+            let cv String^host(os.get_arg() as pointer[const_char])
+            catalog_sysids.add(*cv)
+        }
+        else if c = 0x43
+            map_catalog_document := true
+        else if c = 0x44
+        {
+            let dv String^host(os.get_arg() as pointer[const_char])
+            search_dirs.add(*dv)
+        }
+        else if c = 0x52
+            restrict_reading := true
+        else if c = 0x61
+        {
+            if active_links = null
+                active_links := Array[String]^host()
+            active_links.add(String(os.get_arg() as pointer[const_char]))
+        }
+        else if c = 0x41
+        {
+            if arc_names = null
+                arc_names := Array[String]^host()
+            arc_names.add(String(os.get_arg() as pointer[const_char]))
+        }
+        else if c = 0x45
+        {
+            var ok_lim false
+            let lim parse_error_limit(os.get_arg(), &ok_lim)
+            if ok_lim
+                error_limit := lim
+            else
+            {
+                let repn (reporter_options & DZ_REP_MESSAGE_NUMBERS) <> 0
+                app_msg0(prog_name, out_utf8, repn, 2, ParserAppMessages.badErrorLimit())
+            }
+        }
+        else if c = 0x65
+            reporter_options := reporter_options | DZ_REP_OPEN_ENTITIES
+        else if c = 0x67
+            reporter_options := reporter_options | DZ_REP_OPEN_ELEMENTS
+        else if c = 0x6E
+            reporter_options := reporter_options | DZ_REP_MESSAGE_NUMBERS
+        else if c = 0x78
+            reporter_options := reporter_options | DZ_REP_CLAUSES
+        else if c = 0x69
+        {
+            if popts = null
+            {
+                let made ParserOptions.make(host)
+                made.read_environment()
+                popts := made
+            }
+            if popts.includes = null
+                popts.includes := Array[StringC]^host()
+            let iv StringC^host(os.get_arg() as pointer[const_char])
+            popts.includes.add(iv)
+        }
+        else if c = 0x77
+        {
+            if popts = null
+            {
+                let made ParserOptions.make(host)
+                made.read_environment()
+                popts := made
+            }
+            let wv String(os.get_arg() as pointer[const_char])
+            if popts.enable_warning(wv) = false
+            {
+                let repn (reporter_options & DZ_REP_MESSAGE_NUMBERS) <> 0
+                app_msg1(prog_name, out_utf8, repn, 2, ParserAppMessages.unknownWarning(), StringC(os.get_arg() as pointer[const_char]))
+            }
+        }
+        else if c = 0x47
+            debug := true
+        else if c = 0x32
+            dsssl2 := true
+        else if c = 0x73
+            strict := true
+        else if c = 0x64
+        {
+            ; DssslApp 'd': splitOffId — a trailing #FRAGMENT selects the
+            ; style-specification with that ID.
+            let dv os.get_arg()
+            var dn: size_t 0
+            while ((*(dv + dn)) as u32) <> 0
+                dn := dn + 1
+            var hash dn
+            var k dn
+            while k > 0
+            {
+                if ((*(dv + (k - 1))) as u32) = 0x23
+                {
+                    hash := k - 1
+                    k := 0
+                }
+                else
+                    k := k - 1
+            }
+            dsl_path := String(dv as pointer[const_char], hash)
+            if hash < dn
+            {
+                var idb u32[256]
+                let idp idb as pointer[u32]
+                var il: size_t 0
+                var q hash + 1
+                while (q < dn) and (il < 256)
+                {
+                    ; general-name normalization: the parser stores the
+                    ; style-specification IDs upcased, and the reference's
+                    ; not-found message prints the fragment upcased too.
+                    var idch (*(dv + q)) as u32
+                    if (idch >= 0x61) and (idch <= 0x7A)
+                        idch := idch - 0x20
+                    idb[il] := idch
+                    il := il + 1
+                    q := q + 1
+                }
+                ; pin the copy on the run arena (the id outlives this branch)
+                let idc StringC^host(idp, il)
+                dsl_id := *idc
+            }
+            else
+                dsl_id := StringC()
+            have_dsl := true
+        }
+        else if c = 0x56
+        {
+            let vf define_var_form(String(os.get_arg() as pointer[const_char]))
+            vsb.append(vf)
+        }
+        else if c = 0x74
+        {
+            let nt parse_type_arg(os.get_arg(), &out_opts)
+            if nt >= 0
+                out_type := nt
+            else
+            {
+                let repn (reporter_options & DZ_REP_MESSAGE_NUMBERS) <> 0
+                app_msg1(prog_name, out_utf8, repn, 2, jade_unknown_type(), StringC(os.get_arg() as pointer[const_char]))
+            }
+        }
+        else if c = 0x6F
+        {
+            let ov os.get_arg()
+            if ((*ov) as u32) = 0
+            {
+                let repn (reporter_options & DZ_REP_MESSAGE_NUMBERS) <> 0
+                app_msg0(prog_name, out_utf8, repn, 2, jade_empty_output_filename())
+            }
+            else
+                out_path := String(ov as pointer[const_char])
+        }
+        else if c = 0x105
+            no_frame_mark := true
+        else if c = 0x106
+            want_spec_stats := true
+        scanning := os.get(&c)
+    }
+
+    ; processOptions epilogue: `if (!outputCodingSystem_) outputCodingSystem_
+    ; = codingSystem()`, then every char-stream backend of this run reads it.
+    if have_b = false
+        dz_coding_system(host, out_enc)
+    CodingSystemKit.install_output_encoder(out_enc)
+
+    ; -f: opened AFTER the option loop (processOptions does), so option-time
+    ; messages always reach the real stderr; open failure aborts.
+    var msg_fd: int 2
+    if error_file <> null
+    {
+        let fd creat(error_file as pointer[const_char], 0x1B6 as u32)
+        if fd = ((0 - 1) as i32)
+        {
+            var fargs Vector[MessageArg](2)
+            *(fargs.get(0)) := MessageArg.Str(StringC(error_file as pointer[const_char]))
+            *(fargs.get(1)) := MessageArg.Raw(StringC(strerror(scaly_eio_errno())))
+            let repn (reporter_options & DZ_REP_MESSAGE_NUMBERS) <> 0
+            app_msg(prog_name, out_utf8, repn, 2, CmdLineAppMessages.openFileError(), fargs)
+            return 1
+        }
+        msg_fd := fd as int
+    }
+    let repn (reporter_options & DZ_REP_MESSAGE_NUMBERS) <> 0
+
+    ; -h/--help: usage AFTER processOptions (a failing -f aborts first).
+    if want_usage
+    {
+        print_usage(prog_name, out_utf8)
+        return 0
+    }
+
+    ; rtf "95" (word95 stream) is unported; other backend options are ignored
+    ; by their reference builders too, except the transform "raw".
+    var transform_raw false
+    var oi: size_t 0
+    while oi < out_opts.get_length()
+    {
+        let oo out_opts[oi]
+        if oo.equals("raw")
+            transform_raw := true
+        if oo.equals("95") and (out_type = DZ_TYPE_RTF)
+        {
+            let em2 "`prog_name`:E: rtf option 95 not ported (dazzle port)\n"
+            Io.write_all(2, em2.get_buffer() as pointer[void], em2.get_length())
+            return 17
+        }
+        oi := oi + 1
+    }
+
+    ; the entity-manager config (EntityApp::entityManager): the command-line
+    ; catalogs count as must-exist; SGML_CATALOG_FILES and SGML_SEARCH_PATH
+    ; append; SP_USE_DOCUMENT_CATALOG=NO/0 disables the implicit `catalog`.
+    let n_must_exist catalog_sysids.get_length()
+    split_path_env(&catalog_sysids, getenv("SGML_CATALOG_FILES"), host)
+    split_path_env(&search_dirs, getenv("SGML_SEARCH_PATH"), host)
+    var use_doc_catalog true
+    let udc getenv("SP_USE_DOCUMENT_CATALOG")
+    if udc <> null
+    {
+        if env_matches(udc, String("NO")) or env_matches(udc, String("0"))
+            use_doc_catalog := false
+    }
+    var em_cfg EmConfig()
+    em_cfg.adopt_app_input_cs()
+    em_cfg.catalog_sysids := &catalog_sysids
+    em_cfg.n_must_exist := n_must_exist
+    em_cfg.search_dirs := &search_dirs
+    em_cfg.use_doc_catalog := use_doc_catalog
+    em_cfg.restrict_reading := restrict_reading
+    em_cfg.map_catalog_document := map_catalog_document
+    ; codingSystem() — what document/DTD/entity files are DECODED with.
+    ; DssslApp is a GroveApp("unicode"), so internalCharsetIsDocCharset_ is
+    ; always FALSE here: the reference consults SP_ENCODING (never SP_BCTF) and
+    ; otherwise falls back to SP_DEFAULT_ENCODING = IS8859-1, which on the
+    ; ISO 10646 system charset IS the identity system.
+    ;
+    ; ★This default was UTF-8 until the OUTPUT half was ported: an identity
+    ; DECODER under a hardwired UTF-8 ENCODER would have turned every non-ASCII
+    ; byte into mojibake, where the reference is byte-transparent because BOTH
+    ; its halves are identity. Now the encoder follows the same environment
+    ; name, so the pair is the reference's pair again.
+    var dz_cs CodingSystem.identity()
+    let enc_name getenv("SP_ENCODING")
+    if enc_name <> null
+        CodingSystemKit.select_app_input(host, String(enc_name), &dz_cs)
+    em_cfg.set_input_cs(dz_cs)
+    ; and everything else the run decodes with the same system: the DSSSL
+    ; spec (its own EmConfig in load_stylesheet) and every grove sgml-parse
+    ; loads. The reference has one app coding system, not one per parse.
+    EmConfig.install_app_input_cs(host, dz_cs)
+
+    ; ---- the document args: every remaining argument merges into ONE
+    ; document entity; "-" (or none) is stdin `<OSFD>0` ----------------------
+    let first_arg os.get_ind()
+    let n_doc argc - first_arg
+    var use_stdin false
+    if n_doc = 0
+        use_stdin := true
+    else if n_doc = 1
+    {
+        let a0 *(argv + first_arg)
+        if ((*(a0 + 0)) as u32) = 0x2D
+        {
+            if ((*(a0 + 1)) as u32) = 0
+                use_stdin := true
+        }
+    }
+    var contents String()
+    let specs Array[String]^host()
+    var specs_ptr: ref[Array[String]]? null
+    ; the LAST file argument drives the default fot/rtf output basename
+    var last_file String("")
+    if use_stdin
+        contents := read_stdin_to_string()
+    else
+    {
+        var ai 0
+        var have_fd0 false
+        while ai < n_doc
+        {
+            let av *(argv + (first_arg + ai))
+            var is_dash false
+            if ((*(av + 0)) as u32) = 0x2D
+            {
+                if ((*(av + 1)) as u32) = 0
+                    is_dash := true
+            }
+            if is_dash
+            {
+                specs.add(String("<OSFD>0"))
+                have_fd0 := true
+            }
+            else
+            {
+                specs.add(String(av as pointer[const_char]))
+                last_file := String(av as pointer[const_char])
+            }
+            ai := ai + 1
+        }
+        if have_fd0
+            contents := read_stdin_to_string()
+        specs_ptr := &specs
+    }
+    let doc_name StringC("<OSFD>0")
+
+    ; ---- fot/rtf output file: created BEFORE the document parse (the
+    ; reference makeFOTBuilder order); a failed create reports and skips
+    ; style processing while the document still parses for the exit code.
+    ; Without -d no file is created at all (the reference never reaches
+    ; makeFOTBuilder on the noSpec path). ----
+    var out_fd: i32 0 - 1
+    var skip_style false
+    var out_target String()
+    if have_dsl and ((out_type = DZ_TYPE_FOT) or (out_type = DZ_TYPE_RTF) or (out_type = DZ_TYPE_TEX) or (out_type = DZ_TYPE_MIF))
+    {
+        var ext String("fot")
+        if out_type = DZ_TYPE_RTF
+            ext := String("rtf")
+        if out_type = DZ_TYPE_TEX
+            ext := String("tex")
+        if out_type = DZ_TYPE_MIF
+            ext := String("mif")
+        var target out_path
+        if target.get_length() = 0
+            target := default_output_name(last_file, ext)
+        out_target := target
+        out_fd := creat(target.to_c_string(), 0x1B6 as u32)
+        if out_fd = ((0 - 1) as i32)
+        {
+            var oargs Vector[MessageArg](2)
+            *(oargs.get(0)) := MessageArg.Str(StringC(target.to_c_string()))
+            *(oargs.get(1)) := MessageArg.Raw(StringC(strerror(scaly_eio_errno())))
+            app_msg(prog_name, out_utf8, repn, msg_fd, jade_cannot_open_output(), oargs)
+            skip_style := true
+        }
+    }
+
+    ; --- document -> grove (streaming: the parse drains event chunks into
+    ; the grove builder and resets the event scratch region — the whole-run
+    ; event queue retained ~600 MB on a 5 MB parse) ------------------------
+    ; the GroveManager (DssslApp IS one): the parse parameters `sgml-parse`
+    ; re-runs a document with, and the table that makes two loads of one sysid
+    ; the same grove. Installed before the document parse so the document grove
+    ; is index 0 and every later load counts up from there.
+    let grove_mgr GroveManager.install(host, prog_name, error_limit, reporter_options, popts, &em_cfg, msg_fd)
+    let gs GroveBuilder.begin(host, 0)
+    let ps Parser.parse_simple_stream(host, contents, specs_ptr, doc_name, prog_name, &grove_stream_drain, gs as pointer[void], error_limit, popts, reporter_options, active_links, arc_names, &em_cfg, msg_fd)
+    ; the tail queued since the last drain
+    GroveBuilder.feed(gs, ps)
+    let root GroveBuilder.finish(gs)
+    ; exit code = document-parse errors only (ParserApp::generateEvents:
+    ; `return errorCount > 0`) — stylesheet/Scheme/style errors never flip it.
+    var doc_rc 0
+    if ps.get_n_errors() > 0
+        doc_rc := 1
+
+    ; DssslApp::generateEvents: no spec -> noSpec after the document parse,
+    ; style processing skipped.
+    if have_dsl = false
+    {
+        app_msg0(prog_name, out_utf8, repn, msg_fd, dsssl_no_spec())
+        if out_fd >= 0
+            close(out_fd as int)
+        return doc_rc
+    }
+    if skip_style
+        return doc_rc
+
+    ; --- stylesheet -> interpreter (parse + compile the construction rules) --
+    ; -G (debugMode): VM errors print the `called from here` stack trace.
+    ; unitsPerInch = 72000 (millipoints) — JadeApp's `u` for every backend
+    ; except RTF (which overrides to twips); the fot Units format depends on it.
+    ; The transform extension classes exist only under -t sgml/xml (jade.cxx
+    ; passes an extension table only there).
+    let fot out_type = DZ_TYPE_FOT
+    let rtf out_type = DZ_TYPE_RTF
+    let tex out_type = DZ_TYPE_TEX
+    let html out_type = DZ_TYPE_HTML
+    let mif out_type = DZ_TYPE_MIF
+    let xml out_type = DZ_TYPE_XML
+    if fot or rtf or tex or html or mif
+        Interpreter.set_extensions_on(false)
+    ; RTF runs the engine in twips (jade.cxx: unitsPerInch = 20*72)
+    var upi 72000
+    if rtf
+        upi := 1440
+    let interp Interpreter.make(host, upi, debug, dsssl2, strict)
+    interp.grove_mgr := grove_mgr
+    if no_frame_mark
+        interp.disable_frame_mark()
+    ; for `--frame-mark-stats`, which main prints after the run
+    frame_mark_out := interp.frame_mark
+    if rtf
+        interp.set_rtf_extensions(true)
+    if tex
+        interp.set_tex_extensions(true)
+    if html
+        interp.set_html_extensions(true)
+    if mif
+        interp.set_mif_extensions(true)
+    ; argv0 for the interpreter's MessageReporter prefix
+    ; (`<argv0>:<file>:<line>:<col>:<sev>: …`) — set BEFORE the stylesheet
+    ; loads, so Scheme parse diagnostics already carry it.
+    let prog_c0 prog_name.to_c_string()
+    Interpreter.set_msg_prog(prog_c0)
+    install_builtins(host, interp)
+    let vcmd vsb.to_string()
+    var extra_cats: ref[Array[String]]? null
+    if catalog_sysids.get_length() > 0
+        extra_cats := &catalog_sysids
+    var spec_dirs: ref[Array[String]]? null
+    if search_dirs.get_length() > 0
+        spec_dirs := &search_dirs
+    if load_stylesheet(host, interp, dsl_path, dsl_id, prog_name, vcmd, extra_cats, spec_dirs, restrict_reading, want_spec_stats) = false
+    {
+        Console.println("dazzle: cannot load stylesheet")
+        return 1
+    }
+    interp.compile()
+
+    ; --- drive the grove through the style engine into the transform sink ----
+    ; GroveImpl's parser-side half for the DOCUMENT grove: the ID index
+    ; (element-with-id), the governing DTD (the entity-* primitives), the
+    ; instance syntax's name-fold table (the NAMED node lists normalize their
+    ; queries through it) and Entity::defaulted()'s side table. Exactly what
+    ; GroveManager.load fills in for a grove sgml-parse brings in — one
+    ; procedure serves both, because a loaded grove is not a lesser grove.
+    GroveManager.fill_from_parse(host, root, ps)
+    ; the document grove is grove 0 and the fallback for the two places where a
+    ; fold table cannot be reached from the arguments (see nnl_normalize).
+    GroveManager.set_document_root(grove_mgr, root)
+
+    if fot
+    {
+        ; --- the fot backend: the flow object tree as SGML, written to the
+        ; pre-opened FILE (jade.cxx: default <docbase>.fot; -o overrides) ----
+        let sgml SgmlFOTBuilder.make(host)
+        let pcf ProcessContext.make_fot(host, interp, sgml)
+        pcf.process(root)
+        sgml.finish()
+        let outf sgml.to_utf8()
+        Io.write_all(out_fd, outf.get_buffer() as pointer[void], outf.get_length())
+        close(out_fd as int)
+        return doc_rc
+    }
+
+    if rtf
+    {
+        ; --- the rtf backend: written to the pre-opened FILE (jade.cxx:
+        ; default <docbase>.rtf; -o overrides) -------------------------------
+        let rtfb RtfFOTBuilder.make(host, interp)
+        let pcr ProcessContext.make_rtf(host, interp, rtfb)
+        pcr.process(root)
+        let outr rtfb.finish()
+        Io.write_all(out_fd, outr.get_buffer() as pointer[void], outr.get_length())
+        close(out_fd as int)
+        return doc_rc
+    }
+
+    if tex
+    {
+        ; --- the tex backend: David Megginson's macro stream, written to the
+        ; pre-opened FILE (jade.cxx: default <docbase>.tex; -o overrides) ----
+        let prog_ct prog_name.to_c_string()
+        TeXFOTBuilder.set_prog_name(prog_ct)
+        let texb TeXFOTBuilder.make(host)
+        let pct ProcessContext.make_tex(host, interp, texb)
+        pct.process(root)
+        texb.finish()
+        let outt texb.output()
+        Io.write_all(out_fd, outt.arr.get_buffer() as pointer[void], outt.size())
+        close(out_fd as int)
+        return doc_rc
+    }
+
+    if html
+    {
+        ; --- the html backend: the builder opens its own files (the reference
+        ; makeFOTBuilder does NOT pre-open one for html), so -o only names
+        ; them; the default is <docbase>.html next to the document. ---------
+        let prog_ch prog_name.to_c_string()
+        HtmlFOTBuilder.set_prog_name(prog_ch)
+        var hname out_path
+        if hname.get_length() = 0
+            hname := default_output_name(last_file, String("html"))
+        let htmlb HtmlFOTBuilder.make(host, hname)
+        let pch ProcessContext.make_html(host, interp, htmlb)
+        pch.process(root)
+        htmlb.finish()
+        return doc_rc
+    }
+
+    if mif
+    {
+        ; --- the mif backend: a MIF document object model; commit() writes
+        ; the files itself (the reference MifDoc destructor), so the
+        ; pre-opened descriptor is only the reference's truncating open. ----
+        let prog_cm prog_name.to_c_string()
+        MifFOTBuilder.set_prog_name(prog_cm)
+        let mifb MifFOTBuilder.make(host, out_target)
+        let pcm ProcessContext.make_mif(host, interp, mifb)
+        pcm.process(root)
+        close(out_fd as int)
+        mifb.commit()
+        return doc_rc
+    }
+
+    let fotb TransformFOTBuilder.make(host, xml)
+    if transform_raw
+        fotb.set_raw(true)
+    ; argv0 for the entity-file app messages (`<argv0>:E: cannot open …`).
+    let prog_c prog_name.to_c_string()
+    TransformFOTBuilder.set_prog_name(prog_c)
+    let pc ProcessContext.make(host, interp, fotb)
+    pc.process(root)
+
+    ; --- emit the top-level stream to stdout (entity/directory FOs wrote
+    ; their own files; the reference IGNORES -o for sgml/xml) ----------------
+    let outp fotb.root_to_utf8()
+    Io.write_all(1, outp.get_buffer() as pointer[void], outp.get_length())
+    doc_rc
+}

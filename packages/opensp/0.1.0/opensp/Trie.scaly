@@ -1,0 +1,448 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+
+; Trie + TrieBuilder — the recognizer's decision tree (Trie.cs / TrieBuilder.cs).
+;
+; A Trie node has one child per EquivCode (`next`, an array of n_codes child
+; Nodes, or null at a leaf) plus the token/length/priority recognized at that
+; node. TrieBuilder threads each delimiter's code sequence into the tree
+; (`extend`/`force_next`) and stamps the token with longest-match / priority
+; arbitration (`set_token`), recording lexical ambiguities. `recognize_ee`
+; installs the end-of-entity transition on code 0.
+;
+; PORT SHAPE: the C++ Trie/BlankTrie pair is flattened to one page-hosted
+; `TrieNode` struct (as with ContentToken's graph) mutated through a pointer via
+; plain `.`. Priority is a u8: data=0, function=2, delim=255 (Priority.cs).
+;
+; SHORTREF B-SEQUENCE (landed with the Dtd increment, which brings shortrefs):
+; the BlankTrie machinery (`recognize_b`/`do_b`/`copy_into` + the blank fields).
+; A "B" in a shortref delimiter matches a run of blank characters; the trie
+; hangs a BlankTrie off a node (`blank`) that, once entered, scans up to
+; `max_blanks_to_scan` blank codes (those flagged in `code_is_blank`) before
+; matching the delimiter's continuation. It is reached ONLY when compiling
+; shortref delimiters against a DTD; the plain mode recognizers never build one,
+; so `blank` stays null and the recognizer takes the plain path.
+
+define PRI_DATA: u8 0
+define PRI_FUNCTION: u8 2
+define PRI_DELIM: u8 255
+
+; Priority::blank(n) = n + function — a longer B-sequence outranks a shorter.
+function pri_blank(n: int) returns u8
+    (n as u8) + PRI_FUNCTION
+
+define TrieNode
+(
+    var token: u32
+    var token_length: u8
+    var priority: u8
+    n_codes: int
+    var next: Slice[ref[TrieNode]?]          ; array[n_codes] of child TrieNode, or empty
+    var blank: ref[TrieNode]?                 ; the BlankTrie subtree, or null
+    ; BlankTrie fields (meaningful only on a node reached via `blank`):
+    var additional_length: u8            ; delimiter chars consumed before the B-run
+    var max_blanks_to_scan: size_t       ; upper bound on blanks in the run
+    var code_is_blank: Slice[u8]         ; per-EquivCode 0/1 blank flags, or empty
+)
+{
+    function has_next(this: TrieNode) returns bool
+        next.is_empty() = false
+
+    ; const Trie *next(int i)
+    function child(this: TrieNode, i: int) returns ref[TrieNode]?
+    {
+        if next.is_empty()
+            return null
+
+        next[(i as size_t)]
+    }
+
+    function get_token(this: TrieNode) returns u32
+        token
+
+    function get_token_length(this: TrieNode) returns int
+        token_length as int
+
+    function get_blank(this: TrieNode) returns ref[TrieNode]?
+        blank
+
+    ; Boolean includeBlanks() const { return Priority::isBlank(priority_); }
+    function include_blanks(this: TrieNode) returns bool
+        (priority > PRI_FUNCTION) and (priority < PRI_DELIM)
+
+    ; BlankTrie accessors.
+    function get_additional_length(this: TrieNode) returns int
+        additional_length as int
+
+    function get_max_blanks_to_scan(this: TrieNode) returns size_t
+        max_blanks_to_scan
+
+    function code_is_blank_at(this: TrieNode, i: int) returns bool
+    {
+        if code_is_blank.data = null
+            return false
+        this.code_is_blank[(i as size_t)] <> 0
+    }
+}
+
+define TrieBuilder (root: ref[TrieNode], n_codes: int)
+{
+    init(n_codes: int)
+    {
+        let host Page.get(this)
+        this.n_codes := n_codes
+        root := new_node(host, n_codes)
+        root.priority := PRI_DATA
+    }
+
+    function new_node(host: ref[Page], n_codes: int) returns ref[TrieNode]
+    {
+        ; `null` for the two Slice fields (`next`, `code_is_blank`) emits `store zeroinitializer`
+        ; -- an EMPTY view for free; a `Slice[u8]()` argument here was materialised on a
+        ; forced frame per node (measured in the IR: scaly_force_frame + Page.allocate).
+        let p &TrieNode^host(0, 0, PRI_DATA, n_codes, null, null, 0, 0, null)
+        p
+    }
+
+    function extract_trie(this: TrieBuilder) returns ref[TrieNode]
+        root
+
+    ; void recognize(const String<EquivCode> &chars, Token, Priority, ambiguities)
+    procedure recognize(mutable this: TrieBuilder, mutable codes: Slice[u16], token: u32, priority: u8, mutable amb: ref[Array[u32]]?)
+    {
+        let trie extend_trie(root, codes)
+        set_token(trie as ref[TrieNode], codes.length as int, token, priority, amb as ref[Array[u32]])
+    }
+
+    ; void recognize(chars, set, Token, Priority, ambiguities): each set char
+    ; forms a one-longer delimiter-in-context.
+    procedure recognize_set(mutable this: TrieBuilder, mutable codes: Slice[u16], set_codes: Slice[u16], token: u32, priority: u8, mutable amb: ref[Array[u32]]?)
+    {
+        let trie extend_trie(root, codes)
+        var i: size_t 0
+        while i < set_codes.length
+        {
+            let t force_next(trie as ref[TrieNode], set_codes[i])
+            set_token(t as ref[TrieNode], (codes.length as int) + 1, token, priority, amb as ref[Array[u32]])
+            i := i + 1
+        }
+    }
+
+    ; void recognizeEE(EquivCode code, Token t)
+    procedure recognize_ee(mutable this: TrieBuilder, code: u16, token: u32)
+    {
+        let trie force_next(root, code)
+        trie.token_length := 0
+        trie.token := token
+        trie.priority := PRI_DATA
+    }
+
+    procedure extend_trie(mutable this: TrieBuilder, mutable start: ref[TrieNode]?, codes: Slice[u16]) returns ref[TrieNode]?
+    {
+        var trie start
+        var i: size_t 0
+        while i < codes.length
+        {
+            trie := force_next(trie as ref[TrieNode], codes[i]) as ref[TrieNode]
+            i := i + 1
+        }
+        trie
+    }
+
+    ; void setToken(Trie *, int tokenLength, Token, Priority, ambiguities)
+    procedure set_token(this: TrieBuilder, mutable trie: ref[TrieNode], token_length: int, token: u32, pri: u8, mutable amb: ref[Array[u32]])
+    {
+        if (token_length > (trie.token_length as int)) or ((token_length = (trie.token_length as int)) and (pri > trie.priority))
+        {
+            trie.token_length := token_length as u8
+            trie.token := token
+            trie.priority := pri
+        }
+        else if ((trie.token_length as int) = token_length) and (trie.priority = pri) and (trie.token <> token) and (trie.token <> 0)
+        {
+            amb.add(trie.token)
+            amb.add(token)
+        }
+        if trie.has_next()
+        {
+            var i: int 0
+            while i < n_codes
+            {
+                set_token((trie.child(i)) as ref[TrieNode], token_length, token, pri, amb)
+                i := i + 1
+            }
+        }
+    }
+
+    ; Trie *forceNext(Trie *trie, EquivCode c) — materialize the child array,
+    ; inheriting this node's token/length/priority into each child. When `trie`
+    ; carries a BlankTrie, it is pushed down: its length/scan bounds are advanced
+    ; by one, it is moved into the first blank-code child (deep-copied into the
+    ; rest), and its token structure is copied back via copy_into.
+    procedure force_next(mutable this: TrieBuilder, mutable trie: ref[TrieNode], c: u16) returns ref[TrieNode]?
+    {
+        if trie.has_next() = false
+        {
+            let host Page.get(this)
+            let arr allocate_slice[ref[TrieNode]?]^host(host, n_codes as size_t)
+            ; advance the blank bounds before distributing (C++: before extract).
+            let b trie.blank
+            if b <> null
+            {
+                b.additional_length := b.additional_length + 1
+                b.max_blanks_to_scan := b.max_blanks_to_scan - 1
+            }
+            trie.blank := null
+            var moved false
+            var i: int 0
+            while i < n_codes
+            {
+                let ch new_node(host, n_codes)
+                ch.token := trie.token
+                ch.token_length := trie.token_length
+                ch.priority := trie.priority
+                if b <> null
+                {
+                    if b.code_is_blank_at(i)
+                    {
+                        if moved = false
+                        {
+                            ch.blank := b
+                            moved := true
+                        }
+                        else
+                            ch.blank := copy_node(host, b)
+                    }
+                }
+                arr.put((i as size_t), ch)
+                i := i + 1
+            }
+            trie.next := arr
+            if b <> null
+                copy_into(trie, b, (b.additional_length as int) - 1)
+        }
+        trie.child(c as int)
+    }
+
+    ; A full recursive TrieNode-subtree copy (C++ new BlankTrie(other)) — used when a
+    ; BlankTrie has to be shared into more than one blank-code child. code_is_blank
+    ; is immutable after construction, so the flag buffer is shared.
+    function copy_node(this: TrieBuilder, host: ref[Page], from: ref[TrieNode]) returns ref[TrieNode]
+    {
+        let n new_node(host, from.n_codes)
+        n.token := from.token
+        n.token_length := from.token_length
+        n.priority := from.priority
+        n.additional_length := from.additional_length
+        n.max_blanks_to_scan := from.max_blanks_to_scan
+        n.code_is_blank := from.code_is_blank
+        if from.has_next()
+        {
+            let arr allocate_slice[ref[TrieNode]?]^host(host, from.n_codes as size_t)
+            var i: int 0
+            while i < from.n_codes
+            {
+                arr.put((i as size_t), copy_node(host, (from.child(i)) as ref[TrieNode]))
+                i := i + 1
+            }
+            n.next := arr
+        }
+        if from.blank <> null
+            n.blank := copy_node(host, from.blank)
+        n
+    }
+
+    ; void copyInto(Trie *into, const Trie *from, int additionalLength) — graft
+    ; `from`'s token structure onto `into`, adding additionalLength to lengths.
+    procedure copy_into(mutable this: TrieBuilder, mutable into: ref[TrieNode]?, from: ref[TrieNode], additional_length: int)
+    {
+        if from.token <> 0
+        {
+            let host Page.get(into)
+            let dummy Array[u32]^host()
+            set_token(into as ref[TrieNode], (from.get_token_length()) + additional_length, from.token, from.priority, dummy)
+        }
+        if from.has_next()
+        {
+            var i: int 0
+            while i < n_codes
+            {
+                let ci force_next(into as ref[TrieNode], i as u16)
+                copy_into(ci, (from.child(i)) as ref[TrieNode], additional_length)
+                i := i + 1
+            }
+        }
+    }
+
+    ; void recognizeB(chars, bSequenceLength, maxBlankSequence, blankCodes,
+    ;                 chars2, Token, ambiguities) — a shortref delimiter with an
+    ; embedded "B" (blank run) of length >= bSequenceLength, up to
+    ; maxBlankSequence, followed by chars2.
+    procedure recognize_b(mutable this: TrieBuilder, mutable codes: Slice[u16], b_sequence_length: int, max_blank_sequence: size_t, blank_codes: Slice[u16], mutable chars2: Slice[u16], token: u32, mutable amb: ref[Array[u32]]?)
+    {
+        let start extend_trie(root, codes)
+        do_b(start as ref[TrieNode], codes.length as int, b_sequence_length, max_blank_sequence, blank_codes, chars2, token, pri_blank(b_sequence_length), amb)
+    }
+
+    procedure do_b(mutable this: TrieBuilder, mutable trie: ref[TrieNode], token_length: int, min_b_length: int, max_length: size_t, blank_codes: Slice[u16], mutable chars2: Slice[u16], token: u32, pri: u8, mutable amb: ref[Array[u32]]?)
+    {
+        if (min_b_length = 0) and (trie.has_next() = false)
+        {
+            if trie.blank = null
+            {
+                let host Page.get(this)
+                let b new_node(host, n_codes)
+                b.max_blanks_to_scan := max_length
+                b.additional_length := token_length as u8
+                let cib allocate_slice[u8]^host(host, n_codes as size_t)
+                var k: int 0
+                while k < n_codes
+                {
+                    cib.put((k as size_t), 0)
+                    k := k + 1
+                }
+                var j: size_t 0
+                while j < blank_codes.length
+                {
+                    cib.put((blank_codes[j] as size_t), 1)
+                    j := j + 1
+                }
+                b.code_is_blank := cib
+                trie.blank := b
+            }
+            if chars2.length = 0
+                set_token(trie, token_length, token, pri, amb as ref[Array[u32]])
+            else
+            {
+                let t extend_trie(trie.blank, chars2)
+                set_token(t as ref[TrieNode], chars2.length as int, token, pri, amb as ref[Array[u32]])
+            }
+        }
+        else
+        {
+            if min_b_length = 0
+            {
+                let t extend_trie(trie, chars2)
+                set_token(t as ref[TrieNode], token_length + (chars2.length as int), token, pri, amb as ref[Array[u32]])
+            }
+            var next_min: int 0
+            if min_b_length <> 0
+                next_min := min_b_length - 1
+            var j: size_t 0
+            while j < blank_codes.length
+            {
+                let nxt force_next(trie, blank_codes[j])
+                do_b(nxt as ref[TrieNode], token_length + 1, next_min, max_length - 1, blank_codes, chars2, token, pri, amb)
+                j := j + 1
+            }
+        }
+    }
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+
+        ; nCodes = 4 (codes 0..3, 0 = eE)
+        let tb TrieBuilder^host(4)
+        var amb Array[u32]^host()
+
+        ; end-of-entity on code 0
+        tb.recognize_ee(0, 1)
+
+        ; a two-code delimiter [2,3] -> token 55
+        var d1 u16[2]
+        let pd1 d1 as pointer[u16]
+        d1[0] := 2
+        d1[1] := 3
+        tb.recognize(Slice[u16](2, pd1), 55, PRI_DELIM, amb)
+
+        ; a one-code delimiter [2] -> token 30 (prefix of the above)
+        tb.recognize(Slice[u16](1, pd1), 30, PRI_DELIM, amb)
+
+        let r tb.extract_trie()
+
+        ; root -> code 0 : EE token 1, no further
+        let ee r.child(0)
+        if ee.get_token() <> 1
+            return -1
+
+        ; root -> 2 : token 30, has a child (the [2,3] continuation)
+        let n2 r.child(2)
+        if n2.get_token() <> 30
+            return -2
+        if n2.has_next() = false
+            return -3
+
+        ; root -> 2 -> 3 : token 55 (longest match wins)
+        let n23 n2.child(3)
+        if n23.get_token() <> 55
+            return -4
+
+        ; root -> 2 -> 1 : inherits the [2] token 30 (fallback)
+        let n21 n2.child(1)
+        if n21.get_token() <> 30
+            return -5
+
+        ; no ambiguities recorded
+        if amb.get_length() <> 0
+            return -6
+
+        ; ---- BlankTrie / shortref B-sequence ----
+        ; nCodes = 3, code 1 = a blank character. A shortref "B" (one blank run,
+        ; up to 3 blanks) -> token 77. chars/chars2 empty (n=0, ptr unread).
+        var amb2 Array[u32]^host()
+        let tb2 TrieBuilder^host(3)
+        var bc u16[1]
+        let pbc bc as pointer[u16]
+        *pbc := 1
+        tb2.recognize_b(Slice[u16](0, pbc), 1, 3, Slice[u16](1, pbc), Slice[u16](0, pbc), 77, amb2)
+
+        let r2 tb2.extract_trie()
+        let c1 r2.child(1)
+        if c1.get_token() <> 77
+            return -7
+        if c1.get_token_length() <> 1
+            return -8
+        let bl c1.get_blank()
+        if bl = null
+            return -9
+        if bl.get_max_blanks_to_scan() <> 2
+            return -10
+        if bl.get_additional_length() <> 1
+            return -11
+        if bl.code_is_blank_at(1) = false
+            return -12
+        if bl.code_is_blank_at(0)
+            return -13
+        if amb2.get_length() <> 0
+            return -14
+
+        ; push the trie one blank code deeper: the BlankTrie migrates to the
+        ; blank-code child, its bounds advance (additionalLength 1->2,
+        ; maxBlanksToScan 2->1), and the source node's blank is extracted.
+        let gc tb2.force_next(c1 as ref[TrieNode], 1)
+        if c1.get_blank() <> null
+            return -15
+        let ch1 c1.child(1)
+        let bl2 ch1.get_blank()
+        if bl2 = null
+            return -16
+        if bl2.get_max_blanks_to_scan() <> 1
+            return -17
+        if bl2.get_additional_length() <> 2
+            return -18
+        ; the inherited token rides along.
+        if ch1.get_token() <> 77
+            return -19
+        if ch1.get_token_length() <> 1
+            return -20
+        ; a non-blank sibling carries no BlankTrie.
+        let ch0 c1.child(0)
+        if ch0.get_blank() <> null
+            return -21
+
+        0
+    }
+}

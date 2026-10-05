@@ -1,0 +1,3685 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.Vector
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.Location.Origin
+use opensp.XcharMap.XcharMap
+use opensp.Message.MessageType
+use opensp.Message.MessageFragment
+use opensp.Message.MessageArg
+use opensp.Message.MessageFormatter
+use opensp.ParserState.ParserState
+use dazzle.FrameMark.FrameMark
+use dazzle.NameTable.NamedTable
+use dazzle.NumberCache.NumberCache
+use dazzle.Grove.GroveNode
+use dazzle.Grove.IdEntry
+use dazzle.Grove.ComponentName
+use dazzle.Grove.SiblingHint
+use dazzle.GroveManager.GroveManager
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
+use dazzle.ELObj.FlowObj
+use dazzle.ELObj.MacroDef
+use dazzle.ELObj.GlyphSubstTableRec
+use dazzle.ELObj.OutputCharStream
+use dazzle.Style.InheritedC
+use dazzle.Style.LengthSpec
+use dazzle.Style.FotSym
+use dazzle.Style.VarStyleRec
+use dazzle.Style.InlineSpace
+use dazzle.Style.Convert
+use dazzle.Expression.Expression
+use dazzle.Expression.Environment
+use dazzle.VM.VM
+use dazzle.Insn.Signature
+use dazzle.Insn.Insn
+use dazzle.ELObj.QuantityValue
+use dazzle.ELObj.QT_NONE
+use dazzle.ELObj.QT_LONG
+use dazzle.ProcessingMode.ProcessingMode
+use dazzle.InterpreterMessages.InterpreterMessages
+use dazzle.CharNames.CharNames
+use dazzle.Sdata.Sdata
+
+; Interpreter — the style-language interpreter (style/Interpreter.cxx).
+; Inc-2 scope: the READER seam the SchemeParser datum reader needs — the
+; lexical-category table, symbol/keyword/identifier interning, number
+; conversion (convertNumber family incl. quantities and units), character
+; names (charNames.h table + U-XXXX), sdata entity mapping, and the
+; standard-chars / add-name-chars / add-separator-chars / map-sdata-entity
+; declaration hooks. The evaluation half (syntactic keys, primitives,
+; processing modes, Insn/VM) lands with Inc 3 per DESIGN.md.
+;
+; Messages: text/severity sourced from the generated InterpreterMessages
+; table (InterpreterMessages.msg). Rendering here is the package-level seam
+; (`dazzle:<severity>: <text>` on stderr + error count); the full
+; file:line:col MessageReporter prefix is the CLI driver's job and lands
+; with Inc 7 (DssslApp/CmdLineApp port), like the reference where the app
+; object IS the Messenger.
+
+; argv0 for the MessageReporter prefix (`<argv0>:<file>:<line>:<col>:<sev>: …`,
+; exactly the reference where the app object IS the Messenger). The CLI driver
+; sets this once before processing; unset (unit tests, --jit suite) the prefix
+; stays the historical package name `dazzle`. A `shared` module global, not an
+; Interpreter field — growing a heap-hosted struct in the dazzle run region
+; trips the page-boundary RBMM fragility (S62), and `mutable` (TLS) in a dep
+; package aborts under --jit.
+shared msg_prog: pointer[const_char] null
+
+; whether the active backend provides the transform extension flow-object
+; classes (jade.cxx passes an extension table only for -t sgml/xml); the CLI
+; clears it for -t fot. A `shared` module global by the S62 rule (no
+; Interpreter field growth); single-threaded CLI setup writes it once.
+shared xt_extensions_on: bool true
+
+; MessageReporter's column-omission sentinel (opensp.Location COL_OMITTED —
+; module-level consts are not cross-package-visible; mirrored here).
+define MSG_COL_OMITTED: u32 0xFFFFFFFF
+
+; Interpreter::LexCategory
+define LEX_LETTER: int 0            ; a-z A-Z
+define LEX_OTHER_NAME_START: int 1  ; !$%&*/<=>?~_^:
+define LEX_ADD_NAME_START: int 2
+define LEX_DIGIT: int 3             ; 0-9
+define LEX_OTHER_NUMBER_START: int 4 ; -+.
+define LEX_OTHER: int 5
+define LEX_DELIMITER: int 6         ; ();"
+define LEX_WHITESPACE: int 7
+define LEX_ADD_WHITESPACE: int 8
+
+; the printer's replacement char for unknown character names
+define DEFAULT_CHAR: int 0xFFFD
+
+; Unit::computed_ states
+define UNIT_NOT_COMPUTED: int 0
+define UNIT_BEING_COMPUTED: int 1
+define UNIT_COMPUTED_EXACT: int 2
+define UNIT_COMPUTED_INEXACT: int 3
+define UNIT_COMPUTED_ERROR: int 4
+
+; strtod(3) — fixed-prototype, non-variadic, errno-free use: direct extern
+; per the containment rule.
+function strtod(s: pointer[const_char], endp: pointer[pointer[u8]]) returns double extern
+
+; the memo-host seam's one switch (DZ_MEMO_PERM)
+function getenv(name: pointer[const_char]) returns pointer[const_char] extern
+
+; A named-character-table entry (Interpreter::CharPart): the char plus the
+; index of the defining part (unsigned(-1) = predefined).
+define CharPart (name: StringC, var c: u32, var def_part: u32)
+{
+    init(name: StringC, c: u32, def_part: u32)
+    {
+        this.name := name
+        this.c := c
+        this.def_part := def_part
+    }
+}
+
+; CharProp (Interpreter.h) — one character property: a DEFAULT value plus a
+; per-character map. The reference's map is a full CharMap<ELObjPart> whose
+; unset slot is a null object; here it is an ordered list of
+; [first, last] -> value entries searched BACKWARD, so a later
+; add-char-properties overrides an earlier install exactly as setChar over
+; setRange does. `def_part` carries the spec part that supplied the default,
+; which is what the duplicate-declaration rule compares.
+; ★`part` is the ELObjPart half of the reference's CharMap<ELObjPart>
+; (Interpreter.cxx:2347): a per-character value remembers WHICH PART set it,
+; because that is what decides between overwrite, silence and a duplicate
+; diagnostic.
+define CharPropRange (first: u32, last: u32, obj: ref[ELObj]?, part: u32)
+{
+    init(first: u32, last: u32, obj: ref[ELObj], part: u32)
+    {
+        this.first := first
+        this.last := last
+        this.obj := obj
+        this.part := part
+    }
+}
+
+define CharProp (name: StringC, var def: ref[ELObj], var def_part: u32, var loc: Location, ranges: ref[Array[CharPropRange]])
+{
+    function make(host: ref[Page], name: StringC, def: ref[ELObj], def_part: u32) returns ref[CharProp]
+    {
+        let p &CharProp^host(name, def, def_part, Location(), Array[CharPropRange]^host())
+        p
+    }
+
+    ; CharMap::setRange — a later entry wins, so the lookup walks BACKWARD.
+    procedure set_range(mutable this: ref[CharProp], first: u32, last: u32, obj: ref[ELObj], part: u32)
+        this.ranges.add(CharPropRange(first, last, obj, part))
+
+    ; the part that last set this character's own value; 0xFFFFFFFF when it
+    ; has none (the reference's ELObjPart(0, unsigned(-1)) default).
+    function lookup_part(this: CharProp, c: u32) returns u32
+    {
+        let n ranges.get_length()
+        var i n
+        while i > 0
+        {
+            i := i - 1
+            let rp ranges.get(i)
+            if rp <> null
+            {
+                let r *rp
+                if (c >= r.first) and (c <= r.last)
+                    return r.part
+            }
+        }
+        0xFFFFFFFF
+    }
+
+    ; (*cp->map)[c].obj — null when the character has no value of its own.
+    function lookup(this: CharProp, c: u32) returns ref[ELObj]?
+    {
+        let n ranges.get_length()
+        var i n
+        while i > 0
+        {
+            i := i - 1
+            let rp ranges.get(i)
+            if rp <> null
+            {
+                let r *rp
+                if (c >= r.first) and (c <= r.last)
+                    return r.obj
+            }
+        }
+        null
+    }
+}
+
+; Unit — a named measurement unit (Interpreter.h class Unit : Named).
+; Builtin units get their value from unitsPerInch in installUnits (setValue
+; marks them computedExact/Inexact); define-unit bodies arrive via
+; setDefinition and compute lazily in tryCompute (canEval-gated without
+; force, exactly the reference's eager-top-level shape).
+define Unit (name: StringC, var computed: int, var exact: int, var inexact: double, var dim: int, var def_part: u32, var def_expr: ref[Expression]?, var def_insn: ref[Insn]?, var def_loc: Location)
+{
+    function make(host: ref[Page], name: StringC) returns ref[Unit]
+    {
+        let u &Unit^host(StringC^host(name.as_slice()), UNIT_NOT_COMPUTED, 0, 0.0, 0, 0xFFFFFFFF, null, null, Location())
+        u
+    }
+
+    ; void setDefinition(Owner<Expression> &, unsigned part, const Location &)
+    ; — the define-unit body; computed resets so the next resolve recomputes.
+    procedure set_definition(mutable this: ref[Unit], expr: ref[Expression]?, part: u32, loc: Location)
+    {
+        this.def_expr := expr
+        this.def_part := part
+        this.def_loc := loc
+        this.computed := UNIT_NOT_COMPUTED
+    }
+
+    ; bool defined(unsigned &part, Location &loc)
+    procedure defined(this: ref[Unit], mutable part_out: ref[u32], mutable loc_out: ref[Location]) returns bool
+    {
+        if this.def_expr = null
+        {
+            if this.computed = UNIT_NOT_COMPUTED
+                return false
+        }
+        part_out := this.def_part
+        loc_out := this.def_loc
+        true
+    }
+
+    function get_name(this: Unit) returns StringC
+        name
+
+    ; void setValue(long)
+    procedure set_value_long(mutable this: ref[Unit], n: int)
+    {
+        this.computed := UNIT_COMPUTED_EXACT
+        this.exact := n
+        this.dim := 1
+        this.def_part := 0xFFFFFFFF
+    }
+
+    ; void setValue(double)
+    procedure set_value_double(mutable this: ref[Unit], n: double)
+    {
+        this.computed := UNIT_COMPUTED_INEXACT
+        this.inexact := n
+        this.dim := 1
+        this.def_part := 0xFFFFFFFF
+    }
+
+    ; bool defined(unsigned &part, Location &loc) — Inc-2 subset: no def_
+    ; expression yet, so defined <=> a computed value exists (the out-params
+    ; feed doDefineUnit's duplicate diagnostics, Inc 3).
+    function is_defined(this: Unit) returns bool
+        computed <> UNIT_NOT_COMPUTED
+
+    ; static bool scale(long val, int valExp, long factor, long &result):
+    ; result = val * 10^valExp * factor, 0 on overflow.
+    procedure scale(val: int, val_exp_in: int, factor_in: int, mutable result: ref[int]) returns bool
+    {
+        var val_exp val_exp_in
+        var factor factor_in
+        let long_max 0x7FFFFFFFFFFFFFFF
+        if factor <= 0
+            return false
+        while val_exp > 0
+        {
+            if factor > long_max / 10
+                return false
+            val_exp := val_exp - 1
+            factor := factor * 10
+        }
+        if val >= 0
+        {
+            if val > long_max / factor
+                return false
+        }
+        else
+        {
+            ; -(unsigned long)val > -(unsigned long)LONG_MIN/factor
+            let neg_val 0 - (val as u64)
+            let neg_min (long_max as u64) + 1
+            if neg_val > neg_min / (factor as u64)
+                return false
+        }
+        var r val * factor
+        while val_exp < 0
+        {
+            r := r / 10
+            val_exp := val_exp + 1
+        }
+        result := r
+        true
+    }
+
+    ; ELObj *resolveQuantity(bool force, Interpreter &, long val, int valExp)
+    ; (val * 10^valExp of this unit; the unit's own exponent is 1).
+    procedure resolve_quantity_long(mutable this: ref[Unit], force: bool, mutable interp: ref[Interpreter], val: int, val_exp_in: int) returns ref[ELObj]?
+    {
+        this.try_compute(force, interp)
+        if this.computed = UNIT_COMPUTED_EXACT
+        {
+            var result 0
+            if Unit.scale(val, val_exp_in, this.exact, &result)
+                return ELObj.make_length(interp.host, result)
+        }
+        var val_exp val_exp_in
+        var x val as double
+        while val_exp > 0
+        {
+            x := x * 10.0
+            val_exp := val_exp - 1
+        }
+        while val_exp < 0
+        {
+            x := x / 10.0
+            val_exp := val_exp + 1
+        }
+        this.resolve_quantity_double(force, interp, x, 1)
+    }
+
+    ; ELObj *resolveQuantity(bool force, Interpreter &, double val, int unitExp)
+    procedure resolve_quantity_double(mutable this: ref[Unit], force: bool, mutable interp: ref[Interpreter], val: double, unit_exp_in: int) returns ref[ELObj]?
+    {
+        this.try_compute(force, interp)
+        var factor 0.0
+        if this.computed = UNIT_COMPUTED_EXACT
+            factor := this.exact as double
+        else if this.computed = UNIT_COMPUTED_INEXACT
+            factor := this.inexact
+        else if this.computed = UNIT_COMPUTED_ERROR
+            return interp.make_error()
+        else
+            return null
+        var unit_exp unit_exp_in
+        var result_dim 0
+        var result_val val
+        while unit_exp > 0
+        {
+            result_dim := result_dim + this.dim
+            result_val := result_val * factor
+            unit_exp := unit_exp - 1
+        }
+        while unit_exp < 0
+        {
+            result_dim := result_dim - this.dim
+            result_val := result_val / factor
+            unit_exp := unit_exp + 1
+        }
+        if result_dim = 0
+            return ELObj.make_real(interp.host, result_val)
+        ELObj.make_quantity(interp.host, result_val, result_dim)
+    }
+
+    ; void tryCompute(bool force, Interpreter &) — evaluate the define-unit
+    ; body (compiled once); without force only a canEval body computes (the
+    ; reference's lazy top-level shape); a recursive resolve is the unitLoop
+    ; error; a non-quantity result is badUnitDefinition at the definition.
+    procedure try_compute(mutable this: ref[Unit], force: bool, mutable interp: ref[Interpreter])
+    {
+        if this.computed = UNIT_NOT_COMPUTED
+        {
+            if this.def_expr = null
+                return
+            this.computed := UNIT_BEING_COMPUTED
+            let host interp.get_host()
+            if this.def_insn = null
+            {
+                let env Environment.make(host)
+                this.def_insn := Expression.optimize_compile(this.def_expr, interp, env, 0, null)
+            }
+            var run force
+            if run = false
+                run := this.def_expr.can_eval(false, interp)
+            if run
+            {
+                let vm VM.make(host, interp)
+                let v vm.eval(this.def_insn, null, null)
+                let qv v.quantity_value()
+                let qt qv.get_qtype()
+                if qt = QT_NONE
+                {
+                    if interp.is_error(v) = false
+                    {
+                        interp.set_next_location(this.def_loc)
+                        interp.message1(InterpreterMessages.badUnitDefinition(), this.name)
+                    }
+                    this.computed := UNIT_COMPUTED_ERROR
+                }
+                else if qt = QT_LONG
+                {
+                    this.exact := qv.get_lval()
+                    this.dim := qv.get_dim()
+                    this.computed := UNIT_COMPUTED_EXACT
+                }
+                else
+                {
+                    this.inexact := qv.get_dval()
+                    this.dim := qv.get_dim()
+                    this.computed := UNIT_COMPUTED_INEXACT
+                }
+            }
+            if this.computed = UNIT_BEING_COMPUTED
+                this.computed := UNIT_NOT_COMPUTED
+        }
+        else if this.computed = UNIT_BEING_COMPUTED
+        {
+            interp.set_next_location(this.def_loc)
+            interp.message1(InterpreterMessages.unitLoop(), this.name)
+            this.computed := UNIT_COMPUTED_ERROR
+        }
+    }
+}
+
+; externalProcTable_ entry: a public identifier -> primitive value binding
+; (Interpreter::installPrimitive / installXPrimitive; external-procedure
+; resolves against it). Linear array, insertion order.
+define ExternalProc (pubid: StringC, value: ref[ELObj]?)
+{
+    function make(host: ref[Page], pubid: StringC, value: ref[ELObj]) returns ref[ExternalProc]
+    {
+        let e &ExternalProc^host(StringC^host(pubid.as_slice()), value)
+        e
+    }
+}
+
+define Interpreter
+(
+    var host: ref[Page]
+    var units_per_inch: int
+    var debug_mode: bool
+    var dsssl2: bool
+    var strict_mode: bool
+    var part_index: u32
+    var d_part_index: u32
+    ; the permanent singletons (one per run; eqv? = identity)
+    var nil_obj: ref[ELObj]
+    var true_obj: ref[ELObj]
+    var false_obj: ref[ELObj]
+    var error_obj: ref[ELObj]
+    var unspecified_obj: ref[ELObj]
+    ; interning tables. The Array holds the objects in insertion order (the
+    ; reference's NamedTable owns its entries the same way); the NameTable
+    ; beside it is the hash index that answers a lookup — see the module
+    ; header there for why the linear scan had to go.
+    var symbol_table: ref[Array[ref[ELObj]?]]
+    var ident_table: ref[Array[ref[Identifier]?]]
+    var symbol_index: ref[NamedTable[ELObj]]
+    var ident_index: ref[NamedTable[Identifier]]
+    var unit_table: ref[Array[ref[Unit]?]]
+    var named_char_table: ref[Array[ref[CharPart]?]]
+    var sdata_entity_name_table: ref[Array[ref[CharPart]?]]
+    var sdata_entity_text_table: ref[Array[ref[CharPart]?]]
+    var lex_category_table: ref[XcharMap]
+    ; Messenger seam (see header note): counts + prints; the driver owns
+    ; the full location-prefixed rendering (Inc 7).
+    var error_count: int
+    var next_loc: Location
+    ; processing modes (Style/Interpreter.cxx): the unnamed initial mode plus
+    ; every named mode (mode NAME …). Rules register here; compile() finalises.
+    var initial_mode: ref[ProcessingMode]
+    var processing_mode_table: ref[Array[ref[ProcessingMode]?]]?
+    ; declare-default-language: the declaration expression (evaluated by
+    ; compile(), like the reference compileDefaultLanguage) and the resulting
+    ; language value char-upcase/downcase consult.
+    var default_language_def: ref[Expression]?
+    var default_language_part: int
+    var default_language_loc: Location
+    var default_language: ref[ELObj]?
+    ; NumberCache — the reference DERIVES Interpreter from it
+    ; (style/Interpreter.h:303), so `element-number` reaches it as a method on
+    ; the interpreter. One per run; the grove-order vector it steps along hangs
+    ; off the grove, not off this.
+    var number_cache: ref[NumberCache]
+    ; charProperties_ — the character-property table (installCharProperties +
+    ; declare-char-property + add-char-properties).
+    var char_property_table: ref[Array[ref[CharProp]?]]
+    ; externalProcTable_ — public id -> FunctionObj (external-procedure).
+    var external_proc_table: ref[Array[ref[ExternalProc]?]]
+    ; the canned border styles (a single border-present? spec; table borders
+    ; specified as booleans resolve to these).
+    var border_true_style_obj: ref[ELObj]?
+    var border_false_style_obj: ref[ELObj]?
+    ; nextGlyphSubstTableUniqueId_ — the fot dump's gst<n> ids.
+    var next_gst_unique_id: int
+    ; nInheritedC_ — the next fresh IC index (registry entries end at 164;
+    ; declare-characteristic extensions allocate from here).
+    var next_ic_index: int
+    ; the backend extension characteristic table selector: true under -t rtf
+    ; (jade.cxx passes the RtfFOTBuilder extension table; fot/transform have
+    ; none in this port — the IgnoredC fallback).
+    var rtf_extensions: bool
+    var tex_extensions: bool
+    var html_extensions: bool
+    var mif_extensions: bool
+    ; declared initial values (declare-initial-value / declare-characteristic):
+    ; parallel ident/expr arrays, compiled into initialStyle_ by compile().
+    var initial_value_names: ref[Array[ref[Identifier]?]]
+    var initial_value_exprs: ref[Array[ref[Expression]?]]
+    var current_part_first_initial_value: int
+    var initial_style_obj: ref[ELObj]?
+    ; nodePropertyTable_ — the grove ComponentName metamodel (both the RCS and
+    ; the SDQL spelling of all 107 component names).
+    var component_names: ref[ComponentName]
+    ; Pattern::MatchContext — the reference's Interpreter IS the match context,
+    ; and these are its two vectors: the attribute names that carry a CLASS and
+    ; an ID, filled by declare-class-attribute / declare-id-attribute (both
+    ; dsssl2-only forms). The class qualifier can match NOTHING while the class
+    ; list is empty; the id qualifier still has the grove's own ID attribute.
+    var class_attribute_names: ref[Array[ref[StringC]?]]
+    var id_attribute_names: ref[Array[ref[StringC]?]]
+    ; Interpreter::groveManager_ — the driver's (DssslApp IS one); null under
+    ; the unit paths, where no document is parsed and nothing folds.
+    var grove_mgr: ref[GroveManager]?
+    ; the sibling-position memo GroveNode.group_index reads and refreshes
+    var sib_hint: ref[SiblingHint]
+    ; The eval scratch region (Collector seam, RBMM shape): while ProcessContext
+    ; evaluates a construction rule, get_host() returns this region instead of
+    ; the run page, so every eval-transient (intermediate ELObjs, sosofo trees,
+    ; per-call insns, fresh VMs) dies with the node's bracket instead of
+    ; retaining until run end — the reference reclaims the same objects with
+    ; Clark's GC. null outside processing (load/compile allocate on the run
+    ; page as before). Interning (symbols/identifiers/units) and Identifier
+    ; value forcing go to the PERM host explicitly (makePermanent semantics).
+    var eval_region: ref[Page]?
+    ; the frame mark's state block (FrameMark.create; null: the mark is off)
+    var frame_mark: pointer[i64]
+)
+{
+    procedure make(host: ref[Page], units_per_inch: int, debug_mode: bool, dsssl2: bool, strict_mode: bool) returns ref[Interpreter]
+    {
+        let interp host.allocate(sizeof Interpreter, alignof Interpreter) as pointer[Interpreter]
+        interp.host := host
+        interp.frame_mark := FrameMark.create()
+        FrameMark.set_perm(interp.frame_mark, host)
+        interp.units_per_inch := units_per_inch
+        interp.debug_mode := debug_mode
+        interp.dsssl2 := dsssl2
+        interp.strict_mode := strict_mode
+        interp.part_index := 0
+        interp.d_part_index := 1
+        interp.nil_obj := ELObj.make_nil(host)
+        interp.true_obj := ELObj.make_true(host)
+        interp.false_obj := ELObj.make_false(host)
+        interp.error_obj := ELObj.make_error(host)
+        interp.unspecified_obj := ELObj.make_unspecified(host)
+        interp.symbol_table := Array[ref[ELObj]?]^host()
+        interp.ident_table := Array[ref[Identifier]?]^host()
+        ; sized for a stylesheet of the DocBook class (~5 000 identifiers,
+        ; ~1 500 symbols) — the table grows on its own past that.
+        interp.symbol_index := &NamedTable[ELObj]^host(2048)
+        interp.ident_index := &NamedTable[Identifier]^host(8192)
+        interp.unit_table := Array[ref[Unit]?]^host()
+        interp.named_char_table := Array[ref[CharPart]?]^host()
+        interp.sdata_entity_name_table := Array[ref[CharPart]?]^host()
+        interp.sdata_entity_text_table := Array[ref[CharPart]?]^host()
+        interp.error_count := 0
+        interp.next_loc := Location()
+        interp.processing_mode_table := null
+        interp.default_language_def := null
+        interp.default_language_part := 0 - 1
+        interp.default_language_loc := Location()
+        interp.default_language := null
+        interp.number_cache := NumberCache.make(host)
+        interp.char_property_table := Array[ref[CharProp]?]^host()
+        interp.external_proc_table := Array[ref[ExternalProc]?]^host()
+        interp.border_true_style_obj := null
+        interp.border_false_style_obj := null
+        interp.next_gst_unique_id := 0
+        interp.next_ic_index := 0
+        interp.rtf_extensions := false
+        interp.tex_extensions := false
+        interp.html_extensions := false
+        interp.mif_extensions := false
+        interp.initial_value_names := Array[ref[Identifier]?]^host()
+        interp.initial_value_exprs := Array[ref[Expression]?]^host()
+        interp.current_part_first_initial_value := 0
+        interp.initial_style_obj := null
+        interp.initial_mode := ProcessingMode.make(host, StringC(), null)
+        interp.initial_mode.set_defined()
+        interp.class_attribute_names := Array[ref[StringC]?]^host()
+        interp.id_attribute_names := Array[ref[StringC]?]^host()
+        interp.grove_mgr := null
+        interp.sib_hint := &SiblingHint^host(null, 0)
+        interp.eval_region := null
+
+        ; installNodeProperties — the grove component-name table (both name
+        ; spellings), the oracle behind node-property and select-by-class.
+        interp.component_names := ComponentName.make(host)
+
+        interp.install_units()
+        interp.install_syntactic_keys()
+        interp.install_c_value_symbols()
+        ; flow objects BEFORE the inherited Cs (reference order — fraction-
+        ; bar's initial value is the rule class binding).
+        interp.install_flow_objs()
+        interp.install_inherited_cs()
+        interp.install_primitives()
+        if strict_mode = false
+        {
+            CharNames.install(interp)
+            Sdata.install(interp)
+        }
+        ; installCharProperties runs unconditionally — every built-in
+        ; property EXISTS under -s, only its table stays empty.
+        CharProps.install(interp, strict_mode)
+
+        ; the lexical-category table (constructor tail, Interpreter.cxx:107)
+        let lex XcharMap.make(host, LEX_OTHER as u8)
+        interp.lex_category_table := lex
+        lex.set_ee(LEX_DELIMITER as u8)
+        Interpreter.set_lex_ascii(lex, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", LEX_LETTER as u8)
+        Interpreter.set_lex_ascii(lex, "!$%&*/<=>?~_^:", LEX_OTHER_NAME_START as u8)
+        Interpreter.set_lex_ascii(lex, "0123456789", LEX_DIGIT as u8)
+        Interpreter.set_lex_ascii(lex, "-+.", LEX_OTHER_NUMBER_START as u8)
+        Interpreter.set_lex_ascii(lex, "();\"", LEX_DELIMITER as u8)
+        Interpreter.set_lex_ascii(lex, " \t\r\n", LEX_WHITESPACE as u8)
+        lex.set_char(0x0C, LEX_WHITESPACE as u8)  ; \f
+        ; #',@[\]`{|} stay lexOther: not allowed in names. Chars >= 127 are
+        ; name-start in the non-strict repertoire (XcharMap's dense range
+        ; covers the BMP; higher planes clamp to the default — the XcharMap
+        ; port's documented scope).
+        if strict_mode = false
+            lex.set_range(127, 0xFFFF, LEX_ADD_NAME_START as u8)
+
+        interp
+    }
+
+    procedure set_lex_ascii(mutable lex: ref[XcharMap], s: Slice[char], cat: u8)
+    {
+        var i: size_t 0
+        while i < s.length
+        {
+            lex.set_char(s[i] as u32, cat)
+            i := i + 1
+        }
+    }
+
+    ; LexCategory lexCategory(Xchar c)
+    function lex_category(this: Interpreter, c: i32) returns int
+        lex_category_table.get(c) as int
+
+    ; the allocation page (Collector seam) — cross-module allocation sites
+    ; reach it through this accessor: the eval scratch region while a
+    ; construction rule evaluates, the run arena page otherwise.
+    function get_host(this: Interpreter) returns ref[Page]
+    {
+        let r eval_region
+        if r <> null
+            return r as ref[Page]
+        host
+    }
+
+    ; the run arena page unconditionally — for allocations that must outlive
+    ; the eval bracket (interning, forced Identifier values).
+    function get_perm_host(this: Interpreter) returns ref[Page]
+        host
+
+    ; --- the LAZY MEMO host (DZ_MEMO_PERM) ----------------------------------
+    ;
+    ; ★★★Where a lazy MEMOISATION puts its storage: the array a node-list view
+    ; fills on demand, the flattened buffer of a string rope. Until now that was
+    ; `Page.get(the object)` — the END of the object's own region — with the
+    ; documented reason that the memo must live exactly as long as the object,
+    ; and a caller's host can be shorter-lived. Right against BRACKET
+    ; granularity, and the class that shaped both the frame mark's store sweep
+    ; and the escape audit: within ONE region the region's end is above every
+    ; live frame mark, so the memo of an outer frame's object is younger than the
+    ; object. Two consequences, both measured: memoisation PUBLISHES under the
+    ; mark (10.5 M frames blocked), and every node-list and string-rope primitive
+    ; has to stay conservative in the escape analysis (its 8.8x gate).
+    ;
+    ; This makes the choice a seam instead of an idiom: on the RUN arena the memo
+    ; is older than every frame and every bracket, so neither problem can arise —
+    ; at the price of memo storage that outlives the bracket it was filled in.
+    ; The elements stored are grove nodes (permanent) or the rope's own flattened
+    ; buffer, so nothing here can create a pointer from the run arena into a
+    ; shorter-lived region.
+    ;
+    ; ★★★It FOLLOWS THE MARK (see memo_host), because the two only make sense
+    ; together. With the mark it is a large win, because memoisation stops
+    ; PUBLISHING: 18.9 M publications become 1.4 M, 4.1 M more frames are
+    ; rewound, 10.03 -> 17.22 GB reclaimed, peak footprint 3911 -> 3463 MB
+    ; (-11.5 %). Without the mark the same change is pure retention and costs
+    ; +18 % peak (5966 -> 7047 MB), so alone it is never right.
+    ;
+    ; ★★★And the reason this stood OFF for a day is the most valuable thing the
+    ; seam produced: with the mark it made 3 of the 48 real-world codegens write
+    ; garbage. It was not this placement — mark + memo on the object's region was
+    ; identical, and memo on the run arena WITHOUT the mark was identical too. It
+    ; was the extra REWINDS: removing 17.5 M publications took away a blanket
+    ; protection nobody had meant as one, and exposed a hole in the mark's rule.
+    ; The hole is condition 6 (BACKFILL) in `FrameMark.scaly`, and it was not a
+    ; missing store hook at all — `Page.allocate` serves from the page it is
+    ; CALLED ON, so the region head kept handing out small objects BELOW every
+    ; live mark. With that condition in place this configuration is 48/48
+    ; byte-identical, which is why the seam is armed.
+    ;
+    ; ★The seam FOLLOWS THE MARK. On its own the run-arena host is pure
+    ; retention (+18 % peak, measured); together with the mark it is a large
+    ; win, because memoisation stops publishing — so it is on exactly when the
+    ; mark is, and `DAZZLE_FRAME_MARK=0` turns both off.
+    ;
+    ; The run arena is kept in the mark's own state block (FrameMark.set_perm,
+    ; from `make`): the lazy flatten deep in ELObj that asks has the object and
+    ; a transient host, not the interpreter.
+    function memo_host(this: Interpreter, own: ref[Page]) returns ref[Page]
+    {
+        let p FrameMark.perm(frame_mark)
+        if p = null
+            return own
+        p as ref[Page]
+    }
+
+    ; The CLI's `--no-frame-mark`: the mark and the memo seam that follows it
+    ; go off together. Runs before the first VM is made, since every VM copies
+    ; the block.
+    procedure disable_frame_mark(mutable this: ref[Interpreter])
+        this.frame_mark := null
+
+    function get_eval_region(this: Interpreter) returns ref[Page]?
+        eval_region
+
+    ; `p` is the NULLABLE form because clearing the region is the documented
+    ; operation: Identifier.compute_value and Expression.make_macro both pass
+    ; null to take the eval scratch region out of play, and the field starts
+    ; null too.
+    procedure set_eval_region(mutable this: ref[Interpreter], p: ref[Page]?)
+    {
+        ; the region under every live frame mark changes with the bracket
+        FrameMark.region(this.frame_mark, p)
+        this.eval_region := p
+    }
+
+    function is_dsssl2(this: Interpreter) returns bool
+        dsssl2
+
+    ; Interpreter::addClassAttributeName / addIdAttributeName (Interpreter.h:742)
+    ; — the MatchContext vectors the class and id pattern qualifiers read. The
+    ; name is stored as declared; matchAttribute normalizes on the way in.
+    procedure add_class_attribute_name(mutable this: ref[Interpreter], name: ref[StringC])
+        this.class_attribute_names.add(name)
+
+    procedure add_id_attribute_name(mutable this: ref[Interpreter], name: ref[StringC])
+        this.id_attribute_names.add(name)
+
+    function get_class_attribute_names(this: Interpreter) returns ref[Array[ref[StringC]?]]?
+        class_attribute_names
+
+    function get_id_attribute_names(this: Interpreter) returns ref[Array[ref[StringC]?]]?
+        id_attribute_names
+
+    ; ★The grove ID index, the governing DTD and the fold table used to live
+    ; here as interpreter state — right only while exactly one grove could
+    ; exist. They are GroveInfo fields now, one record per grove, and every
+    ; consumer reaches its own through Node::getGroveRoot (dazzle/Grove.scaly).
+
+    function get_units_per_inch(this: Interpreter) returns int
+        units_per_inch
+
+    ; --- singletons --------------------------------------------------------
+    function make_nil(this: Interpreter) returns ref[ELObj]
+        nil_obj
+
+    function make_true(this: Interpreter) returns ref[ELObj]
+        true_obj
+
+    function make_false(this: Interpreter) returns ref[ELObj]
+        false_obj
+
+    ; #t / #f from a Scaly bool (Primitive predicate results).
+    function make_bool(this: Interpreter, b: bool) returns ref[ELObj]
+    {
+        if b
+            return true_obj
+        false_obj
+    }
+
+    function make_error(this: Interpreter) returns ref[ELObj]
+        error_obj
+
+    function make_unspecified(this: Interpreter) returns ref[ELObj]
+        unspecified_obj
+
+    function is_error(this: Interpreter, obj: ref[ELObj]?) returns bool
+        obj = error_obj
+
+    ; endPart(): the next specification part (later parts' defines lose to
+    ; earlier ones — doDefine's defPart gate).
+    ; Interpreter::dEndPart (Interpreter.cxx:755) — the DECLARATION phase has
+    ; its own part counter, separate from end_part's: declarations of all
+    ; parts are processed before any body element, so the two numbering
+    ; schemes cannot share a counter. `d_part_index` is what
+    ; `def_char`/`add_sdata_entity` arbitrate on (earlier part wins, same part
+    ; with a different value is a duplicate diagnostic).
+    procedure d_end_part(mutable this: ref[Interpreter])
+        this.d_part_index := this.d_part_index + 1
+
+    procedure end_part(mutable this: ref[Interpreter])
+    {
+        this.part_index := this.part_index + 1
+        ; endPart: the duplicate-initial-value window closes with the part.
+        this.current_part_first_initial_value := this.initial_value_names.get_length() as int
+    }
+
+    ; installBuiltins brackets the builtins parse with part index -1 (so any
+    ; user define overrides a builtin), then endPart wraps back to 0.
+    procedure set_part_index(mutable this: ref[Interpreter], n: u32)
+        this.part_index := n
+
+    ; --- processing modes --------------------------------------------------
+    function current_part_index(this: Interpreter) returns u32
+        part_index
+
+    function initial_processing_mode(this: Interpreter) returns ref[ProcessingMode]
+        initial_mode
+
+    ; lookupProcessingMode(name): the named mode, created (with the initial mode
+    ; as fall-through parent) on first reference.
+    procedure lookup_processing_mode(mutable this: ref[Interpreter], str: StringC) returns ref[ProcessingMode]
+    {
+        ; the table is allocated lazily — a stylesheet with no named modes (the
+        ; common case) never grabs its exclusive page.
+        if this.processing_mode_table = null
+        {
+            let hp this.host
+            this.processing_mode_table := Array[ref[ProcessingMode]?]^hp()
+        }
+        let tbl this.processing_mode_table
+        let n tbl.get_length()
+        let buf tbl.as_slice()
+        var i: size_t 0
+        while i < n
+        {
+            let m buf[i]
+            if m.get_name().equals(str)
+                return m as ref[ProcessingMode]
+            i := i + 1
+        }
+        let m ProcessingMode.make(this.host, str, this.initial_mode)
+        tbl.add(m)
+        m
+    }
+
+    ; WithModeExpression::compile's defined() gate — the check + undefinedMode
+    ; message live on this seam because the message table does, not because
+    ; Expression could not name ProcessingMode (see VM.processing_mode).
+    procedure check_mode_defined(mutable this: ref[Interpreter], mode: ref[ProcessingMode]?, loc: Location)
+    {
+        let m mode
+        if m = null
+            return
+        if m.defined()
+            return
+        this.set_next_location(loc)
+        this.message1(InterpreterMessages.undefinedMode(), m.get_name())
+    }
+
+    ; compile(): finalise every mode's rules (Interpreter::compile). Top-level
+    ; definitions used by rule bodies compute lazily via TopRefInsn at eval.
+    ; The sorted element-rule scan order is built HERE (not lazily on the
+    ; first find_match): during processing get_host() is the eval scratch
+    ; region, and a lazily-built sorted array would dangle after the bracket.
+    procedure compile(mutable this: ref[Interpreter])
+    {
+        ; reference order: compileInitialValues runs FIRST (Interpreter::
+        ; compile), before the modes.
+        this.compile_initial_values()
+        this.compile_default_language()
+        this.initial_mode.compile(this)
+        this.initial_mode.build_sorted(this.host)
+        if this.processing_mode_table = null
+            return
+        let tbl this.processing_mode_table
+        var i: size_t 0
+        while i < tbl.get_length()
+        {
+            let m tbl[i]
+            m.compile(this)
+            m.build_sorted(this.host)
+            i := i + 1
+        }
+    }
+
+    ; --- declare-default-language (Interpreter::compileDefaultLanguage) -----
+    ; --- character properties (Interpreter.cxx:2064-2380) -------------------
+
+    function lookup_char_property(this: ref[Interpreter], nm: StringC) returns ref[CharProp]?
+    {
+        let t this.char_property_table
+        let n t.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let pp t.get(i)
+            if pp <> null
+            {
+                let p *pp
+                if p.name.equals(nm)
+                    return p
+            }
+            i := i + 1
+        }
+        null
+    }
+
+    ; the installCharProperties helper: a fresh property with `def` as its
+    ; default and defPart -1 (predefined).
+    ;
+    ; ★The name is widened onto the HOST page, not built with `StringC(nm)`:
+    ; that init allocates its buffer through `Page.get(this)`, and for a
+    ; temporary the compiler may place on the stack the resulting `data`
+    ; pointer is garbage. The name then compares unequal to everything and
+    ; every property reads back as unknown — measured, and invisible until
+    ; the first lookup.
+    procedure new_char_property(mutable this: ref[Interpreter], nm: Slice[char], def: ref[ELObj]) returns ref[CharProp]
+    {
+        let host this.host
+        let p CharProp.make(host, Interpreter.ascii_string_c(host, nm), def, 0xFFFFFFFF)
+        this.char_property_table.add(p)
+        p
+    }
+
+    ; widen an ASCII literal onto `host` — the safe replacement for a bound
+    ; or passed `StringC(<cstring>)` (see new_char_property).
+    function ascii_string_c(host: ref[Page], s: Slice[char]) returns StringC
+    {
+        let buf Array[u32]^host()
+        var i: size_t 0
+        while i < s.length
+        {
+            buf.add(s[i] as u32)
+            i := i + 1
+        }
+        StringC^host(buf.as_slice())
+    }
+
+    ; Interpreter::charProperty — the `char-property` primitive's engine.
+    ; An unknown NAME is a hard diagnostic; a character with no value of its
+    ; own falls back to the caller's default argument if there is one, else
+    ; to the property's own default.
+    procedure char_property(mutable this: ref[Interpreter], prop: StringC, c: u32, loc: Location, def: ref[ELObj]?) returns ref[ELObj]?
+    {
+        let cp this.lookup_char_property(prop)
+        if cp = null
+        {
+            this.set_next_location(loc)
+            this.message1(InterpreterMessages.unknownCharProperty(), prop)
+            return this.make_error()
+        }
+        let p *cp
+        let v p.lookup(c)
+        if v <> null
+            return v
+        if def <> null
+            return def
+        p.def
+    }
+
+    ; Interpreter::addCharProperty — declare-char-property. The default must
+    ; be a CONSTANT (a variable expression is varCharPropertyExprUnsupported);
+    ; re-declaring in the SAME spec part with a different value is
+    ; duplicateCharPropertyDecl, while an EARLIER part simply wins.
+    procedure add_char_property(mutable this: ref[Interpreter], mutable ident: ref[Identifier], mutable val: ref[ELObj]?, loc: Location)
+    {
+        if val = null
+        {
+            this.set_next_location(loc)
+            this.message0(InterpreterMessages.varCharPropertyExprUnsupported())
+            return
+        }
+        let nm ident.get_name()
+        let cp this.lookup_char_property(nm)
+        if cp = null
+        {
+            let host this.host
+            let p CharProp.make(host, nm, val, this.part_index)
+            p.loc := loc
+            this.char_property_table.add(p)
+            return
+        }
+        let p *cp
+        if this.part_index < p.def_part
+        {
+            p.def := val as ref[ELObj]
+            p.def_part := this.part_index
+            p.loc := loc
+            return
+        }
+        if this.part_index = p.def_part
+        {
+            if ELObj.eqv(val, p.def) = false
+            {
+                this.set_next_location(loc)
+                this.message1(InterpreterMessages.duplicateCharPropertyDecl(), nm)
+                this.emit_aux(InterpreterMessages.duplicateCharPropertyDecl_aux(), p.loc)
+            }
+        }
+    }
+
+    ; Interpreter::setCharProperty — one (property, character) cell from
+    ; add-char-properties. An unknown property name is the same diagnostic
+    ; the primitive gives.
+    procedure set_char_property(mutable this: ref[Interpreter], mutable ident: ref[Identifier], c: u32, mutable val: ref[ELObj]?, loc: Location)
+    {
+        let nm ident.get_name()
+        let cp this.lookup_char_property(nm)
+        if cp = null
+        {
+            this.set_next_location(loc)
+            this.message1(InterpreterMessages.unknownCharProperty(), nm)
+            return
+        }
+        if val = null
+        {
+            this.set_next_location(loc)
+            this.message0(InterpreterMessages.varCharPropertyExprUnsupported())
+            return
+        }
+        let p *cp
+        ; Interpreter::addCharProperty's part arbitration (Interpreter.cxx:2347).
+        ; A character that already has a value of its own is overwritten only by
+        ; an EARLIER part; the same part sets it twice differently is a
+        ; duplicate diagnostic; a LATER part is ignored in silence.
+        let part this.current_part_index()
+        let def_part p.lookup_part(c)
+        let def p.lookup(c)
+        if def <> null
+        {
+            if part < def_part
+            {
+                p.set_range(c, c, val, part)
+                return
+            }
+            if part = def_part
+            {
+                if ELObj.eqv(val, def) = false
+                {
+                    this.set_next_location(loc)
+                    ; the character itself is the second argument — a one-char
+                    ; StringC, built on the run page (never a stack temporary:
+                    ; StringC's copying init allocates through Page.get(this)).
+                    let hp this.host
+                    var ch c
+                    let cs StringC(&ch, 1)
+                    this.message2(InterpreterMessages.duplicateAddCharProperty(), nm, *cs)
+                }
+                return
+            }
+            return
+        }
+        p.set_range(c, c, val, part)
+    }
+
+    ; ★the PART matters: the reference keeps the FIRST declaration seen in
+    ; this part or an earlier one and refuses to overwrite it
+    ; (SchemeParser.cxx:2101), so the part index is state, not a formality.
+    procedure set_default_language_def(mutable this: ref[Interpreter], expr: ref[Expression]?, part: int, loc: Location)
+    {
+        this.default_language_def := expr
+        this.default_language_part := part
+        this.default_language_loc := loc
+    }
+
+    function default_language_is_set(this: Interpreter) returns bool
+        default_language_def <> null
+
+    function get_default_language_part(this: Interpreter) returns int
+        default_language_part
+
+    function get_default_language_loc(this: Interpreter) returns Location
+        default_language_loc
+
+    function get_default_language(this: Interpreter) returns ref[ELObj]?
+        default_language
+
+    procedure compile_default_language(mutable this: ref[Interpreter])
+    {
+        if this.default_language_def = null
+            return
+        let host this.host
+        let env Environment.make(host)
+        let insn Expression.optimize_compile(this.default_language_def, this, env, 0, null)
+        let vm VM.make(host, this)
+        let obj vm.eval(insn, null, null)
+        if obj = null
+            return
+        if obj.is_language_p() = false
+        {
+            if this.is_error(obj) = false
+            {
+                let os OutputCharStream.make(host)
+                obj.print(os, this.units_per_inch)
+                let printed os.to_string_c(host)
+                this.set_next_location(this.default_language_loc)
+                this.message1(InterpreterMessages.defLangDeclRequiresLanguage(), printed)
+            }
+            return
+        }
+        this.default_language := obj
+    }
+
+    ; --- interning ---------------------------------------------------------
+    ; Identifier *lookup(const StringC &): one Identifier per name.
+    procedure lookup(mutable this: ref[Interpreter], str: StringC) returns ref[Identifier]
+    {
+        let hit this.ident_index.lookup(str)
+        if hit <> null
+            return hit as ref[Identifier]
+        let ident Identifier.make(this.host, str)
+        this.ident_table.add(ident)
+        ; the key is the Identifier's OWN name — a StringC over the arena copy
+        ; Identifier.make just took, not the caller's (possibly stack-built)
+        ; argument.
+        let key ident.get_name()
+        this.ident_index.insert(this.host, key, ident)
+        ident
+    }
+
+    ; SymbolObj *makeSymbol(const StringC &): one SymbolObj per name.
+    procedure make_symbol(mutable this: ref[Interpreter], str: StringC) returns ref[ELObj]
+    {
+        let hit this.symbol_index.lookup(str)
+        if hit <> null
+            return hit as ref[ELObj]
+        let host this.host
+        let name StringC^host(str.as_slice())
+        let sym ELObj.make_symbol(host, name)
+        this.symbol_table.add(sym)
+        let key sym.symbol_name()
+        this.symbol_index.insert(host, key, sym)
+        sym
+    }
+
+    ; --- NumberCache seam --------------------------------------------------
+    ; The reference DERIVES Interpreter from NumberCache (style/Interpreter.h:303),
+    ; so the numbering primitives call `interp.elementNumber(node, gi)`. Same
+    ; seam here, one cache per run.
+    procedure element_number(mutable this: ref[Interpreter], mutable node: ref[GroveNode]?, mutable gi: StringC) returns int
+        this.number_cache.element_number(this.host, node as ref[GroveNode], gi)
+
+    procedure element_number_after(mutable this: ref[Interpreter], mutable node: ref[GroveNode]?, gi: StringC, mutable reset_gi: StringC) returns int
+        this.number_cache.element_number_after(this.host, node as ref[GroveNode], gi, reset_gi)
+
+    procedure child_number(mutable this: ref[Interpreter], mutable node: ref[GroveNode]?, gi: StringC) returns int
+        this.number_cache.child_number(this.host, node as ref[GroveNode], gi)
+
+    ; KeywordObj *makeKeyword(const StringC &): a fresh KeywordObj whose
+    ; identity is the interned Identifier.
+    procedure make_keyword(mutable this: ref[Interpreter], str: StringC) returns ref[ELObj]
+    {
+        let ident this.lookup(str)
+        ELObj.make_keyword(this.host, ident)
+    }
+
+    ; --- grove component names ---------------------------------------------
+    ; bool lookupNodeProperty(const StringC &, ComponentName::Id &) — either
+    ; spelling, case-insensitively; CN_NO_ID when the name is not a component.
+    function lookup_node_property(this: ref[Interpreter], name: StringC) returns int
+        this.component_names.lookup(name)
+
+    ; the name a component-name VALUE renders as (ELObjPropertyValue::set —
+    ; rcs? picks the short RCS name, otherwise the SDQL name).
+    function component_name(this: ref[Interpreter], id: int, want_rcs: bool) returns StringC
+        this.component_names.name_of(id, want_rcs)
+
+    ; --- units -------------------------------------------------------------
+    ; Unit *lookupUnit(const StringC &): create on demand.
+    procedure lookup_unit(mutable this: ref[Interpreter], name: StringC) returns ref[Unit]
+    {
+        let n this.unit_table.get_length()
+        let buf this.unit_table.as_slice()
+        var i: size_t 0
+        while i < n
+        {
+            let p buf[i]
+            if p.get_name().equals(name)
+                return p as ref[Unit]
+            i := i + 1
+        }
+        let u Unit.make(this.host, name)
+        this.unit_table.add(u)
+        u
+    }
+
+    ; void installUnits(): builtin units valued from unitsPerInch; "pc" is
+    ; the DSSSL2 addition.
+    procedure install_units(mutable this: ref[Interpreter])
+    {
+        this.install_unit("m", 5000, 127)
+        this.install_unit("cm", 50, 127)
+        this.install_unit("mm", 5, 127)
+        this.install_unit("in", 1, 1)
+        this.install_unit("pt", 1, 72)
+        this.install_unit("pica", 1, 6)
+        if this.dsssl2
+            this.install_unit("pc", 1, 6)
+    }
+
+    procedure install_unit(mutable this: ref[Interpreter], mutable name: Slice[char], numer: int, denom: int)
+    {
+        let u this.lookup_unit(StringC(name))
+        let n this.units_per_inch * numer
+        if n % denom = 0
+            u.set_value_long(n / denom)
+        else
+            u.set_value_double((n as double) / (denom as double))
+    }
+
+    ; --- syntactic keys ----------------------------------------------------
+    procedure install_syntactic_key(mutable this: ref[Interpreter], mutable name: Slice[char], key: int)
+    {
+        let ident this.lookup(StringC(name))
+        ident.set_syntactic_key(key)
+        ; ★installSyntacticKeys' dsssl2 alias (Interpreter.cxx:388): a key
+        ; whose name ends in `?` is ALSO bound without the `?` under -2, so
+        ; `keep-with-previous:` is a valid make keyword there and an error
+        ; without the flag. Measured against the reference binary.
+        ; ★the name is scanned as RAW BYTES, not bound as a StringC: that
+        ; init allocates through `Page.get(this)`, which is a bogus page for
+        ; a stack-bound value (see CharProps.script_value).
+        if this.dsssl2
+        {
+            let n name.length
+            if n > 0
+            {
+                if (name[n - 1] as u32) = 0x3F
+                {
+                    let host this.host
+                    let sbuf Array[u32]^host()
+                    var i: size_t 0
+                    while i < (n - 1)
+                    {
+                        sbuf.add(name[i] as u32)
+                        i := i + 1
+                    }
+                    let id2 this.lookup(StringC^host(sbuf.as_slice()))
+                    id2.set_syntactic_key(key)
+                }
+            }
+        }
+    }
+
+    ; the `keys2[]` table (Interpreter.cxx:377) — installed ONLY under -2.
+    ; Without the flag `begin` and `set!` are undefined variables and
+    ; `or-element` an unknown top-level form; all three measured.
+    procedure install_syntactic_key2(mutable this: ref[Interpreter], mutable name: Slice[char], key: int)
+    {
+        if this.dsssl2
+            this.install_syntactic_key(name, key)
+    }
+
+    ; installSyntacticKey batch (Interpreter ctor). Inc-3 subset: the eval-core
+    ; forms; the style/grove top-level keys (element/root/mode/declare-*) join
+    ; with those increments, though the tags are reserved here.
+    procedure install_syntactic_keys(mutable this: ref[Interpreter])
+    {
+        this.install_syntactic_key("define", SK_DEFINE)
+        this.install_syntactic_key("define-unit", SK_DEFINE_UNIT)
+        this.install_syntactic_key("quote", SK_QUOTE)
+        this.install_syntactic_key("quasiquote", SK_QUASIQUOTE)
+        this.install_syntactic_key("unquote", SK_UNQUOTE)
+        this.install_syntactic_key("unquote-splicing", SK_UNQUOTE_SPLICING)
+        this.install_syntactic_key("if", SK_IF)
+        this.install_syntactic_key("cond", SK_COND)
+        this.install_syntactic_key("case", SK_CASE)
+        this.install_syntactic_key("and", SK_AND)
+        this.install_syntactic_key("or", SK_OR)
+        this.install_syntactic_key("let", SK_LET)
+        this.install_syntactic_key("let*", SK_LET_STAR)
+        this.install_syntactic_key("letrec", SK_LETREC)
+        this.install_syntactic_key("lambda", SK_LAMBDA)
+        this.install_syntactic_key2("begin", SK_BEGIN)
+        this.install_syntactic_key2("set!", SK_SET)
+        ; the DSSSL QUERY LANGUAGE forms. keys[], so UNCONDITIONAL — what -2
+        ; adds is only the `?`-less alias above, which makes `there-exists`
+        ; and `for-all` the same keys. They are pure syntax over four
+        ; builtins.dsl procedures; see SchemeParser.parse_special_query.
+        this.install_syntactic_key("there-exists?", SK_THERE_EXISTS)
+        this.install_syntactic_key("for-all?", SK_FOR_ALL)
+        this.install_syntactic_key("select-each", SK_SELECT_EACH)
+        this.install_syntactic_key("union-for-each", SK_UNION_FOR_EACH)
+        ; `query` is in the reference's keys[] as well, but keyQuery sits
+        ; above lastSyntacticKey (so it is no expression key) and no
+        ; top-level form dispatches it — installing it is measurably
+        ; indistinguishable from leaving it out. Here for table fidelity.
+        this.install_syntactic_key("query", SK_QUERY)
+        this.install_syntactic_key("else", SK_ELSE)
+        this.install_syntactic_key("=>", SK_ARROW)
+        ; construction/style rule top-level forms (Inc 5)
+        this.install_syntactic_key("element", SK_ELEMENT)
+        this.install_syntactic_key2("or-element", SK_OR_ELEMENT)
+        ; keys with a deliberately SILENT top-level skip in the reference
+        this.install_syntactic_key("declare-reference-value-type", SK_DECLARE_REFERENCE_VALUE_TYPE)
+        this.install_syntactic_key("define-page-model", SK_DEFINE_PAGE_MODEL)
+        this.install_syntactic_key("define-column-set-model", SK_DEFINE_COLUMN_SET_MODEL)
+        this.install_syntactic_key("declare-char-property", SK_DECLARE_CHAR_PROPERTY)
+        this.install_syntactic_key("add-char-properties", SK_ADD_CHAR_PROPERTIES)
+        this.install_syntactic_key("declare-char-characteristic+property", SK_DECLARE_CHAR_CHARACTERISTIC_AND_PROPERTY)
+        ; the five built-in char-property names the reference also keys. They
+        ; are above lastSyntacticKey, hence inert until the `character` flow
+        ; object arrives with CharacterFlowObj::hasNonInheritedC — pinned as
+        ; inert by the ccp1 fixture, which still uses `space?` as an ordinary
+        ; procedure name.
+        this.install_syntactic_key("space?", SK_IS_SPACE)
+        this.install_syntactic_key("record-end?", SK_IS_RECORD_END)
+        this.install_syntactic_key("input-tab?", SK_IS_INPUT_TAB)
+        this.install_syntactic_key("input-whitespace?", SK_IS_INPUT_WHITESPACE)
+        this.install_syntactic_key("punct?", SK_IS_PUNCT)
+        ; the PATTERN QUALIFIER keys — the keyword half of convertToPattern is
+        ; itself dsssl2-only, but the KEYS are installed unconditionally, so a
+        ; qualifier keyword without `-2` is `cannot occur in a pattern` and
+        ; never `unknown pattern qualifier`.
+        this.install_syntactic_key("attributes", SK_ATTRIBUTES)
+        this.install_syntactic_key("children", SK_CHILDREN)
+        this.install_syntactic_key("repeat", SK_REPEAT)
+        this.install_syntactic_key("position", SK_POSITION)
+        this.install_syntactic_key("only", SK_ONLY)
+        this.install_syntactic_key("class", SK_CLASS)
+        this.install_syntactic_key("importance", SK_IMPORTANCE)
+        ; sgml-parse's keyword arguments (a loud stub here; keys all the same).
+        ; `architecture` is the third, and belongs to the OpenJade EXTENSION
+        ; sgml-parse alone (XXPRIMITIVE XSgmlParse) — the ISO one takes only
+        ; active:/parent:.
+        this.install_syntactic_key("parent", SK_PARENT)
+        this.install_syntactic_key("active", SK_ACTIVE)
+        this.install_syntactic_key("architecture", SK_ARCHITECTURE)
+        ; keys2[] — the class/id attribute declarations and the flow-object
+        ; macro, dsssl2-only
+        this.install_syntactic_key2("declare-class-attribute", SK_DECLARE_CLASS_ATTRIBUTE)
+        this.install_syntactic_key2("declare-id-attribute", SK_DECLARE_ID_ATTRIBUTE)
+        this.install_syntactic_key2("declare-flow-object-macro", SK_DECLARE_FLOW_OBJECT_MACRO)
+        this.install_syntactic_key("default", SK_DEFAULT)
+        this.install_syntactic_key("root", SK_ROOT)
+        this.install_syntactic_key("id", SK_ID)
+        this.install_syntactic_key("mode", SK_MODE)
+        this.install_syntactic_key("with-mode", SK_WITH_MODE)
+        this.install_syntactic_key("make", SK_MAKE)
+        this.install_syntactic_key("style", SK_STYLE)
+        this.install_syntactic_key("use", SK_KEY_USE)
+        this.install_syntactic_key("label", SK_KEY_LABEL)
+        this.install_syntactic_key("content-map", SK_KEY_CONTENT_MAP)
+        this.install_syntactic_key("declare-initial-value", SK_DECLARE_INITIAL_VALUE)
+        this.install_syntactic_key("declare-characteristic", SK_DECLARE_CHARACTERISTIC)
+        this.install_syntactic_key("declare-flow-object-class", SK_DECLARE_FLOW_OBJECT_CLASS)
+        this.install_syntactic_key("define-language", SK_DEFINE_LANGUAGE)
+        this.install_syntactic_key("declare-default-language", SK_DECLARE_DEFAULT_LANGUAGE)
+        ; the clause keywords of define-language. `element` and `position` are
+        ; keys already (they double as a top-level form and a NIC name) — the
+        ; collate clause reuses them, which is why the whole form dispatches
+        ; on keys and never on spelling.
+        this.install_syntactic_key("collate", SK_COLLATE)
+        this.install_syntactic_key("toupper", SK_TOUPPER)
+        this.install_syntactic_key("tolower", SK_TOLOWER)
+        this.install_syntactic_key("symbol", SK_SYMBOL)
+        this.install_syntactic_key("order", SK_ORDER)
+        this.install_syntactic_key("forward", SK_FORWARD)
+        this.install_syntactic_key("backward", SK_BACKWARD)
+        ; display/inline NIC keywords (FlowObj::isDisplayNIC family, Inc 8)
+        this.install_syntactic_key("position-preference", SK_POSITION_PREFERENCE)
+        this.install_syntactic_key("keep-with-previous?", SK_KEEP_WITH_PREVIOUS)
+        this.install_syntactic_key("keep-with-next?", SK_KEEP_WITH_NEXT)
+        this.install_syntactic_key("keep", SK_KEEP)
+        this.install_syntactic_key("break-before", SK_BREAK_BEFORE)
+        this.install_syntactic_key("break-after", SK_BREAK_AFTER)
+        this.install_syntactic_key("may-violate-keep-before?", SK_MAY_VIOLATE_KEEP_BEFORE)
+        this.install_syntactic_key("may-violate-keep-after?", SK_MAY_VIOLATE_KEEP_AFTER)
+        this.install_syntactic_key("space-before", SK_SPACE_BEFORE)
+        this.install_syntactic_key("space-after", SK_SPACE_AFTER)
+        this.install_syntactic_key("coalesce-id", SK_COALESCE_ID)
+        this.install_syntactic_key("break-before-priority", SK_BREAK_BEFORE_PRIORITY)
+        this.install_syntactic_key("break-after-priority", SK_BREAK_AFTER_PRIORITY)
+        ; simple-page-sequence header/footer sosofo NICs
+        this.install_syntactic_key("left-header", SK_LEFT_HEADER)
+        this.install_syntactic_key("center-header", SK_CENTER_HEADER)
+        this.install_syntactic_key("right-header", SK_RIGHT_HEADER)
+        this.install_syntactic_key("left-footer", SK_LEFT_FOOTER)
+        this.install_syntactic_key("center-footer", SK_CENTER_FOOTER)
+        this.install_syntactic_key("right-footer", SK_RIGHT_FOOTER)
+        ; table-family NIC keywords
+        this.install_syntactic_key("before-row-border", SK_BEFORE_ROW_BORDER)
+        this.install_syntactic_key("after-row-border", SK_AFTER_ROW_BORDER)
+        this.install_syntactic_key("before-column-border", SK_BEFORE_COLUMN_BORDER)
+        this.install_syntactic_key("after-column-border", SK_AFTER_COLUMN_BORDER)
+        this.install_syntactic_key("table-width", SK_TABLE_WIDTH)
+        this.install_syntactic_key("column-number", SK_COLUMN_NUMBER)
+        this.install_syntactic_key("n-columns-spanned", SK_N_COLUMNS_SPANNED)
+        this.install_syntactic_key("n-rows-spanned", SK_N_ROWS_SPANNED)
+        this.install_syntactic_key("width", SK_WIDTH)
+        this.install_syntactic_key("starts-row?", SK_IS_STARTS_ROW)
+        this.install_syntactic_key("ends-row?", SK_IS_ENDS_ROW)
+        ; display-space / inline-space keyword args
+        this.install_syntactic_key("min", SK_MIN)
+        this.install_syntactic_key("max", SK_MAX)
+        this.install_syntactic_key("conditional?", SK_IS_CONDITIONAL)
+        this.install_syntactic_key("priority", SK_PRIORITY)
+        ; CIE color-space keyword args
+        this.install_syntactic_key("white-point", SK_WHITE_POINT)
+        this.install_syntactic_key("black-point", SK_BLACK_POINT)
+        this.install_syntactic_key("range", SK_RANGE)
+        this.install_syntactic_key("range-abc", SK_RANGE_ABC)
+        this.install_syntactic_key("range-lmn", SK_RANGE_LMN)
+        this.install_syntactic_key("range-a", SK_RANGE_A)
+        this.install_syntactic_key("decode-abc", SK_DECODE_ABC)
+        this.install_syntactic_key("decode-lmn", SK_DECODE_LMN)
+        this.install_syntactic_key("decode-a", SK_DECODE_A)
+        this.install_syntactic_key("matrix-abc", SK_MATRIX_ABC)
+        this.install_syntactic_key("matrix-lmn", SK_MATRIX_LMN)
+        this.install_syntactic_key("matrix-a", SK_MATRIX_A)
+        ; rule NIC keywords
+        this.install_syntactic_key("orientation", SK_ORIENTATION)
+        this.install_syntactic_key("length", SK_LENGTH)
+        this.install_syntactic_key("destination", SK_DESTINATION)
+        this.install_syntactic_key("display?", SK_IS_DISPLAY)
+        this.install_syntactic_key("scale", SK_SCALE)
+        this.install_syntactic_key("max-width", SK_MAX_WIDTH)
+        this.install_syntactic_key("max-height", SK_MAX_HEIGHT)
+        this.install_syntactic_key("entity-system-id", SK_ENTITY_SYSTEM_ID)
+        this.install_syntactic_key("notation-system-id", SK_NOTATION_SYSTEM_ID)
+        this.install_syntactic_key("position-point-x", SK_POSITION_POINT_X)
+        this.install_syntactic_key("position-point-y", SK_POSITION_POINT_Y)
+        this.install_syntactic_key("escapement-direction", SK_ESCAPEMENT_DIRECTION)
+        this.install_syntactic_key("type", SK_TYPE)
+        this.install_syntactic_key("placement", SK_PLACEMENT)
+        ; the ISOGEN index-entry NICs (reachable only under -t mif)
+        this.install_syntactic_key("components", SK_COMPONENTS)
+        this.install_syntactic_key("page-number?", SK_PAGE_NUMBER_P)
+        this.install_syntactic_key("sort-string", SK_SORT_STRING)
+        this.install_syntactic_key("starts-page-range?", SK_STARTS_PAGE_RANGE)
+        this.install_syntactic_key("ends-page-range?", SK_ENDS_PAGE_RANGE)
+        ; the INLINE/MARK family's NIC keywords. The `character` class owns all
+        ; but the last (its other five — space?/record-end?/input-tab?/
+        ; input-whitespace?/punct? — are the char-property keys installed
+        ; above, one identifier serving both roles); `mark` is
+        ; emphasizing-mark's.
+        this.install_syntactic_key("char", SK_CHAR)
+        this.install_syntactic_key("glyph-id", SK_GLYPH_ID)
+        this.install_syntactic_key("drop-after-line-break?", SK_IS_DROP_AFTER_LINE_BREAK)
+        this.install_syntactic_key("drop-unless-before-line-break?", SK_IS_DROP_UNLESS_BEFORE_LINE_BREAK)
+        this.install_syntactic_key("math-class", SK_MATH_CLASS)
+        this.install_syntactic_key("math-font-posture", SK_MATH_FONT_POSTURE)
+        this.install_syntactic_key("script", SK_SCRIPT)
+        this.install_syntactic_key("stretch-factor", SK_STRETCH_FACTOR)
+        this.install_syntactic_key("mark", SK_MARK)
+        ; the NIC names of the MATH classes. ★`column-number` (grid-cell's
+        ; other one) is installed with the table family above — the reference
+        ; shares the key, not just the spelling.
+        this.install_syntactic_key("radical", SK_RADICAL)
+        this.install_syntactic_key("grid-n-columns", SK_GRID_N_COLUMNS)
+        this.install_syntactic_key("grid-n-rows", SK_GRID_N_ROWS)
+        this.install_syntactic_key("row-number", SK_ROW_NUMBER)
+        ; the NIC names of the LAYOUT-COMPOSITE classes. ★Only three are new:
+        ; `direction` (embedded-text's one characteristic) plus `height` and
+        ; `contents-rotation` (two of included-container-area's); its other
+        ; eight names are keys the external-graphic and inline families already
+        ; installed, shared exactly as the reference shares them.
+        this.install_syntactic_key("direction", SK_DIRECTION)
+        this.install_syntactic_key("height", SK_HEIGHT)
+        this.install_syntactic_key("contents-rotation", SK_CONTENTS_ROTATION)
+        ; `multi-modes` — the ONE characteristic of the online multi-mode class.
+        this.install_syntactic_key("multi-modes", SK_MULTI_MODES)
+        ; ★the last four keys[] names this port had never installed. None of
+        ; them is a NIC of the page/column model — `data` belongs to
+        ; `formatting-instruction`, `open`/`close` to the commented-out
+        ; `multi-line-inline-note`, and `null` is a keyword argument of
+        ; `node-property`. All four are reached by NAME on this side, so the
+        ; keys are inert; they are installed because the table itself is a
+        ; contract (see the SK_ block in ELObj).
+        this.install_syntactic_key("data", SK_DATA)
+        this.install_syntactic_key("null", SK_NULL)
+        this.install_syntactic_key("open", SK_OPEN)
+        this.install_syntactic_key("close", SK_CLOSE)
+        ; the built-in `sequence` flow object (no declare needed).
+        let seq this.lookup(StringC("sequence"))
+        this.bind_flow_object_class(seq, FOC_SEQUENCE)
+    }
+
+
+    ; --- Inc 8: FOT symbols, inherited characteristics, standard flow objects --
+    ; installCValueSymbols — the 120-code FOTBuilder::Symbol table (codes 0/1
+    ; are #f/#t; 2.. follow the enum order; faithful quirk: symbolBevel's name
+    ; is "join"). Symbols are interned with their c-value so convert_enum can
+    ; validate any characteristic symbol value.
+    procedure install_c_value_symbols(mutable this: ref[Interpreter])
+    {
+        let names StringC("not-applicable ultra-condensed extra-condensed condensed semi-condensed ultra-light extra-light light semi-light medium semi-expanded expanded extra-expanded ultra-expanded semi-bold bold extra-bold ultra-bold upright oblique back-slanted-oblique italic back-slanted-italic start end center justify spread-inside spread-outside page-inside page-outside wrap asis asis-wrap asis-truncate none before through after top-to-bottom left-to-right bottom-to-top right-to-left inside outside horizontal vertical escapement line-progression math ordinary operator binary relation opening closing punctuation inner space page page-region column-set column max max-uniform miter round join butt square loose normal kern tight touch preserve collapse ignore relative display inline border background both base font top bottom spread solid outline with against force independent pile sup-out sub-out lead-edge trail-edge explicit row-major column-major front back parent right left centered shouldered glyph even indent final truncate error repeat initial")
+        var code 2
+        let n names.get_size()
+        var start: size_t 0
+        var i: size_t 0
+        while i <= n
+        {
+            var at_sep false
+            if i = n
+                at_sep := true
+            else
+            {
+                if names.get(i) = 0x20
+                    at_sep := true
+            }
+            if at_sep
+            {
+                if i > start
+                {
+                    let tok StringC(names.as_slice().subslice(start, i))
+                    let sym this.make_symbol(tok)
+                    sym.set_symbol_c_value(code)
+                    code := code + 1
+                }
+                start := i + 1
+            }
+            i := i + 1
+        }
+    }
+
+    ; one inherited-characteristic registry entry: intern the identifier and
+    ; hang the prototype IC off it (Identifier::setInheritedC). `print_name`
+    ; is the exact fot attribute name (reference quirks preserved). The
+    ; prototype carries the characteristic's INITIAL value (the inherited-*
+    ; fallback when nothing is pushed). iic = all-zero defaults (#f / 0 /
+    ; empty); iicn / iicsym / iicstr / iicobj set non-zero initials.
+    procedure iic(mutable this: ref[Interpreter], mutable name: Slice[char], kind: int, mutable print_name: Slice[char], index: int)
+    {
+        let ic this.make_proto_ic(name, kind, print_name, index)
+        this.finish_ic(ic)
+    }
+
+    ; numeric initial: length/length-spec/integer/maybe-integer/bool kinds.
+    procedure iicn(mutable this: ref[Interpreter], mutable name: Slice[char], kind: int, mutable print_name: Slice[char], index: int, n: int)
+    {
+        let ic this.make_proto_ic(name, kind, print_name, index)
+        if kind = IC_LENGTH_SPEC
+        {
+            var ls LengthSpec()
+            ls.length := n
+            ic.ls := ls
+        }
+        else if kind = IC_BOOL
+            ic.bval := n <> 0
+        else
+            ic.lval := n
+        this.finish_ic(ic)
+    }
+
+    ; symbol initial (GenericSymbolInheritedC's non-default entries); the
+    ; symbol table (install_c_value_symbols) runs first, so the interned
+    ; symbol already carries its c-value code.
+    procedure iicsym(mutable this: ref[Interpreter], mutable name: Slice[char], mutable print_name: Slice[char], index: int, sym_name: Slice[char])
+    {
+        let host this.host
+        let ic this.make_proto_ic(name, IC_SYMBOL, print_name, index)
+        let symobj this.make_symbol(StringC(sym_name))
+        var s FotSym()
+        s.code := symobj.symbol_c_value()
+        s.name := symobj.symbol_name()
+        ic.sym := s
+        this.finish_ic(ic)
+    }
+
+    procedure iicstr(mutable this: ref[Interpreter], mutable name: Slice[char], mutable print_name: Slice[char], index: int, s: Slice[char])
+    {
+        let host this.host
+        let ic this.make_proto_ic(name, IC_STRING, print_name, index)
+        let lit StringC(s)
+        ic.sval := StringC^host(lit.as_slice())
+        this.finish_ic(ic)
+    }
+
+    ; an ignored characteristic (IgnoredC): initial value is an arbitrary
+    ; ELObj; set() renders nothing.
+    procedure iicobj(mutable this: ref[Interpreter], mutable name: Slice[char], mutable print_name: Slice[char], index: int, val: ref[ELObj])
+    {
+        let ic this.make_proto_ic(name, IC_IGNORED, print_name, index)
+        ic.obj := val
+        this.finish_ic(ic)
+    }
+
+    procedure make_proto_ic(mutable this: ref[Interpreter], name: Slice[char], kind: int, print_name: Slice[char], index: int) returns ref[InheritedC]
+    {
+        let host this.host
+        let ident this.lookup(StringC(name))
+        let pn_lit StringC(print_name)
+        let pn StringC^host(pn_lit.as_slice())
+        InheritedC.make(host, kind, ident, index, pn)
+    }
+
+    ; installInheritedC's tail: bind the prototype and install the
+    ; inherited-*/actual-* primitives. (The reference's trailing-'?' alias is
+    ; gated on dsssl2(), which is default-OFF — the `-2` flag is not ported.)
+    procedure finish_ic(mutable this: ref[Interpreter], mutable ic: ref[InheritedC])
+    {
+        let ident ic.ident
+        ident.set_inherited_c(ic)
+        this.install_inherited_c_proc(ident)
+    }
+
+    ; installInheritedCProc — bind `inherited-<name>` / `actual-<name>` to
+    ; zero-arg primitives reading the style stack (NOT registered as external
+    ; procedures — the reference binds the value only).
+    procedure install_inherited_c_proc(mutable this: ref[Interpreter], ident: ref[Identifier]?)
+    {
+        this.install_prefixed_prim("inherited-", ident as ref[Identifier], PRIM_INHERITED_C)
+        this.install_prefixed_prim("actual-", ident as ref[Identifier], PRIM_ACTUAL_C)
+    }
+
+    procedure install_prefixed_prim(mutable this: ref[Interpreter], prefix: Slice[char], base: ref[Identifier], prim_id: int)
+    {
+        let host this.host
+        let buf Array[u32]^host()
+        var i: size_t 0
+        while i < prefix.length
+        {
+            buf.add(prefix[i] as u32)
+            i := i + 1
+        }
+        let nm base.get_name()
+        let n nm.get_size()
+        i := 0
+        while i < n
+        {
+            buf.add(nm.get(i))
+            i := i + 1
+        }
+        let pident this.lookup(StringC(buf.as_slice()))
+        let prim ELObj.make_primitive(host, Signature(0, 0, false), prim_id)
+        prim.primitive_set_ident(pident)
+        pident.set_definition(0xFFFFFFFF, Location(), prim)
+    }
+
+    ; installInheritedCs — the generic entries of the reference registry
+    ; (InheritedC.cxx) incl. the ignored characteristics (IgnoredC) and the
+    ; maybe-integers; initial values transcribed at upi=72000. The full
+    ; reference registry is installed (incl. color/background-color, the
+    ; border and rule specials, glyph-subst-table, the opt-length-spec and
+    ; inline-space entries).
+    procedure install_inherited_cs(mutable this: ref[Interpreter])
+    {
+        let host this.host
+        this.iicn("font-size", IC_LENGTH, "font-size", 0, (this.units_per_inch * 10) / 72)
+        this.iicstr("font-family-name", "font-family-name", 1, "iso-serif")
+        this.iicsym("font-weight", "font-weight", 2, "medium")
+        this.iicsym("font-posture", "font-posture", 3, "upright")
+        this.iicsym("quadding", "quadding", 4, "start")
+        this.iicsym("display-alignment", "display-alignment", 5, "start")
+        this.iicsym("field-align", "field-align", 6, "start")
+        this.iicsym("lines", "lines", 7, "wrap")
+        this.iic("start-indent", IC_LENGTH_SPEC, "start-indent", 8)
+        this.iic("first-line-start-indent", IC_LENGTH_SPEC, "first-line-start-indent", 9)
+        this.iic("end-indent", IC_LENGTH_SPEC, "end-indent", 10)
+        this.iic("last-line-end-indent", IC_LENGTH_SPEC, "last-line-end-indent", 11)
+        this.iicn("line-spacing", IC_LENGTH_SPEC, "line-spacing", 12, this.units_per_inch * 12 / 72)
+        this.iic("field-width", IC_LENGTH_SPEC, "field-width", 13)
+        this.iic("left-margin", IC_LENGTH, "left-margin", 14)
+        this.iic("right-margin", IC_LENGTH, "right-margin", 15)
+        this.iic("top-margin", IC_LENGTH, "top-margin", 16)
+        this.iic("bottom-margin", IC_LENGTH, "bottom-margin", 17)
+        this.iic("header-margin", IC_LENGTH, "header-margin", 18)
+        this.iic("footer-margin", IC_LENGTH, "footer-margin", 19)
+        this.iicn("page-width", IC_LENGTH, "page-width", 20, (this.units_per_inch * 8) + (this.units_per_inch / 2))
+        this.iicn("page-height", IC_LENGTH, "page-height", 21, this.units_per_inch * 11)
+        this.iicn("border-present?", IC_BOOL, "border-present", 22, 1)
+        this.iicn("line-thickness", IC_LENGTH, "line-thickness", 23, this.units_per_inch / 72)
+        this.iic("cell-before-row-margin", IC_LENGTH, "cell-before-row-margin", 24)
+        this.iic("cell-after-row-margin", IC_LENGTH, "cell-after-row-margin", 25)
+        this.iic("cell-before-column-margin", IC_LENGTH, "cell-before-column-margin", 26)
+        this.iic("cell-after-column-margin", IC_LENGTH, "cell-after-column-margin", 27)
+        this.iicn("line-sep", IC_LENGTH, "line-sep", 28, this.units_per_inch / 72)
+        this.iicn("box-size-before", IC_LENGTH, "box-size-before", 29, 8 * this.units_per_inch / 72)
+        this.iicn("box-size-after", IC_LENGTH, "box-size-after", 30, 4 * this.units_per_inch / 72)
+        this.iic("position-point-shift", IC_LENGTH_SPEC, "position-point-shift", 31)
+        this.iic("start-margin", IC_LENGTH_SPEC, "start-margin", 32)
+        this.iic("end-margin", IC_LENGTH_SPEC, "end-margin", 33)
+        this.iicn("sideline-sep", IC_LENGTH_SPEC, "sideline-sep", 34, 4 * this.units_per_inch / 72)
+        this.iic("asis-wrap-indent", IC_LENGTH_SPEC, "asis-wrap-indent", 35)
+        this.iic("line-number-sep", IC_LENGTH_SPEC, "line-number-sep", 36)
+        this.iic("last-line-justify-limit", IC_LENGTH_SPEC, "last-line-justify-limit", 37)
+        this.iic("justify-glyph-space-max-add", IC_LENGTH_SPEC, "justify-glyph-space-max-add", 38)
+        this.iic("justify-glyph-space-max-remove", IC_LENGTH_SPEC, "justify-glyph-space-max-remove", 39)
+        this.iicn("table-corner-radius", IC_LENGTH_SPEC, "table-corner-radius", 40, 3 * this.units_per_inch / 72)
+        this.iicn("box-corner-radius", IC_LENGTH_SPEC, "box-corner-radius", 41, 3 * this.units_per_inch / 72)
+        this.iic("marginalia-sep", IC_LENGTH_SPEC, "marginalia-sep", 42)
+        this.iic("inhibit-line-breaks?", IC_BOOL, "inhibit-line-breaks?", 43)
+        this.iic("hyphenate?", IC_BOOL, "hyphenate", 44)
+        this.iic("kern?", IC_BOOL, "kern", 45)
+        this.iic("ligature?", IC_BOOL, "ligature", 46)
+        this.iic("score-spaces?", IC_BOOL, "score-spaces", 47)
+        this.iic("float-out-sidelines?", IC_BOOL, "float-out-sidelines", 48)
+        this.iic("float-out-marginalia?", IC_BOOL, "float-out-marginalia", 49)
+        this.iic("float-out-line-numbers?", IC_BOOL, "float-out-line-numbers", 50)
+        this.iic("cell-background?", IC_BOOL, "cell-background", 51)
+        this.iic("span-weak?", IC_BOOL, "span-weak", 52)
+        this.iic("ignore-record-end?", IC_BOOL, "ignore-record-end", 53)
+        this.iicn("numbered-lines?", IC_BOOL, "numbered-lines", 54, 1)
+        this.iic("hanging-punct?", IC_BOOL, "hanging-punct", 55)
+        this.iic("box-open-end?", IC_BOOL, "box-open-end", 56)
+        this.iic("truncate-leader?", IC_BOOL, "truncate-leader", 57)
+        this.iicn("align-leader?", IC_BOOL, "align-leader", 58, 1)
+        this.iic("table-part-omit-middle-header?", IC_BOOL, "table-part-omit-middle-header", 59)
+        this.iic("table-part-omit-middle-footer?", IC_BOOL, "table-part-omit-middle-footer", 60)
+        this.iic("border-omit-at-break?", IC_BOOL, "border-omit-at-break", 61)
+        this.iic("principal-mode-simultaneous?", IC_BOOL, "principal-mode-simultaneous", 62)
+        this.iic("marginalia-keep-with-previous?", IC_BOOL, "marginalia-keep-with-previous", 63)
+        this.iic("grid-equidistant-rows?", IC_BOOL, "grid-equidistant-rows", 64)
+        this.iic("grid-equidistant-columns?", IC_BOOL, "grid-equidistant-columns", 65)
+        this.iicsym("line-join", "line-join", 66, "miter")
+        this.iicsym("line-cap", "line-cap", 67, "butt")
+        this.iicsym("line-number-side", "line-number-side", 68, "start")
+        this.iicsym("kern-mode", "kern-mode", 69, "normal")
+        this.iicsym("input-whitespace-treatment", "input-whitespace-treatment", 70, "preserve")
+        this.iicsym("filling-direction", "filling-direction", 71, "top-to-bottom")
+        this.iicsym("writing-mode", "writing-mode", 72, "left-to-right")
+        this.iicsym("last-line-quadding", "last-line-quadding", 73, "relative")
+        this.iicsym("math-display-mode", "math-display-mode", 74, "display")
+        this.iicsym("script-pre-align", "script-pre-align", 75, "independent")
+        this.iicsym("script-post-align", "script-post-align", 76, "independent")
+        this.iicsym("script-mid-sup-align", "script-mid-sup-align", 77, "center")
+        this.iicsym("script-mid-sub-align", "script-mid-sub-align", 78, "center")
+        this.iicsym("numerator-align", "numerator-align", 79, "center")
+        this.iicsym("denominator-align", "denominator-align", 80, "center")
+        this.iicsym("grid-position-cell-type", "grid-position-cell-type", 81, "row-major")
+        this.iicsym("grid-column-alignment", "grid-column-alignment", 82, "center")
+        this.iicsym("grid-row-alignment", "grid-row-alignment", 83, "center")
+        this.iicsym("box-type", "box-type", 84, "border")
+        this.iicsym("glyph-alignment-mode", "glyph-alignment-mode", 85, "font")
+        this.iicsym("box-border-alignment", "box-border-alignment", 86, "outside")
+        this.iicsym("cell-row-alignment", "cell-row-alignment", 87, "start")
+        this.iicsym("border-alignment", "border-alignment", 88, "center")
+        this.iicsym("sideline-side", "sideline-side", 89, "start")
+        this.iic("hyphenation-keep", IC_SYMBOL, "hyphenation-keep", 90)
+        this.iicsym("font-structure", "font-structure", 91, "solid")
+        this.iicsym("font-proportionate-width", "font-proportionate-width", 92, "medium")
+        this.iic("cell-crossed", IC_SYMBOL, "cell-crossed", 93)
+        this.iicsym("marginalia-side", "marginalia-side", 94, "start")
+        this.iic("layer", IC_INT, "layer", 95)
+        this.iicn("background-layer", IC_INT, "background-layer", 96, 0 - 1)
+        this.iic("border-priority", IC_INT, "border-priority", 97)
+        this.iicn("line-repeat", IC_INT, "line-repeat", 98, 1)
+        this.iicn("span", IC_INT, "span", 99, 1)
+        this.iicn("min-leader-repeat", IC_INT, "min-leader-repeat", 100, 1)
+        this.iicn("hyphenation-remain-char-count", IC_INT, "hyphenation-remain-char-count", 101, 2)
+        this.iicn("hyphenation-push-char-count", IC_INT, "hyphenation-push-char-count", 102, 2)
+        this.iicn("widow-count", IC_INT, "widow-count", 103, 2)
+        this.iicn("orphan-count", IC_INT, "orphan-count", 104, 2)
+        this.iic("background-tile", IC_PUBLIC_ID, "background-tile", 105)
+        this.iic("line-breaking-method", IC_PUBLIC_ID, "line-breaking-method", 106)
+        this.iic("line-composition-method", IC_PUBLIC_ID, "line-composition-method", 107)
+        this.iic("implicit-bidi-method", IC_PUBLIC_ID, "implicit-bidi-method", 108)
+        this.iic("glyph-subst-method", IC_PUBLIC_ID, "glyph-subst-method", 109)
+        this.iic("glyph-reorder-method", IC_PUBLIC_ID, "glyph-reorder-method", 110)
+        this.iic("hyphenation-method", IC_PUBLIC_ID, "hyphenation-method", 111)
+        this.iic("table-auto-width-method", IC_PUBLIC_ID, "table-auto-width-method", 112)
+        this.iic("font-name", IC_PUBLIC_ID, "font-name", 113)
+        this.iic("page-category", IC_SYMBOL, "page-category", 114)
+        this.iic("force-last-page", IC_SYMBOL, "force-last-page", 115)
+        this.iic("force-first-page", IC_SYMBOL, "force-first-page", 116)
+        this.iic("first-page-type", IC_SYMBOL, "first-page-type", 117)
+        this.iic("justify-spread?", IC_BOOL, "jystify-spread", 118)
+        this.iic("binding-edge", IC_SYMBOL, "binding-edge", 119)
+        this.iic("anchor-keep-with-previous?", IC_BOOL, "anchor-keep-with-previous", 120)
+        this.iic("contents-alignment", IC_SYMBOL, "contents-alignment", 121)
+        this.iic("overflow-action", IC_SYMBOL, "overflow-action", 122)
+        this.iic("annotation-glyph-placement", IC_SYMBOL, "annotation-glyph-placement", 123)
+        this.iic("annotation-glyph-style", IC_PUBLIC_ID, "annotation-glyph-style", 124)
+        this.iicn("inline-note-line-count", IC_INT, "inline-note-line-count", 125, 2)
+        this.iic("inline-note-style", IC_PUBLIC_ID, "inline-note-style", 126)
+        this.iic("mark-distribution", IC_SYMBOL, "mark-distribution", 127)
+        this.iic("mark-style", IC_PUBLIC_ID, "mark-style", 128)
+        this.iic("side-by-side-overlap-control", IC_SYMBOL, "side-by-side-overlap-control", 129)
+        this.iic("side-by-side-pre-align", IC_SYMBOL, "side-by-side-pre-align", 130)
+        this.iic("side-by-side-post-align", IC_SYMBOL, "side-by-side-post-align", 131)
+        this.iic("language", IC_LETTER2, "language", 132)
+        this.iic("country", IC_LETTER2, "country", 133)
+        ; #f or strictly positive integer
+        this.iicn("expand-tabs?", IC_MAYBE_INT, "expand-tabs", 134, 8)
+        this.iicn("hyphenation-ladder-count", IC_MAYBE_INT, "hyphenation-ladder-count", 135, 0)
+        ; ignored characteristics (IgnoredC — accepted, never rendered)
+        this.iicobj("line-miter-limit", "line-miter-limit", 136, ELObj.make_integer(host, 10))
+        this.iicobj("alignment-point-offset", "alignment-point-offset", 137, ELObj.make_integer(host, 50))
+        this.iicobj("hyphenation-char", "hyphenation-char", 138, ELObj.make_char(host, 0x2D))
+        this.iicobj("asis-truncate-char", "asis-truncate-char", 139, this.make_false())
+        this.iicobj("asis-wrap-char", "asis-wrap-char", 140, this.make_false())
+        this.iicobj("first-line-align", "first-line-align", 141, this.make_false())
+        this.iicobj("hyphenation-exceptions", "hyphenation-exceptions", 142, ELObj.make_nil(host))
+        this.iicobj("box-corner-rounded", "box-corner-rounded", 143, this.make_false())
+        this.iicobj("table-corner-rounded", "table-corner-rounded", 144, this.make_false())
+        this.iicobj("line-dash", "line-dash", 145, ELObj.make_pair(host, ELObj.make_length(host, 0), ELObj.make_nil(host)))
+        this.iicobj("allowed-ligatures", "allowed-ligatures", 146, ELObj.make_nil(host))
+        this.iicobj("line-number", "line-number", 147, this.make_false())
+        this.iicobj("line-spacing-priority", "line-spacing-priority", 148, ELObj.make_integer(host, 0))
+        this.iicobj("char-map", "char-map", 149, this.make_false())
+        ; the border characteristics (BorderC) + the canned styles boolean
+        ; border values resolve to (makeBorderStyle: one border-present? spec,
+        ; the index of the entry installed above).
+        this.border_true_style_obj := this.make_border_style(true)
+        this.border_false_style_obj := this.make_border_style(false)
+        this.iicborder("table-border", 150)
+        this.iicborder("cell-before-row-border", 151)
+        this.iicborder("cell-after-row-border", 152)
+        this.iicborder("cell-before-column-border", 153)
+        this.iicborder("cell-after-column-border", 154)
+        ; color (ColorC, initial device-RGB black) + background-color
+        ; (BackgroundColorC, initial #f).
+        let color_ic this.make_proto_ic("color", IC_COLOR, "color", 155)
+        color_ic.obj := ELObj.make_color(host, 0, 0, 0)
+        this.finish_ic(color_ic)
+        let bg_ic this.make_proto_ic("background-color", IC_OPT_COLOR, "background-color", 156)
+        this.finish_ic(bg_ic)
+        ; #f or length-spec (GenericOptLengthSpecInheritedC; initial #f).
+        let mpre this.make_proto_ic("min-pre-line-spacing", IC_OPT_LENGTH_SPEC, "min-pre-line-spacing", 157)
+        mpre.bval := true
+        this.finish_ic(mpre)
+        let mpost this.make_proto_ic("min-post-line-spacing", IC_OPT_LENGTH_SPEC, "min-post-line-spacing", 158)
+        mpost.bval := true
+        this.finish_ic(mpost)
+        let mlead this.make_proto_ic("min-leading", IC_OPT_LENGTH_SPEC, "min-leading", 159)
+        mlead.bval := true
+        this.finish_ic(mlead)
+        ; inline spaces (GenericInlineSpaceInheritedC; initial zero space).
+        let esb this.make_proto_ic("escapement-space-before", IC_INLINE_SPACE, "escapement-space-before", 160)
+        let esb_sp InlineSpace.make(host)
+        esb.obj := ELObj.make_inline_space(host, esb_sp)
+        this.finish_ic(esb)
+        let esa this.make_proto_ic("escapement-space-after", IC_INLINE_SPACE, "escapement-space-after", 161)
+        let esa_sp InlineSpace.make(host)
+        esa.obj := ELObj.make_inline_space(host, esa_sp)
+        this.finish_ic(esa)
+        ; #f or inline-space (GenericOptInlineSpaceInheritedC; initial #f).
+        let iss this.make_proto_ic("inline-space-space", IC_OPT_INLINE_SPACE, "inline-space-space", 162)
+        this.finish_ic(iss)
+        ; fraction-bar (RuleC; initial = the rule flow-object class binding —
+        ; install_flow_objs runs first, reference order).
+        let fb this.make_proto_ic("fraction-bar", IC_RULE, "fraction-bar", 163)
+        let rident this.lookup(StringC("rule"))
+        fb.obj := rident.get_value_raw()
+        this.finish_ic(fb)
+        ; #f or glyph-subst-table (GlyphSubstTableC; initial #f = empty).
+        let gst_ic this.make_proto_ic("glyph-subst-table", IC_GST, "glyph-subst-table", 164)
+        gst_ic.gst := Array[ref[GlyphSubstTableRec]?]^host()
+        this.finish_ic(gst_ic)
+        ; nInheritedC_ continues past the registry for declare-characteristic.
+        this.next_ic_index := 165
+    }
+
+    ; Identifier::setInheritedC(ic, part, loc) — the definition record the
+    ; duplicate gates of declare-characteristic / declare-flow-object-class /
+    ; declare-flow-object-macro consult. Only a declare-characteristic writes
+    ; it; a BUILT-IN characteristic keeps the -1 part its prototype was made
+    ; with, which is what keeps `(declare-flow-object-macro font-size …)`
+    ; legal.
+    procedure stamp_inherited_c_def(this: ref[Interpreter], mutable ident: ref[Identifier], part: u32, loc: Location)
+    {
+        let ic ident.get_inherited_c()
+        if ic = null
+            return
+        ic.def_part := part
+        ic.def_loc := loc
+    }
+
+    ; inheritedCDefined(part, loc) — true when the name carries a
+    ; characteristic prototype; the part/loc come back through the pointers.
+    procedure inherited_c_defined(this: ref[Interpreter], ident: ref[Identifier], mutable part: ref[u32], mutable loc: ref[Location]) returns bool
+    {
+        let ic ident.get_inherited_c()
+        if ic = null
+            return false
+        part := ic.def_part
+        loc := ic.def_loc
+        true
+    }
+
+    ; Interpreter::installExtensionCharNIC (Interpreter.cxx:2381) — the whole
+    ; body is `ident->setCharNIC(currentPartIndex(), loc)`. ★The public
+    ; identifier is PARSED and then DROPPED: unlike declare-characteristic
+    ; (which resolves the pubid against the backend's extension table) a char
+    ; NIC is never handed to a backend — the `character` flow object reads it
+    ; off the Identifier by name. The parameter stays for the reference's
+    ; shape.
+    procedure install_extension_char_nic(this: ref[Interpreter], mutable ident: ref[Identifier], pubid: StringC, loc: Location)
+    {
+        ident.set_char_nic(this.current_part_index(), loc)
+    }
+
+    ; Interpreter::installExtensionInheritedC — resolve the public id against
+    ; the backend's extension table. Under -t rtf the 12-entry RtfFOTBuilder
+    ; table applies (typed ICs carrying an ext-setter id, dispatched in
+    ; RtfFOTBuilder.set_extension_ic); fot/transform have no table, so every
+    ; declared characteristic takes the reference's fallback: an IgnoredC —
+    ; accepted anywhere, renders nothing, value slot #f.
+    procedure install_extension_inherited_c(mutable this: ref[Interpreter], mutable ident: ref[Identifier], pubid: StringC, loc: Location)
+    {
+        let host this.host
+        let nm ident.get_name()
+        let pn StringC^host(nm.as_slice())
+        if this.rtf_extensions
+        {
+            var kind IC_IGNORED
+            var ext 0
+            this.match_rtf_extension(pubid, &kind, &ext)
+            if ext <> 0
+            {
+                let eic InheritedC.make(host, kind, ident, this.next_ic_index, pn)
+                this.next_ic_index := this.next_ic_index + 1
+                eic.ext_setter := ext
+                this.finish_ic(eic)
+                return
+            }
+        }
+        if this.html_extensions
+        {
+            ; the jade.cxx HtmlFOTBuilder extension table: one entry.
+            if pubid.equals(StringC("UNREGISTERED::James Clark//Characteristic::scroll-title"))
+            {
+                let hic InheritedC.make(host, IC_STRING, ident, this.next_ic_index, pn)
+                this.next_ic_index := this.next_ic_index + 1
+                hic.ext_setter := 1
+                this.finish_ic(hic)
+                return
+            }
+        }
+        if this.mif_extensions
+        {
+            ; the jade.cxx makeMifFOTBuilder extension table: three
+            ; characteristics (the index-entry flow object class is bound in
+            ; install_extension_flow_object_class).
+            var mkind IC_IGNORED
+            var mext 0
+            let mprefix StringC("UNREGISTERED::James Clark//Characteristic::")
+            let mplen mprefix.get_size()
+            if pubid.get_size() > mplen
+            {
+                let mhead pubid.substr(0, mplen)
+                if mhead.equals(mprefix)
+                {
+                    let mtail pubid.substr(mplen, pubid.get_size() - mplen)
+                    if mtail.equals(StringC("page-n-columns"))
+                    {
+                        mkind := IC_INT
+                        mext := 1
+                    }
+                    else if mtail.equals(StringC("page-column-sep"))
+                    {
+                        mkind := IC_LENGTH
+                        mext := 2
+                    }
+                    else if mtail.equals(StringC("page-balance-columns?"))
+                    {
+                        mkind := IC_BOOL
+                        mext := 3
+                    }
+                }
+            }
+            if mext <> 0
+            {
+                let mic InheritedC.make(host, mkind, ident, this.next_ic_index, pn)
+                this.next_ic_index := this.next_ic_index + 1
+                mic.ext_setter := mext
+                this.finish_ic(mic)
+                return
+            }
+        }
+        if this.tex_extensions
+        {
+            var kind IC_IGNORED
+            var ext 0
+            this.match_tex_extension(pubid, &kind, &ext)
+            if ext <> 0
+            {
+                let eic InheritedC.make(host, kind, ident, this.next_ic_index, pn)
+                this.next_ic_index := this.next_ic_index + 1
+                eic.ext_setter := ext
+                this.finish_ic(eic)
+                return
+            }
+        }
+        let ic InheritedC.make(host, IC_IGNORED, ident, this.next_ic_index, pn)
+        this.next_ic_index := this.next_ic_index + 1
+        ic.obj := this.make_false()
+        this.finish_ic(ic)
+    }
+
+    ; the jade.cxx RtfFOTBuilder extension table: pubid suffix after
+    ; "UNREGISTERED::James Clark//Characteristic::" -> (value kind, setter id)
+    procedure match_rtf_extension(this: ref[Interpreter], pubid: StringC, mutable kind: ref[int], mutable ext: ref[int])
+    {
+        let prefix StringC("UNREGISTERED::James Clark//Characteristic::")
+        let plen prefix.get_size()
+        if pubid.get_size() <= plen
+            return
+        let head pubid.substr(0, plen)
+        if head.equals(prefix) = false
+            return
+        let tail pubid.substr(plen, pubid.get_size() - plen)
+        if tail.equals(StringC("page-number-format"))
+        {
+            kind := IC_STRING
+            ext := 1
+        }
+        else if tail.equals(StringC("page-number-restart?"))
+        {
+            kind := IC_BOOL
+            ext := 2
+        }
+        else if tail.equals(StringC("page-n-columns"))
+        {
+            kind := IC_INT
+            ext := 3
+        }
+        else if tail.equals(StringC("page-column-sep"))
+        {
+            kind := IC_LENGTH
+            ext := 4
+        }
+        else if tail.equals(StringC("page-balance-columns?"))
+        {
+            kind := IC_BOOL
+            ext := 5
+        }
+        else if tail.equals(StringC("subscript-depth"))
+        {
+            kind := IC_LENGTH
+            ext := 6
+        }
+        else if tail.equals(StringC("over-mark-height"))
+        {
+            kind := IC_LENGTH
+            ext := 7
+        }
+        else if tail.equals(StringC("under-mark-depth"))
+        {
+            kind := IC_LENGTH
+            ext := 8
+        }
+        else if tail.equals(StringC("superscript-height"))
+        {
+            kind := IC_LENGTH
+            ext := 9
+        }
+        else if tail.equals(StringC("grid-row-sep"))
+        {
+            kind := IC_LENGTH
+            ext := 10
+        }
+        else if tail.equals(StringC("grid-column-sep"))
+        {
+            kind := IC_LENGTH
+            ext := 11
+        }
+        else if tail.equals(StringC("heading-level"))
+        {
+            kind := IC_INT
+            ext := 12
+        }
+    }
+
+    ; the jade.cxx TeXFOTBuilder extension table (makeTeXFOTBuilder): the 15
+    ; characteristics it registers. Ids 1-12 share the RTF numbering where the
+    ; characteristics coincide; 13-15 are TeX-only (page-two-side?,
+    ; two-side-start-on-right?, preserve-sdata?) — note the OpenJade-prefixed
+    ; public ids for the two-side pair.
+    procedure match_tex_extension(this: ref[Interpreter], pubid: StringC, mutable kind: ref[int], mutable ext: ref[int])
+    {
+        let jc StringC("UNREGISTERED::James Clark//Characteristic::")
+        let oj StringC("UNREGISTERED::OpenJade//Characteristic::")
+        let jn jc.get_size()
+        let on oj.get_size()
+        if pubid.get_size() > on
+        {
+            let head2 pubid.substr(0, on)
+            if head2.equals(oj)
+            {
+                let tail2 pubid.substr(on, pubid.get_size() - on)
+                if tail2.equals(StringC("page-two-side?"))
+                {
+                    kind := IC_BOOL
+                    ext := 13
+                    return
+                }
+                if tail2.equals(StringC("two-side-start-on-right?"))
+                {
+                    kind := IC_BOOL
+                    ext := 14
+                    return
+                }
+            }
+        }
+        if pubid.get_size() <= jn
+            return
+        let head pubid.substr(0, jn)
+        if head.equals(jc) = false
+            return
+        let tail pubid.substr(jn, pubid.get_size() - jn)
+        if tail.equals(StringC("page-number-format"))
+        {
+            kind := IC_STRING
+            ext := 1
+        }
+        else if tail.equals(StringC("page-number-restart?"))
+        {
+            kind := IC_BOOL
+            ext := 2
+        }
+        else if tail.equals(StringC("page-n-columns"))
+        {
+            kind := IC_INT
+            ext := 3
+        }
+        else if tail.equals(StringC("page-column-sep"))
+        {
+            kind := IC_LENGTH
+            ext := 4
+        }
+        else if tail.equals(StringC("page-balance-columns?"))
+        {
+            kind := IC_BOOL
+            ext := 5
+        }
+        else if tail.equals(StringC("subscript-depth"))
+        {
+            kind := IC_LENGTH
+            ext := 6
+        }
+        else if tail.equals(StringC("over-mark-height"))
+        {
+            kind := IC_LENGTH
+            ext := 7
+        }
+        else if tail.equals(StringC("under-mark-depth"))
+        {
+            kind := IC_LENGTH
+            ext := 8
+        }
+        else if tail.equals(StringC("superscript-height"))
+        {
+            kind := IC_LENGTH
+            ext := 9
+        }
+        else if tail.equals(StringC("grid-row-sep"))
+        {
+            kind := IC_LENGTH
+            ext := 10
+        }
+        else if tail.equals(StringC("grid-column-sep"))
+        {
+            kind := IC_LENGTH
+            ext := 11
+        }
+        else if tail.equals(StringC("heading-level"))
+        {
+            kind := IC_INT
+            ext := 12
+        }
+        else if tail.equals(StringC("preserve-sdata?"))
+        {
+            kind := IC_BOOL
+            ext := 15
+        }
+    }
+
+    procedure set_rtf_extensions(mutable this: ref[Interpreter], b: bool)
+        this.rtf_extensions := b
+
+    procedure set_tex_extensions(mutable this: ref[Interpreter], b: bool)
+        this.tex_extensions := b
+
+    procedure set_html_extensions(mutable this: ref[Interpreter], b: bool)
+        this.html_extensions := b
+
+    procedure set_mif_extensions(mutable this: ref[Interpreter], b: bool)
+        this.mif_extensions := b
+
+    ; Interpreter::installInitialValue — collect (ident, expr); a same-part
+    ; re-declaration is duplicateInitialValue with the first one as aux line.
+    procedure install_initial_value(mutable this: ref[Interpreter], ident: ref[Identifier], expr: ref[Expression])
+    {
+        let names this.initial_value_names
+        let n names.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            if names[i] = ident
+            {
+                if (i as int) >= this.current_part_first_initial_value
+                {
+                    let prev this.initial_value_exprs[i]
+                    this.set_next_location(expr.location())
+                    this.message1(InterpreterMessages.duplicateInitialValue(), ident.get_name())
+                    this.emit_aux(InterpreterMessages.duplicateInitialValue_aux(), prev.location())
+                }
+                return
+            }
+            i := i + 1
+        }
+        names.add(ident)
+        this.initial_value_exprs.add(expr)
+    }
+
+    ; Interpreter::compileInitialValues — each declared value becomes a
+    ; constant IC (via the per-kind conversion) or a VarInheritedC; together
+    ; they form the initial style ProcessContext::process pushes around the
+    ; whole run.
+    procedure compile_initial_values(mutable this: ref[Interpreter])
+    {
+        let names this.initial_value_names
+        let n names.get_length()
+        if n = 0
+            return
+        let host this.host
+        let ics Array[ref[InheritedC]?]^host()
+        var i: size_t 0
+        while i < n
+        {
+            let ident names[i]
+            let expr this.initial_value_exprs[i]
+            let proto ident.get_inherited_c()
+            if proto <> null
+            {
+                let env Environment.make(host)
+                let oexpr expr.optimize(this, env)
+                let val oexpr.constant_value()
+                if val <> null
+                {
+                    let cic Convert.ic_from_value(host, proto, val, oexpr.location(), this)
+                    if cic <> null
+                        ics.add(cic)
+                }
+                else
+                {
+                    let code oexpr.compile(this, env, 0, null)
+                    ics.add(InheritedC.make_var(host, proto, code, oexpr.location()))
+                }
+            }
+            i := i + 1
+        }
+        if ics.get_length() > 0
+        {
+            let rec VarStyleRec.make(host, null, ics, null, null)
+            this.initial_style_obj := ELObj.make_style(host, rec, null)
+        }
+    }
+
+    function initial_style(this: Interpreter) returns ref[ELObj]?
+        initial_style_obj
+
+    procedure make_border_style(mutable this: ref[Interpreter], b: bool) returns ref[ELObj]
+    {
+        let host this.host
+        let bp this.lookup(StringC("border-present?"))
+        let proto bp.get_inherited_c() as ref[InheritedC]
+        let ic InheritedC.make(host, IC_BOOL, bp, proto.get_index(), proto.print_name)
+        ic.bval := b
+        let specs Array[ref[InheritedC]?]^host()
+        specs.add(ic)
+        let rec VarStyleRec.make(host, null, specs, null, null)
+        ELObj.make_style(host, rec, null)
+    }
+
+    function border_true_style(this: ref[Interpreter]) returns ref[ELObj]?
+        border_true_style_obj
+
+    function border_false_style(this: ref[Interpreter]) returns ref[ELObj]?
+        border_false_style_obj
+
+    ; a BorderC registry entry (initial value #f; print name unused — set()
+    ; renders nothing).
+    procedure iicborder(mutable this: ref[Interpreter], mutable name: Slice[char], index: int)
+    {
+        let ic this.make_proto_ic(name, IC_BORDER, name, index)
+        ic.obj := this.make_false()
+        this.finish_ic(ic)
+    }
+
+    procedure set_extensions_on(on: bool) mutable xt_extensions_on
+        xt_extensions_on := on
+
+    ; installFlowObjs — the standard flow-object classes of this slice
+    ; (reference installs all ~45 unconditionally; the rest land with their
+    ; SgmlFOTBuilder methods).
+    procedure install_flow_objs(mutable this: ref[Interpreter])
+    {
+        this.bind_flow_object_class(this.lookup(StringC("paragraph")), FOC_PARAGRAPH)
+        this.bind_flow_object_class(this.lookup(StringC("paragraph-break")), FOC_PARAGRAPH_BREAK)
+        this.bind_flow_object_class(this.lookup(StringC("display-group")), FOC_DISPLAY_GROUP)
+        this.bind_flow_object_class(this.lookup(StringC("line-field")), FOC_LINE_FIELD)
+        this.bind_flow_object_class(this.lookup(StringC("simple-page-sequence")), FOC_SIMPLE_PAGE_SEQUENCE)
+        this.bind_flow_object_class(this.lookup(StringC("table")), FOC_TABLE)
+        this.bind_flow_object_class(this.lookup(StringC("table-part")), FOC_TABLE_PART)
+        this.bind_flow_object_class(this.lookup(StringC("table-column")), FOC_TABLE_COLUMN)
+        this.bind_flow_object_class(this.lookup(StringC("table-row")), FOC_TABLE_ROW)
+        this.bind_flow_object_class(this.lookup(StringC("table-cell")), FOC_TABLE_CELL)
+        this.bind_flow_object_class(this.lookup(StringC("table-border")), FOC_TABLE_BORDER)
+        this.bind_flow_object_class(this.lookup(StringC("rule")), FOC_RULE)
+        this.bind_flow_object_class(this.lookup(StringC("link")), FOC_LINK)
+        this.bind_flow_object_class(this.lookup(StringC("external-graphic")), FOC_EXTERNAL_GRAPHIC)
+        this.bind_flow_object_class(this.lookup(StringC("leader")), FOC_LEADER)
+        this.bind_flow_object_class(this.lookup(StringC("box")), FOC_BOX)
+        this.bind_flow_object_class(this.lookup(StringC("score")), FOC_SCORE)
+        this.bind_flow_object_class(this.lookup(StringC("scroll")), FOC_SCROLL)
+        ; the INLINE/MARK family (reference order: character and the two
+        ; inline marks sit with the print classes, the three Universitat-
+        ; Politecnica additions after the page/column model).
+        this.bind_flow_object_class(this.lookup(StringC("character")), FOC_CHARACTER)
+        this.bind_flow_object_class(this.lookup(StringC("alignment-point")), FOC_ALIGNMENT_POINT)
+        this.bind_flow_object_class(this.lookup(StringC("sideline")), FOC_SIDELINE)
+        this.bind_flow_object_class(this.lookup(StringC("anchor")), FOC_ANCHOR)
+        this.bind_flow_object_class(this.lookup(StringC("glyph-annotation")), FOC_GLYPH_ANNOTATION)
+        this.bind_flow_object_class(this.lookup(StringC("emphasizing-mark")), FOC_EMPHASIZING_MARK)
+        ; the MATH family (installFlowObjs' `// math` block, in its order).
+        this.bind_flow_object_class(this.lookup(StringC("math-sequence")), FOC_MATH_SEQUENCE)
+        this.bind_flow_object_class(this.lookup(StringC("fraction")), FOC_FRACTION)
+        this.bind_flow_object_class(this.lookup(StringC("unmath")), FOC_UNMATH)
+        this.bind_flow_object_class(this.lookup(StringC("superscript")), FOC_SUPERSCRIPT)
+        this.bind_flow_object_class(this.lookup(StringC("subscript")), FOC_SUBSCRIPT)
+        this.bind_flow_object_class(this.lookup(StringC("script")), FOC_SCRIPT)
+        this.bind_flow_object_class(this.lookup(StringC("mark")), FOC_MARK)
+        this.bind_flow_object_class(this.lookup(StringC("fence")), FOC_FENCE)
+        this.bind_flow_object_class(this.lookup(StringC("radical")), FOC_RADICAL)
+        this.bind_flow_object_class(this.lookup(StringC("math-operator")), FOC_MATH_OPERATOR)
+        this.bind_flow_object_class(this.lookup(StringC("grid")), FOC_GRID)
+        this.bind_flow_object_class(this.lookup(StringC("grid-cell")), FOC_GRID_CELL)
+        ; the LAYOUT-COMPOSITE family (installFlowObjs binds them between the
+        ; page/column model and the tables, in this order).
+        this.bind_flow_object_class(this.lookup(StringC("embedded-text")), FOC_EMBEDDED_TEXT)
+        this.bind_flow_object_class(this.lookup(StringC("included-container-area")), FOC_INCLUDED_CONTAINER_AREA)
+        this.bind_flow_object_class(this.lookup(StringC("side-by-side")), FOC_SIDE_BY_SIDE)
+        this.bind_flow_object_class(this.lookup(StringC("side-by-side-item")), FOC_SIDE_BY_SIDE_ITEM)
+        this.bind_flow_object_class(this.lookup(StringC("aligned-column")), FOC_ALIGNED_COLUMN)
+        ; the ONLINE family (installFlowObjs binds them right after `scroll`).
+        this.bind_flow_object_class(this.lookup(StringC("marginalia")), FOC_MARGINALIA)
+        this.bind_flow_object_class(this.lookup(StringC("multi-mode")), FOC_MULTI_MODE)
+        ; the PAGE/COLUMN MODEL — the reference binds these two immediately
+        ; after `simple-page-sequence` (FlowObj.cxx:2996-2998), the last two
+        ; entries of the registry that were still missing here.
+        this.bind_flow_object_class(this.lookup(StringC("page-sequence")), FOC_PAGE_SEQUENCE)
+        this.bind_flow_object_class(this.lookup(StringC("column-set-sequence")), FOC_COLUMN_SET_SEQUENCE)
+    }
+
+    ; allocGlyphSubstTableUniqueId — the fot dump's gst<n> id counter.
+    procedure alloc_gst_unique_id(mutable this: ref[Interpreter]) returns int
+    {
+        let n this.next_gst_unique_id
+        this.next_gst_unique_id := n + 1
+        n
+    }
+
+    ; bind an identifier's VALUE to a FlowObjBox carrying `foc` (the DSSSL flow-
+    ; object-class binding; NOT a new Identifier field — see ELObj FOC note).
+    procedure bind_flow_object_class(mutable this: ref[Interpreter], mutable ident: ref[Identifier], foc: int)
+    {
+        let fo FlowObj.make(this.host, foc)
+        let box ELObj.make_flowobj_box(this.host, fo)
+        ident.set_definition(0xFFFFFFFF, Location(), box)
+    }
+
+    ; declare-flow-object-macro's binding: a FlowObjBox carrying the macro
+    ; seed (FOC_MACRO + the shared definition + one empty characteristic slot
+    ; per declared name). Every `make` of the name copies that seed.
+    procedure bind_flow_object_macro(mutable this: ref[Interpreter], mutable ident: ref[Identifier], def: ref[MacroDef])
+    {
+        let fo FlowObj.make_macro(this.host, def)
+        let box ELObj.make_flowobj_box(this.host, fo)
+        ident.set_definition(0xFFFFFFFF, Location(), box)
+    }
+
+    ; installExtensionFlowObjectClass — bind an identifier to a transform flow
+    ; object class keyed on its public id (the jade/dazzle-net extension table).
+    ; The active backend decides whether the extension table is present
+    ; (jade.cxx: only the transform backends pass extensions): with extensions
+    ; off (-t fot), every id except the always-available formatting-instruction
+    ; binds the reference's UnknownFlowObj (key-swallowing, content-
+    ; transparent). An unrecognised id under the transform backends keeps the
+    ; historical FOC_SEQUENCE fallback (corpus-validated).
+    procedure install_extension_flow_object_class(mutable this: ref[Interpreter], mutable ident: ref[Identifier], public_id: StringC)
+    {
+        if xt_extensions_on = false
+        {
+            var xfoc FOC_UNKNOWN
+            if public_id.equals(StringC("UNREGISTERED::James Clark//Flow Object Class::formatting-instruction"))
+                xfoc := FOC_FORMATTING_INSTRUCTION
+            ; the TeX backend's own two extension classes (jade.cxx passes
+            ; them in the makeTeXFOTBuilder extension table).
+            if this.tex_extensions
+            {
+                if public_id.equals(StringC("UNREGISTERED::Sebastian Rahtz//Flow Object Class::page-float"))
+                    xfoc := FOC_PAGE_FLOAT
+                if public_id.equals(StringC("UNREGISTERED::Sebastian Rahtz//Flow Object Class::page-footnote"))
+                    xfoc := FOC_PAGE_FOOTNOTE
+            }
+            ; the MIF backend's own extension class (jade.cxx passes it in the
+            ; makeMifFOTBuilder extension table).
+            if this.mif_extensions
+            {
+                if public_id.equals(StringC("UNREGISTERED::ISOGEN//Flow Object Class::index-entry"))
+                    xfoc := FOC_INDEX_ENTRY
+            }
+            this.bind_flow_object_class(ident, xfoc)
+            return
+        }
+        var foc FOC_SEQUENCE
+        if public_id.equals(StringC("UNREGISTERED::James Clark//Flow Object Class::element"))
+            foc := FOC_ELEMENT
+        else if public_id.equals(StringC("UNREGISTERED::James Clark//Flow Object Class::empty-element"))
+            foc := FOC_EMPTY_ELEMENT
+        else if public_id.equals(StringC("UNREGISTERED::James Clark//Flow Object Class::entity"))
+            foc := FOC_ENTITY
+        else if public_id.equals(StringC("UNREGISTERED::James Clark//Flow Object Class::entity-ref"))
+            foc := FOC_ENTITY_REF
+        else if public_id.equals(StringC("UNREGISTERED::James Clark//Flow Object Class::processing-instruction"))
+            foc := FOC_PROCESSING_INSTRUCTION
+        else if public_id.equals(StringC("UNREGISTERED::James Clark//Flow Object Class::document-type"))
+            foc := FOC_DOCUMENT_TYPE
+        else if public_id.equals(StringC("UNREGISTERED::James Clark//Flow Object Class::formatting-instruction"))
+            foc := FOC_FORMATTING_INSTRUCTION
+        else if public_id.equals(StringC("UNREGISTERED::Dazzle//Flow Object Class::directory"))
+            foc := FOC_DIRECTORY
+        this.bind_flow_object_class(ident, foc)
+    }
+
+    ; --- primitives --------------------------------------------------------
+    procedure install_primitive(mutable this: ref[Interpreter], mutable name: Slice[char], prim_id: int, mutable sig: Signature)
+    {
+        let ident this.lookup(StringC(name))
+        let prim ELObj.make_primitive(this.host, sig, prim_id)
+        prim.primitive_set_ident(ident)
+        ident.set_definition(0xFFFFFFFF, Location(), prim)
+        ; every standard primitive is reachable via external-procedure under
+        ; its ISO public id (reference installPrimitive).
+        this.register_external_proc("ISO/IEC 10179:1996//Procedure::", name, prim)
+    }
+
+    ; The PRIMITIVE2 macro (primitive.cxx:5333): `if (dsssl2())
+    ; installPrimitive(...)`. Without the `-2` flag these eleven names are
+    ; UNDEFINED VARIABLES in the reference, not procedures — measured against
+    ; the reference binary, which reports `reference to undefined variable
+    ; "vector?"` and friends. This port used to install them unconditionally.
+    procedure install_primitive2(mutable this: ref[Interpreter], mutable name: Slice[char], prim_id: int, mutable sig: Signature)
+    {
+        if this.dsssl2
+            this.install_primitive(name, prim_id, sig)
+    }
+
+    ; installXPrimitive — an extension primitive: NOT bound to its identifier
+    ; (only external-procedure reaches it), registered under prefix+name.
+    procedure install_x_primitive(mutable this: ref[Interpreter], prefix: Slice[char], name: Slice[char], prim_id: int, mutable sig: Signature)
+    {
+        let ident this.lookup(StringC(name))
+        let prim ELObj.make_primitive(this.host, sig, prim_id)
+        prim.primitive_set_ident(ident)
+        this.register_external_proc(prefix, name, prim)
+    }
+
+    procedure register_external_proc(mutable this: ref[Interpreter], prefix: Slice[char], name: Slice[char], value: ref[ELObj])
+    {
+        let host this.host
+        let buf Array[u32]^host()
+        var i: size_t 0
+        while i < prefix.length
+        {
+            buf.add(prefix[i] as u32)
+            i := i + 1
+        }
+        i := 0
+        while i < name.length
+        {
+            buf.add(name[i] as u32)
+            i := i + 1
+        }
+        let pubid StringC^host(buf.as_slice())
+        this.external_proc_table.add(ExternalProc.make(host, pubid, value))
+    }
+
+    ; lookupExternalProc — external-procedure's table probe; null = unknown.
+    function lookup_external_proc(this: ref[Interpreter], pubid: StringC) returns ref[ELObj]?
+    {
+        let n this.external_proc_table.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let ep this.external_proc_table.get(i)
+            if ep <> null
+            {
+                let e *ep
+                if e.pubid.equals(pubid)
+                    return e.value
+            }
+            i := i + 1
+        }
+        null
+    }
+
+    ; installPrimitives (Interpreter.cs). Inc-3 starter batch: the pure-ELObj
+    ; primitives. String/char/vector and grove/sosofo/style primitives join
+    ; with their machinery.
+    procedure install_primitives(mutable this: ref[Interpreter])
+    {
+        this.install_primitive("cons", PRIM_CONS, Signature(2, 0, false))
+        this.install_primitive("list", PRIM_LIST, Signature(0, 0, true))
+        this.install_primitive("car", PRIM_CAR, Signature(1, 0, false))
+        this.install_primitive("cdr", PRIM_CDR, Signature(1, 0, false))
+        this.install_primitive("null?", PRIM_IS_NULL, Signature(1, 0, false))
+        this.install_primitive("pair?", PRIM_IS_PAIR, Signature(1, 0, false))
+        this.install_primitive("list?", PRIM_IS_LIST, Signature(1, 0, false))
+        this.install_primitive("length", PRIM_LENGTH, Signature(1, 0, false))
+        this.install_primitive("append", PRIM_APPEND, Signature(0, 0, true))
+        this.install_primitive("reverse", PRIM_REVERSE, Signature(1, 0, false))
+        this.install_primitive("list-ref", PRIM_LIST_REF, Signature(2, 0, false))
+        this.install_primitive2("memv", PRIM_MEMV, Signature(2, 0, false))
+        this.install_primitive("member", PRIM_MEMBER, Signature(2, 0, false))
+        this.install_primitive("equal?", PRIM_IS_EQUAL, Signature(2, 0, false))
+        this.install_primitive2("eqv?", PRIM_IS_EQV, Signature(2, 0, false))
+        this.install_primitive("not", PRIM_NOT, Signature(1, 0, false))
+        this.install_primitive("+", PRIM_PLUS, Signature(0, 0, true))
+        this.install_primitive("-", PRIM_MINUS, Signature(1, 0, true))
+        this.install_primitive("*", PRIM_TIMES, Signature(0, 0, true))
+        this.install_primitive("/", PRIM_DIVIDE, Signature(1, 0, true))
+        this.install_primitive("=", PRIM_NUM_EQ, Signature(0, 0, true))
+        this.install_primitive("<", PRIM_LESS, Signature(0, 0, true))
+        this.install_primitive(">", PRIM_GREATER, Signature(0, 0, true))
+        this.install_primitive("<=", PRIM_LESS_EQ, Signature(0, 0, true))
+        this.install_primitive(">=", PRIM_GREATER_EQ, Signature(0, 0, true))
+        this.install_primitive("zero?", PRIM_IS_ZERO, Signature(1, 0, false))
+        this.install_primitive("positive?", PRIM_IS_POSITIVE, Signature(1, 0, false))
+        this.install_primitive("negative?", PRIM_IS_NEGATIVE, Signature(1, 0, false))
+        this.install_primitive("odd?", PRIM_IS_ODD, Signature(1, 0, false))
+        this.install_primitive("even?", PRIM_IS_EVEN, Signature(1, 0, false))
+        this.install_primitive("abs", PRIM_ABS, Signature(1, 0, false))
+        this.install_primitive("modulo", PRIM_MODULO, Signature(2, 0, false))
+        this.install_primitive("round", PRIM_ROUND, Signature(1, 0, false))
+        this.install_primitive("remainder", PRIM_REMAINDER, Signature(2, 0, false))
+        this.install_primitive("quotient", PRIM_QUOTIENT, Signature(2, 0, false))
+        this.install_primitive("number?", PRIM_IS_NUMBER, Signature(1, 0, false))
+        this.install_primitive("integer?", PRIM_IS_INTEGER, Signature(1, 0, false))
+        this.install_primitive("real?", PRIM_IS_REAL, Signature(1, 0, false))
+        this.install_primitive("string?", PRIM_IS_STRING, Signature(1, 0, false))
+        this.install_primitive("symbol?", PRIM_IS_SYMBOL, Signature(1, 0, false))
+        this.install_primitive("char?", PRIM_IS_CHAR, Signature(1, 0, false))
+        this.install_primitive("boolean?", PRIM_IS_BOOLEAN, Signature(1, 0, false))
+        this.install_primitive("procedure?", PRIM_IS_PROCEDURE, Signature(1, 0, false))
+        this.install_primitive2("vector?", PRIM_IS_VECTOR, Signature(1, 0, false))
+        this.install_primitive("keyword?", PRIM_IS_KEYWORD, Signature(1, 0, false))
+        ; --- string / char / symbol / keyword / vector --------------------
+        this.install_primitive("symbol->string", PRIM_SYMBOL_TO_STRING, Signature(1, 0, false))
+        this.install_primitive("string->symbol", PRIM_STRING_TO_SYMBOL, Signature(1, 0, false))
+        this.install_primitive("keyword->string", PRIM_KEYWORD_TO_STRING, Signature(1, 0, false))
+        this.install_primitive("string->keyword", PRIM_STRING_TO_KEYWORD, Signature(1, 0, false))
+        this.install_primitive("string-append", PRIM_STRING_APPEND, Signature(0, 0, true))
+        this.install_primitive("string-length", PRIM_STRING_LENGTH, Signature(1, 0, false))
+        this.install_primitive("string-ref", PRIM_STRING_REF, Signature(2, 0, false))
+        this.install_primitive("substring", PRIM_SUBSTRING, Signature(3, 0, false))
+        this.install_primitive("string", PRIM_STRING, Signature(0, 0, true))
+        this.install_primitive("string=?", PRIM_STRING_EQUAL, Signature(2, 0, false))
+        this.install_primitive("string<?", PRIM_STRING_LESS, Signature(2, 0, false))
+        this.install_primitive("string<=?", PRIM_STRING_LESS_EQ, Signature(2, 0, false))
+        this.install_primitive("string->list", PRIM_STRING_TO_LIST, Signature(1, 0, false))
+        this.install_primitive("list->string", PRIM_LIST_TO_STRING, Signature(1, 0, false))
+        this.install_primitive("string->number", PRIM_STRING_TO_NUMBER, Signature(1, 1, false))
+        this.install_primitive("number->string", PRIM_NUMBER_TO_STRING, Signature(1, 1, false))
+        this.install_primitive("char<?", PRIM_CHAR_LESS, Signature(2, 0, false))
+        this.install_primitive("char<=?", PRIM_CHAR_LESS_EQ, Signature(2, 0, false))
+        this.install_primitive("char=?", PRIM_CHAR_EQUAL, Signature(2, 0, false))
+        this.install_primitive("char-upcase", PRIM_CHAR_UPCASE, Signature(1, 0, false))
+        this.install_primitive("char-downcase", PRIM_CHAR_DOWNCASE, Signature(1, 0, false))
+        ; the vector family is PRIMITIVE2 throughout (primitive.h:180-187)
+        this.install_primitive2("make-vector", PRIM_MAKE_VECTOR, Signature(1, 1, false))
+        this.install_primitive2("vector", PRIM_VECTOR, Signature(0, 0, true))
+        this.install_primitive2("vector-ref", PRIM_VECTOR_REF, Signature(2, 0, false))
+        this.install_primitive2("vector-set!", PRIM_VECTOR_SET, Signature(3, 0, false))
+        this.install_primitive2("vector-fill!", PRIM_VECTOR_FILL, Signature(2, 0, false))
+        this.install_primitive2("vector->list", PRIM_VECTOR_TO_LIST, Signature(1, 0, false))
+        this.install_primitive2("list->vector", PRIM_LIST_TO_VECTOR, Signature(1, 0, false))
+        this.install_primitive("list-tail", PRIM_LIST_TAIL, Signature(2, 0, false))
+        ; --- grove / node-list (Inc 4) ------------------------------------
+        this.install_primitive("node-list?", PRIM_IS_NODE_LIST, Signature(1, 0, false))
+        this.install_primitive("node-list-empty?", PRIM_NODE_LIST_EMPTY, Signature(1, 0, false))
+        this.install_primitive("node-list-error", PRIM_NODE_LIST_ERROR, Signature(2, 0, false))
+        this.install_primitive("node-list-length", PRIM_NODE_LIST_LENGTH, Signature(1, 0, false))
+        this.install_primitive("node-list-first", PRIM_NODE_LIST_FIRST, Signature(1, 0, false))
+        this.install_primitive("node-list-rest", PRIM_NODE_LIST_REST, Signature(1, 0, false))
+        this.install_primitive("node-list-ref", PRIM_NODE_LIST_REF, Signature(2, 0, false))
+        this.install_primitive("empty-node-list", PRIM_EMPTY_NODE_LIST, Signature(0, 0, false))
+        this.install_primitive("node-list", PRIM_NODE_LIST, Signature(0, 0, true))
+        this.install_primitive("children", PRIM_CHILDREN, Signature(1, 0, false))
+        this.install_primitive("preced", PRIM_PRECED, Signature(1, 0, false))
+        this.install_primitive("follow", PRIM_FOLLOW, Signature(1, 0, false))
+        this.install_primitive("select-by-class", PRIM_SELECT_BY_CLASS, Signature(2, 0, false))
+        this.install_primitive("attributes", PRIM_ATTRIBUTES, Signature(1, 0, false))
+        this.install_primitive("named-node-list?", PRIM_IS_NAMED_NODE_LIST, Signature(1, 0, false))
+        this.install_primitive("named-node", PRIM_NAMED_NODE, Signature(2, 0, false))
+        this.install_primitive("named-node-list-names", PRIM_NAMED_NODE_LIST_NAMES, Signature(1, 0, false))
+        this.install_primitive("named-node-list-normalize", PRIM_NAMED_NODE_LIST_NORMALIZE, Signature(3, 0, false))
+        this.install_primitive("gi", PRIM_GI, Signature(0, 1, false))
+        this.install_primitive("data", PRIM_DATA, Signature(1, 0, false))
+        ; --- grove / property axis (Inc 4) --------------------------------
+        this.install_primitive("parent", PRIM_PARENT, Signature(0, 1, false))
+        this.install_primitive("attribute-string", PRIM_ATTRIBUTE_STRING, Signature(1, 1, false))
+        this.install_primitive("inherited-attribute-string", PRIM_INHERITED_ATTRIBUTE_STRING, Signature(1, 1, false))
+        this.install_primitive("ancestor", PRIM_ANCESTOR, Signature(1, 1, false))
+        this.install_primitive("descendants", PRIM_DESCENDANTS, Signature(1, 0, false))
+        this.install_primitive("sosofo?", PRIM_IS_SOSOFO, Signature(1, 0, false))
+        this.install_primitive("empty-sosofo", PRIM_EMPTY_SOSOFO, Signature(0, 0, false))
+        this.install_primitive("sosofo-append", PRIM_SOSOFO_APPEND, Signature(0, 0, true))
+        this.install_primitive("process-children", PRIM_PROCESS_CHILDREN, Signature(0, 0, false))
+        this.install_primitive("process-children-trim", PRIM_PROCESS_CHILDREN_TRIM, Signature(0, 0, false))
+        this.install_primitive("process-element-with-id", PRIM_PROCESS_ELEMENT_WITH_ID, Signature(1, 0, false))
+        this.install_primitive("process-node-list", PRIM_PROCESS_NODE_LIST, Signature(1, 0, false))
+        this.install_primitive("current-node", PRIM_CURRENT_NODE, Signature(0, 0, false))
+        this.install_primitive("literal", PRIM_LITERAL, Signature(0, 0, true))
+        this.install_primitive("next-match", PRIM_NEXT_MATCH, Signature(0, 1, false))
+        this.install_primitive("select-elements", PRIM_SELECT_ELEMENTS, Signature(2, 0, false))
+        this.install_primitive("element-with-id", PRIM_ELEMENT_WITH_ID, Signature(1, 1, false))
+        this.install_primitive("id", PRIM_ID, Signature(0, 1, false))
+        this.install_primitive("first-sibling?", PRIM_IS_FIRST_SIBLING, Signature(0, 1, false))
+        this.install_primitive("absolute-first-sibling?", PRIM_IS_ABSOLUTE_FIRST_SIBLING, Signature(0, 1, false))
+        this.install_primitive("last-sibling?", PRIM_IS_LAST_SIBLING, Signature(0, 1, false))
+        this.install_primitive("absolute-last-sibling?", PRIM_IS_ABSOLUTE_LAST_SIBLING, Signature(0, 1, false))
+        this.install_primitive("have-ancestor?", PRIM_HAVE_ANCESTOR, Signature(1, 1, false))
+        this.install_primitive("child-number", PRIM_CHILD_NUMBER, Signature(0, 1, false))
+        this.install_primitive("hierarchical-number-recursive", PRIM_HIERARCHICAL_NUMBER_RECURSIVE, Signature(1, 1, false))
+        this.install_primitive("element-number", PRIM_ELEMENT_NUMBER, Signature(0, 1, false))
+        this.install_primitive("entity-public-id", PRIM_ENTITY_PUBLIC_ID, Signature(1, 1, false))
+        this.install_primitive("entity-generated-system-id", PRIM_ENTITY_GENERATED_SYSTEM_ID, Signature(1, 1, false))
+        this.install_primitive("entity-notation", PRIM_ENTITY_NOTATION, Signature(1, 1, false))
+        this.install_primitive("entity-system-id", PRIM_ENTITY_SYSTEM_ID, Signature(1, 1, false))
+        this.install_primitive("general-name-normalize", PRIM_GENERAL_NAME_NORMALIZE, Signature(1, 1, false))
+        this.install_primitive("node-list=?", PRIM_IS_NODE_LIST_EQUAL, Signature(2, 0, false))
+        this.install_primitive("node-list-map", PRIM_NODE_LIST_MAP, Signature(2, 0, false))
+        this.install_primitive("node-list-reverse", PRIM_NODE_LIST_REVERSE, Signature(1, 0, false))
+        this.install_primitive("sgml-parse", PRIM_SGML_PARSE, Signature(1, 0, true))
+        ; reference PRIMITIVE(NodeProperty, "node-property", 2, 0, 1) — the
+        ; keyword args (default:/null:/rcs?) arrive through the rest slot.
+        this.install_primitive("node-property", PRIM_NODE_PROPERTY, Signature(2, 0, true))
+        this.install_primitive("page-number-sosofo", PRIM_PAGE_NUMBER_SOSOFO, Signature(0, 0, false))
+        this.install_primitive("current-node-page-number-sosofo", PRIM_CURRENT_NODE_PAGE_NUMBER_SOSOFO, Signature(0, 0, false))
+        this.install_primitive("format-number", PRIM_FORMAT_NUMBER, Signature(2, 0, false))
+        this.install_primitive("format-number-list", PRIM_FORMAT_NUMBER_LIST, Signature(3, 0, false))
+        ; reference neighborhood: Error sits between format-number-list and
+        ; external-procedure (primitive.h).
+        this.install_primitive("error", PRIM_ERROR, Signature(1, 0, false))
+        this.install_primitive("external-procedure", PRIM_EXTERNAL_PROCEDURE, Signature(1, 0, false))
+        ; length-spec / space / color (Family-B front)
+        this.install_primitive("display-size", PRIM_DISPLAY_SIZE, Signature(0, 0, false))
+        this.install_primitive("table-unit", PRIM_TABLE_UNIT, Signature(1, 0, false))
+        this.install_primitive("display-space?", PRIM_IS_DISPLAY_SPACE, Signature(1, 0, false))
+        this.install_primitive("display-space", PRIM_DISPLAY_SPACE, Signature(1, 0, true))
+        this.install_primitive("inline-space?", PRIM_IS_INLINE_SPACE, Signature(1, 0, false))
+        this.install_primitive("inline-space", PRIM_INLINE_SPACE, Signature(1, 0, true))
+        this.install_primitive("color?", PRIM_IS_COLOR, Signature(1, 0, false))
+        this.install_primitive("color-space?", PRIM_IS_COLOR_SPACE, Signature(1, 0, false))
+        this.install_primitive("color", PRIM_COLOR, Signature(1, 0, true))
+        this.install_primitive("color-space", PRIM_COLOR_SPACE, Signature(1, 0, true))
+        ; addresses (reference neighborhood: IsAddress..NodeListAddress sit
+        ; between color-space and hytime-linkend)
+        this.install_primitive("address?", PRIM_IS_ADDRESS, Signature(1, 0, false))
+        this.install_primitive("address-local?", PRIM_IS_ADDRESS_LOCAL, Signature(1, 0, false))
+        this.install_primitive("address-visited?", PRIM_IS_ADDRESS_VISITED, Signature(1, 0, false))
+        this.install_primitive("current-node-address", PRIM_CURRENT_NODE_ADDRESS, Signature(0, 0, false))
+        this.install_primitive("idref-address", PRIM_IDREF_ADDRESS, Signature(1, 0, false))
+        this.install_primitive("entity-address", PRIM_ENTITY_ADDRESS, Signature(1, 0, false))
+        this.install_primitive("sgml-document-address", PRIM_SGML_DOCUMENT_ADDRESS, Signature(2, 0, false))
+        this.install_primitive("node-list-address", PRIM_NODE_LIST_ADDRESS, Signature(1, 0, false))
+        this.install_primitive("hytime-linkend", PRIM_HYTIME_LINKEND, Signature(0, 0, false))
+        ; glyph ids / glyph substitution tables
+        this.install_primitive("glyph-id?", PRIM_IS_GLYPH_ID, Signature(1, 0, false))
+        this.install_primitive("glyph-id", PRIM_GLYPH_ID, Signature(1, 0, false))
+        this.install_primitive("glyph-subst-table?", PRIM_IS_GLYPH_SUBST_TABLE, Signature(1, 0, false))
+        this.install_primitive("glyph-subst-table", PRIM_GLYPH_SUBST_TABLE, Signature(1, 0, false))
+        this.install_primitive("glyph-subst", PRIM_GLYPH_SUBST, Signature(2, 0, false))
+        ; XPRIMITIVEs — reachable only via external-procedure (Clark prefix).
+        this.install_x_primitive("UNREGISTERED::James Clark//Procedure::", "read-entity", PRIM_READ_ENTITY, Signature(1, 0, false))
+        this.install_x_primitive("UNREGISTERED::James Clark//Procedure::", "debug", PRIM_DEBUG, Signature(1, 0, false))
+        this.install_x_primitive("UNREGISTERED::James Clark//Procedure::", "if-first-page", PRIM_IF_FIRST_PAGE, Signature(2, 0, false))
+        this.install_x_primitive("UNREGISTERED::James Clark//Procedure::", "if-front-page", PRIM_IF_FRONT_PAGE, Signature(2, 0, false))
+        this.install_x_primitive("UNREGISTERED::James Clark//Procedure::", "all-element-number", PRIM_ALL_ELEMENT_NUMBER, Signature(0, 1, false))
+        ; the numeric / transcendental family (primitive.h:50-57, 195-212)
+        this.install_primitive("min", PRIM_MIN, Signature(1, 0, true))
+        this.install_primitive("max", PRIM_MAX, Signature(1, 0, true))
+        this.install_primitive("floor", PRIM_FLOOR, Signature(1, 0, false))
+        this.install_primitive("ceiling", PRIM_CEILING, Signature(1, 0, false))
+        this.install_primitive("truncate", PRIM_TRUNCATE, Signature(1, 0, false))
+        this.install_primitive("sqrt", PRIM_SQRT, Signature(1, 0, false))
+        this.install_primitive("exact?", PRIM_IS_EXACT, Signature(1, 0, false))
+        this.install_primitive("inexact?", PRIM_IS_INEXACT, Signature(1, 0, false))
+        this.install_primitive("exp", PRIM_EXP, Signature(1, 0, false))
+        this.install_primitive("log", PRIM_LOG, Signature(1, 0, false))
+        this.install_primitive("sin", PRIM_SIN, Signature(1, 0, false))
+        this.install_primitive("cos", PRIM_COS, Signature(1, 0, false))
+        this.install_primitive("tan", PRIM_TAN, Signature(1, 0, false))
+        this.install_primitive("asin", PRIM_ASIN, Signature(1, 0, false))
+        this.install_primitive("acos", PRIM_ACOS, Signature(1, 0, false))
+        this.install_primitive("atan", PRIM_ATAN, Signature(1, 1, false))
+        this.install_primitive("expt", PRIM_EXPT, Signature(2, 0, false))
+        this.install_primitive("exact->inexact", PRIM_EXACT_TO_INEXACT, Signature(1, 0, false))
+        this.install_primitive("inexact->exact", PRIM_INEXACT_TO_EXACT, Signature(1, 0, false))
+        ; XXPRIMITIVEs — the OpenJade prefix; NOT bound to their identifier
+        ; (`expt` stays the ISO one installed just above).
+        this.install_x_primitive("UNREGISTERED::OpenJade//Procedure::", "expt", PRIM_X_EXPT, Signature(2, 0, false))
+        ; the extension sgml-parse — same stub, one keyword argument more
+        ; (`architecture:`).
+        this.install_x_primitive("UNREGISTERED::OpenJade//Procedure::", "sgml-parse", PRIM_X_SGML_PARSE, Signature(1, 0, true))
+        ; the remaining list / vector / quantity primitives
+        this.install_primitive("assoc", PRIM_ASSOC, Signature(2, 0, false))
+        this.install_primitive("map-constructor", PRIM_MAP_CONSTRUCTOR, Signature(2, 0, false))
+        this.install_primitive("quantity?", PRIM_IS_QUANTITY, Signature(1, 0, false))
+        this.install_primitive("quantity->number", PRIM_QUANTITY_TO_NUMBER, Signature(1, 0, false))
+        this.install_primitive2("quantity->string", PRIM_QUANTITY_TO_STRING, Signature(1, 1, false))
+        ; the entity / notation lookups (primitive.h:137-145)
+        this.install_primitive("entity-text", PRIM_ENTITY_TEXT, Signature(1, 1, false))
+        this.install_primitive("entity-type", PRIM_ENTITY_TYPE, Signature(1, 1, false))
+        this.install_primitive("entity-attribute-string", PRIM_ENTITY_ATTRIBUTE_STRING, Signature(2, 1, false))
+        this.install_primitive("entity-name-normalize", PRIM_ENTITY_NAME_NORMALIZE, Signature(1, 1, false))
+        this.install_primitive("notation-system-id", PRIM_NOTATION_SYSTEM_ID, Signature(1, 1, false))
+        this.install_primitive("notation-public-id", PRIM_NOTATION_PUBLIC_ID, Signature(1, 1, false))
+        this.install_primitive("notation-generated-system-id", PRIM_NOTATION_GENERATED_SYSTEM_ID, Signature(1, 1, false))
+        ; the numbering family
+        this.install_primitive("ancestor-child-number", PRIM_ANCESTOR_CHILD_NUMBER, Signature(1, 1, false))
+        this.install_primitive("hierarchical-number", PRIM_HIERARCHICAL_NUMBER, Signature(1, 1, false))
+        this.install_primitive("element-number-list", PRIM_ELEMENT_NUMBER_LIST, Signature(1, 1, false))
+        this.install_primitive("first-child-gi", PRIM_FIRST_CHILD_GI, Signature(0, 1, false))
+        this.install_primitive("node-list-no-order", PRIM_NODE_LIST_NO_ORDER, Signature(1, 0, false))
+        ; the process / sosofo / style cluster
+        this.install_primitive("sosofo-label", PRIM_SOSOFO_LABEL, Signature(2, 0, false))
+        this.install_primitive("sosofo-discard-labeled", PRIM_SOSOFO_DISCARD_LABELED, Signature(2, 0, false))
+        this.install_primitive("style?", PRIM_IS_STYLE, Signature(1, 0, false))
+        this.install_primitive("merge-style", PRIM_MERGE_STYLE, Signature(0, 0, true))
+        this.install_primitive("process-first-descendant", PRIM_PROCESS_FIRST_DESCENDANT, Signature(0, 0, true))
+        this.install_primitive("process-matching-children", PRIM_PROCESS_MATCHING_CHILDREN, Signature(0, 0, true))
+        this.install_primitive("inherited-element-attribute-string", PRIM_INHERITED_ELEMENT_ATTRIBUTE_STRING, Signature(2, 1, false))
+        this.install_primitive("match-element?", PRIM_IS_MATCH_ELEMENT, Signature(2, 0, false))
+        ; language / collation (primitive.h:220-222, 233)
+        this.install_primitive("language?", PRIM_IS_LANGUAGE, Signature(1, 0, false))
+        this.install_primitive("current-language", PRIM_CURRENT_LANGUAGE, Signature(0, 0, false))
+        this.install_primitive("with-language", PRIM_WITH_LANGUAGE, Signature(2, 0, false))
+        this.install_primitive("string-equiv?", PRIM_STRING_EQUIV, Signature(3, 0, false))
+        this.install_x_primitive("UNREGISTERED::OpenJade//Procedure::", "language", PRIM_LANGUAGE, Signature(2, 0, false))
+        ; character properties
+        this.install_primitive("char-property", PRIM_CHAR_PROPERTY, Signature(2, 1, false))
+        this.install_primitive("char-script-case", PRIM_CHAR_SCRIPT_CASE, Signature(1, 0, true))
+        ; the time family (primitive.h:58-59, 216-219) — `time->string` is the
+        ; only one with an optional argument, and the four comparisons take
+        ; exactly two.
+        this.install_primitive("time", PRIM_TIME, Signature(0, 0, false))
+        this.install_primitive("time->string", PRIM_TIME_TO_STRING, Signature(1, 1, false))
+        this.install_primitive("time<?", PRIM_TIME_LESS, Signature(2, 0, false))
+        this.install_primitive("time>?", PRIM_TIME_GREATER, Signature(2, 0, false))
+        this.install_primitive("time<=?", PRIM_TIME_LESS_EQ, Signature(2, 0, false))
+        this.install_primitive("time>=?", PRIM_TIME_GREATER_EQ, Signature(2, 0, false))
+        ; apply and call/cc are FunctionObj subclasses (custom call/tailCall),
+        ; not PrimitiveObj — install the dedicated arms. `apply` is
+        ; unconditional; call/cc and the string->quantity alias are the tail
+        ; of installPrimitives, both gated on dsssl2().
+        this.install_apply()
+        if this.dsssl2
+        {
+            this.install_call_cc()
+            ; `string->quantity` IS `string->number`: the reference copies the
+            ; identifier's computed value rather than installing a primitive.
+            let src this.lookup(StringC("string->number"))
+            let dst this.lookup(StringC("string->quantity"))
+            let v src.compute_value(false, this)
+            dst.set_definition(0xFFFFFFFF, Location(), v)
+        }
+    }
+
+    ; ApplyPrimitiveObj / CallWithCurrentContinuationPrimitiveObj — bound as
+    ; the ApplyFn / CallCCFn ELObj arms whose call() reshuffles / captures.
+    procedure install_apply(mutable this: ref[Interpreter])
+    {
+        let ident this.lookup(StringC("apply"))
+        let fn ELObj.make_apply_fn(this.host)
+        ident.set_definition(0xFFFFFFFF, Location(), fn)
+    }
+
+    ; ★Only the long name: the reference installs no `call/cc` abbreviation
+    ; (this port used to bind one), and this whole procedure is dsssl2-only.
+    procedure install_call_cc(mutable this: ref[Interpreter])
+    {
+        let fn ELObj.make_callcc_fn(this.host)
+        let id1 this.lookup(StringC("call-with-current-continuation"))
+        id1.set_definition(0xFFFFFFFF, Location(), fn)
+    }
+
+    ; --- named characters --------------------------------------------------
+    function lookup_char_entry(t: ref[Array[ref[CharPart]?]], name: StringC) returns ref[CharPart]?
+    {
+        let n t.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let p t[i]
+            if p.name.equals(name)
+                return p
+            i := i + 1
+        }
+        null
+    }
+
+    procedure insert_char_entry(mutable this: ref[Interpreter], mutable t: ref[Array[ref[CharPart]?]], mutable name: StringC, c: u32, def_part: u32)
+    {
+        let existing Interpreter.lookup_char_entry(t, name)
+        if existing <> null
+        {
+            existing.c := c
+            existing.def_part := def_part
+            return
+        }
+        let host this.host
+        let e &CharPart^host(StringC^host(name.as_slice()), c, def_part)
+        t.add(e)
+    }
+
+    ; the generated CharNames/Sdata tables install through these (defPart -1)
+    procedure def_char(mutable this: ref[Interpreter], mutable name: Slice[char], c: u32)
+        this.insert_char_entry(this.named_char_table, StringC(name), c, 0xFFFFFFFF)
+
+    procedure def_sdata_char(mutable this: ref[Interpreter], mutable name: Slice[char], c: u32)
+        this.insert_char_entry(this.sdata_entity_name_table, StringC(name), c, 0xFFFFFFFF)
+
+    ; bool convertCharName(const StringC &str, Char &c)
+    procedure convert_char_name(this: Interpreter, str: StringC, mutable c: ref[u32]) returns bool
+    {
+        let cp Interpreter.lookup_char_entry(named_char_table, str)
+        if cp <> null
+        {
+            c := cp.c
+            return true
+        }
+        Interpreter.convert_unicode_char_name(str, c)
+    }
+
+    ; Interpreter::sdataMap (style/Interpreter.cxx:590) — the SdataMapper the
+    ; grove's SdataNode::charChunk consults, and therefore the ONE character an
+    ; SDATA entity reference contributes to any backend. Four steps, in order:
+    ; the entity NAME table (the built-in sdata.h names plus map-sdata-entity
+    ; declarations), the entity TEXT table (map-sdata-entity only), a U-XXXX
+    ; name, and finally defaultChar. ★It NEVER fails — the reference returns 1
+    ; on the fallback too, deliberately ("at least it makes preserve-sdata work
+    ; with unknown SDATA entities"), so an sdata node's `char` is always
+    ; accessOK.
+    function sdata_map(this: Interpreter, name: StringC, text: StringC) returns u32
+    {
+        let byname Interpreter.lookup_char_entry(sdata_entity_name_table, name)
+        if byname <> null
+            return byname.c
+        let bytext Interpreter.lookup_char_entry(sdata_entity_text_table, text)
+        if bytext <> null
+            return bytext.c
+        var uc: u32 0
+        if Interpreter.convert_unicode_char_name(name, &uc)
+            return uc
+        DEFAULT_CHAR as u32
+    }
+
+    ; static bool convertUnicodeCharName(const StringC &str, Char &c): U-XXXX
+    procedure convert_unicode_char_name(str: StringC, mutable c: ref[u32]) returns bool
+    {
+        if str.get_size() <> 6
+            return false
+        if str.get(0) <> 0x55
+            return false
+        if str.get(1) <> 0x2D
+            return false
+        var value: u32 0
+        var i: size_t 2
+        while i < 6
+        {
+            let ch str.get(i)
+            value := value << (4 as u32)
+            if (ch >= 0x30) and (ch <= 0x39)
+                value := value | (ch - 0x30)
+            else if (ch >= 0x41) and (ch <= 0x46)
+                value := value | (10 + (ch - 0x41))
+            else
+                return false
+            i := i + 1
+        }
+        c := value
+        true
+    }
+
+    ; --- declaration hooks (style-specification declaration elements) ------
+    ; void setCharRepertoire(const StringC &pubid)
+    procedure set_char_repertoire(mutable this: ref[Interpreter], pubid: StringC)
+    {
+        if pubid.equals(StringC("UNREGISTERED::OpenJade//Character Repertoire::OpenJade"))
+        {
+            if this.strict_mode
+            {
+                CharNames.install(this)
+                Sdata.install(this)
+                this.lex_category_table.set_range(127, 0xFFFF, LEX_ADD_NAME_START as u8)
+                this.strict_mode := false
+            }
+        }
+        else
+            this.message1(InterpreterMessages.unsupportedCharRepertoire(), pubid)
+    }
+
+    ; void addStandardChar(const StringC &name, const StringC &num)
+    procedure add_standard_char(mutable this: ref[Interpreter], mutable name: StringC, num: StringC)
+    {
+        var n 0
+        var i: size_t 0
+        if Interpreter.scan_sign_digits(num, &i, &n) = false
+        {
+            this.message1(InterpreterMessages.invalidCharNumber(), num)
+            return
+        }
+        let def Interpreter.lookup_char_entry(this.named_char_table, name)
+        if def <> null
+        {
+            if this.d_part_index < def.def_part
+                this.insert_char_entry(this.named_char_table, name, n as u32, this.d_part_index)
+            else if (def.def_part = this.d_part_index) and (def.c <> (n as u32))
+                this.message1(InterpreterMessages.duplicateCharName(), name)
+        }
+        else
+            this.insert_char_entry(this.named_char_table, name, n as u32, this.d_part_index)
+    }
+
+    ; void addNameChar(const StringC &name)
+    procedure add_name_char(mutable this: ref[Interpreter], name: StringC)
+    {
+        let cp Interpreter.lookup_char_entry(this.named_char_table, name)
+        if cp = null
+        {
+            this.message1(InterpreterMessages.badCharName(), name)
+            return
+        }
+        if (this.lex_category_table.get(cp.c as i32) as int) <> LEX_OTHER
+        {
+            this.message0(InterpreterMessages.badDeclaration())
+            return
+        }
+        this.lex_category_table.set_char(cp.c, LEX_ADD_NAME_START as u8)
+    }
+
+    ; void addSeparatorChar(const StringC &name)
+    procedure add_separator_char(mutable this: ref[Interpreter], name: StringC)
+    {
+        let cp Interpreter.lookup_char_entry(this.named_char_table, name)
+        if cp = null
+        {
+            this.message1(InterpreterMessages.badCharName(), name)
+            return
+        }
+        if (this.lex_category_table.get(cp.c as i32) as int) <> LEX_OTHER
+        {
+            this.message0(InterpreterMessages.badDeclaration())
+            return
+        }
+        this.lex_category_table.set_char(cp.c, LEX_ADD_WHITESPACE as u8)
+    }
+
+    ; void addSdataEntity(const StringC &ename, const StringC &etext, const StringC &name)
+    procedure add_sdata_entity(mutable this: ref[Interpreter], mutable ename: StringC, mutable etext: StringC, name: StringC)
+    {
+        let cp Interpreter.lookup_char_entry(this.named_char_table, name)
+        if cp = null
+        {
+            this.message1(InterpreterMessages.badCharName(), name)
+            return
+        }
+        if ename.get_size() > 0
+        {
+            let def Interpreter.lookup_char_entry(this.sdata_entity_name_table, ename)
+            if def <> null
+            {
+                if this.d_part_index < def.def_part
+                    this.insert_char_entry(this.sdata_entity_name_table, ename, cp.c, this.d_part_index)
+                else if (def.def_part = this.d_part_index) and (def.c <> cp.c)
+                    this.message1(InterpreterMessages.duplicateSdataEntityName(), ename)
+            }
+            else
+                this.insert_char_entry(this.sdata_entity_name_table, ename, cp.c, this.d_part_index)
+        }
+        if etext.get_size() > 0
+        {
+            let def Interpreter.lookup_char_entry(this.sdata_entity_text_table, etext)
+            if def <> null
+            {
+                if this.d_part_index < def.def_part
+                    this.insert_char_entry(this.sdata_entity_text_table, etext, cp.c, this.d_part_index)
+                else if (def.def_part = this.d_part_index) and (def.c <> cp.c)
+                    this.message1(InterpreterMessages.duplicateSdataEntityText(), etext)
+            }
+            else
+                this.insert_char_entry(this.sdata_entity_text_table, etext, cp.c, this.d_part_index)
+        }
+    }
+
+    ; --- the `-2` string leniency ------------------------------------------
+    ; ELObj *convertFromString(ELObj *, unsigned hints, const Location &)
+    ; (Interpreter.cxx:1095). Under `-2` EVERY characteristic value passes
+    ; through here before its converter, so a STRING may stand in for the
+    ; number, symbol or boolean the converter wants. Without `-2` — and for
+    ; anything that is not a string — it returns the object unchanged.
+    ;
+    ; ★The hints belong to the CONVERTER, not to the key: convertLengthC
+    ; allows a number only, convertEnumC a symbol or a boolean. A union over
+    ; all three would be wrong, because it would reinterpret the value of a
+    ; genuine STRING characteristic (`entity-system-id: "5"` is the string
+    ; "5", never the number 5).
+    ;
+    ; ★The number arm resolves quantities: convertNumber answers an
+    ; UnresolvedLengthObj for "3pt", which is only a length once its unit is
+    ; resolved — and an undefined unit messages at `loc`.
+    procedure convert_from_string(mutable this: ref[Interpreter], mutable obj: ref[ELObj], hints: int, loc: Location) returns ref[ELObj]
+    {
+        ; FIXME fold to lower case  (the reference's own comment)
+        if this.dsssl2 = false
+            return obj
+        if obj.is_string_p() = false
+            return obj
+        let host this.host
+        let str obj.string_data(host)
+        if (hints & CONVERT_ALLOW_NUMBER) <> 0
+        {
+            let tem this.convert_number(str)
+            if tem <> null
+                return tem.resolve_quantities(true, this, loc) as ref[ELObj]
+        }
+        if (hints & CONVERT_ALLOW_SYMBOL) <> 0
+        {
+            ; ★a LOOKUP, not makeSymbol: a name that is no symbol yet must
+            ; not be interned here — and a symbol without a c-value (one that
+            ; no characteristic ever names) does not convert either.
+            let sym this.lookup_symbol(str)
+            if sym <> null
+            {
+                if sym.symbol_c_value() <> SYM_FALSE
+                    return sym as ref[ELObj]
+            }
+        }
+        if (hints & CONVERT_ALLOW_BOOLEAN) <> 0
+        {
+            let n str.get_size()
+            if n = 2
+            {
+                if Interpreter.equals_ascii(str, "no")
+                    return ELObj.make_false(host)
+            }
+            else if n = 3
+            {
+                if Interpreter.equals_ascii(str, "yes")
+                    return ELObj.make_true(host)
+            }
+            else if n = 4
+            {
+                if Interpreter.equals_ascii(str, "true")
+                    return ELObj.make_true(host)
+            }
+            else if n = 5
+            {
+                if Interpreter.equals_ascii(str, "false")
+                    return ELObj.make_false(host)
+            }
+        }
+        obj
+    }
+
+    ; static bool equal(const Char *s1, const char *s2, size_t n)
+    ; (Interpreter.cxx:1086) — the byte compare of the boolean arm.
+    function equals_ascii(str: StringC, lit: Slice[char]) returns bool
+    {
+        if str.get_size() <> lit.length
+            return false
+        var i: size_t 0
+        while i < lit.length
+        {
+            if str.get(i) <> (lit[i] as u32)
+                return false
+            i := i + 1
+        }
+        true
+    }
+
+    ; SymbolObj *symbolTable_.lookup(const StringC &) — the lookup half of
+    ; makeSymbol, WITHOUT the interning: convertFromString may not create a
+    ; symbol for a string that names none.
+    function lookup_symbol(this: ref[Interpreter], str: StringC) returns ref[ELObj]?
+    {
+        let hit this.symbol_index.lookup(str)
+        if hit = null
+            return null
+        hit
+    }
+
+    ; --- number conversion -------------------------------------------------
+    ; static bool scanSignDigits(const StringC &, size_t &i, int &n)
+    procedure scan_sign_digits(str: StringC, mutable i: ref[size_t], mutable n: ref[int]) returns bool
+    {
+        var negative false
+        if i < str.get_size()
+        {
+            if str.get(i) = 0x2D
+            {
+                i := i + 1
+                negative := true
+            }
+            else if str.get(i) = 0x2B
+                i := i + 1
+        }
+        let j: size_t i
+        var v 0
+        while i < str.get_size()
+        {
+            let ch str.get(i)
+            if (ch < 0x30) or (ch > 0x39)
+                break
+            if negative
+                v := v * 10 - ((ch - 0x30) as int)
+            else
+                v := v * 10 + ((ch - 0x30) as int)
+            i := i + 1
+        }
+        n := v
+        i <> j
+    }
+
+    ; ELObj *convertNumber(const StringC &str, int radix = 10)
+    procedure convert_number(mutable this: ref[Interpreter], str: StringC) returns ref[ELObj]?
+        this.convert_number_radix(str, 10)
+
+    procedure convert_number_radix(mutable this: ref[Interpreter], str: StringC, radix_in: int) returns ref[ELObj]?
+    {
+        var radix radix_in
+        if str.get_size() = 0
+            return null
+        var i: size_t 0
+        if str.get(0) = 0x23
+        {
+            ; '#' radix prefix: #d #x #o #b
+            if str.get_size() < 2
+                return null
+            let r str.get(1)
+            if r = 0x64
+                radix := 10
+            else if r = 0x78
+                radix := 16
+            else if r = 0x6F
+                radix := 8
+            else if r = 0x62
+                radix := 2
+            else
+                return null
+            i := i + 2
+        }
+        if i >= str.get_size()
+            return null
+        var negative false
+        if str.get(i) = 0x2D
+        {
+            negative := true
+            i := i + 1
+        }
+        else
+        {
+            if str.get(i) = 0x2B
+                i := i + 1
+        }
+        var had_decimal_point false
+        var had_digit false
+        var n 0
+        var exp 0
+        let long_max 0x7FFFFFFFFFFFFFFF
+        while i < str.get_size()
+        {
+            let c str.get(i)
+            var weight 0 - 1
+            if (c >= 0x30) and (c <= 0x39)
+                weight := (c - 0x30) as int
+            else if (c >= 0x61) and (c <= 0x66)
+                weight := ((c - 0x61) as int) + 10
+            if (weight >= 0) and (weight < radix)
+            {
+                had_digit := true
+                if negative
+                {
+                    ; -(unsigned long)n > (-(unsigned long)LONG_MIN - weight)/radix
+                    let neg_n 0 - (n as u64)
+                    let neg_min (long_max as u64) + 1
+                    if neg_n > (neg_min - (weight as u64)) / (radix as u64)
+                    {
+                        if radix <> 10
+                            return null
+                        return this.convert_number_float(str)
+                    }
+                    n := n * radix - weight
+                }
+                else
+                {
+                    if n > (long_max - weight) / radix
+                    {
+                        if radix <> 10
+                            return null
+                        return this.convert_number_float(str)
+                    }
+                    n := n * radix + weight
+                }
+                if had_decimal_point
+                    exp := exp - 1
+            }
+            else if (c = 0x2E) and (radix = 10)
+            {
+                if had_decimal_point
+                    return null
+                had_decimal_point := true
+            }
+            else
+                break
+            i := i + 1
+        }
+        if had_digit = false
+            return null
+        if (radix <> 10) and (i < str.get_size())
+            return null
+        if (i + 1) < str.get_size()
+        {
+            if str.get(i) = 0x65
+            {
+                ; 'e' exponent — but not when a letter follows ("1em" is a
+                ; quantity in the em unit)
+                if (this.lex_category_table.get(str.get(i + 1) as i32) as int) <> LEX_LETTER
+                {
+                    had_decimal_point := true
+                    i := i + 1
+                    var e 0
+                    if Interpreter.scan_sign_digits(str, &i, &e) = false
+                        return null
+                    exp := exp + e
+                }
+            }
+        }
+        if i < str.get_size()
+        {
+            var unit_exp 0
+            let unit this.scan_unit(str, i, &unit_exp)
+            if unit = null
+                return null
+            if unit_exp = 1
+                return ELObj.make_unresolved_length(this.host, n, exp, unit)
+            return this.convert_number_float(str)
+        }
+        if had_decimal_point
+            return this.convert_number_float(str)
+        ELObj.make_integer(this.host, n)
+    }
+
+    ; ELObj *convertNumberFloat(const StringC &str)
+    procedure convert_number_float(mutable this: ref[Interpreter], str: StringC) returns ref[ELObj]?
+    {
+        ; omit an optional #d radix prefix
+        var i0: size_t 0
+        if str.get_size() > 1
+        {
+            if (str.get(0) = 0x23) and (str.get(1) = 0x64)
+                i0 := 2
+        }
+        let host this.host
+        let cap (str.get_size() + 1) - i0
+        let buf allocate_slice[u8](host, cap)
+        var w: size_t 0
+        var i i0
+        while i < str.get_size()
+        {
+            let c str.get(i)
+            if (c > 127) or (c = 0)
+                return null
+            ; 'E' is a valid exponent marker for C but not for us
+            if c = 0x45
+                break
+            buf.put(w, c as u8)
+            w := w + 1
+            i := i + 1
+        }
+        buf.put(w, 0)
+        var endp: pointer[u8] null
+        let val strtod(buf.data as pointer[const_char], &endp)
+        let consumed (endp as size_t) - (buf.data as size_t)
+        if consumed = (str.get_size() - i0)
+            return ELObj.make_real(host, val)
+        if consumed = 0
+            return null
+        var unit_exp 0
+        let unit this.scan_unit(str, consumed + i0, &unit_exp)
+        if unit = null
+            return null
+        ELObj.make_unresolved_quantity(host, val, unit, unit_exp)
+    }
+
+    ; Unit *scanUnit(const StringC &str, size_t i, int &unitExp) — null on error.
+    procedure scan_unit(mutable this: ref[Interpreter], str: StringC, i_in: size_t, mutable unit_exp: ref[int]) returns ref[Unit]?
+    {
+        let host this.host
+        var i i_in
+        let name_chars Array[u32]^host()
+        while i < str.get_size()
+        {
+            let c str.get(i)
+            if (c = 0x2D) or (c = 0x2B) or ((c >= 0x30) and (c <= 0x39))
+                break
+            name_chars.add(c)
+            i := i + 1
+        }
+        if i >= str.get_size()
+            unit_exp := 1
+        else
+        {
+            var e 0
+            var neg false
+            if (str.get(i) = 0x2D) or (str.get(i) = 0x2B)
+            {
+                if str.get(i) = 0x2D
+                    neg := true
+                i := i + 1
+                if i >= str.get_size()
+                    return null
+            }
+            while i < str.get_size()
+            {
+                let c str.get(i)
+                if (c < 0x30) or (c > 0x39)
+                    return null
+                e := e * 10
+                if neg
+                    e := e - ((c - 0x30) as int)
+                else
+                    e := e + ((c - 0x30) as int)
+                i := i + 1
+            }
+            unit_exp := e
+        }
+        let unit_name StringC^host(name_chars.as_slice())
+        this.lookup_unit(unit_name)
+    }
+
+    ; --- Messenger seam ----------------------------------------------------
+    procedure set_next_location(mutable this: ref[Interpreter], loc: Location)
+        this.next_loc := loc
+
+    function get_error_count(this: Interpreter) returns int
+        error_count
+
+    procedure message0(mutable this: ref[Interpreter], mt: MessageType)
+    {
+        let args Vector[MessageArg]()
+        this.emit(mt, args)
+    }
+
+    procedure message1(mutable this: ref[Interpreter], mt: MessageType, a1: StringC)
+    {
+        var args Vector[MessageArg](1)
+        *(args.get(0)) := MessageArg.Str(a1)
+        this.emit(mt, args)
+    }
+
+    procedure message2(mutable this: ref[Interpreter], mt: MessageType, a1: StringC, a2: StringC)
+    {
+        var args Vector[MessageArg](2)
+        *(args.get(0)) := MessageArg.Str(a1)
+        *(args.get(1)) := MessageArg.Str(a2)
+        this.emit(mt, args)
+    }
+
+    ; NumberMessageArg shape (stackTraceEllipsis's omitted-call count): %1
+    ; renders unquoted.
+    procedure message_num(mutable this: ref[Interpreter], mt: MessageType, n: u64)
+    {
+        var args Vector[MessageArg](1)
+        *(args.get(0)) := MessageArg.Num(n)
+        this.emit(mt, args)
+    }
+
+    function get_debug_mode(this: Interpreter) returns bool
+        debug_mode
+
+    ; MessageType3 shape of PrimitiveObj::argError: %1 primitive name,
+    ; %2 ordinal, %3 printed object.
+    procedure message3(mutable this: ref[Interpreter], mt: MessageType, a1: StringC, ord2: u64, a3: StringC)
+    {
+        var args Vector[MessageArg](3)
+        *(args.get(0)) := MessageArg.Str(a1)
+        *(args.get(1)) := MessageArg.Ord(ord2)
+        *(args.get(2)) := MessageArg.Str(a3)
+        this.emit(mt, args)
+    }
+
+    ; --- self-test ---------------------------------------------------------
+    procedure test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+        ; jade's default: twips (20*72 units per inch)
+        let interp Interpreter.make(host, 1440, false, false, false)
+
+        ; integer conversion incl. radix prefixes
+        let a interp.convert_number(StringC("42"))
+        if a = null
+            return 1
+        if a.exact_integer_value() <> 42
+            return 2
+        let b interp.convert_number(StringC("-17"))
+        if b.exact_integer_value() <> (0 - 17)
+            return 3
+        let c interp.convert_number(StringC("#x1a"))
+        if c.exact_integer_value() <> 26
+            return 4
+        let d interp.convert_number(StringC("#b101"))
+        if d.exact_integer_value() <> 5
+            return 5
+        let e interp.convert_number(StringC("#o17"))
+        if e.exact_integer_value() <> 15
+            return 6
+        let f interp.convert_number(StringC("+5"))
+        if f.exact_integer_value() <> 5
+            return 7
+
+        ; reals
+        let g interp.convert_number(StringC("1.5"))
+        if g.is_inexact_real() = false
+            return 8
+        if g.real_value() <> 1.5
+            return 9
+        let h interp.convert_number(StringC("1.5e2"))
+        if h.real_value() <> 150.0
+            return 10
+
+        ; malformed
+        if interp.convert_number(StringC("1.2.3")) <> null
+            return 11
+        if interp.convert_number(StringC("#xg")) <> null
+            return 12
+
+        ; quantities: builtin units are precomputed from unitsPerInch, so
+        ; resolve_quantities completes without the VM
+        let q interp.convert_number(StringC("2in"))
+        if q = null
+            return 13
+        let rq q.resolve_quantities(false, interp, Location())
+        if rq.is_length() = false
+            return 14
+        if rq.length_value() <> 2880
+            return 15
+        let q2 interp.convert_number(StringC("3pt"))
+        let rq2 q2.resolve_quantities(false, interp, Location())
+        if rq2.length_value() <> 60
+            return 16
+
+        ; char names: the generated table + U-XXXX
+        var ch: u32 0
+        if interp.convert_char_name(StringC("space"), &ch) = false
+            return 17
+        if ch <> 0x20
+            return 18
+        if interp.convert_char_name(StringC("U-0041"), &ch) = false
+            return 19
+        if ch <> 0x41
+            return 20
+        if interp.convert_char_name(StringC("no-such-name"), &ch)
+            return 21
+
+        ; interning: one Identifier / SymbolObj per name; keywords are fresh
+        ; objects equal through their interned Identifier
+        let i1 interp.lookup(StringC("foo"))
+        let i2 interp.lookup(StringC("foo"))
+        if i1 <> i2
+            return 22
+        let s1 interp.make_symbol(StringC("bar"))
+        let s2 interp.make_symbol(StringC("bar"))
+        if s1 <> s2
+            return 23
+        let k1 interp.make_keyword(StringC("baz"))
+        let k2 interp.make_keyword(StringC("baz"))
+        if k1 = k2
+            return 24
+        if ELObj.equal(k1, k2) = false
+            return 25
+
+        ; lexical categories
+        if interp.lex_category(0x41) <> LEX_LETTER
+            return 26
+        if interp.lex_category(0x28) <> LEX_DELIMITER
+            return 27
+        if interp.lex_category(0 - 1) <> LEX_DELIMITER
+            return 28
+        if interp.lex_category(0x2B) <> LEX_OTHER_NUMBER_START
+            return 29
+
+        if interp.get_error_count() <> 0
+            return 30
+
+        0
+    }
+
+    ; the CLI driver's argv0 — the MessageReporter prefix. Unset, messages keep
+    ; the historical package prefix `dazzle` (unit tests / --jit suite).
+    procedure set_msg_prog(prog: pointer[const_char]) mutable msg_prog
+        msg_prog := prog
+
+    ; render one diagnostic line to stderr, byte-identical to the reference
+    ; MessageReporter::dispatchMessage the style Interpreter reports through:
+    ;   <prog>:[<file>:<line>[:<col>]:]<sev>: <formatted text>\n
+    ; The location is the Messenger's next-location (setNextLocation), CONSUMED
+    ; by this message (initMessage clears it). A null-origin location renders
+    ; no location segment at all (`<prog>:I: called from here`); a non-null
+    ; origin whose chain names no real backing source renders the reference's
+    ; "(invalid location)". Errors count; Info (stack traces) does not.
+    procedure emit(mutable this: ref[Interpreter], mt: MessageType, args: Vector[MessageArg])
+    {
+        let loc this.next_loc
+        this.next_loc := Location()
+
+        var buf u32[2048]
+        let bp buf as pointer[u32]
+        let cap: size_t 2048
+        var p: size_t 0
+
+        ; program name (raw ASCII bytes) + ':'
+        if msg_prog <> null
+        {
+            let pb msg_prog as pointer[u8]
+            var pi: size_t 0
+            while (*(pb + pi)) <> 0
+            {
+                p := ParserState.put_char(Slice[u32](cap, bp), p, (*(pb + pi)) as u32)
+                pi := pi + 1
+            }
+        }
+        else
+        {
+            p := ParserState.put_char(Slice[u32](cap, bp), p, 0x64)
+            p := ParserState.put_char(Slice[u32](cap, bp), p, 0x61)
+            p := ParserState.put_char(Slice[u32](cap, bp), p, 0x7A)
+            p := ParserState.put_char(Slice[u32](cap, bp), p, 0x7A)
+            p := ParserState.put_char(Slice[u32](cap, bp), p, 0x6C)
+            p := ParserState.put_char(Slice[u32](cap, bp), p, 0x65)
+        }
+        p := ParserState.put_char(Slice[u32](cap, bp), p, 0x3A)
+
+        if loc.get_origin() <> null
+        {
+            var line: u32 0
+            var col: u32 0
+            var ridx: size_t 0
+            let resolved Origin.resolve_chain(loc, false, &line, &col, &ridx)
+            ; a chain that names no real backing source prints NO location
+            ; segment at all — MessageReporter::dispatchMessage skips
+            ; printLocation when locationHeader returns null (the builtins
+            ; prolog's InputSourceOrigin::make() has no external info).
+            if resolved <> null
+            {
+                ; file name + ':' + line ':' [col ':'] — the same rendering
+                ; rules as ParserState.emit_message (printLocation).
+                let fname resolved.file_name_at(ridx)
+                var fi: size_t 0
+                while fi < fname.get_size()
+                {
+                    p := ParserState.put_char(Slice[u32](cap, bp), p, fname.get(fi))
+                    fi := fi + 1
+                }
+                p := ParserState.put_char(Slice[u32](cap, bp), p, 0x3A)
+                p := ParserState.put_dec(Slice[u32](cap, bp), p, line as u64)
+                p := ParserState.put_char(Slice[u32](cap, bp), p, 0x3A)
+                var omit_col false
+                if (loc.get_index() = 0) and (line = 1) and (col = 0)
+                {
+                    if resolved.get_buf_length() > 0
+                        omit_col := true
+                }
+                if resolved.on_segment_leading_rs(ridx)
+                    omit_col := true
+                if col = MSG_COL_OMITTED
+                    omit_col := true
+                if omit_col = false
+                {
+                    p := ParserState.put_dec(Slice[u32](cap, bp), p, col as u64)
+                    p := ParserState.put_char(Slice[u32](cap, bp), p, 0x3A)
+                }
+            }
+        }
+
+        p := ParserState.put_char(Slice[u32](cap, bp), p, mt.severity_char())
+        p := ParserState.put_char(Slice[u32](cap, bp), p, 0x3A)
+        p := ParserState.put_char(Slice[u32](cap, bp), p, 0x20)
+        let fmt MessageFormatter()
+        ; get_text() is the raw literal template now (opensp.Message.MessageFragment)
+        let added fmt.format(StringC(mt.get_text()), args, Slice[u32](cap - p, bp + p), false)
+        p := p + added
+        p := ParserState.put_char(Slice[u32](cap, bp), p, 0x0A)
+        ParserState.write_stderr(Slice[u32](p, bp), true, 2)
+        if mt.is_error()
+            this.error_count := this.error_count + 1
+    }
+
+    ; an auxiliary message line (`<prog>:<file>:<line>:<col>: <text>` — no
+    ; severity char; the reference MessageReporter's auxiliary fragment, e.g.
+    ; duplicateDefinition's "first definition was here").
+    ; ★The parameter is a MessageFragment, not a MessageType, and said so in
+    ; the wrong place until 2026-08-23: every caller hands over an `*_aux()`
+    ; accessor, all of which return MessageFragment, and the body only ever
+    ; wants the template text. It ran correctly because MessageType's FIRST
+    ; field IS a MessageFragment, so MessageType.get_text() read `fragment.text`
+    ; at exactly the offset the argument's own `text` sits at — right by
+    ; layout coincidence. Caught by lookup_method#'s type gate the day it
+    ; landed; nothing else could see it, since emit_call builds the callee's
+    ; type from the argument VALUES.
+    procedure emit_aux(this: ref[Interpreter], mt: MessageFragment, loc: Location)
+    {
+        ; ★MessageReporter::dispatchMessage prints the AUXILIARY fragment only
+        ; when `message.auxLoc.origin()` is non-null (MessageReporter.cxx:99).
+        ; Every caller so far handed over a location that had one; a BUILT-IN
+        ; characteristic does not — its definition record was never stamped by
+        ; a declaration — so `(declare-char-characteristic+property font-size
+        ; … )` reports the duplicate with NO "first definition was here".
+        if loc.get_origin() = null
+            return
+        var buf u32[1024]
+        let bp buf as pointer[u32]
+        let cap: size_t 1024
+        var p: size_t 0
+        if msg_prog <> null
+        {
+            let pb msg_prog as pointer[u8]
+            var pi: size_t 0
+            while (*(pb + pi)) <> 0
+            {
+                p := ParserState.put_char(Slice[u32](cap, bp), p, (*(pb + pi)) as u32)
+                pi := pi + 1
+            }
+        }
+        else
+        {
+            p := ParserState.put_char(Slice[u32](cap, bp), p, 0x64)
+            p := ParserState.put_char(Slice[u32](cap, bp), p, 0x61)
+            p := ParserState.put_char(Slice[u32](cap, bp), p, 0x7A)
+            p := ParserState.put_char(Slice[u32](cap, bp), p, 0x7A)
+            p := ParserState.put_char(Slice[u32](cap, bp), p, 0x6C)
+            p := ParserState.put_char(Slice[u32](cap, bp), p, 0x65)
+        }
+        p := ParserState.put_char(Slice[u32](cap, bp), p, 0x3A)
+        if loc.get_origin() <> null
+        {
+            var line: u32 0
+            var col: u32 0
+            var ridx: size_t 0
+            let resolved Origin.resolve_chain(loc, false, &line, &col, &ridx)
+            if resolved <> null
+            {
+                let fname resolved.file_name_at(ridx)
+                var fi: size_t 0
+                while fi < fname.get_size()
+                {
+                    p := ParserState.put_char(Slice[u32](cap, bp), p, fname.get(fi))
+                    fi := fi + 1
+                }
+                p := ParserState.put_char(Slice[u32](cap, bp), p, 0x3A)
+                p := ParserState.put_dec(Slice[u32](cap, bp), p, line as u64)
+                p := ParserState.put_char(Slice[u32](cap, bp), p, 0x3A)
+                var omit_col false
+                if (loc.get_index() = 0) and (line = 1) and (col = 0)
+                {
+                    if resolved.get_buf_length() > 0
+                        omit_col := true
+                }
+                if resolved.on_segment_leading_rs(ridx)
+                    omit_col := true
+                if col = MSG_COL_OMITTED
+                    omit_col := true
+                if omit_col = false
+                {
+                    p := ParserState.put_dec(Slice[u32](cap, bp), p, col as u64)
+                    p := ParserState.put_char(Slice[u32](cap, bp), p, 0x3A)
+                }
+            }
+        }
+        p := ParserState.put_char(Slice[u32](cap, bp), p, 0x20)
+        let fmt MessageFormatter()
+        let args Vector[MessageArg]()
+        ; the raw literal template (opensp.Message.MessageFragment)
+        let added fmt.format(StringC(mt.text), args, Slice[u32](cap - p, bp + p), false)
+        p := p + added
+        p := ParserState.put_char(Slice[u32](cap, bp), p, 0x0A)
+        ParserState.write_stderr(Slice[u32](p, bp), true, 2)
+    }
+}

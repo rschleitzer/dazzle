@@ -1,0 +1,347 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.Location.Origin
+use opensp.Location.InputSource
+
+; Id — Id.cs (65 LOC). The id-table record for one ID attribute value: the name,
+; the defining location (once the ID has been declared by an ELEMENT that
+; carries it), and the list of pending IDREF locations recorded BEFORE the ID was
+; defined (so forward references that never resolve can be reported). C++'s
+; `Id : Named` base -> a `name` field; the `Vector<Location> pendingRefs_` -> an
+; `Array[Location]` (grows within the run, never shrinks).
+;
+; PORT SHAPE: page-hosted flat struct (referenced by identity from the parser's
+; NamedTable<Id> id table). `defined()` mirrors C++: an ID is defined once its
+; defLocation_ has a non-null origin.
+
+define Id (name: StringC, var def_loc: Location, var pending_refs: ref[Array[Location]])
+{
+    function make(host: ref[Page], name: StringC) returns ref[Id]
+    {
+        let id &Id^host(name, Location(), Array[Location]^host())
+        id
+    }
+
+    function get_name(this: Id) returns StringC
+        name
+
+    ; define(loc) [renamed: `define` is a Scaly keyword]: record the defining
+    ; location and release the pending refs (C++ swaps pendingRefs_ with a fresh
+    ; empty vector — the arena makes the old one dead; we drop the reference to a
+    ; fresh empty Array).
+    procedure mark_defined(mutable this: ref[Id], loc: Location)
+    {
+        this.def_loc := loc
+        let pg Page.get(this)
+        this.pending_refs := Array[Location]^pg()
+    }
+
+    function defined(this: Id) returns bool
+        def_loc.is_null() = false
+
+    function def_location(this: Id) returns Location
+        def_loc
+
+    procedure add_pending_ref(mutable this: ref[Id], loc: Location)
+        this.pending_refs.add(loc)
+
+    ; noteIdref(loc): record a pending ref only while the ID is still undefined.
+    procedure note_idref(mutable this: ref[Id], loc: Location)
+    {
+        if this.defined() = false
+            this.pending_refs.add(loc)
+    }
+
+    function n_pending_refs(this: Id) returns size_t
+        pending_refs.get_length()
+
+    function pending_ref_at(this: Id, i: size_t) returns Location
+        pending_refs[i]
+
+    function first_ref_location(this: Id) returns Location
+    {
+        if pending_refs.get_length() > 0
+            return *(pending_refs.get_buffer())
+
+        Location()
+    }
+
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+
+        ; A brand-new id: undefined, no pending refs.
+        let id Id.make(host, StringC("chap1"))
+        if id.get_name().equals(StringC("chap1")) = false
+            return -1
+        if id.defined()
+            return -2
+        if id.n_pending_refs() <> 0
+            return -3
+
+        ; Two forward IDREFs arrive before the ID is defined -> both pend.
+        var org_a Origin()
+        var buf_a u32[1]
+        *(buf_a as pointer[u32]) := 0x41
+        var src InputSource(&org_a, Slice[u32](1, buf_a as pointer[u32]))
+        let ref1 src.current_location(3)
+        let ref2 src.current_location(7)
+        id.note_idref(ref1)
+        id.note_idref(ref2)
+        if id.n_pending_refs() <> 2
+            return -4
+        if id.first_ref_location().get_index() <> 3
+            return -5
+
+        ; Defining the ID records the location and clears the pending refs.
+        let def_at src.current_location(10)
+        id.mark_defined(def_at)
+        if id.defined() = false
+            return -6
+        if id.def_location().get_index() <> 10
+            return -7
+        if id.n_pending_refs() <> 0
+            return -8
+
+        ; Once defined, note_idref no longer pends.
+        id.note_idref(ref1)
+        if id.n_pending_refs() <> 0
+            return -9
+
+        0
+    }
+}
+
+; --- IdTable ---------------------------------------------------------------
+; ParserState's idTable_: NamedTable<Id> = OwnerTable over PointerTable
+; (PointerTable.cxx) keyed by Hash::hash (Hash.cxx: h = h*33 + char, the Chris
+; Torek fold in an unsigned long). The table SHAPE is load-bearing for the
+; drop-in: checkIdrefs iterates the raw bucket vector in ascending index order,
+; so the missingId message ORDER is the open-addressing layout — initial size
+; 8 (usedLimit 4), grow x2 when used_ >= usedLimit_ (rehash reinserting in old
+; bucket order), probe DOWNWARD (nextIndex: i == 0 ? size-1 : i-1). Verified
+; against real onsgmls: ids NOPE,Y,GONE,LOST land as [GONE,Y,NOPE,_,_,_,_,LOST]
+; and the messages print GONE,NOPE,LOST — not document order.
+define IdTable
+(
+    var vec: Slice[ref[Id]?]
+    var vec_size: size_t
+    var used: size_t
+    var used_limit: size_t
+)
+{
+    function make(host: ref[Page]) returns ref[IdTable]
+    {
+        let t &IdTable^host(Slice[ref[Id]?](), 0, 0, 0)
+        t
+    }
+
+    ; Hash::hash — h*33 + char over the (folded) name, in u64.
+    function hash(name: StringC) returns u64
+    {
+        var h: u64 0
+        let n name.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            h := (h << 5) + h + (name.get(i) as u64)
+            i := i + 1
+        }
+        h
+    }
+
+    function start_index(this: IdTable, name: StringC) returns size_t
+        (IdTable.hash(name) & ((vec_size - 1) as u64)) as size_t
+
+    function next_index(this: IdTable, i: size_t) returns size_t
+    {
+        if i = 0
+            return vec_size - 1
+        i - 1
+    }
+
+    function alloc_vec(host: ref[Page], n: size_t) returns Slice[ref[Id]?]
+    {
+        let v allocate_slice[ref[Id]?](host, n)
+        var i: size_t 0
+        while i < n
+        {
+            v.put(i, null)
+            i := i + 1
+        }
+        v
+    }
+
+    function lookup(this: IdTable, name: StringC) returns ref[Id]?
+    {
+        if used = 0
+            return null
+        var i this.start_index(name)
+        while vec[i] <> null
+        {
+            let id vec[i]
+            if id.get_name().equals(name)
+                return id
+            i := this.next_index(i)
+        }
+        null
+    }
+
+    ; PointerTable::insert of a fresh Id (no replace arm — lookupCreateId
+    ; looks up first). Mirrors the reference exactly: first insert allocates 8
+    ; buckets; at used_ >= usedLimit_ the vector doubles and every old entry
+    ; reinserts IN OLD BUCKET ORDER, each probing down to the first free slot.
+    procedure insert(mutable this: ref[IdTable], host: ref[Page], id: ref[Id])
+    {
+        var h: size_t 0
+        if this.vec_size = 0
+        {
+            this.vec := IdTable.alloc_vec(host, 8)
+            this.vec_size := 8
+            this.used_limit := 4
+            h := this.start_index(id.get_name())
+        }
+        else
+        {
+            h := this.start_index(id.get_name())
+            while this.vec[h] <> null
+                h := this.next_index(h)
+            if this.used >= this.used_limit
+            {
+                let old_vec this.vec
+                let old_size this.vec_size
+                this.vec := IdTable.alloc_vec(host, old_size * 2)
+                this.vec_size := old_size * 2
+                this.used_limit := this.vec_size / 2
+                var oi: size_t 0
+                while oi < old_size
+                {
+                    let e old_vec[oi]
+                    if e <> null
+                    {
+                        var j this.start_index(e.get_name())
+                        while this.vec[j] <> null
+                            j := this.next_index(j)
+                        this.vec.put(j, e)
+                    }
+                    oi := oi + 1
+                }
+                h := this.start_index(id.get_name())
+                while this.vec[h] <> null
+                    h := this.next_index(h)
+            }
+        }
+        this.used := this.used + 1
+        this.vec.put(h, id)
+    }
+
+    ; ParserState::lookupCreateId.
+    procedure lookup_create(mutable this: ref[IdTable], host: ref[Page], name: StringC) returns ref[Id]
+    {
+        let found this.lookup(name)
+        if found <> null
+            return found as ref[Id]
+        ; deep-copy the name onto the table's page: the caller's StringC
+        ; borrows a transient value buffer.
+        let n name.get_size()
+        let nb allocate_slice[u32](host, n)
+        var i: size_t 0
+        while i < n
+        {
+            nb.put(i, name.get(i))
+            i := i + 1
+        }
+        let owned StringC^host(nb)
+        let id Id.make(host, *owned)
+        this.insert(host, id)
+        id
+    }
+
+    ; iteration surface for checkIdrefs: ascending bucket index, nulls skipped
+    ; by the caller (PointerTableIter::next).
+    function bucket_count(this: IdTable) returns size_t
+        vec_size
+
+    function bucket_at(this: IdTable, i: size_t) returns ref[Id]?
+        vec[i]
+
+    ; The NamedTable ITERATION ORDER (ascending bucket index) for a list of
+    ; names, as a permutation of their positions: every C++ NamedTable in the
+    ; prolog (entities, notations, element types) is a PointerTable with this
+    ; layout while the port's tables are insertion-ordered Arrays, and the order
+    ; is OBSERVABLE — through the missingId message order (checkIdrefs), through
+    ; the -oentity endProlog sweep, and through the GROVE's named node lists.
+    ; The permutation is computed here rather than at each caller because the
+    ; layout belongs to this table; a name appearing twice keeps its FIRST
+    ; position (PointerTable::insert replaces in place).
+    function bucket_order(host: ref[Page], names: ref[Array[StringC]]) returns ref[Array[size_t]]
+    {
+        let out Array[size_t]^host()
+        let n names.get_length()
+        let t IdTable.make(host)
+        var i: size_t 0
+        while i < n
+        {
+            let nm names[i]
+            t.lookup_create(host, nm)
+            i := i + 1
+        }
+        let nb t.bucket_count()
+        var b: size_t 0
+        while b < nb
+        {
+            let slot t.bucket_at(b)
+            if slot <> null
+            {
+                let sname slot.get_name()
+                var k: size_t 0
+                var found false
+                while k < n
+                {
+                    if found = false
+                    {
+                        let nm2 names[k]
+                        if nm2.equals(sname)
+                        {
+                            out.add(k)
+                            found := true
+                        }
+                    }
+                    k := k + 1
+                }
+            }
+            b := b + 1
+        }
+        out
+    }
+
+    function id_test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+        let t IdTable.make(host)
+        if t.lookup(StringC("NOPE")) <> null
+            return -20
+        let a t.lookup_create(host, StringC("NOPE"))
+        let b t.lookup_create(host, StringC("Y"))
+        let c t.lookup_create(host, StringC("GONE"))
+        let d t.lookup_create(host, StringC("LOST"))
+        if t.lookup_create(host, StringC("NOPE")) <> a
+            return -21
+        if t.bucket_count() <> 8
+            return -22
+        ; the layout real onsgmls's message order proved: GONE,Y,NOPE,_,...,LOST
+        if t.bucket_at(0) <> c
+            return -23
+        if t.bucket_at(1) <> b
+            return -24
+        if t.bucket_at(2) <> a
+            return -25
+        if t.bucket_at(7) <> d
+            return -26
+        0
+    }
+}

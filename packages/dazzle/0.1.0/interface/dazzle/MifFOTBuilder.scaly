@@ -1,0 +1,1877 @@
+; MifFOTBuilder — the `-t mif` backend: Kathleen Marszalek's and Paul
+; Prescod's FrameMaker Interchange Format writer. Ported from
+; ~/repos/dazzle/jade/MifFOTBuilder.cxx (C++ oracle, openjade 1.3.3-pre1;
+; JADE_MIF defined, NDEBUG undefined — the reference asserts are live and
+; port as loud exit-17 traps). The C# mirror has no MIF backend; the C++ is
+; the only source.
+;
+; Output model: a MIF DOCUMENT OBJECT MODEL, not a stream. The builder grows
+; one `MifBookComponent` per simple-page-sequence (plus the implicit first
+; one) holding the catalogs (Pgf/Color/Ruling/Tbl), the anchored frames, the
+; tables, the master/body pages with their text rects, and the text flows;
+; flow-object content is written into per-tag-stream byte buffers (the
+; reference MifTmpOutputByteStream) that are spliced into the file at commit
+; time. `commit()` writes one file per book component (a `<Book 5.0>` root
+; plus `1.mif`, `2.mif`, … when there is more than one) — the reference
+; MifDoc destructor.
+;
+; Paragraph and font formats are DELTA formats: every `Pgf`/`Font` statement
+; prints only the properties that differ from the enclosing state
+; (`compare`/`setFrom`/`updateFrom` + a per-property set-bit mask), which is
+; why the format records carry their `*_set` masks everywhere.
+;
+; Cross-references, hypertext links and index entries are resolved in a
+; SECOND PASS: `<Marker>`/`<XRef>` cannot be emitted until it is known
+; whether anything referenced the element, so the content stream carries a
+; one-byte escape (NUL) plus a 4-byte index into `cross_ref_infos`, and the
+; commit-time splice expands it.
+;
+; Reference quirks reproduced deliberately (verified against the reference
+; binary): the `case SP_LETTER2('D','E')` arm of computePgfLanguage has NO
+; `break`, so language "DE" falls through and yields `French`; the
+; T_dimension format loses the sign of values in (-1000, 0); the
+; `fXRefSrcText` enumerator has no initialiser and is therefore 5, not 8;
+; `startLineField`'s `PgfNumTabs + leadingTab ? 2 : 1` parses as
+; `(PgfNumTabs + leadingTab) ? 2 : 1`; and `TablePart::begin` wipes the
+; column list a table declared before its first table-part, which is what
+; makes the `missing table column flow object` warning fire on ordinary
+; documents.
+;
+; RBMM: everything lives on the builder's page (the run arena) — the whole
+; document model has to survive until commit anyway, so nothing is ever
+; freed; the reference's `delete`s are simply dropped. The stacks are
+; slot-reused pointer arrays with depth cursors.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String.String
+use scaly.os.File.File
+use opensp.StringC.StringC
+use dazzle.Grove.GroveNode
+use dazzle.Grove.GroveInfo
+use dazzle.ELObj.ELObj
+use dazzle.Style.InheritedC
+use dazzle.Style.FotSym
+use dazzle.Style.LengthSpec
+use dazzle.Style.DisplaySpace
+use dazzle.Style.DisplayNIC
+use dazzle.Style.RuleNIC
+use dazzle.Style.LinkNIC
+use dazzle.Style.ExternalGraphicNIC
+use dazzle.Style.LeaderNIC
+use dazzle.Style.BoxNIC
+use dazzle.Style.ScoreNIC
+use dazzle.Style.TableNIC
+use dazzle.Style.TableColumnNIC
+use dazzle.Style.TableCellNIC
+use dazzle.Style.LineFieldNIC
+use dazzle.Style.IndexEntryNIC
+use dazzle.Style.CharacterNIC
+use dazzle.Style.AnchorNIC
+use dazzle.Style.GlyphAnnotationNIC
+use dazzle.Style.EmphasizingMarkNIC
+use dazzle.Style.GridNIC
+use dazzle.Style.GridCellNIC
+use dazzle.Style.EmbeddedTextNIC
+use dazzle.Style.IncludedContainerAreaNIC
+use dazzle.Style.MultiModeRec
+use dazzle.Style.MultiModeNIC
+
+; libc + shim externs (prototypes type-match the other roots').
+function exit(code: i32) extern
+procedure scaly_eputs(s: pointer[const_char]) extern
+procedure scaly_eputnl() extern
+function strerror(code: i32) returns pointer[const_char] extern
+function scaly_eio_errno() returns i32 extern
+
+; argv0 for the MifMessages prefix (`<argv0>:E: MIF: …`).
+shared mif_prog: pointer[const_char] linked
+
+; --- FOTBuilder::Symbol codes the MIF backend tests -------------------------
+define MIF_SYM_FALSE: int 0
+define MIF_SYM_MEDIUM: int 11
+define MIF_SYM_OBLIQUE: int 21
+define MIF_SYM_BS_OBLIQUE: int 22
+define MIF_SYM_ITALIC: int 23
+define MIF_SYM_BS_ITALIC: int 24
+define MIF_SYM_START: int 25
+define MIF_SYM_END: int 26
+define MIF_SYM_CENTER: int 27
+define MIF_SYM_JUSTIFY: int 28
+define MIF_SYM_WRAP: int 33
+define MIF_SYM_NONE: int 37
+define MIF_SYM_BEFORE: int 38
+define MIF_SYM_THROUGH: int 39
+define MIF_SYM_AFTER: int 40
+define MIF_SYM_INSIDE: int 45
+define MIF_SYM_OUTSIDE: int 46
+define MIF_SYM_HORIZONTAL: int 47
+define MIF_SYM_VERTICAL: int 48
+define MIF_SYM_PAGE: int 61
+define MIF_SYM_COLUMN: int 64
+define MIF_SYM_ROUND: int 68
+define MIF_SYM_BUTT: int 70
+define MIF_SYM_SQUARE: int 71
+define MIF_SYM_PRESERVE: int 77
+define MIF_SYM_COLLAPSE: int 78
+define MIF_SYM_IGNORE: int 79
+
+; --- simple-page-sequence header/footer part flags (FOTBuilder::nHF) --------
+define MIF_HF_FIRST: int 1
+define MIF_HF_FRONT: int 2
+define MIF_HF_HEADER: int 4
+define MIF_HF_CENTER: int 8
+define MIF_HF_RIGHT: int 16
+
+; --- FontFormat property bits ----------------------------------------------
+define MIF_FF_FAMILY: int 0x1
+define MIF_FF_ANGLE: int 0x2
+define MIF_FF_WEIGHT: int 0x4
+define MIF_FF_VAR: int 0x8
+define MIF_FF_SIZE: int 0x10
+define MIF_FF_COLOR: int 0x20
+define MIF_FF_UNDERLINING: int 0x40
+define MIF_FF_OVERLINE: int 0x80
+define MIF_FF_STRIKE: int 0x100
+define MIF_FF_POSITION: int 0x200
+define MIF_FF_PAIRKERN: int 0x400
+define MIF_FF_CASE: int 0x800
+define MIF_FF_DX: int 0x1000
+define MIF_FF_DY: int 0x2000
+define MIF_FF_DW: int 0x4000
+define MIF_FF_ALL: int 0x7FFF
+
+; --- ParagraphFormat property bits -----------------------------------------
+define MIF_PF_FINDENT: int 0x1
+define MIF_PF_LINDENT: int 0x2
+define MIF_PF_RINDENT: int 0x4
+define MIF_PF_ALIGNMENT: int 0x8
+define MIF_PF_SPBEFORE: int 0x10
+define MIF_PF_SPAFTER: int 0x20
+define MIF_PF_LINESPACING: int 0x40
+define MIF_PF_LEADING: int 0x80
+define MIF_PF_WITHPREV: int 0x100
+define MIF_PF_WITHNEXT: int 0x200
+define MIF_PF_BLOCKSIZE: int 0x400
+define MIF_PF_AUTONUM: int 0x800
+define MIF_PF_NUMFORMAT: int 0x1000
+define MIF_PF_NUMBERFONT: int 0x2000
+define MIF_PF_HYPHENATE: int 0x4000
+define MIF_PF_HMAXLINES: int 0x8000
+define MIF_PF_HMINPREFIX: int 0x10000
+define MIF_PF_HMINSUFFIX: int 0x20000
+define MIF_PF_HMINWORD: int 0x40000
+define MIF_PF_LETTERSPACE: int 0x80000
+define MIF_PF_LANGUAGE: int 0x100000
+define MIF_PF_CELLALIGN: int 0x200000
+define MIF_PF_CELLMARGINS: int 0x400000
+define MIF_PF_CELLLFIXED: int 0x800000
+define MIF_PF_CELLTFIXED: int 0x1000000
+define MIF_PF_CELLRFIXED: int 0x2000000
+define MIF_PF_CELLBFIXED: int 0x4000000
+define MIF_PF_TAG: int 0x8000000
+define MIF_PF_TABSTOPS: int 0x10000000
+define MIF_PF_PLACEMENT: int 0x20000000
+define MIF_PF_NUMTABS: int 0x40000000
+define MIF_PF_PLACEMENTSTYLE: int 0x80000000
+define MIF_PF_ALL: int 0xFFFFFFFF
+
+; --- TabStop bits ----------------------------------------------------------
+define MIF_TS_X: int 0x1
+define MIF_TS_TYPE: int 0x2
+define MIF_TS_LEADERSTR: int 0x4
+define MIF_TS_DECIMALCHAR: int 0x8
+
+; --- Document bits ---------------------------------------------------------
+define MIF_DOC_PAGESIZE: int 0x1
+define MIF_DOC_STARTPAGE: int 0x2
+define MIF_DOC_PAGENUMSTYLE: int 0x4
+define MIF_DOC_TWOSIDES: int 0x8
+define MIF_DOC_PARITY: int 0x10
+define MIF_DOC_MARGINS: int 0x20
+define MIF_DOC_COLUMNS: int 0x40
+define MIF_DOC_COLUMNGAP: int 0x80
+
+; --- Object bits (shared base) + the per-subclass extensions ---------------
+define MIF_OB_ID: int 0x1
+define MIF_OB_PEN: int 0x2
+define MIF_OB_FILL: int 0x4
+define MIF_OB_PENWIDTH: int 0x8
+define MIF_OB_NEXT: int 0x10
+define MIF_OB_OBCOLOR: int 0x20
+; PolyLine
+define MIF_PL_HEADCAP: int 0x20
+define MIF_PL_TAILCAP: int 0x40
+; ImportObject
+define MIF_IM_FILEDI: int 0x20
+define MIF_IM_DPI: int 0x40
+define MIF_IM_SHAPERECT: int 0x80
+define MIF_IM_FIXEDSIZE: int 0x100
+define MIF_IM_NATIVEORIGIN: int 0x200
+; Frame
+define MIF_FR_SHAPERECT: int 0x20
+define MIF_FR_TYPE: int 0x40
+define MIF_FR_NSOFFSET: int 0x80
+define MIF_FR_BLOFFSET: int 0x100
+define MIF_FR_ANCHORALIGN: int 0x200
+; TextRect
+define MIF_TR_SHAPERECT: int 0x40
+define MIF_TR_NUMCOLUMNS: int 0x80
+define MIF_TR_COLUMNGAP: int 0x100
+define MIF_TR_COLUMNBALANCE: int 0x200
+
+; object tags
+define MIF_OBJ_POLYLINE: int 0
+define MIF_OBJ_IMPORT: int 1
+define MIF_OBJ_FRAME: int 2
+define MIF_OBJ_TEXTRECT: int 3
+
+; --- Page bits -------------------------------------------------------------
+define MIF_PG_TYPE: int 0x1
+define MIF_PG_TAG: int 0x2
+define MIF_PG_BACKGROUND: int 0x4
+
+; --- TextFlow / Para / Cell / ParaLine bits --------------------------------
+define MIF_TF_TAG: int 0x1
+define MIF_TF_AUTOCONNECT: int 0x2
+define MIF_PARA_PGFTAG: int 0x1
+define MIF_PARA_FORMAT: int 0x2
+define MIF_CELL_LRULING: int 0x1
+define MIF_CELL_BRULING: int 0x2
+define MIF_CELL_RRULING: int 0x4
+define MIF_CELL_TRULING: int 0x8
+define MIF_CELL_COLUMNS: int 0x10
+define MIF_CELL_ROWS: int 0x20
+define MIF_CELL_FILL: int 0x40
+define MIF_CELL_COLOR: int 0x80
+define MIF_PARALINE_TEXTRECTID: int 0x1
+define MIF_PARALINE_ATBL: int 0x2
+
+; tag-stream classes
+define MIF_TS_PLAIN: int 0
+define MIF_TS_TEXTFLOW: int 1
+define MIF_TS_CELL: int 2
+define MIF_TS_PARA: int 3
+
+; --- Color / Ruling / Tbl / TblFormat / TblColumn bits ----------------------
+define MIF_COL_TAG: int 0x1
+define MIF_COL_CYAN: int 0x2
+define MIF_COL_MAGENTA: int 0x4
+define MIF_COL_YELLOW: int 0x8
+define MIF_COL_BLACK: int 0x10
+define MIF_RUL_TAG: int 0x1
+define MIF_RUL_PENWIDTH: int 0x2
+define MIF_RUL_GAP: int 0x4
+define MIF_RUL_PEN: int 0x8
+define MIF_RUL_LINES: int 0x10
+define MIF_RUL_COLOR: int 0x20
+define MIF_TBLC_NUM: int 0x1
+define MIF_TBLC_WIDTH: int 0x2
+define MIF_TBLF_TAG: int 0x1
+define MIF_TBLF_LINDENT: int 0x2
+define MIF_TBLF_RINDENT: int 0x4
+define MIF_TBLF_SPBEFORE: int 0x8
+define MIF_TBLF_SPAFTER: int 0x10
+define MIF_TBLF_ALIGNMENT: int 0x20
+define MIF_TBLF_CELLMARGINS: int 0x40
+define MIF_TBLF_WIDTH: int 0x80
+define MIF_TBLF_TITLEPLACEMENT: int 0x100
+define MIF_TBL_ID: int 0x1
+define MIF_TBL_TAG: int 0x2
+define MIF_TBL_NUMCOLUMNS: int 0x4
+define MIF_TBL_COLUMNWIDTHS: int 0x8
+define MIF_TBL_FORMAT: int 0x10
+
+; --- XRefFormat / XRef / Marker bits ---------------------------------------
+define MIF_XRF_NAME: int 0x1
+define MIF_XRF_DEF: int 0x2
+define MIF_XR_NAME: int 0x1
+define MIF_XR_SRCFILE: int 0x2
+define MIF_XR_TEXT: int 0x4
+; NOTE: the reference enumerator `fXRefSrcText` has NO initialiser and thus
+; takes the value 5 (fXRefText + 1) — reproduced verbatim.
+define MIF_XR_SRCTEXT: int 0x5
+define MIF_MK_TYPE: int 0x1
+define MIF_MK_TEXT: int 0x2
+
+; Marker::Type
+define MIF_MARKER_XREF: int 9
+define MIF_MARKER_INDEX: int 2
+define MIF_MARKER_HYPERTEXT: int 8
+define MIF_MARKER_HYPERTEXT_LINK: int 100
+define MIF_MARKER_HYPERTEXT_DEST: int 101
+
+; CrossRefInfo::InfoType
+define MIF_CRI_POTENTIAL_MARKER: int 0
+define MIF_CRI_XREF: int 1
+define MIF_CRI_HYPERTEXT_LINK: int 2
+
+; ElementSet::ReferenceType
+define MIF_REF_ANY: int 0xC000
+define MIF_REF_LINK: int 0x8000
+define MIF_REF_PAGE: int 0x4000
+define MIF_REF_BC_INDEX_MASK: int 0x3FFF
+
+; TableNIC::widthExplicit
+define MIF_TABLE_WIDTH_EXPLICIT: int 2
+
+; ScoreNIC.kind — only the Symbol form reaches MifFOTBuilder's override
+define MIF_SCORE_SYMBOL: int 3
+
+; the CharMap bound: the highest symbol-font code point is 0x27BE
+define MIF_CHAR_TABLE_SIZE: int 0x2800
+define MIF_CHAR_TABLE_SYMBOL_FLAG: int 0x80000000
+define MIF_N_SYMBOL_FONTS: int 3
+
+; --- static data (extracted from MifFOTBuilder.cxx 4354-4479) ---------------
+define MIF_FRAME_CHARSET_MAP: u32[] [
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x00C1, 0x00A2, 0x00A3, 0x00DB, 0x00B4, 0x007C, 0x00A4,
+    0x00AC, 0x00A9, 0x00BB, 0x00C7, 0x00C2, 0x002D, 0x00A8, 0x00F8,
+    0x00FB, 0x0000, 0x0000, 0x0000, 0x00AB, 0x0000, 0x00A6, 0x00A5,
+    0x00FC, 0x0000, 0x00BC, 0x00C8, 0x0000, 0x0000, 0x0000, 0x00C0,
+    0x00CB, 0x00E7, 0x00E5, 0x00CC, 0x0080, 0x0081, 0x00AE, 0x0082,
+    0x00E9, 0x0083, 0x00E6, 0x00E9, 0x00ED, 0x00EA, 0x00EB, 0x00EC,
+    0x0000, 0x0084, 0x00F1, 0x00EE, 0x00EF, 0x00CD, 0x0085, 0x0000,
+    0x00AF, 0x00F4, 0x00F2, 0x00F3, 0x0086, 0x0000, 0x0000, 0x00A7,
+    0x0088, 0x0087, 0x0089, 0x008B, 0x008A, 0x008C, 0x00BE, 0x008D,
+    0x008F, 0x008E, 0x0090, 0x0091, 0x0093, 0x0092, 0x0094, 0x0095,
+    0x0000, 0x0096, 0x0098, 0x0097, 0x0099, 0x009B, 0x009A, 0x0000,
+    0x00BF, 0x009D, 0x009C, 0x009E, 0x009F, 0x0000, 0x0000, 0x00D8]
+
+define MIF_SYMBOL_FONT_MAP: u32[] [
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0020, 0x0021, 0x2200, 0x0023, 0x2203, 0x0025, 0x0026, 0x220B,
+    0x0028, 0x0029, 0x2217, 0x002B, 0x002C, 0x2212, 0x002E, 0x002F,
+    0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
+    0x0038, 0x0039, 0x003A, 0x003B, 0x003C, 0x003D, 0x003E, 0x003F,
+    0x2245, 0x0391, 0x0392, 0x03A7, 0x2206, 0x0395, 0x03A6, 0x0393,
+    0x0397, 0x0399, 0x03D1, 0x039A, 0x039B, 0x039C, 0x039D, 0x039F,
+    0x03A0, 0x0398, 0x03A1, 0x03A3, 0x03A4, 0x03A5, 0x03C2, 0x2126,
+    0x039E, 0x03A8, 0x0396, 0x005B, 0x2234, 0x005D, 0x22A5, 0x005F,
+    0x203E, 0x03B1, 0x03B2, 0x03C7, 0x03B4, 0x03B5, 0x03C6, 0x03B3,
+    0x03B7, 0x03B9, 0x03D5, 0x03BA, 0x03BB, 0x03BC, 0x03BD, 0x03BF,
+    0x03C0, 0x03B8, 0x03C1, 0x03C3, 0x03C4, 0x03C5, 0x03D6, 0x03C9,
+    0x03BE, 0x03C8, 0x03B6, 0x007B, 0x007C, 0x007D, 0x223C, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x03D2, 0x2032, 0x2264, 0x2215, 0x221E, 0x0192, 0x2663,
+    0x2666, 0x2665, 0x2660, 0x2194, 0x2190, 0x2191, 0x2192, 0x2193,
+    0x00B0, 0x00B1, 0x2033, 0x2265, 0x00D7, 0x221D, 0x2202, 0x2022,
+    0x00F7, 0x2260, 0x2261, 0x2248, 0x2026, 0x0000, 0x0000, 0x21B5,
+    0x2135, 0x2111, 0x211C, 0x2118, 0x2297, 0x2295, 0x2205, 0x2229,
+    0x222A, 0x2283, 0x2287, 0x2284, 0x2282, 0x2286, 0x2208, 0x2209,
+    0x2220, 0x2207, 0x00AE, 0x00A9, 0x2122, 0x220F, 0x221A, 0x22C5,
+    0x00AC, 0x2227, 0x2228, 0x21D4, 0x21D0, 0x21D1, 0x21D2, 0x21D3,
+    0x25CA, 0x2329, 0x00AE, 0x00A9, 0x2122, 0x2211, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x232A, 0x222B, 0x2320, 0x0000, 0x2321, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x2702, 0x2701, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x260E, 0x2706, 0x2709, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x2328,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x2707, 0x270D,
+    0x0000, 0x270C, 0x0000, 0x0000, 0x0000, 0x261C, 0x261E, 0x261D,
+    0x261F, 0x0000, 0x263A, 0x0000, 0x2639, 0x0000, 0x2620, 0x0000,
+    0x0000, 0x2708, 0x263C, 0x0000, 0x2744, 0x0000, 0x271E, 0x0000,
+    0x2720, 0x2721, 0x262A, 0x262F, 0x0950, 0x2638, 0x2648, 0x2649,
+    0x264A, 0x264B, 0x264C, 0x264D, 0x264E, 0x264F, 0x2650, 0x2651,
+    0x2652, 0x2653, 0x0000, 0x0000, 0x25CF, 0x274D, 0x25A0, 0x25A1,
+    0x0000, 0x2751, 0x2752, 0x0000, 0x0000, 0x25C6, 0x2756, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x2780, 0x2781, 0x2782, 0x2783, 0x2784, 0x2785, 0x2786,
+    0x2787, 0x2788, 0x2789, 0x0000, 0x278A, 0x278B, 0x278C, 0x278D,
+    0x278E, 0x278F, 0x2790, 0x2791, 0x2792, 0x2793, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x25CB, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x25AA,
+    0x0000, 0x0000, 0x2726, 0x2605, 0x2736, 0x0000, 0x2739, 0x0000,
+    0x0000, 0x0000, 0x2727, 0x0000, 0x0000, 0x272A, 0x2730, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x232B, 0x2326, 0x0000,
+    0x27A2, 0x0000, 0x0000, 0x0000, 0x27B2, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x25AB, 0x2718, 0x2714, 0x2612, 0x2611, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x2701, 0x2702, 0x2703, 0x2704, 0x260E, 0x2706, 0x2707,
+    0x2708, 0x2709, 0x261B, 0x261E, 0x270C, 0x270D, 0x270E, 0x270F,
+    0x2710, 0x2711, 0x2712, 0x2713, 0x2714, 0x2715, 0x2716, 0x2717,
+    0x2718, 0x2719, 0x271A, 0x271B, 0x271C, 0x271D, 0x271E, 0x271F,
+    0x2720, 0x2721, 0x2722, 0x2723, 0x2724, 0x2725, 0x2726, 0x2727,
+    0x2605, 0x2729, 0x272A, 0x272B, 0x272C, 0x272D, 0x272E, 0x272F,
+    0x2730, 0x2731, 0x2732, 0x2733, 0x2734, 0x2735, 0x2736, 0x2737,
+    0x2738, 0x2739, 0x273A, 0x273B, 0x273C, 0x273D, 0x273E, 0x273F,
+    0x2740, 0x2741, 0x2742, 0x2743, 0x2744, 0x2745, 0x2746, 0x2747,
+    0x2748, 0x2749, 0x274A, 0x274B, 0x0000, 0x274D, 0x25A0, 0x274F,
+    0x2750, 0x2751, 0x2752, 0x25B2, 0x25BC, 0x25C6, 0x2756, 0x0000,
+    0x2758, 0x2759, 0x275A, 0x275B, 0x275C, 0x275D, 0x275E, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x2761, 0x2762, 0x2763, 0x2764, 0x2765, 0x2766, 0x2767,
+    0x2663, 0x2666, 0x2665, 0x2660, 0x2460, 0x2461, 0x2462, 0x2463,
+    0x2464, 0x2465, 0x2466, 0x2467, 0x2468, 0x2469, 0x2776, 0x2777,
+    0x2778, 0x2779, 0x277A, 0x277B, 0x277C, 0x277D, 0x277E, 0x277F,
+    0x2780, 0x2781, 0x2782, 0x2783, 0x2784, 0x2785, 0x2786, 0x2787,
+    0x2788, 0x2789, 0x278A, 0x278B, 0x278C, 0x278D, 0x278E, 0x278F,
+    0x2790, 0x2791, 0x2792, 0x2793, 0x2794, 0x2192, 0x2194, 0x2195,
+    0x2798, 0x2799, 0x279A, 0x279B, 0x279C, 0x279D, 0x279E, 0x279F,
+    0x27A0, 0x27A1, 0x27A2, 0x27A3, 0x27A4, 0x27A5, 0x27A6, 0x27A7,
+    0x27A8, 0x27A9, 0x27AA, 0x27AB, 0x27AC, 0x27AD, 0x27AE, 0x27AF,
+    0x0000, 0x27B1, 0x27B2, 0x27B3, 0x27B4, 0x27B5, 0x27B6, 0x27B7,
+    0x27B8, 0x27B9, 0x27BA, 0x27BB, 0x27BC, 0x27BD, 0x27BE, 0x0000]
+
+
+; --- MifConsts: the reference's `CONST_STRING` block, interned once on the
+; run page (a String is a one-pointer handle, so passing them by value is
+; free; every one of them is compared bytewise by the delta-format code) ----
+define MifConsts
+(
+    s_none: String
+    s_space: String
+    s_default_tbl_format: String
+    s_default_pgf_format: String
+    s_times_new_roman: String
+    s_page_num_xref_format_name: String
+    s_a: String
+    s_regular: String
+    s_bold: String
+    s_italic: String
+    s_fno_underlining: String
+    s_fsingle: String
+    s_fdouble: String
+    s_fnumeric: String
+    s_fnormal: String
+    s_fsuperscript: String
+    s_fsubscript: String
+    s_fastyped: String
+    s_fsmallcaps: String
+    s_flowercase: String
+    s_fuppercase: String
+    s_left_right: String
+    s_left: String
+    s_right: String
+    s_center: String
+    s_fixed: String
+    s_proportional: String
+    s_top: String
+    s_middle: String
+    s_bottom: String
+    s_no_language: String
+    s_us_english: String
+    s_uk_english: String
+    s_german: String
+    s_swiss_german: String
+    s_french: String
+    s_canadian_french: String
+    s_spanish: String
+    s_catalan: String
+    s_italian: String
+    s_portuguese: String
+    s_brazilian: String
+    s_danish: String
+    s_dutch: String
+    s_norwegian: String
+    s_nynorsk: String
+    s_finnish: String
+    s_swedish: String
+    s_left_master_page: String
+    s_right_master_page: String
+    s_other_master_page: String
+    s_body_page: String
+    s_decimal: String
+    s_tab: String
+    s_hard_space: String
+    s_soft_hyphen: String
+    s_hard_hyphen: String
+    s_hard_return: String
+    s_number_space: String
+    s_thin_space: String
+    s_en_space: String
+    s_em_space: String
+    s_header: String
+    s_footer: String
+    s_arabic: String
+    s_uc_roman: String
+    s_lc_roman: String
+    s_uc_alpha: String
+    s_lc_alpha: String
+    s_first_left: String
+    s_first_right: String
+    s_anywhere: String
+    s_column_top: String
+    s_page_top: String
+    s_lpage_top: String
+    s_rpage_top: String
+    s_first: String
+    s_inside: String
+    s_outside: String
+    s_none_kw: String
+    s_run_into_paragraph: String
+    s_inline: String
+    s_below: String
+    s_butt: String
+    s_round: String
+    s_square: String
+    s_white: String
+    s_black: String
+    s_normal: String
+    s_straddle: String
+    s_cent: String
+    s_pound: String
+    s_yen: String
+    s_en_dash: String
+    s_em_dash: String
+    s_dagger: String
+    s_double_dagger: String
+    s_bullet: String
+)
+{
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[MifConsts] linked
+}
+
+; --- MifOS: MifOutputByteStream — a byte sink plus the CurTagIndent cursor.
+; Several MifOS views can share one byte array (the reference constructs a
+; fresh MifOutputByteStream with indent 0 over a stream at commit time). ----
+define MifOS (b: ref[Array[u8]], var ind: int)
+{
+    function make(host: ref[Page], b: ref[Array[u8]], ind: int) @ret_explicit_0 true @deep true returns ref[MifOS] linked
+
+    procedure put(mutable this: ref[MifOS], c: u8) @persists true @ret_nonlocal true @deep true linked
+
+    procedure raw(mutable this: ref[MifOS], s: Slice[char]) @deep true linked
+
+    ; the raw bytes of a String<char>-valued property (T_keyword prints bare)
+    procedure str(mutable this: ref[MifOS], s: String) @deep true linked
+
+    ; T_string / T_tagstring / T_pathname: backtick + bytes + apostrophe
+    procedure tstr(mutable this: ref[MifOS], s: String) @ret_nonlocal true @deep true linked
+
+    procedure indent(mutable this: ref[MifOS]) @deep true linked
+
+    procedure undent(mutable this: ref[MifOS]) @deep true linked
+
+    ; `os << '\n' << MifOutputByteStream::INDENT`
+    procedure nlind(mutable this: ref[MifOS]) @deep true linked
+
+    procedure udec(mutable this: ref[MifOS], n_in: int) @deep true linked
+
+    procedure num(mutable this: ref[MifOS], n: int) @deep true linked
+
+    ; T_dimension: sprintf("%li.%.3i", d/1000, abs(d%1000)) with the trailing
+    ; zeros (and a bare trailing '.') stripped, then "pt". Values in
+    ; (-1000, 0) lose their sign because the integer part prints as 0 —
+    ; faithful to the reference.
+    procedure dim(mutable this: ref[MifOS], d: int) @ret_nonlocal true @deep true linked
+
+    ; T_percentage: sprintf("%.6f")
+    procedure pct(mutable this: ref[MifOS], x: double) @deep true linked
+
+    procedure boolyn(mutable this: ref[MifOS], v: bool) @ret_nonlocal true @deep true linked
+
+    procedure sp(mutable this: ref[MifOS]) @ret_nonlocal true @deep true linked
+
+    procedure ltrb(mutable this: ref[MifOS], l: int, t: int, r: int, b2: int) @ret_nonlocal true @deep true linked
+
+    procedure two(mutable this: ref[MifOS], a: int, b2: int) @ret_nonlocal true @deep true linked
+
+    ; `<Name ` … `>` at the current indent
+    procedure open_prop(mutable this: ref[MifOS], name: Slice[char]) @ret_nonlocal true @deep true linked
+
+    procedure close_prop(mutable this: ref[MifOS]) @ret_nonlocal true @deep true linked
+
+    procedure p_dim(mutable this: ref[MifOS], name: Slice[char], v: int) @ret_nonlocal true @deep true linked
+
+    procedure p_num(mutable this: ref[MifOS], name: Slice[char], v: int) @ret_nonlocal true @deep true linked
+
+    procedure p_udec(mutable this: ref[MifOS], name: Slice[char], v: int) @ret_nonlocal true @deep true linked
+
+    procedure p_kw(mutable this: ref[MifOS], name: Slice[char], v: String) @ret_nonlocal true @deep true linked
+
+    procedure p_tstr(mutable this: ref[MifOS], name: Slice[char], v: String) @ret_nonlocal true @deep true linked
+
+    procedure p_bool(mutable this: ref[MifOS], name: Slice[char], v: bool) @ret_nonlocal true @deep true linked
+
+    procedure p_pct(mutable this: ref[MifOS], name: Slice[char], v: double) @ret_nonlocal true @deep true linked
+
+    procedure p_ltrb(mutable this: ref[MifOS], name: Slice[char], l: int, t: int, r: int, b2: int) @ret_nonlocal true @deep true linked
+
+    procedure p_two(mutable this: ref[MifOS], name: Slice[char], a: int, b2: int) @ret_nonlocal true @deep true linked
+
+    ; `<Name ` … open a nested statement and indent
+    procedure begin_stmt(mutable this: ref[MifOS], name: Slice[char]) @ret_nonlocal true @deep true linked
+
+    procedure end_stmt(mutable this: ref[MifOS]) @ret_nonlocal true @deep true linked
+}
+
+; --- MifTmp: MifTmpOutputByteStream — the per-tag-stream content buffer ----
+define MifTmp (b: ref[Array[u8]], os: ref[MifOS])
+{
+    function make(host: ref[Page], ind: int) @ret_explicit_0 true @deep true returns ref[MifTmp] linked
+
+    function is_empty(this: ref[MifTmp]) @ret_param_0 true @deep true returns bool linked
+}
+
+; --- MifTabStop ------------------------------------------------------------
+define MifTabStop (var set_props: int, var tsx: int, var ts_type: String, var ts_leader: String, var ts_decimal: int)
+{
+    function make(host: ref[Page], ts_type: String, tsx: int, leader: String) @ret_args_11 true @deep true returns ref[MifTabStop] linked
+
+    procedure out(this: ref[MifTabStop], mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+}
+
+; --- MifFormat: FontFormat + ParagraphFormat + MifFOTBuilder::Format -------
+define MifFormat
+(
+    var ff_set: int
+    var f_family: String
+    var f_angle: String
+    var f_weight: String
+    var f_var: String
+    var f_size: int
+    var f_color: String
+    var f_underlining: String
+    var f_overline: bool
+    var f_strike: bool
+    var f_position: String
+    var f_pair_kern: bool
+    var f_case: String
+    var f_dx: double
+    var f_dy: double
+    var f_dw: double
+    var pf_set: int
+    var pgf_tag: String
+    var pgf_findent: int
+    var pgf_lindent: int
+    var pgf_rindent: int
+    var pgf_alignment: String
+    var pgf_sp_before: int
+    var pgf_sp_after: int
+    var pgf_line_spacing: String
+    var pgf_leading: int
+    var pgf_num_tabs: int
+    var tab_stops: ref[Array[ref[MifTabStop]?]]
+    var pgf_placement: String
+    var pgf_placement_style: String
+    var pgf_with_prev: bool
+    var pgf_with_next: bool
+    var pgf_block_size: int
+    var pgf_auto_num: bool
+    var pgf_num_format: String
+    var pgf_number_font: String
+    var pgf_hyphenate: bool
+    var hyphen_max_lines: int
+    var hyphen_min_prefix: int
+    var hyphen_min_suffix: int
+    var hyphen_min_word: int
+    var pgf_letter_space: bool
+    var pgf_language: String
+    var pgf_cell_alignment: String
+    var pgf_cm_l: int
+    var pgf_cm_t: int
+    var pgf_cm_r: int
+    var pgf_cm_b: int
+    var pgf_cell_l_fixed: bool
+    var pgf_cell_t_fixed: bool
+    var pgf_cell_r_fixed: bool
+    var pgf_cell_b_fixed: bool
+    ; --- MifFOTBuilder::Format: the FOT-side snapshot -----------------------
+    var fot_first_line_start_indent: LengthSpec
+    var fot_start_indent: LengthSpec
+    var fot_end_indent: LengthSpec
+    var fot_line_spacing: LengthSpec
+    var fot_position_point_shift: LengthSpec
+    var fot_field_width: LengthSpec
+    var fot_min_leading_has: bool
+    var fot_cur_display_size: int
+    var fot_line_thickness: int
+    var fot_line_cap: int
+    var fot_border_priority: int
+    var fot_border_present: bool
+    var fot_line_repeat: int
+    var fot_line_sep: int
+    var fot_display_alignment: int
+    var fot_left_margin: int
+    var fot_right_margin: int
+    var fot_top_margin: int
+    var fot_bottom_margin: int
+    var fot_header_margin: int
+    var fot_footer_margin: int
+    var fot_page_width: int
+    var fot_page_height: int
+    var fot_field_align: int
+    var fot_input_whitespace: int
+    var fot_lines: int
+    var fot_page_n_columns: int
+    var fot_page_column_sep: int
+    var fot_span: int
+    var fot_page_balance: bool
+    var fot_cell_background: bool
+    var mif_background_color: String
+    var fot_language: int
+    var fot_country: int
+)
+{
+    ; the reference Format ctor's member initialiser list
+    function make(host: ref[Page]) @ret_caller true @deep true returns ref[MifFormat] linked
+
+    ; the FontFormat + ParagraphFormat slice (`ParagraphFormat = Format`)
+    procedure copy_pf(host: ref[Page], mutable dst: ref[MifFormat], src: ref[MifFormat]) @deep true @deep_into_1_4 true linked
+
+    ; the full Format copy (`new Format(nextFormat)` / `nextFormat = *head`)
+    procedure copy_all(host: ref[Page], mutable dst: ref[MifFormat], src: ref[MifFormat]) @deep true @deep_into_1_4 true linked
+
+    procedure set_dsssl_defaults(mutable this: ref[MifFormat], mc: ref[MifConsts]) @deep true @deep_this_2 true linked
+
+    ; FontFormat::compare
+    function ff_compare(a: ref[MifFormat], b2: ref[MifFormat]) @ret_nonlocal true @deep true returns int linked
+
+    ; FontFormat::setFrom
+    procedure ff_set_from(mutable dst: ref[MifFormat], src: ref[MifFormat], props: int) @deep true @deep_this_2 true linked
+
+    procedure ff_update_from(mutable dst: ref[MifFormat], src: ref[MifFormat]) @deep true @deep_this_2 true linked
+
+    ; ParagraphFormat::compare
+    function pf_compare(a: ref[MifFormat], b2: ref[MifFormat]) @ret_nonlocal true @deep true returns int linked
+
+    ; ParagraphFormat::setFrom
+    procedure pf_set_from(mutable dst: ref[MifFormat], src: ref[MifFormat], props: int, fprops: int) @ret_nonlocal true @deep true @deep_this_2 true linked
+
+    procedure pf_update_from(mutable dst: ref[MifFormat], src: ref[MifFormat]) @deep true @deep_this_2 true linked
+
+    procedure clear_set_props(mutable this: ref[MifFormat]) @deep true linked
+
+    ; FontFormat::out — `is_pgf_font` picks the statement name
+    procedure ff_out(this: ref[MifFormat], mutable os: ref[MifOS], props: int, is_pgf_font: bool) @deep true linked
+}
+
+; --- MifTagStream: TagStream / TextFlow / Cell / Para in one tagged record --
+define MifTagStream
+(
+    ts_class: int
+    content: ref[MifTmp]
+    fmt: ref[MifFormat]
+    var initial_pgf_tag: String
+    var pgf_tag_used: bool
+    ; TextFlow
+    var tf_set: int
+    var tf_tag: String
+    var tf_auto_connect: bool
+    var text_rect_id: int
+    var text_rect_id_used: bool
+    ; Para
+    var para_set: int
+    para_pgf_tag: String
+    var leader_tabs_set: bool
+    cur_fmt: ref[MifFormat]
+    ; Cell
+    var cell_set: int
+    var cell_fill: int
+    var cell_color: String
+    var cell_l_ruling: String
+    var cell_b_ruling: String
+    var cell_r_ruling: String
+    var cell_t_ruling: String
+    var cell_columns: int
+    var cell_rows: int
+)
+{
+    function make(host: ref[Page], ts_class: int, ind: int, mc: ref[MifConsts]) @ret_explicit_0 true @deep true returns ref[MifTagStream] linked
+
+    ; Para(T_indent osIndent = 2): setProperties = fParagraphFormat
+    procedure make_para(host: ref[Page], ind: int, mutable mc: ref[MifConsts]) @deep true returns ref[MifTagStream] linked
+
+    function make_cell(host: ref[Page], mc: ref[MifConsts]) @ret_explicit_0 true @deep true returns ref[MifTagStream] linked
+}
+
+; --- MifObject: PolyLine / ImportObject / Frame / TextRect ------------------
+define MifObject
+(
+    tag: int
+    var set_props: int
+    id: int
+    var pen: int
+    var fill: int
+    var pen_width: int
+    var ob_color: String
+    ; PolyLine
+    var head_cap: String
+    var tail_cap: String
+    var points_x: ref[Array[int]]?
+    var points_y: ref[Array[int]]?
+    ; ImportObject
+    var import_file: String
+    var bitmap_dpi: int
+    var fixed_size: bool
+    native_x: int
+    native_y: int
+    ; Frame + ImportObject + TextRect share the shape rect
+    var shape_l: int
+    var shape_t: int
+    var shape_w: int
+    var shape_h: int
+    var frame_type: String
+    ns_offset: int
+    var bl_offset: int
+    var anchor_align: String
+    var objects: ref[Array[ref[MifObject]?]]?
+    ; TextRect
+    var tr_num_columns: int
+    var tr_column_gap: int
+    var tr_column_balance: bool
+)
+{
+    ; Object(pen=15, fill=15, penWidth=0, obColor=sBlack) — one global ID
+    ; counter across every object of the run (the reference static IDCnt).
+    function make(host: ref[Page], tag: int, id: int, mc: ref[MifConsts]) @ret_explicit_0 true @deep true returns ref[MifObject] linked
+
+    procedure out_object_properties(this: ref[MifObject], mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+
+    procedure out(this: ref[MifObject], mutable os: ref[MifOS]) @deep true linked
+}
+
+; --- MifPage ---------------------------------------------------------------
+define MifPage (set_props: int, page_type: String, page_tag: String, page_background: String, text_rects: ref[Array[ref[MifObject]?]])
+{
+    function make(host: ref[Page], page_type: String, page_tag: String, page_background: String, mc: ref[MifConsts]) @deep true returns ref[MifPage] linked
+
+    procedure out(this: ref[MifPage], mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+}
+
+; --- MifTblColumn / MifTblFormat / MifRow / MifTbl -------------------------
+define MifTblColumn (set_props: int, num: int, width: int)
+{
+    function make(host: ref[Page], num: int, width: int) @ret_explicit_0 true @deep true returns ref[MifTblColumn] linked
+
+    ; NOTE: the reference prints a TblColumn as `<TblFormat …>` (a bug that
+    ; is part of the byte stream).
+    procedure out(this: ref[MifTblColumn], mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+}
+
+define MifTblFormat
+(
+    var set_props: int
+    var tbl_tag: String
+    var lindent: int
+    var rindent: int
+    var sp_before: int
+    var sp_after: int
+    var alignment: String
+    var cm_l: int
+    var cm_t: int
+    var cm_r: int
+    var cm_b: int
+    var title_placement: String
+    width: int
+    columns: ref[Array[ref[MifTblColumn]?]]?
+)
+{
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[MifTblFormat] linked
+
+    procedure set_dsssl_defaults(mutable this: ref[MifTblFormat], mc: ref[MifConsts]) @deep true @deep_this_2 true linked
+
+    procedure out(this: ref[MifTblFormat], mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+}
+
+define MifRow (cells: ref[Array[ref[MifTagStream]?]]?)
+{
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[MifRow] linked
+}
+
+define MifTbl
+(
+    var set_props: int
+    tbl_id: int
+    tbl_tag: String
+    var id_used: bool
+    fmt: ref[MifTblFormat]
+    var num_columns: int
+    var col_widths: ref[Array[int]]
+    tblh: ref[Array[ref[MifRow]?]]
+    tblbody: ref[Array[ref[MifRow]?]]
+    tblf: ref[Array[ref[MifRow]?]]
+)
+{
+    function make(host: ref[Page], id: int, mc: ref[MifConsts]) @ret_explicit_0 true @deep true returns ref[MifTbl] linked
+}
+
+; --- MifRuling / MifColor / MifXRefFormat ----------------------------------
+define MifRuling (var set_props: int, var tag: String, var pen_width: int, var gap: int, var color: String, pen: int, var lines: int, var key: String)
+{
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[MifRuling] linked
+
+    procedure out(this: ref[MifRuling], mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+}
+
+define MifColor (var set_props: int, var tag: String, var cyan: double, var magenta: double, var yellow: double, var black: double)
+{
+    procedure out(this: ref[MifColor], mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+}
+
+define MifXRefFormat (set_props: int, name: String, def: String)
+{
+    procedure out(this: ref[MifXRefFormat], mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+}
+
+; --- MifCrossRefInfo / MifMarker / MifSgmlIdInfo ---------------------------
+define MifCrossRefInfo (cri_type: int, grove_index: int, element_index: int, var tag_indent: int, sgml_id: StringC)
+{
+    function make(host: ref[Page], cri_type: int, grove_index: int, element_index: int, tag_indent: int, sgml_id: StringC) @ret_explicit_0 true @deep true returns ref[MifCrossRefInfo] linked
+
+    function copy(this: ref[MifCrossRefInfo], host: ref[Page]) @ret_explicit_1 true @deep true returns ref[MifCrossRefInfo] linked
+}
+
+define MifMarker (set_props: int, m_type: int, m_text: String)
+
+define MifSgmlIdInfo (sgml_id: StringC, var flags: int, grove_index: int)
+{
+    function make(host: ref[Page], sgml_id: StringC, grove_index: int) @ret_explicit_0 true @deep true returns ref[MifSgmlIdInfo] linked
+}
+
+; --- MifBookComponent (the Document struct is inlined) ---------------------
+define MifBookComponent
+(
+    var file_name: String
+    xref_formats: ref[Array[ref[MifXRefFormat]?]]
+    var doc_set: int
+    var d_margin_l: int
+    var d_margin_t: int
+    var d_margin_r: int
+    var d_margin_b: int
+    var d_columns: int
+    var d_column_gap: int
+    var d_page_w: int
+    var d_page_h: int
+    d_start_page: int
+    d_page_num_style: String
+    var d_two_sides: bool
+    var d_parity: String
+    var color_slots: ref[Array[ref[MifColor]?]]
+    var color_used: int
+    var color_limit: int
+    pgf_catalog: ref[Array[ref[MifFormat]?]]
+    tbl_catalog: ref[Array[ref[MifTblFormat]?]]
+    var ruling_slots: ref[Array[ref[MifRuling]?]]
+    var ruling_used: int
+    var ruling_limit: int
+    aframes: ref[Array[ref[MifObject]?]]
+    tbls: ref[Array[ref[MifTbl]?]]
+    pages: ref[Array[ref[MifPage]?]]
+    text_flows: ref[Array[ref[MifTagStream]?]]
+    var pgnum_xref_generated: bool
+    epilog_os: ref[MifTmp]?
+)
+{
+    function make(host: ref[Page], epilog_os: ref[MifTmp]?) @ret_explicit_0 true @deep true returns ref[MifBookComponent] linked
+
+    procedure out_document(this: ref[MifBookComponent], mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+}
+
+; --- the FOT-side table machinery ------------------------------------------
+define MifBorder (var border_priority: int, var line_thickness: int, var border_present: bool, var line_repeat: int, var line_sep: int, cell_border: bool, var color: String)
+{
+    function make(host: ref[Page], cell_border: bool) @ret_explicit_0 true @deep true returns ref[MifBorder] linked
+
+    ; Border::resolve — mutates BOTH borders
+    procedure resolve(mutable this: ref[MifBorder], mutable adj: ref[MifBorder]) @deep true @deep_this_2 true linked
+}
+
+define MifColumn (var has_width: bool, var width: LengthSpec, var tuf: double)
+{
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[MifColumn] linked
+}
+
+define MifFotCell
+(
+    var missing: bool
+    var n_cols_spanned: int
+    var n_rows_spanned: int
+    before_row_border: ref[MifBorder]
+    after_row_border: ref[MifBorder]
+    before_column_border: ref[MifBorder]
+    after_column_border: ref[MifBorder]
+    var display_size: int
+    var overlapping: ref[MifFotCell]?
+    mif_cell: ref[MifTagStream]
+)
+{
+    function make(host: ref[Page], mc: ref[MifConsts]) @ret_explicit_0 true @deep true returns ref[MifFotCell] linked
+}
+
+define MifFotRow (cells: ref[Array[ref[MifFotCell]?]]?)
+{
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[MifFotRow] linked
+}
+
+define MifTablePart
+(
+    var columns: ref[Array[ref[MifColumn]?]]?
+    var header: ref[Array[ref[MifFotRow]?]]
+    var body: ref[Array[ref[MifFotRow]?]]?
+    var footer: ref[Array[ref[MifFotRow]?]]
+    var mif_table_num: int
+    var columns_processed: bool
+    var needs_col_reproc: bool
+)
+{
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[MifTablePart] linked
+}
+
+define MifTable
+(
+    var parts: ref[Array[ref[MifTablePart]?]]?
+    before_row_border: ref[MifBorder]
+    after_row_border: ref[MifBorder]
+    before_column_border: ref[MifBorder]
+    after_column_border: ref[MifBorder]
+    var table_width: int
+    var display_alignment: int
+    var start_indent: int
+    var cur_part: ref[MifTablePart]?
+    var cur_cell: ref[MifFotCell]?
+    ; Table::CurRows — a DIRECT pointer, as in the reference: it survives a
+    ; table's end and a stray table-row then appends to the stale (but live)
+    ; row list instead of asserting.
+    var cur_rows: ref[Array[ref[MifFotRow]?]]?
+    var default_tblfmt_generated: bool
+    var no_parts_seen: bool
+)
+{
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[MifTable] linked
+}
+
+; --- display / link / node bookkeeping ------------------------------------
+define MifDisplayInfo
+(
+    space_before: DisplaySpace
+    space_after: DisplaySpace
+    keep: int
+    break_before: int
+    break_after: int
+    keep_with_previous: bool
+    keep_with_next: bool
+    may_violate_keep_before: bool
+    may_violate_keep_after: bool
+    var first_para_outputed: bool
+    var is_paragraph: bool
+    var para_closed_in_mif: bool
+    keep_within_page: bool
+)
+{
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[MifDisplayInfo] linked
+}
+
+define MifDsi (space: DisplaySpace, break_type: int, break_is_after: bool)
+{
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[MifDsi] linked
+}
+
+; EffectiveDisplaySpace — a value record
+define MifEds (var nominal: int, var min: int, var max: int, priority: int, conditional: bool, force: bool)
+{
+    init() linked
+}
+
+define MifNodeInfo (node: ref[GroveNode]?, node_level: int)
+
+define MifLinkInfo (var cri: ref[MifCrossRefInfo]?, var opened_in_mif: bool)
+{
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[MifLinkInfo] linked
+}
+
+; TFotSimplePageSequence
+define MifSps
+(
+    var body: ref[MifTagStream]?
+    var first_header: ref[MifTagStream]?
+    var first_footer: ref[MifTagStream]?
+    var left_header: ref[MifTagStream]?
+    var left_footer: ref[MifTagStream]?
+    var right_header: ref[MifTagStream]?
+    var right_footer: ref[MifTagStream]?
+    para_fmt: ref[MifFormat]
+)
+{
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[MifSps] linked
+}
+
+define MifFOTBuilder
+@resident true @inplace true (
+    host: ref[Page]
+    mc: ref[MifConsts]
+    ; --- MifDoc state -------------------------------------------------------
+    out_loc: String
+    var next_id: int
+    var obj_id_cnt: int
+    var cur_os: ref[MifOS]?
+    book_components: ref[Array[ref[MifBookComponent]?]]
+    var cur_tbl_num: int
+    var doc_format: ref[MifFormat]
+    var cur_text_flow: ref[MifTagStream]?
+    var cur_cell: ref[MifTagStream]?
+    var cur_para: ref[MifTagStream]?
+    ts_stack: ref[Array[ref[MifTagStream]?]]
+    var ts_depth: int
+    cross_ref_infos: ref[Array[ref[MifCrossRefInfo]?]]
+    ; ElementSet: the SgmlIdInfo PointerTable + the per-grove flag vectors
+    var elem_slots: ref[Array[ref[MifSgmlIdInfo]?]]
+    var elem_used: int
+    var elem_limit: int
+    elem_flags: ref[Array[ref[Array[int]]?]]
+    ; the statics: Para::currentlyOpened, ParaLine::setProperties/TextRectID/ATbl
+    var para_currently_opened: bool
+    var paraline_set: int
+    var paraline_text_rect_id: int
+    var paraline_atbl: int
+    ; --- MifFOTBuilder state ------------------------------------------------
+    char_table: ref[Array[int]]
+    format_stack: ref[Array[ref[MifFormat]?]]
+    var format_depth: int
+    next_format: ref[MifFormat]
+    display_stack: ref[Array[ref[MifDisplayInfo]?]]
+    var display_depth: int
+    dsq: ref[Array[ref[MifDsi]?]]
+    var dsq_head: int
+    var dsq_tail: int
+    node_stack: ref[Array[ref[MifNodeInfo]?]]?
+    var node_depth: int
+    link_stack: ref[Array[ref[MifLinkInfo]?]]
+    var link_depth: int
+    index_entry_stack: ref[Array[ref[MifMarker]?]]
+    var index_depth: int
+    var pending_break: int
+    var pending_eds: MifEds
+    var non_empty_elements_opened: int
+    var cur_node_level: int
+    var pending_mif_closings: int
+    var paragraph_break_in_effect: bool
+    var in_leader: bool
+    var last_flow_object_was_whitespace: bool
+    var first_header_footer: bool
+    var in_simple_page_sequence: bool
+    var book_component_opened: bool
+    var book_component_available: bool
+    var cur_leader_stream: ref[MifTmp]?
+    sps: ref[MifSps]
+    cur_table: ref[MifTable]
+    ; the port passes a null NIC pointer where the reference has a
+    ; default-constructed one; these stand in for it
+    default_dnic: ref[DisplayNIC]
+    default_cell_nic: ref[TableCellNIC]
+)
+{
+    procedure make(host: ref[Page], mutable out_loc: String) @ret_explicit_0 true @deep true returns ref[MifFOTBuilder] io reads mif_prog linked
+
+    ; --- messages -----------------------------------------------------------
+    procedure trap(what: Slice[char]) @ret_nonlocal true @deep true @deep_beyond_1 true io reads mif_prog linked
+
+    procedure set_prog_name(prog: pointer[const_char]) @deep true @deep_beyond_1 true @deep_whole_1 true mutable mif_prog reads mif_prog linked
+
+    ; MifMessages W0 (no location): `<prog>:W: <text>`
+    procedure msg_w(text: Slice[char]) @ret_nonlocal true @deep true @deep_beyond_1 true io reads mif_prog linked
+
+    ; MifMessages E1 systemIdNotFilename
+    procedure msg_system_id_not_filename(sysid: StringC) @ret_nonlocal true @deep true reads mif_prog linked
+
+    ; MifMessages E2 cannotOpenOutputError
+    procedure msg_cannot_open(name: String, err: i32) @ret_nonlocal true @deep true reads mif_prog linked
+
+    ; --- String helpers -----------------------------------------------------
+    function str_from_bytes(host: ref[Page], arr: ref[Array[u8]]) @page true @direct true @ret_explicit_0 true @deep true returns String linked
+
+    function bytes_of(host: ref[Page], s: String) @ret_explicit_0 true @deep true returns ref[Array[u8]] linked
+
+    procedure str_cat(host: ref[Page], mutable a: String, b2: String) @page true @direct true @ret_explicit_0 true @deep true returns String linked
+
+    function str_of_c(host: ref[Page], s: Slice[char]) @page true @direct true @ret_explicit_0 true @deep true returns String linked
+
+    ; append the decimal of an unsigned long to a byte array
+    procedure arr_udec(mutable arr: ref[Array[u8]], n_in: int) @deep true linked
+
+    procedure arr_raw(mutable arr: ref[Array[u8]], s: Slice[char]) @deep true linked
+
+    procedure arr_str(mutable arr: ref[Array[u8]], s: String) @deep true linked
+
+    procedure arr_stringc(mutable arr: ref[Array[u8]], s: StringC) @deep true linked
+
+    procedure arr_hex_char(mutable arr: ref[Array[u8]], code: int) @page true @direct true @ret_nonlocal true @deep true linked
+
+    function hex_digit(v: int) @ret_nonlocal true @deep true returns u8 linked
+
+    ; T_string::escapeSpecialChars
+    function escape_special_chars(host: ref[Page], s: String) @page true @direct true @ret_args_3 true @deep true returns String linked
+
+    ; --- the CharMap --------------------------------------------------------
+    function char_at(this: ref[MifFOTBuilder], c: int) @ret_param_0 true @deep true returns int linked
+
+    procedure char_set(mutable this: ref[MifFOTBuilder], c: int, v: int) @persists true @deep true linked
+
+    procedure build_char_table(mutable this: ref[MifFOTBuilder]) @deep true linked
+
+    procedure symbol_font_name(mutable this: ref[MifFOTBuilder], n: int) @page true @direct true @ret_param_0 true @deep true returns String linked
+
+    ; --- book components / tag streams -------------------------------------
+    procedure book_component(this: ref[MifFOTBuilder]) @ret_param_0 true @deep true returns ref[MifBookComponent] io reads mif_prog linked
+
+    procedure next_object_id(mutable this: ref[MifFOTBuilder]) @ret_param_0 true @deep true returns int linked
+
+    procedure alloc_id(mutable this: ref[MifFOTBuilder]) @ret_param_0 true @deep true returns int linked
+
+    procedure os(this: ref[MifFOTBuilder]) @ret_param_0 true @deep true returns ref[MifOS] io reads mif_prog linked
+
+    procedure cur_tag_stream(this: ref[MifFOTBuilder]) @ret_param_0 true @deep true returns ref[MifTagStream] io reads mif_prog linked
+
+    procedure switch_to_tag_stream(mutable this: ref[MifFOTBuilder], mutable ts: ref[MifTagStream], default_pgf: bool) @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    procedure enter_tag_stream(mutable this: ref[MifFOTBuilder], mutable ts: ref[MifTagStream]?) @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    procedure exit_tag_stream(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure enter_book_component(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true linked
+
+    procedure exit_book_component(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure enter_text_flow(mutable this: ref[MifFOTBuilder], mutable tf: ref[MifTagStream]?) @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    procedure exit_text_flow(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure enter_table_cell(mutable this: ref[MifFOTBuilder], mutable cell: ref[MifTagStream]) @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    procedure exit_table_cell(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure enter_para(mutable this: ref[MifFOTBuilder], mutable p: ref[MifTagStream]) @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    procedure exit_para(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure cur_tbl(this: ref[MifFOTBuilder]) @deep true returns ref[MifTbl]? io reads mif_prog linked
+
+    procedure cur_tbl_asserted(this: ref[MifFOTBuilder]) @deep true returns ref[MifTbl]? io reads mif_prog linked
+
+    ; --- format stack -------------------------------------------------------
+    procedure format_push(mutable this: ref[MifFOTBuilder]) @deep true linked
+
+    procedure format(this: ref[MifFOTBuilder]) @ret_param_0 true @deep true returns ref[MifFormat] io reads mif_prog linked
+
+    ; FOTBuilder::start()
+    procedure mif_start(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    ; FOTBuilder::end()
+    procedure mif_end(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; FOTBuilder::atomic() — start() then end().
+    procedure mif_atomic(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure compute_length_spec(this: ref[MifFOTBuilder], spec: LengthSpec) @ret_param_1 true @deep true returns int io reads mif_prog linked
+
+    procedure make_eds(this: ref[MifFOTBuilder], ds: DisplaySpace) @page true @direct true @ret_caller true @deep true returns MifEds io reads mif_prog linked
+
+    ; EffectiveDisplaySpace::combine
+    procedure eds_combine(mutable dst: ref[MifEds], src: MifEds) @deep true linked
+
+    ; --- the display-space queue (IQueue: FIFO) -----------------------------
+    procedure dsq_append(mutable this: ref[MifFOTBuilder], space: DisplaySpace, break_type: int, break_is_after: bool) @deep true linked
+
+    ; --- the display stack (IList: LIFO) ------------------------------------
+    function display_head(this: ref[MifFOTBuilder]) @ret_param_0 true @deep true returns ref[MifDisplayInfo]? linked
+
+    procedure display_push(mutable this: ref[MifFOTBuilder], nic: ref[DisplayNIC]) @deep true linked
+
+    ; --- the node / link / index-entry stacks -------------------------------
+    procedure node_push(mutable this: ref[MifFOTBuilder], node: ref[GroveNode], level: int) @deep true linked
+
+    function node_at(this: ref[MifFOTBuilder], i: int) @ret_param_0 true @deep true returns ref[MifNodeInfo] linked
+
+    procedure link_push(mutable this: ref[MifFOTBuilder]) @deep true linked
+
+    function link_at(this: ref[MifFOTBuilder], i: int) @ret_param_0 true @deep true returns ref[MifLinkInfo] linked
+
+    procedure index_push(mutable this: ref[MifFOTBuilder], m: ref[MifMarker]) @deep true @deep_this_2 true @deep_whole_2 true linked
+
+    ; --- ElementSet ---------------------------------------------------------
+    function stringc_hash(s: StringC) @ret_nonlocal true @deep true returns size_t linked
+
+    procedure enforce_sgml_id(mutable this: ref[MifFOTBuilder], sgml_id: StringC, grove_index: int) @page true @direct true @ret_param_0 true @deep true @deep_this_2 true @deep_whole_2 true returns ref[MifSgmlIdInfo]? linked
+
+    procedure elem_get_flags(this: ref[MifFOTBuilder], grove_index: int, n: int, mutable result: ref[int]) @ret_nonlocal true @deep true returns bool linked
+
+    procedure elem_add(mutable this: ref[MifFOTBuilder], grove_index: int, n: int, flags: int) @ret_nonlocal true @deep true linked
+
+    procedure set_referenced_flag_n(mutable this: ref[MifFOTBuilder], ref_type: int, grove_index: int, n: int) @ret_nonlocal true @deep true linked
+
+    procedure set_referenced_flag_id(mutable this: ref[MifFOTBuilder], ref_type: int, grove_index: int, mutable sgml_id: StringC) @deep true @deep_this_8 true @deep_whole_8 true linked
+
+    procedure set_bc_index_n(mutable this: ref[MifFOTBuilder], grove_index: int, n: int, idx: int) @ret_nonlocal true @deep true linked
+
+    procedure set_bc_index_id(mutable this: ref[MifFOTBuilder], grove_index: int, mutable sgml_id: StringC, idx: int) @deep true @deep_this_4 true @deep_whole_4 true linked
+
+    function has_been_referenced_n(this: ref[MifFOTBuilder], ref_type: int, grove_index: int, n: int) @ret_nonlocal true @deep true returns bool linked
+
+    procedure has_been_referenced_id(mutable this: ref[MifFOTBuilder], ref_type: int, grove_index: int, sgml_id: StringC) @ret_param_0 true @deep true @deep_this_8 true @deep_whole_8 true returns bool linked
+
+    procedure bc_index_n(this: ref[MifFOTBuilder], grove_index: int, n: int) @ret_nonlocal true @deep true returns int io reads mif_prog linked
+
+    procedure bc_index_id(mutable this: ref[MifFOTBuilder], grove_index: int, sgml_id: StringC) @ret_param_0 true @deep true @deep_this_4 true @deep_whole_4 true returns int linked
+
+    ; --- the Ruling / Color PointerTables (OpenSP StringHash over bytes) ----
+    function string_hash(s: String) @ret_nonlocal true @deep true returns size_t linked
+
+    function ruling_lookup(bc: ref[MifBookComponent], key: String) @ret_nonlocal true @deep true returns ref[MifRuling]? linked
+
+    procedure ruling_insert(mutable this: ref[MifFOTBuilder], mutable bc: ref[MifBookComponent], r: ref[MifRuling]) @deep true @deep_into_1_4 true linked
+
+    function color_lookup(bc: ref[MifBookComponent], key: String) @ret_nonlocal true @deep true returns ref[MifColor]? linked
+
+    procedure color_insert(mutable this: ref[MifFOTBuilder], mutable bc: ref[MifBookComponent], r: ref[MifColor]) @deep true @deep_into_1_4 true linked
+
+    ; --- ParagraphFormat::out (needs curTagStream()/curCell()) --------------
+    procedure pf_out(mutable this: ref[MifFOTBuilder], f: ref[MifFormat], mutable os: ref[MifOS], props: int, fprops: int, exclude_cell: bool) @deep true io reads mif_prog linked
+
+    ; --- Para / ParaLine prologs and epilogs -------------------------------
+    procedure para_out_simple_prolog(mutable this: ref[MifFOTBuilder], mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+
+    procedure para_out_epilog(mutable this: ref[MifFOTBuilder], mutable os: ref[MifOS]) @deep true linked
+
+    procedure paraline_out_prolog(mutable this: ref[MifFOTBuilder], mutable os: ref[MifOS]) @deep true io reads mif_prog linked
+
+    procedure paraline_out_epilog(this: ref[MifFOTBuilder], mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+
+    ; Para::out — the whole paragraph statement into the enclosing stream
+    procedure para_out(mutable this: ref[MifFOTBuilder], p: ref[MifTagStream], mutable os: ref[MifOS]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure para_out_prolog(mutable this: ref[MifFOTBuilder], p: ref[MifTagStream], mutable os: ref[MifOS]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; --- MifDoc emission helpers -------------------------------------------
+    procedure out_hex_char(this: ref[MifFOTBuilder], code: int, mutable os: ref[MifOS]) @page true @direct true @ret_nonlocal true @deep true linked
+
+    procedure out_special_char(this: ref[MifFOTBuilder], name: String, mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+
+    procedure out_page_number(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure out_a_frame(this: ref[MifFOTBuilder], id: int, mutable os: ref[MifOS]) @ret_nonlocal true @deep true linked
+
+    procedure begin_para_line(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_para_line(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure out_breaking_para(mutable this: ref[MifFOTBuilder], pgf_placement: String) @ret_nonlocal true @deep true @deep_this_2 true @deep_whole_2 true io reads mif_prog linked
+
+    ; --- CrossRefInfo: record + escape, then resolve at commit time --------
+    procedure out_cross_ref_info(mutable this: ref[MifFOTBuilder], cri: ref[MifCrossRefInfo], mutable os: ref[MifOS]) @page true @direct true @ret_nonlocal true @deep true linked
+
+    procedure cross_ref_text(mutable this: ref[MifFOTBuilder], cri: ref[MifCrossRefInfo]) @page true @direct true @ret_param_0 true @deep true returns String linked
+
+    procedure out_marker(mutable this: ref[MifFOTBuilder], mutable os: ref[MifOS], set_props: int, m_type: int, m_text_in: String) @ret_nonlocal true @deep true linked
+
+    ; Marker(CrossRefInfo &, linkDestinationMode)
+    procedure out_marker_for_cri(mutable this: ref[MifFOTBuilder], cri: ref[MifCrossRefInfo], mutable os: ref[MifOS], link_destination: bool) @deep true @deep_this_2 true io reads mif_prog linked
+
+    ; XRef(CrossRefInfo &)
+    procedure out_xref_for_cri(mutable this: ref[MifFOTBuilder], cri: ref[MifCrossRefInfo], mutable os: ref[MifOS]) @page true @direct true @ret_nonlocal true @deep true @deep_this_2 true io reads mif_prog linked
+
+    ; CrossRefInfo::out
+    procedure cri_out(mutable this: ref[MifFOTBuilder], cri: ref[MifCrossRefInfo], mutable os: ref[MifOS]) @deep true @deep_this_2 true io reads mif_prog linked
+
+    ; MifTmpOutputByteStream::commit
+    procedure tmp_commit(mutable this: ref[MifFOTBuilder], src: ref[MifTmp], mutable dst: ref[Array[u8]], resolve: bool) @deep true io reads mif_prog linked
+
+    ; --- catalog + component emission ---------------------------------------
+    procedure pgf_catalog_out(mutable this: ref[MifFOTBuilder], bc: ref[MifBookComponent], mutable os: ref[MifOS]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure color_catalog_out(this: ref[MifFOTBuilder], bc: ref[MifBookComponent], mutable os: ref[MifOS]) @deep true linked
+
+    procedure ruling_catalog_out(this: ref[MifFOTBuilder], bc: ref[MifBookComponent], mutable os: ref[MifOS]) @deep true linked
+
+    procedure tbl_catalog_out(this: ref[MifFOTBuilder], bc: ref[MifBookComponent], mutable os: ref[MifOS]) @deep true linked
+
+    procedure cell_out(mutable this: ref[MifFOTBuilder], c: ref[MifTagStream], mutable os: ref[MifOS], resolve: bool) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure row_out(mutable this: ref[MifFOTBuilder], r: ref[MifRow], mutable os: ref[MifOS], resolve: bool) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure rows_out(mutable this: ref[MifFOTBuilder], rows: ref[Array[ref[MifRow]?]], name: Slice[char], mutable os: ref[MifOS], resolve: bool) @deep true io reads mif_prog linked
+
+    procedure tbl_out(mutable this: ref[MifFOTBuilder], t: ref[MifTbl], mutable os: ref[MifOS], resolve: bool) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure text_flow_out(mutable this: ref[MifFOTBuilder], tf: ref[MifTagStream], mutable os: ref[MifOS], resolve: bool) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; BookComponent::commit
+    procedure book_component_commit(mutable this: ref[MifFOTBuilder], bc: ref[MifBookComponent], mutable dir: String, resolve: bool) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; MifDoc::commit — the reference destructor
+    procedure commit(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    ; --- initMifBookComponent ----------------------------------------------
+    procedure init_mif_book_component(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    ; --- Format::computePgfLanguage (with the missing `break` after DE) -----
+    procedure compute_pgf_language(this: ref[MifFOTBuilder], mutable f: ref[MifFormat]) @deep true linked
+
+    ; --- synchronizeFontFormat ---------------------------------------------
+    procedure synchronize_font_format(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; --- outString ---------------------------------------------------------
+    procedure out_string(mutable this: ref[MifFOTBuilder], s: Slice[u32], o: ref[MifTmp]?, in_paragraph: bool) @deep true io reads mif_prog linked
+
+    ; --- characters --------------------------------------------------------
+    procedure characters(mutable this: ref[MifFOTBuilder], s: Slice[u32]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure characters_from_node(mutable this: ref[MifFOTBuilder], node: ref[GroveNode]?, s: Slice[u32]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; --- checkForParagraphReopening ----------------------------------------
+    procedure check_for_paragraph_reopening(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    ; --- processDisplaySpaceStack ------------------------------------------
+    procedure process_display_space_stack(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    ; --- paragraphs --------------------------------------------------------
+    procedure do_start_paragraph(mutable this: ref[MifFOTBuilder], nic: ref[DisplayNIC]?, serves_as_wrapper: bool, height_in: int, allow_negative_leading: bool) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_paragraph(mutable this: ref[MifFOTBuilder], nic: ref[DisplayNIC]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure do_end_paragraph(mutable this: ref[MifFOTBuilder], sustain_format: bool, sustain_display: bool, break_test: bool, discard: bool) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_paragraph(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure paragraph_break(mutable this: ref[MifFOTBuilder], nic: ref[DisplayNIC]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; --- displays ----------------------------------------------------------
+    procedure start_display_group(mutable this: ref[MifFOTBuilder], nic: ref[DisplayNIC]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_display_group(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_display(mutable this: ref[MifFOTBuilder], nic_in: ref[DisplayNIC]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_display(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; --- sequence / scroll / box (the FOTBuilder base brackets) -------------
+    procedure start_sequence(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_sequence(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_scroll(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_scroll(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_box(mutable this: ref[MifFOTBuilder], nic: ref[BoxNIC], dnic: ref[DisplayNIC]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_box(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure page_number(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; --- scores ------------------------------------------------------------
+    procedure start_score(mutable this: ref[MifFOTBuilder], nic: ref[ScoreNIC]) @deep true io reads mif_prog linked
+
+    procedure end_score(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; --- leaders -----------------------------------------------------------
+    procedure start_leader(mutable this: ref[MifFOTBuilder], nic: ref[LeaderNIC]) @deep true io reads mif_prog linked
+
+    procedure end_leader(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    ; --- line fields -------------------------------------------------------
+    procedure start_line_field(mutable this: ref[MifFOTBuilder], nic: ref[LineFieldNIC]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_line_field(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    ; --- anchored frames ---------------------------------------------------
+    procedure make_anchored_frame(mutable this: ref[MifFOTBuilder], frame_type: String, width: int, height: int, anchor_align: String) @deep true @deep_this_18 true @deep_whole_18 true returns ref[MifObject] io reads mif_prog linked
+
+    procedure mif_alignment(this: ref[MifFOTBuilder], sym: int) @page true @direct true @ret_param_0 true @deep true returns String io reads mif_prog linked
+
+    ; --- external graphics -------------------------------------------------
+    procedure external_graphic(mutable this: ref[MifFOTBuilder], nic: ref[ExternalGraphicNIC], dnic: ref[DisplayNIC]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; the MIF pathname encoding (`<c\>name`, `<u\>`, `<r\>`)
+    procedure add_path_component(mutable arr: ref[Array[u8]], ctype: int, comp: ref[Array[u8]]) @page true @direct true @deep true linked
+
+    ; systemIdToMifPathname — returns the encoded pathname, or the empty
+    ; string when the system id could not be converted (the reference's
+    ; `false` return; it also reports systemIdNotFilename in that case).
+    procedure system_id_to_mif_pathname(mutable this: ref[MifFOTBuilder], system_id: StringC) @page true @direct true @ret_param_0 true @deep true returns String reads mif_prog linked
+
+    ; MifFOTBuilder::systemIdFilename. Design-note deviation (same as the RTF
+    ; port's includePicture): the reference round-trips the system id through
+    ; the ExtendEntityManager to obtain the OSFILE storage id; the port's
+    ; backend seam has no entity manager, and for the corpus the id IS the
+    ; storage id, so a leading `<OSFILE>` storage-spec prefix is stripped and
+    ; the remainder taken as the file name. A missing file is therefore not
+    ; reported (the reference would emit no frame at all).
+    function system_id_filename(this: ref[MifFOTBuilder], system_id: StringC) @page true @direct true @deep true returns StringC linked
+
+    ; --- rules -------------------------------------------------------------
+    procedure rule(mutable this: ref[MifFOTBuilder], nic: ref[RuleNIC], dnic: ref[DisplayNIC]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; --- simple page sequence ----------------------------------------------
+    procedure start_simple_page_sequence(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_simple_page_sequence(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    procedure make_text_rect(mutable this: ref[MifFOTBuilder], l: int, t: int, w: int, h: int, ncols: int, gap: int, balance: bool) @ret_param_0 true @deep true returns ref[MifObject] linked
+
+    procedure make_text_flow(mutable this: ref[MifFOTBuilder], text_rect: ref[MifObject], body: bool, fmt: ref[MifFormat]?, pgf_tag: String) @ret_args_19 true @deep true returns ref[MifTagStream] linked
+
+    procedure make_empty_text_flow(mutable this: ref[MifFOTBuilder], mutable text_rect: ref[MifObject]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure begin_header_footer(mutable this: ref[MifFOTBuilder], header: bool) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_header_footer(mutable this: ref[MifFOTBuilder], hf_part: int) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure setup_hf_paragraph_format(mutable this: ref[MifFOTBuilder], mutable hpf: ref[MifFormat], mutable fpf: ref[MifFormat], text_rect_width: int) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure setup_simple_page_sequence(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_simple_page_sequence_header_footer(mutable this: ref[MifFOTBuilder], hf_part: int) @deep true io reads mif_prog linked
+
+    procedure end_simple_page_sequence_header_footer(mutable this: ref[MifFOTBuilder], hf_part: int) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    function end_all_simple_page_sequence_header_footer(this: ref[MifFOTBuilder]) @deep true linked
+
+    ; --- tables ------------------------------------------------------------
+    function rows_of(this: ref[MifFOTBuilder], part: ref[MifTablePart], sel: int) @ret_param_1 true @deep true returns ref[Array[ref[MifFotRow]?]] linked
+
+    procedure cur_part(this: ref[MifFOTBuilder]) @ret_param_0 true @deep true returns ref[MifTablePart] io reads mif_prog linked
+
+    procedure cur_rows(this: ref[MifFOTBuilder]) @ret_param_0 true @deep true returns ref[Array[ref[MifFotRow]?]] io reads mif_prog linked
+
+    procedure mif_table_of(this: ref[MifFOTBuilder], part: ref[MifTablePart]) @deep true returns ref[MifTbl] io reads mif_prog linked
+
+    procedure border_from_fot(this: ref[MifFOTBuilder], mutable b: ref[MifBorder]) @deep true io reads mif_prog linked
+
+    ; Border::makeMifRuling
+    procedure make_mif_ruling(mutable this: ref[MifFOTBuilder], b: ref[MifBorder]) @page true @direct true @ret_param_0 true @deep true returns String io reads mif_prog linked
+
+    ; Cell::translate
+    procedure cell_translate(mutable this: ref[MifFOTBuilder], mutable c: ref[MifFotCell]) @deep true io reads mif_prog linked
+
+    ; Row::translate
+    procedure row_translate(mutable this: ref[MifFOTBuilder], mutable row: ref[MifFotRow], mutable mif_rows: ref[Array[ref[MifRow]?]]) @page true @direct true @deep true io reads mif_prog linked
+
+    procedure fot_rows_resize(mutable this: ref[MifFOTBuilder], mutable rows: ref[Array[ref[MifFotRow]?]], n: int) @deep true linked
+
+    procedure cells_resize(mutable this: ref[MifFOTBuilder], mutable row: ref[MifFotRow], n: int) @deep true linked
+
+    procedure columns_resize(mutable this: ref[MifFOTBuilder], mutable part: ref[MifTablePart], n: int) @deep true linked
+
+    function cell_at(row: ref[MifFotRow], i: int) @ret_nonlocal true @deep true returns ref[MifFotCell] linked
+
+    function row_at(rows: ref[Array[ref[MifFotRow]?]], i: int) @ret_nonlocal true @deep true returns ref[MifFotRow] linked
+
+    function column_at(part: ref[MifTablePart], i: int) @ret_nonlocal true @deep true returns ref[MifColumn] linked
+
+    ; TablePart::processColumns
+    procedure part_process_columns(mutable this: ref[MifFOTBuilder], mutable part: ref[MifTablePart]) @deep true io reads mif_prog linked
+
+    ; TablePart::normalizeRows
+    procedure part_normalize_rows(mutable this: ref[MifFOTBuilder], mutable part: ref[MifTablePart]) @deep true linked
+
+    ; Table::resolveBorders
+    procedure resolve_borders(mutable this: ref[MifFOTBuilder], mutable rows: ref[Array[ref[MifFotRow]?]], has_first: bool, has_last: bool) @deep true linked
+
+    ; TablePart::translate
+    procedure part_translate(mutable this: ref[MifFOTBuilder], mutable part: ref[MifTablePart]) @deep true io reads mif_prog linked
+
+    ; TablePart::begin
+    procedure part_begin(mutable this: ref[MifFOTBuilder], mutable part: ref[MifTablePart]) @deep true @deep_this_2 true @deep_whole_2 true io reads mif_prog linked
+
+    ; Table::begin
+    procedure table_begin(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_table(mutable this: ref[MifFOTBuilder], tnic: ref[TableNIC], dnic: ref[DisplayNIC]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_table(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure table_column(mutable this: ref[MifFOTBuilder], nic: ref[TableColumnNIC]) @deep true io reads mif_prog linked
+
+    procedure start_table_row(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    function end_table_row(this: ref[MifFOTBuilder]) @deep true linked
+
+    procedure start_table_cell(mutable this: ref[MifFOTBuilder], nic_in: ref[TableCellNIC]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_table_cell(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    procedure start_table_part_serial(mutable this: ref[MifFOTBuilder], dnic: ref[DisplayNIC]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_table_part_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_table_part_header(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    procedure end_table_part_header(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    procedure start_table_part_footer(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    procedure end_table_part_footer(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    ; --- table borders -----------------------------------------------------
+    procedure table_before_row_border(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure table_after_row_border(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure table_before_column_border(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure table_after_column_border(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure cur_fot_cell(this: ref[MifFOTBuilder]) @ret_param_0 true @deep true returns ref[MifFotCell] io reads mif_prog linked
+
+    procedure table_cell_before_row_border(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure table_cell_after_row_border(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure table_cell_before_column_border(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure table_cell_after_column_border(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; --- cross-references, links, index entries ----------------------------
+    procedure out_pending_inline_statements(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    procedure start_link(mutable this: ref[MifFOTBuilder], mutable nic: ref[LinkNIC]) @ret_nonlocal true @deep true linked
+
+    procedure end_link(mutable this: ref[MifFOTBuilder]) @deep true io reads mif_prog linked
+
+    procedure start_node(mutable this: ref[MifFOTBuilder], node: ref[GroveNode], mode_name: StringC) @ret_nonlocal true @deep true linked
+
+    procedure end_node(mutable this: ref[MifFOTBuilder]) @deep true linked
+
+    procedure current_node_page_number(mutable this: ref[MifFOTBuilder], mutable node: ref[GroveNode]?) @deep true io reads mif_prog linked
+
+    ; --- setCellBackground / colours ---------------------------------------
+    procedure make_color(mutable this: ref[MifFOTBuilder], r: int, g: int, b2: int) @ret_param_0 true @deep true returns ref[MifColor] linked
+
+    procedure intern_color(mutable this: ref[MifFOTBuilder], c: ref[MifColor]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    ; --- setFontFamilyName --------------------------------------------------
+    procedure set_font_family_name(mutable this: ref[MifFOTBuilder], name: StringC) @deep true linked
+
+    ; --- the inherited-characteristic dispatch ------------------------------
+    procedure set_ic(mutable this: ref[MifFOTBuilder], ic: ref[InheritedC]) @deep true io reads mif_prog linked
+
+    ; the jade.cxx makeMifFOTBuilder extension table (3 characteristics)
+    procedure set_extension_ic(mutable this: ref[MifFOTBuilder], ext: int, ic: ref[InheritedC]) @deep true io reads mif_prog linked
+
+    ; --- the index-entry extension flow object ------------------------------
+    procedure index_entry(mutable this: ref[MifFOTBuilder], nic: ref[IndexEntryNIC]) @deep true linked
+    ; --- the INLINE/MARK family -------------------------------------------------
+    ; None of these six classes is overridden by the reference Mif backend, so the
+    ; plain FOTBuilder brackets apply. ★`character` is the interesting one: the
+    ; base EMITS THE CHARACTER as text when the NIC is valid, then takes the
+    ; atomic bracket (FOTBuilder.cxx:174) — measured (`-t rtf` renders
+    ; `(make character char: #\A)` as an "A").
+    procedure character(mutable this: ref[MifFOTBuilder], nic: ref[CharacterNIC]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure alignment_point(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_sideline(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_sideline(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure anchor(mutable this: ref[MifFOTBuilder], nic: ref[AnchorNIC]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_glyph_annotation(mutable this: ref[MifFOTBuilder], nic: ref[GlyphAnnotationNIC]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_glyph_annotation(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_emphasizing_mark_serial(mutable this: ref[MifFOTBuilder], nic: ref[EmphasizingMarkNIC]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_emphasizing_mark_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_emphasizing_mark_mark(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_emphasizing_mark_mark(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    function end_all_emphasizing_mark_mark(this: ref[MifFOTBuilder]) @deep true linked
+    ; --- the MATH family --------------------------------------------------------
+    ; The Mif backend overrides none of the twelve classes, so the plain
+    ; FOTBuilder/SerialFOTBuilder brackets apply: each *_serial pair is
+    ; start()/end(), each PORT bracket is empty (the port content itself still
+    ; flows through), fraction-bar and radical-radical are atomic(), and
+    ; radical-radical-defaulted is nothing at all.
+    procedure start_math_sequence(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_math_sequence(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_fraction_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_fraction_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure fraction_bar(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    function start_fraction_numerator(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_fraction_numerator(this: ref[MifFOTBuilder]) @deep true linked
+
+    function start_fraction_denominator(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_fraction_denominator(this: ref[MifFOTBuilder]) @deep true linked
+
+    procedure start_unmath(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_unmath(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_superscript(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_superscript(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_subscript(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_subscript(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_script_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_script_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    function start_script_pre_sup(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_script_pre_sup(this: ref[MifFOTBuilder]) @deep true linked
+
+    function start_script_pre_sub(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_script_pre_sub(this: ref[MifFOTBuilder]) @deep true linked
+
+    function start_script_post_sup(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_script_post_sup(this: ref[MifFOTBuilder]) @deep true linked
+
+    function start_script_post_sub(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_script_post_sub(this: ref[MifFOTBuilder]) @deep true linked
+
+    function start_script_mid_sup(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_script_mid_sup(this: ref[MifFOTBuilder]) @deep true linked
+
+    function start_script_mid_sub(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_script_mid_sub(this: ref[MifFOTBuilder]) @deep true linked
+
+    procedure start_mark_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_mark_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    function start_mark_over(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_mark_over(this: ref[MifFOTBuilder]) @deep true linked
+
+    function start_mark_under(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_mark_under(this: ref[MifFOTBuilder]) @deep true linked
+
+    procedure start_fence_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_fence_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    function start_fence_open(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_fence_open(this: ref[MifFOTBuilder]) @deep true linked
+
+    function start_fence_close(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_fence_close(this: ref[MifFOTBuilder]) @deep true linked
+
+    procedure start_radical_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_radical_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure radical_radical(mutable this: ref[MifFOTBuilder], nic: ref[CharacterNIC]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    function radical_radical_defaulted(this: ref[MifFOTBuilder]) @deep true linked
+
+    function start_radical_degree(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_radical_degree(this: ref[MifFOTBuilder]) @deep true linked
+
+    procedure start_math_operator_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_math_operator_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    function start_math_operator_operator(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_math_operator_operator(this: ref[MifFOTBuilder]) @deep true linked
+
+    function start_math_operator_lower_limit(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_math_operator_lower_limit(this: ref[MifFOTBuilder]) @deep true linked
+
+    function start_math_operator_upper_limit(this: ref[MifFOTBuilder]) @deep true linked
+
+    function end_math_operator_upper_limit(this: ref[MifFOTBuilder]) @deep true linked
+
+    procedure start_grid(mutable this: ref[MifFOTBuilder], nic: ref[GridNIC]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_grid(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_grid_cell(mutable this: ref[MifFOTBuilder], nic: ref[GridCellNIC]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_grid_cell(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+
+    ; --- the LAYOUT-COMPOSITE family --------------------------------------------
+    ; The MIF backend overrides none of the five, so the plain FOTBuilder
+    ; brackets apply: every start*/end* pair is start()/end().
+    procedure start_embedded_text(mutable this: ref[MifFOTBuilder], nic: ref[EmbeddedTextNIC]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_embedded_text(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_included_container_area(mutable this: ref[MifFOTBuilder], nic: ref[IncludedContainerAreaNIC], dnic: ref[DisplayNIC]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_included_container_area(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_side_by_side(mutable this: ref[MifFOTBuilder], dnic: ref[DisplayNIC]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_side_by_side(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_side_by_side_item(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_side_by_side_item(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_aligned_column(mutable this: ref[MifFOTBuilder], dnic: ref[DisplayNIC]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_aligned_column(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+
+    ; --- the ONLINE family ------------------------------------------------------
+    ; The MIF backend overrides neither class, so the base brackets apply:
+    ; marginalia and the multi-mode SERIAL pair are start()/end(); the per-mode
+    ; bracket is empty (its content still flows through).
+    procedure start_marginalia(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_marginalia(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_multi_mode_serial(mutable this: ref[MifFOTBuilder], mode: ref[MultiModeRec]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_multi_mode_serial(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    function start_multi_mode_mode(this: ref[MifFOTBuilder], mode: ref[MultiModeRec]?) @deep true linked
+
+    function end_multi_mode_mode(this: ref[MifFOTBuilder]) @deep true linked
+
+    ; --- the PAGE/COLUMN MODEL ----------------------------------------------------
+    ; Not overridden here either, so both are the plain start()/end() brackets.
+    procedure start_page_sequence(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_page_sequence(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure start_column_set_sequence(mutable this: ref[MifFOTBuilder], dnic: ref[DisplayNIC]?) @ret_nonlocal true @deep true io reads mif_prog linked
+
+    procedure end_column_set_sequence(mutable this: ref[MifFOTBuilder]) @ret_nonlocal true @deep true io reads mif_prog linked
+
+
+
+}

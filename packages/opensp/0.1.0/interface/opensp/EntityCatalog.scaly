@@ -1,0 +1,252 @@
+use scaly.memory.Page
+use scaly.os.Path
+use scaly.memory.runtime.fopen
+use scaly.memory.runtime.fclose
+use scaly.memory.runtime.fread
+use opensp.ExternalId.ExternalId
+use opensp.StringC.StringC
+use opensp.Message.MessageType
+use opensp.CatalogMessages.CatalogMessages
+use opensp.PosixStorageMessages.PosixStorageMessages
+use opensp.Location.Location
+use opensp.Location.Origin
+
+; SGML Open catalog resolution — SOEntityCatalog.cxx (SOCatalogManagerImpl /
+; SOEntityCatalog / CatalogParser).
+;
+; ONE EntityCatalog accumulates every catalog file of a run in parse order
+; (command-line -c/-m catalogs, the document's implicit `catalog`, the
+; SGML_CATALOG_FILES entries, plus CATALOG-chained sub-catalogs); each file
+; bumps n_catalogs (SOEntityCatalog::endCatalog), and every entry records the
+; catalog number it came from plus the directory its target resolves against
+; (the catalog file's own directory, or the current BASE file's — the port
+; stores the resolved BASE DIRECTORY where the reference stores base
+; Locations). Lookup priority is the reference's: within a kind the FIRST
+; entry for a key wins (the hash-table first-insert semantics); across kinds
+; the entry from the LOWEST-numbered catalog wins, system id beating public
+; id beating entity name on ties (SOEntityCatalog::lookup, :427).
+;
+; The CatalogParser scans the DECODED Char buffer of a catalog file (the same
+; make_char_source normalization documents get, so message locations render
+; through the ordinary Origin line/col walk) and is a pure collector: entries
+; go into the EntityCatalog, diagnostics into a CatMsg list and CATALOG
+; chain requests into a SubCatalog list — the caller (Parser.scaly) replays
+; the messages through the parser's Messenger and drives the chaining (it
+; owns file access and the loop check). Byte-String identifiers throughout
+; (I/O-boundary rule, see ExternalId).
+
+; strerror(3)/errno — the BASE-entry file probe reports read errors with the
+; live errno text (rule (c): errno is a thread-local macro behind a shim).
+function strerror(code: i32) returns pointer[const_char] extern
+function scaly_eio_errno() returns i32 extern
+; Through the eio shim, not libc's fseek/ftell: `long` offsets are 32-bit on
+; Win64 and one seed serves every target (check 4 of tests/abi/run.sh).
+function scaly_eio_seek(stream: pointer[OpaqueFile], offset: int, whence: int) returns int extern
+function scaly_eio_tell(stream: pointer[OpaqueFile]) returns int extern
+function rewind(stream: pointer[OpaqueFile]) extern
+
+define CAT_PUBLIC: int 0
+define CAT_SYSTEM: int 1
+define CAT_DOCTYPE: int 2
+define CAT_ENTITY: int 3
+define CAT_SGMLDECL: int 4
+define CAT_CATALOG: int 5
+define CAT_NOTATION: int 6
+define CAT_LINKTYPE: int 7
+define CAT_SGML: int 8
+define CAT_DELEGATE: int 9
+define CAT_DTDDECL: int 10
+
+define TOK_EOF: int 0
+define TOK_NAME: int 1
+define TOK_LITERAL: int 2
+
+; CatMsg.kind — how the replay renders the args.
+define CMK_NONE: int 0
+define CMK_STR: int 1
+define CMK_STR_RAW: int 2
+
+; a collected catalog diagnostic: replayed by the caller through the parser
+; Messenger (report_at when has_loc, the location-less app shape otherwise).
+define CatMsg (mt: MessageType, kind: int, a1: String, a2: String, has_loc: bool, loc: Location)
+{
+    init(mt: MessageType, kind: int, a1: String, a2: String, has_loc: bool, loc: Location) linked
+}
+
+; a CATALOG chain request: the resolved sub-catalog path + the entry's
+; location (the parent location a failed open reports under).
+define SubCatalog (sysid: String, raw: String, loc: Location)
+{
+    init(sysid: String, raw: String, loc: Location) linked
+}
+
+define TokenResult (kind: int, token: String, start: size_t, next_pos: size_t)
+{
+    init(kind: int, token: String, start: size_t, next_pos: size_t) linked
+}
+
+define CatalogEntry (decl_type: int, key: String, target: String, base: String, base_file: String, catalog_number: int, is_override: bool)
+{
+    init(decl_type: int, key: String, target: String, base: String, base_file: String, catalog_number: int, is_override: bool) linked
+}
+
+; a lookup verdict: `path` is the entry's resolved target; a DELEGATE hit
+; instead names the delegate CATALOG (resolution against it happens at open
+; time — the effective system id renders the `<CATALOG PUBLIC=...>` map).
+define CatLookup (found: bool, path: String, delegated: bool, delegate_catalog: String, target: String, base: String, base_file: String)
+{
+    init(found: bool, path: String, delegated: bool, delegate_catalog: String, target: String, base: String, base_file: String) linked
+}
+
+define EntityCatalog @resident true @inplace true (entries: Array[CatalogEntry], var n_catalogs: int, var have_sgml_decl: bool, var sgml_decl: String, var sgml_decl_base: String, var have_document: bool, var document: String, var document_base: String)
+{
+    init() linked
+
+    function make(host: ref[Page]) @ret_explicit_0 true @deep true returns ref[EntityCatalog] linked
+
+    ; SOEntityCatalog::endCatalog — one catalog file finished.
+    procedure end_catalog(mutable this: ref[EntityCatalog]) @deep true linked
+
+    ; PosixStorageManager::combineDir via extractDir: an absolute target (or
+    ; an empty base) stands alone; otherwise it joins the entry's base dir.
+    function resolve_target(base: String, target: String) @page true @direct true @deep true returns String linked
+
+    function resolve(this: EntityCatalog, e: ref[CatalogEntry]) @page true @direct true @deep true returns String linked
+
+    ; Table::lookup / insert first-wins semantics over the flat entry list:
+    ; the first entry of the kind with the key wins; with override_only (the
+    ; entity DECLARED a system id) only OVERRIDE YES entries apply
+    ; (SOEntityCatalog.cxx:736-758 — see the design note in the header).
+    function find_of(this: EntityCatalog, decl_type: int, key: String, override_only: bool, subst: bool) @ret_param_0 true @deep true returns ref[CatalogEntry]? linked
+
+    ; entry keys match exactly, or through the ASCII upper subst table when
+    ; the syntax namecase-folds the lookup name (the NAME arrives folded, so
+    ; the ENTRY key is upcased for the comparison — SOEntityCatalog.cxx:761).
+    function key_matches(ek: String, key: String, subst: bool) @ret_nonlocal true @deep true returns bool linked
+
+    ; a DELEGATE entry whose key equals public_id[0..plen) — compared IN
+    ; PLACE: lookups must not allocate before a match, because the queried
+    ; strings can alias the parser's transient literal buffer (a fresh String
+    ; here lands on that region and clobbers the caller's public id).
+    function find_delegate_prefix(this: EntityCatalog, public_id: String, plen: size_t, override_only: bool) @ret_param_0 true @deep true returns ref[CatalogEntry]? linked
+
+    ; findBestPublicEntry (SOEntityCatalog.cxx:552): DELEGATE prefixes (every
+    ; partitioned prefix of the public id — the split points around a doubled
+    ; `/` or `:`) compete with the PUBLIC entry; the lowest catalog number
+    ; wins and the PUBLIC entry takes ties (checked second with <=).
+    procedure find_public_entry(this: EntityCatalog, public_id: String, override_only: bool, mutable out_delegated: ref[bool]) @ret_param_0 true @deep true returns ref[CatalogEntry]? linked
+
+    ; SOEntityCatalog::lookup (:427) — the full external-id resolution an
+    ; EntityDecl gets: SYSTEM entry keyed by the declared system id; PUBLIC
+    ; entry (override-gated when a system id was declared, DELEGATE-aware);
+    ; the name table (only consulted while the best entry so far came from a
+    ; catalog other than the first) — each cross-kind contest won by the
+    ; LOWER catalog number. `name_key` arrives PERO-prefixed for parameter
+    ; entities and empty when the name table must not be consulted.
+    function lookup_external(this: EntityCatalog, has_sys: bool, sys: String, has_pub: bool, pub: String, name_key: String, name_decl_type: int, name_subst: bool) @page true @direct true @ret_caller true @deep true returns CatLookup linked
+
+    function lookup_of(this: EntityCatalog, decl_type: int, key: String) @page true @direct true @deep true returns String linked
+
+    ; non-delegate PUBLIC resolution (the DOCTYPE/LINKTYPE subset and SD
+    ; referencePublic sites); a DELEGATE winner reports as a miss here — the
+    ; delegate-aware sites go through find_public_entry/lookup_external.
+    function lookup_public(this: EntityCatalog, public_id: String) @page true @direct true @deep true returns String linked
+
+    function lookup_public_entry(this: EntityCatalog, public_id: String, override_only: bool) @page true @direct true @deep true returns String linked
+
+    function lookup_system(this: EntityCatalog, system_id: String) @page true @direct true @deep true returns String linked
+
+    ; DOCTYPE and NOTATION names match through the syntax's UPPER substitution
+    ; table under NAMECASE GENERAL (SOEntityCatalog.cxx:472-481).
+    function lookup_doctype(this: EntityCatalog, name: String, upcase: bool) @page true @direct true @deep true returns String linked
+
+    function lookup_notation(this: EntityCatalog, name: String, upcase: bool) @page true @direct true @deep true returns String linked
+
+    function lookup_name_of(this: EntityCatalog, decl_type: int, name: String, upcase: bool) @page true @direct true @deep true returns String linked
+
+    function lookup_entity(this: EntityCatalog, name: String) @page true @direct true @deep true returns String linked
+
+    ; the first catalog's SGMLDECL entry (setSgmlDecl is first-wins), resolved
+    ; against the catalog (or BASE) directory current at its declaration.
+    function lookup_sgmldecl(this: EntityCatalog) @page true @direct true @deep true returns String linked
+
+    ; the DOCUMENT entry (-C / SOEntityCatalog::document), first-wins.
+    function lookup_document(this: EntityCatalog) @page true @direct true @deep true returns String linked
+
+    ; EntityCatalog.lookup(EntityDecl): prefer PUBLIC, then SYSTEM, else the
+    ; entity's own system id resolved relative to the catalog dir. (Stage-2
+    ; convenience used by Entity.stack and tests; the parser proper resolves
+    ; through lookup_external and the per-site chains.)
+    function lookup(this: EntityCatalog, id: ExternalId) @page true @direct true @deep true returns String linked
+}
+
+; the parse chain — ancestor catalog paths for the CATALOG loop check
+; (CatalogParser::inLoop compares the current file's storage id against its
+; own inclusion ancestry).
+define CatChain (path: String, parent: ref[CatChain]?)
+{
+    ; ★The init parameter tracks the FIELD's nullability: `parent` is
+    ; `ref[CatChain]?` (a chain root has none), so this must be too, or
+    ; `check_initializer_match` rejects the init and the construction falls
+    ; through to the positional-tuple path.
+    init(path: String, parent: ref[CatChain]?) linked
+
+    function contains(this: CatChain, p: String) @ret_param_0 true @deep true returns bool linked
+}
+
+define CatalogParser ()
+{
+    ; ---- the Char scanner (CatalogParser::parseParam and friends) ----------
+    ; Char classes over the decoded buffer: s = space/tab and the normalized
+    ; RE/RS; lit/lita the two quotes; `-` opens a comment when doubled; NUL
+    ; reports and is otherwise a name char; everything else names.
+
+    function is_s(c: u32) @ret_nonlocal true @deep true returns bool linked
+
+    ; CatalogParser::isMinimumData: lc/uc letters, digits, the minimum-data
+    ; specials `-.'()+,/:=?`, the WWW additions `! # $ % * ; @ _`, and
+    ; space/RE/RS (s minus TAB); `'` (lita) counts, `"` (lit) does not.
+    function is_minimum_data(c: u32) @ret_nonlocal true @deep true returns bool linked
+
+    ; narrow a u32 token run to a byte String pinned on hp.
+    function narrow(this: CatalogParser, hp: ref[Page], buf: Slice[u32], start: size_t, len: size_t) @page true @direct true @ret_param_0 true @deep true returns String linked
+
+    procedure add_msg0(this: CatalogParser, hp: ref[Page], mutable msgs: ref[Array[CatMsg]], mt: MessageType, org: ref[Origin], index: size_t) @page true @direct true @ret_nonlocal true @deep true @deep_into_2_24 true linked
+
+    ; scan one parameter from buf[pos..len): skips s runs and `--…--`
+    ; comments, reports NUL chars, returns EOF / a literal / a name.
+    ; minimum_literal applies the PUBLIC-id literal rules (per-char minimum
+    ; data check, RS dropped, space/RE runs collapsing, edges stripped).
+    procedure scan(this: CatalogParser, hp: ref[Page], buf: Slice[u32], pos: size_t, minimum_literal: bool, org: ref[Origin], mutable msgs: ref[Array[CatMsg]]) @page true @direct true @ret_caller true @deep true returns TokenResult linked
+
+    ; the reference's currentLocation() after a parameter: a NAME is a real
+    ; token (endToken) — its START; a literal was consumed char-wise — the
+    ; CLOSING QUOTE; at EOF the end of the entity. (Probed: overrideYesOrNo
+    ; at the name start, top-level nameExpected at the closing quote.)
+    function anchor_of(this: CatalogParser, t: TokenResult) @ret_param_1 true @deep true returns size_t linked
+
+    ; ASCII-upcase a token for the keyword match (keywords are recognized
+    ; case-insensitively — CatalogParser::upcase via the subst table).
+    function upcased(this: CatalogParser, tok: String) @page true @direct true @ret_caller true @deep true returns String linked
+
+    ; the BASE entry's file probe (parseCatalog's baseKey_ arm): the argument
+    ; must OPEN and READ (an empty file passes; a failed open reports
+    ; openSystemCall, a failed read — a directory — readSystemCall; both
+    ; location-less like the reference's un-parented messenger) — only then
+    ; does the file's directory become the base for subsequent entries.
+    procedure probe_base_file(this: CatalogParser, hp: ref[Page], path: String, mutable msgs: ref[Array[CatMsg]], mutable out_ok: ref[bool]) @page true @direct true @deep true io linked
+
+    ; ---- parseCatalog (SOEntityCatalog.cxx:851) over one decoded file ------
+    ; Appends entries/messages/chain requests; the caller replays messages,
+    ; recurses into `subs` and calls cat.end_catalog(). `in_loop` says this
+    ; file already appears in its own inclusion ancestry — the first CATALOG
+    ; entry then reports inLoop at `incl_loc` (the parent's entry location)
+    ; and abandons the rest of the file, exactly like the reference's break.
+    procedure parse_into(mutable this: CatalogParser, hp: ref[Page], mutable cat: ref[EntityCatalog], mutable buf: Slice[u32], mutable org: ref[Origin], mutable cat_dir: String, cat_file: String, in_loop: bool, incl_loc: Location, mutable msgs: ref[Array[CatMsg]], mutable subs: ref[Array[SubCatalog]]) @page true @direct true @deep true @deep_into_9_256 true @deep_into_10_16 true io linked
+
+    ; ---- byte-String convenience (stage-2 API kept for Entity.stack and the
+    ;      unit tests): parse one catalog text with no message/chain plumbing.
+    procedure parse(mutable this: CatalogParser, text: String, mutable base_dir: String) @page true @direct true @ret_caller true @deep true returns EntityCatalog io linked
+
+    procedure test() @ret_nonlocal true @deep true returns int io linked
+}

@@ -1,0 +1,3356 @@
+; ProcessContext — drives a grove through a mode's construction rules,
+; emitting a flow-object sequence into a FOTBuilder (Style/ProcessContext.cxx +
+; SosofoObj::process). process(root) walks the tree: each node is matched, its
+; rule evaluated to a sosofo, and the sosofo processed — process-children
+; recurses, literal emits characters, and so on.
+;
+; Inc 5a scope (Konstruktionsregeln-Kern): construction rules driving the real
+; transform FOTBuilder (Inc 5b slice A) with the `make` special form wired in
+; (slice B). Deferred (the print/connection machinery): style stacks,
+; connections/ports, tables, page types, inherited characteristics — Inc 9
+; (print path).
+
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use dazzle.Grove.GroveNode
+use dazzle.Grove.GroveInfo
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.FlowObj
+use dazzle.ELObj.SosofoCtlRec
+use dazzle.ELObj.MacroDef
+use dazzle.Expression.Expression
+use dazzle.VM.VM
+use dazzle.Interpreter.Interpreter
+use dazzle.ProcessingMode.ProcessingMode
+use dazzle.ProcessingMode.Rule
+use dazzle.ProcessingMode.Specificity
+use dazzle.TransformFOTBuilder.TransformFOTBuilder
+use dazzle.SgmlFOTBuilder.SgmlFOTBuilder
+use dazzle.RtfFOTBuilder.RtfFOTBuilder
+use dazzle.TeXFOTBuilder.TeXFOTBuilder
+use dazzle.HtmlFOTBuilder.HtmlFOTBuilder
+use dazzle.MifFOTBuilder.MifFOTBuilder
+use dazzle.Style.PageFloatNIC
+use dazzle.Style.IndexEntryNIC
+use dazzle.Style.LineFieldNIC
+use dazzle.Style.CharacterNIC
+use dazzle.Style.AnchorNIC
+use dazzle.Style.GlyphAnnotationNIC
+use dazzle.Style.EmphasizingMarkNIC
+use dazzle.Style.RadicalNIC
+use dazzle.Style.GridNIC
+use dazzle.Style.GridCellNIC
+use dazzle.Style.EmbeddedTextNIC
+use dazzle.Style.IncludedContainerAreaNIC
+use dazzle.Style.MultiModeRec
+use dazzle.Style.MultiModeNIC
+use dazzle.FotSink.FotSink
+use dazzle.SaveFOTBuilder.SaveFOTBuilder
+use dazzle.ELObj.Identifier
+use dazzle.Style.StyleStack
+use dazzle.Style.InheritedC
+use dazzle.Style.InheritedCInfo
+use dazzle.Style.DisplayNIC
+use dazzle.Style.Convert
+use dazzle.Style.TableNIC
+use dazzle.Style.TableColumnNIC
+use dazzle.Style.TableCellNIC
+use dazzle.Style.RuleNIC
+use dazzle.Style.LinkNIC
+use dazzle.Style.ExternalGraphicNIC
+use dazzle.Style.LeaderNIC
+use dazzle.Style.BoxNIC
+use dazzle.Style.ScoreNIC
+use dazzle.Style.VarStyleRec
+use dazzle.Insn.Insn
+; the sdata character mapping (SdataNode::charChunk through the SdataMapper)
+use dazzle.Primitive.Primitive
+use dazzle.InterpreterMessages.InterpreterMessages
+use opensp.Location.Location
+
+; ProcessContext::Table — the per-table state (row/column styles, the covered
+; rowspan tracker). Lives on the eval region CURRENT AT startTable (the table
+; node's bracket, which outlives all row/cell child brackets); every internal
+; allocation must use `host`, never the (deeper) region current at add time.
+; NOTE (RBMM hazard, documented): a column/row STYLE made by a DESCENDANT
+; node's rule lives on that descendant's bracket and dangles once its bracket
+; pops — the reference-faithful common shape (columns made in the table's own
+; rule, row styles used only while the row processes) is safe.
+define TableRec
+(
+    prev: ref[TableRec]?
+    host: ref[Page]
+    var row_style: ref[ELObj]?
+    var current_column: int
+    var in_row: bool
+    var n_columns: int
+    ; the connectable level current when the row started (Table::
+    ; rowConnectableLevel) — endConnection closes a row it opened.
+    var row_connectable_level: int
+    var covered: ref[Array[int]]
+    var column_styles: ref[Array[ref[Array[ref[ELObj]?]]?]]
+)
+{
+    function make(host: ref[Page], prev: ref[TableRec]?) returns ref[TableRec]
+    {
+        let t &TableRec^host(prev, host, null, 0, false, 0, 0, Array[int]^host(), Array[ref[Array[ref[ELObj]?]]?]^host())
+        t
+    }
+}
+
+; ProcessContext::Port — a named connection target of a flow object with
+; non-principal ports (table-part header/footer). `save` is the port's
+; recorded-call queue (the SaveFOTBuilder the owner replays);
+; over-connections while `connected` queue their own recordings, flushed
+; into `save` in order when the count drops to zero. All allocations live on
+; the OWNER's region (`host`, the region current at push_ports — it outlives
+; the deeper node brackets that connect).
+define PortRec
+(
+    var labels: ref[Array[ref[ELObj]?]]
+    save: ref[SaveFOTBuilder]?
+    var save_queue: ref[Array[ref[SaveFOTBuilder]?]]
+    var connected: int
+    host: ref[Page]
+)
+{
+    function make(host: ref[Page], lbl: ref[ELObj]?, save: ref[SaveFOTBuilder]?) returns ref[PortRec]
+    {
+        let labels Array[ref[ELObj]?]^host()
+        labels.add(lbl)
+        let p &PortRec^host(labels, save, Array[ref[SaveFOTBuilder]?]^host(), 0, host)
+        p
+    }
+}
+
+; ProcessContext::Connectable — a flow object that can be connected to
+; (push_ports), or the portless carrier startMapContent synthesizes for
+; principal-port relabeling. Carries a style-stack SNAPSHOT (ported content
+; inherits through the port, not from its lexical position).
+define ConnectableRec
+(
+    prev: ref[ConnectableRec]?
+    ports: ref[Array[ref[PortRec]?]]
+    principal_port_labels: ref[Array[ref[ELObj]?]]
+    style_stack: ref[StyleStack]?
+    flow_obj_level: int
+    host: ref[Page]
+)
+{
+    function make(host: ref[Page], style_stack: ref[StyleStack]?, flow_obj_level: int, prev: ref[ConnectableRec]?) returns ref[ConnectableRec]
+    {
+        let c &ConnectableRec^host(prev, Array[ref[PortRec]?]^host(), Array[ref[ELObj]?]^host(), style_stack, flow_obj_level, host)
+        c
+    }
+}
+
+; ProcessContext::Connection — a label: connection between a flow object and
+; its flow parent. `save` = the recorded-call target (null = the base
+; stream); `style_stack` = the connection's own copy of the connectable's
+; snapshot (null on the base connection = the ProcessContext's stack).
+; n_bad_follow counts startConnection failures so the matching endConnection
+; pops nothing.
+define ConnectionRec
+(
+    prev: ref[ConnectionRec]?
+    save: ref[SaveFOTBuilder]?
+    style_stack: ref[StyleStack]?
+    port: ref[PortRec]?
+    connectable_level: int
+    var n_bad_follow: int
+)
+{
+    function make(host: ref[Page], save: ref[SaveFOTBuilder]?, style_stack: ref[StyleStack]?, port: ref[PortRec]?, connectable_level: int, prev: ref[ConnectionRec]?) returns ref[ConnectionRec]
+    {
+        let c &ConnectionRec^host(prev, save, style_stack, port, connectable_level, 0)
+        c
+    }
+}
+
+; principalPortSaveQueues_ — recordings of principal-restored connections
+; made at a DEEPER flow-obj level than their connectable; flushed (and the
+; record unlinked) when the level unwinds back to `level`. Lives on the
+; connectable's region — flush + unlink always precede that bracket's death.
+define PrincipalQueueRec
+(
+    prev: ref[PrincipalQueueRec]?
+    level: int
+    saves: ref[Array[ref[SaveFOTBuilder]?]]
+    host: ref[Page]
+)
+{
+    function make(host: ref[Page], level: int, prev: ref[PrincipalQueueRec]?) returns ref[PrincipalQueueRec]
+    {
+        let q &PrincipalQueueRec^host(prev, level, Array[ref[SaveFOTBuilder]?]^host(), host)
+        q
+    }
+}
+
+; ProcessContext::NodeStackEntry (ProcessContext.h) — the loop guard's key.
+; `mode` is compared by POINTER, exactly as the reference does: two different
+; modes may legitimately process the same node.
+define NodeStackEntry (element_index: int, grove_index: int, mode: ref[ProcessingMode]?)
+
+define ProcessContext (vm: ref[VM], interp: ref[Interpreter], var match_spec: Specificity, var mode: ref[ProcessingMode]?, sgml_fotb: ref[FotSink]?, style_stack: ref[StyleStack]?, var have_page_type: bool, var page_type: int, var table_stack: ref[TableRec]?, var connection_stack: ref[ConnectionRec]?, var connectable_stack: ref[ConnectableRec]?, var connectable_level: int, var flow_obj_level: int, var principal_queues: ref[PrincipalQueueRec]?, var node_stack: ref[Array[NodeStackEntry]]?, var node_stack_depth: int)
+{
+    ; the transform-backend constructor (`-t sgml` / `-t xml`). Since work
+    ; package 23 it is a sink like any other: the reference's
+    ; TransformFOTBuilder is a SerialFOTBuilder, so this context owns a style
+    ; stack, runs the port/connection machinery and takes the same
+    ; flow-object dispatch as the five print backends. Everything the
+    ; transform builder does not implement dead-ends in FotSink, which is what
+    ; the reference's FOTBuilder base class does.
+    function make(host: ref[Page], interp: ref[Interpreter], fotb: ref[TransformFOTBuilder]) returns ref[ProcessContext]
+    {
+        let sink FotSink.make_transform(host, fotb)
+        ProcessContext.make_styled(host, interp, sink)
+    }
+
+    ; the fot-backend constructor: the SgmlFOTBuilder sink + a style stack.
+    function make_fot(host: ref[Page], interp: ref[Interpreter], sgml: ref[SgmlFOTBuilder]) returns ref[ProcessContext]
+    {
+        let sink FotSink.make_sgml(host, sgml)
+        ProcessContext.make_styled(host, interp, sink)
+    }
+
+    ; the rtf-backend constructor (same styled seam, the RtfFOTBuilder sink).
+    function make_rtf(host: ref[Page], interp: ref[Interpreter], rtf: ref[RtfFOTBuilder]) returns ref[ProcessContext]
+    {
+        let sink FotSink.make_rtf(host, rtf)
+        ProcessContext.make_styled(host, interp, sink)
+    }
+
+    ; the tex-backend constructor (same styled seam, the TeXFOTBuilder sink).
+    function make_tex(host: ref[Page], interp: ref[Interpreter], tex: ref[TeXFOTBuilder]) returns ref[ProcessContext]
+    {
+        let sink FotSink.make_tex(host, tex)
+        ProcessContext.make_styled(host, interp, sink)
+    }
+
+    ; the html-backend constructor (same styled seam, the HtmlFOTBuilder sink).
+    function make_html(host: ref[Page], interp: ref[Interpreter], html: ref[HtmlFOTBuilder]) returns ref[ProcessContext]
+    {
+        let sink FotSink.make_html(host, html)
+        ProcessContext.make_styled(host, interp, sink)
+    }
+
+    ; the mif-backend constructor (same styled seam, the MifFOTBuilder sink).
+    function make_mif(host: ref[Page], interp: ref[Interpreter], mif: ref[MifFOTBuilder]) returns ref[ProcessContext]
+    {
+        let sink FotSink.make_mif(host, mif)
+        ProcessContext.make_styled(host, interp, sink)
+    }
+
+    function make_styled(host: ref[Page], interp: ref[Interpreter], sink: ref[FotSink]) returns ref[ProcessContext]
+    {
+        let pc &ProcessContext^host(VM.make(host, interp), interp, Specificity(), null, sink, StyleStack.make(host), false, 0, null, ConnectionRec.make(host, null, null, null, 0, null), null, 0, 0, null, null, 0)
+        pc
+    }
+
+    function sgml_sink(this: ProcessContext) returns ref[FotSink]?
+        sgml_fotb as ref[FotSink]
+
+    ; --- connections & ports (label:/content-map:, ProcessContext.cxx) -------
+
+    ; currentStyleStack — the top connection's stack (its copy of the
+    ; connectable's snapshot), else the base stack.
+    function current_style_stack(this: ref[ProcessContext]) returns ref[StyleStack]?
+    {
+        let c this.connection_stack
+        if c <> null
+        {
+            if c.style_stack <> null
+                return c.style_stack
+        }
+        this.style_stack as ref[StyleStack]
+    }
+
+    ; route the fot sink at the top connection's call queue (null = base
+    ; stream).
+    procedure apply_conn_target(mutable this: ref[ProcessContext])
+    {
+        let sg this.sgml_sink()
+        if sg = null
+            return
+        var sv: ref[SaveFOTBuilder]? null
+        if this.connection_stack <> null
+            sv := this.connection_stack.save
+        sg.set_save(sv)
+    }
+
+    ; FlowObj::process's flow-object-level bracket.
+    procedure start_flow_obj(mutable this: ref[ProcessContext])
+        this.flow_obj_level := this.flow_obj_level + 1
+
+    ; endFlowObj — unwind the level; flush (and unlink) the principal-port
+    ; save queue parked at the new level into the current output.
+    procedure end_flow_obj(mutable this: ref[ProcessContext])
+    {
+        this.flow_obj_level := this.flow_obj_level - 1
+        var q this.principal_queues
+        var prev_q: ref[PrincipalQueueRec]? null
+        while q <> null
+        {
+            if q.level = this.flow_obj_level
+            {
+                let sg this.sgml_sink()
+                let n q.saves.get_length()
+                var i: size_t 0
+                while i < n
+                {
+                    let sp q.saves.get(i)
+                    if sp <> null
+                    {
+                        if sg <> null
+                            sg.emit_saved((*sp) as ref[SaveFOTBuilder])
+                    }
+                    i := i + 1
+                }
+                if prev_q = null
+                    this.principal_queues := q.prev
+                else
+                    prev_q.prev := q.prev
+                return
+            }
+            prev_q := q
+            q := q.prev
+        }
+    }
+
+    ; pushPorts — a flow object with named ports (table-part header/footer):
+    ; snapshot the current style stack, install the ports, bump the level.
+    procedure push_ports(mutable this: ref[ProcessContext], labels: ref[Array[ref[ELObj]?]], saves: ref[Array[ref[SaveFOTBuilder]?]], host: ref[Page])
+    {
+        var css: ref[StyleStack]? null
+        let cur this.current_style_stack()
+        if cur <> null
+            css := cur.copy(host)
+        let c ConnectableRec.make(host, css, this.flow_obj_level, this.connectable_stack)
+        let n labels.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let lp labels.get(i)
+            let sp saves.get(i)
+            if (lp <> null) and (sp <> null)
+            {
+                let port PortRec.make(host, *lp, *sp)
+                c.ports.add(port)
+            }
+            i := i + 1
+        }
+        this.connectable_stack := c
+        this.connectable_level := this.connectable_level + 1
+    }
+
+    procedure pop_ports(mutable this: ref[ProcessContext])
+    {
+        this.connectable_level := this.connectable_level - 1
+        if this.connectable_stack <> null
+            this.connectable_stack := this.connectable_stack.prev
+    }
+
+    ; pushPrincipalPort / popPrincipalPort (ProcessContext.cxx:391) — route the
+    ; output of one directly-processed sosofo into a given queue, with NO
+    ; connectable and NO port: a bare Connection whose builder is that queue
+    ; (emphasizing-mark's `mark:`). Carries no style-stack snapshot, so the
+    ; content inherits from the lexical position, and emits no startNode.
+    procedure push_principal_port(mutable this: ref[ProcessContext], save: ref[SaveFOTBuilder], host: ref[Page])
+    {
+        let cn ConnectionRec.make(host, save, null, null, this.connectable_level, this.connection_stack)
+        this.connection_stack := cn
+        this.apply_conn_target()
+    }
+
+    procedure pop_principal_port(mutable this: ref[ProcessContext])
+    {
+        if this.connection_stack <> null
+            this.connection_stack := this.connection_stack.prev
+        this.apply_conn_target()
+    }
+
+    ; startDiscardLabeled / endDiscardLabeled (ProcessContext.cxx:401) — one
+    ; anonymous connectable with a single port carrying the label. ★In the
+    ; reference the port's builder IS the ignore-everything sink; here every
+    ; port records into a SaveFOTBuilder that is replayed only when the port
+    ; is connected, so the discard is achieved by popping the connectable
+    ; WITHOUT replaying — the same nothing, reached from the other side.
+    procedure start_discard_labeled(mutable this: ref[ProcessContext], lbl: ref[ELObj]?)
+    {
+        let host this.interp.get_host()
+        this.start_flow_obj()
+        let labels Array[ref[ELObj]?]^host()
+        labels.add(lbl)
+        let saves Array[ref[SaveFOTBuilder]?]^host()
+        saves.add(SaveFOTBuilder.make(host))
+        this.push_ports(labels, saves, host)
+    }
+
+    procedure end_discard_labeled(mutable this: ref[ProcessContext])
+    {
+        this.pop_ports()
+        this.end_flow_obj()
+    }
+
+    ; startConnection — walk the connectable stack for a port (or principal
+    ; label) carrying `label`; no match is a badConnection error and the
+    ; content follows into the current output (nBadFollow).
+    procedure start_connection(mutable this: ref[ProcessContext], lbl: ref[ELObj], loc: Location)
+    {
+        var conn_level this.connectable_level
+        var c this.connectable_stack
+        while c <> null
+        {
+            let np c.ports.get_length()
+            var i: size_t 0
+            while i < np
+            {
+                let pp c.ports.get(i)
+                if pp <> null
+                {
+                    let port *pp
+                    let nl port.labels.get_length()
+                    var j: size_t 0
+                    while j < nl
+                    {
+                        let lp port.labels.get(j)
+                        if lp <> null
+                        {
+                            ; symbols are interned — identity compare.
+                            if *lp = lbl
+                            {
+                                this.restore_connection_port(c, port as ref[PortRec], conn_level)
+                                return
+                            }
+                        }
+                        j := j + 1
+                    }
+                }
+                i := i + 1
+            }
+            let npl c.principal_port_labels.get_length()
+            var k: size_t 0
+            while k < npl
+            {
+                let plp c.principal_port_labels.get(k)
+                if plp <> null
+                {
+                    if *plp = lbl
+                    {
+                        this.restore_connection_principal(c, conn_level)
+                        return
+                    }
+                }
+                k := k + 1
+            }
+            c := c.prev
+            conn_level := conn_level - 1
+        }
+        this.interp.set_next_location(loc)
+        this.interp.message1(InterpreterMessages.badConnection(), lbl.symbol_name())
+        let head this.connection_stack
+        if head <> null
+            head.n_bad_follow := head.n_bad_follow + 1
+    }
+
+    ; restoreConnection, port case: first connection records onto the port's
+    ; queue directly; concurrent ones queue their own node-wrapped recording
+    ; (flushed into the port's queue at last end — the reference passes
+    ; currentNode + mode to the over-connection SaveFOTBuilder ctor).
+    procedure restore_connection_port(mutable this: ref[ProcessContext], mutable c: ref[ConnectableRec], mutable port: ref[PortRec], conn_level: int)
+    {
+        let host this.interp.get_host()
+        var sv: ref[SaveFOTBuilder]? null
+        if port.connected > 0
+        {
+            port.connected := port.connected + 1
+            let ch c.host
+            var mname StringC()
+            if this.mode <> null
+                mname := this.mode.get_name()
+            let node this.vm.get_current_node()
+            sv := SaveFOTBuilder.make_node(ch, node, mname)
+            port.save_queue.add(sv)
+        }
+        else
+        {
+            sv := port.save
+            port.connected := 1
+        }
+        var css: ref[StyleStack]? null
+        if c.style_stack <> null
+            css := c.style_stack.copy(host)
+        let cn ConnectionRec.make(host, sv, css, port, conn_level, this.connection_stack)
+        this.connection_stack := cn
+        this.apply_conn_target()
+        this.connection_start_node()
+    }
+
+    ; restoreConnection, principal case ((label #f) content-map entries): at
+    ; the connectable's own flow-obj level the content joins the current
+    ; output; from deeper levels it buffers until the level unwinds.
+    procedure restore_connection_principal(mutable this: ref[ProcessContext], mutable c: ref[ConnectableRec], conn_level: int)
+    {
+        let host this.interp.get_host()
+        var sv: ref[SaveFOTBuilder]? null
+        if c.flow_obj_level = this.flow_obj_level
+        {
+            let head this.connection_stack
+            if head <> null
+                sv := head.save
+        }
+        else
+        {
+            let ch c.host
+            var mname StringC()
+            if this.mode <> null
+                mname := this.mode.get_name()
+            let node this.vm.get_current_node()
+            sv := SaveFOTBuilder.make_node(ch, node, mname)
+            var q this.principal_queues
+            var found: ref[PrincipalQueueRec]? null
+            while q <> null
+            {
+                if q.level = c.flow_obj_level
+                {
+                    found := q
+                    break
+                }
+                q := q.prev
+            }
+            if found = null
+            {
+                found := PrincipalQueueRec.make(ch, c.flow_obj_level, this.principal_queues)
+                this.principal_queues := found
+            }
+            found.saves.add(sv)
+        }
+        var css: ref[StyleStack]? null
+        if c.style_stack <> null
+            css := c.style_stack.copy(host)
+        let cn ConnectionRec.make(host, sv, css, null, conn_level, this.connection_stack)
+        this.connection_stack := cn
+        this.apply_conn_target()
+        this.connection_start_node()
+    }
+
+    ; the startNode a restored connection emits (pending-anchor bookkeeping).
+    procedure connection_start_node(mutable this: ref[ProcessContext])
+    {
+        let sg this.sgml_sink()
+        if sg = null
+            return
+        let node this.vm.get_current_node()
+        var mname StringC()
+        if this.mode <> null
+            mname := this.mode.get_name()
+        sg.start_node(node as ref[GroveNode], mname)
+    }
+
+    procedure end_connection(mutable this: ref[ProcessContext])
+    {
+        ; a table row opened under this connection's connectable closes here.
+        if this.in_table_row()
+        {
+            let t this.table_stack
+            if t.row_connectable_level = this.connectable_level
+                this.end_table_row()
+        }
+        let head this.connection_stack
+        if head = null
+            return
+        if head.n_bad_follow > 0
+        {
+            head.n_bad_follow := head.n_bad_follow - 1
+            return
+        }
+        let sg this.sgml_sink()
+        if sg <> null
+            sg.end_node()
+        let port head.port
+        if port <> null
+        {
+            port.connected := port.connected - 1
+            if port.connected = 0
+            {
+                ; saved->emit(*port->fotb): replay each queued recording into
+                ; the port's own queue (payload copies land on the port's
+                ; region).
+                let n port.save_queue.get_length()
+                var i: size_t 0
+                while i < n
+                {
+                    let sp port.save_queue.get(i)
+                    if sp <> null
+                    {
+                        if sg <> null
+                            sg.emit_saved_into(*sp, port.save)
+                    }
+                    i := i + 1
+                }
+                let ph port.host
+                port.save_queue := Array[ref[SaveFOTBuilder]?]^ph()
+            }
+        }
+        this.connection_stack := head.prev
+        this.apply_conn_target()
+    }
+
+    procedure bad_content_map(mutable this: ref[ProcessContext], mutable flagged: ref[bool], loc: Location)
+    {
+        if flagged
+            return
+        flagged := true
+        this.interp.set_next_location(loc)
+        this.interp.message0(InterpreterMessages.badContentMap())
+    }
+
+    ; startMapContent — rebind the port labels of the nearest connectable at
+    ; this flow-obj level (synthesizing a portless one if needed) from a
+    ; ((label port|#f) ...) list; #f targets the principal port.
+    procedure start_map_content(mutable this: ref[ProcessContext], map_in: ref[ELObj]?, loc: Location)
+    {
+        let interp this.interp
+        let host interp.get_host()
+        var need false
+        if this.connectable_stack = null
+            need := true
+        else
+        {
+            if this.connectable_stack.flow_obj_level <> this.flow_obj_level
+                need := true
+        }
+        if need
+        {
+            var css: ref[StyleStack]? null
+            let cur this.current_style_stack()
+            if cur <> null
+                css := cur.copy(host)
+            let nc ConnectableRec.make(host, css, this.flow_obj_level, this.connectable_stack)
+            ; NOTE: no connectable_level bump (reference startMapContent).
+            this.connectable_stack := nc
+        }
+        let conn this.connectable_stack
+        ; snapshot each port's current (first) label, then clear the labels.
+        let np conn.ports.get_length()
+        let port_names Array[ref[ELObj]?]()
+        var i: size_t 0
+        while i < np
+        {
+            let pp conn.ports.get(i)
+            if pp <> null
+            {
+                let port *pp
+                var nm: ref[ELObj]? null
+                if port.labels.get_length() > 0
+                {
+                    let l0 port.labels.get(0)
+                    if l0 <> null
+                        nm := *l0
+                }
+                port_names.add(nm)
+                let ph port.host
+                port.labels := Array[ref[ELObj]?]^ph()
+            }
+            else
+                port_names.add(null)
+            i := i + 1
+        }
+        var bad false
+        var m: ref[ELObj]? map_in
+        while true
+        {
+            if m = null
+                break
+            if m.is_nil()
+                break
+            if m.is_pair() = false
+            {
+                this.bad_content_map(&bad, loc)
+                break
+            }
+            let entry m.get_car()
+            m := m.get_cdr()
+            if entry.is_pair() = false
+            {
+                this.bad_content_map(&bad, loc)
+                continue
+            }
+            let lbl entry.get_car()
+            if lbl.is_symbol_p() = false
+            {
+                this.bad_content_map(&bad, loc)
+                continue
+            }
+            let rest entry.get_cdr()
+            if rest.is_pair() = false
+            {
+                this.bad_content_map(&bad, loc)
+                continue
+            }
+            let port_val rest.get_car()
+            if port_val.is_symbol_p()
+            {
+                var found false
+                var pi: size_t 0
+                while pi < np
+                {
+                    if found = false
+                    {
+                        let nmp port_names.get(pi)
+                        if nmp <> null
+                        {
+                            if *nmp = port_val
+                            {
+                                let pp2 conn.ports.get(pi)
+                                if pp2 <> null
+                                {
+                                    let port2 *pp2
+                                    port2.labels.add(lbl)
+                                }
+                                found := true
+                            }
+                        }
+                    }
+                    pi := pi + 1
+                }
+                if found = false
+                {
+                    interp.set_next_location(loc)
+                    interp.message1(InterpreterMessages.contentMapBadPort(), port_val.symbol_name())
+                }
+            }
+            else
+            {
+                if port_val = interp.make_false()
+                    conn.principal_port_labels.add(lbl)
+                else
+                    this.bad_content_map(&bad, loc)
+            }
+            if rest.get_cdr().is_nil() = false
+                this.bad_content_map(&bad, loc)
+        }
+    }
+
+    procedure end_map_content(mutable this: ref[ProcessContext])
+    {
+        let c this.connectable_stack
+        if c <> null
+        {
+            if c.ports.get_length() = 0
+                this.connectable_stack := c.prev
+        }
+    }
+
+    ; characters dispatch — one sink for every backend since work package 23.
+    procedure emit_characters(mutable this: ref[ProcessContext], s: Slice[u32])
+    {
+        let sg this.sgml_sink()
+        if sg <> null
+            sg.characters(s)
+    }
+
+    procedure emit_characters_node(mutable this: ref[ProcessContext], node: ref[GroveNode]?, s: Slice[u32])
+    {
+        let sg this.sgml_sink()
+        if sg <> null
+            sg.characters_from_node(node, s)
+    }
+
+    ; process(root): the entry point (StyleEngine::process). No initial style in
+    ; Inc 5a; go straight to processNode in the initial mode.
+    procedure process(mutable this: ref[ProcessContext], mutable node: ref[GroveNode])
+    {
+        let m this.interp.initial_processing_mode()
+        ; ProcessContext::process — a compiled initial style (declared
+        ; initial values) wraps the whole run in one styled sequence, on EVERY
+        ; backend (ProcessContext.cxx:22; the transform builder's setters are
+        ; simply the no-op base).
+        let style this.interp.initial_style()
+        if style <> null
+        {
+            this.push_style_obj(style)
+            let sg this.sgml_sink()
+            if sg <> null
+                sg.start_sequence()
+        }
+        this.process_node(node, m)
+        if style <> null
+        {
+            let sg2 this.sgml_sink()
+            if sg2 <> null
+                sg2.end_sequence()
+            let ss this.current_style_stack()
+            ss.pop()
+        }
+    }
+
+    ; processNode: characters flow straight through; element/document nodes are
+    ; matched and their rule evaluated to a sosofo. currentNode + match cursor +
+    ; mode are saved and restored around the (possibly nested) eval.
+    procedure process_node(mutable this: ref[ProcessContext], mutable node: ref[GroveNode]?, mutable mode: ref[ProcessingMode])
+    {
+        if node = null
+            return
+        let cls node.get_class()
+        if cls = GN_DATA
+        {
+            ; DataNode::charChunk — the run from THIS view's index to the end of
+            ; the chunk (index 0 for a chunk node, so the common path is the
+            ; whole run). A list that starts mid-chunk, e.g. `(follow <char>)`,
+            ; therefore contributes only its tail.
+            let c node.get_chars()
+            let ci node.get_char_index() as size_t
+            let sz c.get_size()
+            if ci >= sz
+                return
+            this.emit_characters_node(node, c.as_slice().slice_from(ci))
+            return
+        }
+        if cls = GN_SDATA
+        {
+            ; SdataNode::charChunk — ONE character, the one the SdataMapper
+            ; resolved. This is the whole reason sdata is its own class: the
+            ; replacement text never reaches a backend.
+            let sv Primitive.sdata_view_string(this.interp, node)
+            this.emit_characters_node(node, sv.as_slice().slice_to(1))
+            return
+        }
+        ; The classes whose charChunk is not accessOK and which no rule can
+        ; match either: findMatch needs a gi (element rules) or a missing
+        ; origin (the root rule), so these fall through to processChildren over
+        ; an empty child list — measured, the DEFAULT RULE never fires for
+        ; them (tests/dazzle/grove/chars3).
+        if cls = GN_PI
+            return
+        if cls = GN_EXTERNAL_DATA
+            return
+        if cls = GN_SUBDOC
+            return
+        if cls = GN_NONSGML
+            return
+        ; eval bracket (the Collector seam, RBMM shape): a fresh scratch
+        ; region per node — the rule eval's transients (intermediate values,
+        ; the sosofo tree, per-call insns) die when the node is done, where
+        ; the reference reclaims them with the GC. Brackets nest with the
+        ; recursion; inner regions may point into outer ones, never back.
+        ; Everything that must survive is copied out (FOT output) or built
+        ; on the perm host (interning, forced Identifier values).
+        let saved_region this.interp.get_eval_region()
+        let parent this.interp.get_host()
+        let scratch parent.allocate_exclusive_page()
+        this.interp.set_eval_region(scratch)
+        let host this.interp.get_host()
+        let save_node this.vm.get_current_node()
+        let save_spec this.match_spec
+        let save_mode this.mode
+        let save_vm_mode this.vm.get_processing_mode()
+        this.vm.set_current_node(node)
+        this.match_spec := Specificity()
+        this.mode := mode
+        ; EvalContext.processingMode — the process-* primitives capture it,
+        ; with-mode brackets rebind it during the eval.
+        this.vm.set_processing_mode(mode)
+        ; fot: the pending-anchor bracket (ProcessContext.cxx startNode/endNode)
+        let sg0 this.sgml_sink()
+        if sg0 <> null
+            sg0.start_node(node, mode.get_name())
+        ; ProcessContext.cxx:80 — the rule LOOP. The cursor walks the STYLE
+        ; rules first: each match is evaluated to a StyleObj and pushed, and
+        ; the loop goes on. The first CONSTRUCTION match (or running out)
+        ; closes the style level with one pushEnd + startSequence and builds.
+        ; ★A stylesheet with no style rules never enters the `is_style` arm,
+        ; so this is the old straight-line path plus one test.
+        var had_style false
+        repeat
+        {
+            let rule: ref[Rule]? mode.find_match(node, host, this.interp, &this.match_spec)
+            if rule = null
+            {
+                if had_style
+                {
+                    this.push_style_end()
+                    let sgs this.sgml_sink()
+                    if sgs <> null
+                        sgs.start_sequence()
+                }
+                this.process_children(mode)
+                break
+            }
+            if this.match_spec.is_style() = false
+            {
+                let insn rule.get_rule_insn()
+                if had_style
+                {
+                    this.push_style_end()
+                    let sgs this.sgml_sink()
+                    if sgs <> null
+                        sgs.start_sequence()
+                }
+                let obj this.vm.eval(insn, null, null)
+                if this.interp.is_error(obj)
+                {
+                    ; initial (unnamed) mode falls back to processing children.
+                    if mode.get_name().get_size() = 0
+                        this.process_children(mode)
+                }
+                else
+                    this.process_sosofo(obj)
+                break
+            }
+            let sinsn rule.get_rule_insn()
+            let sobj this.vm.eval(sinsn, null, null)
+            if this.interp.is_error(sobj) = false
+            {
+                if had_style = false
+                {
+                    let ss this.current_style_stack()
+                    ss.push_start(this.interp.get_host())
+                    had_style := true
+                }
+                let ss2 this.current_style_stack()
+                ss2.push_continue(sobj, this.interp.get_host(), rule, this.interp)
+            }
+        }
+        if had_style
+        {
+            let sge this.sgml_sink()
+            if sge <> null
+                sge.end_sequence()
+            let ssp this.current_style_stack()
+            ssp.pop()
+        }
+        if sg0 <> null
+            sg0.end_node()
+        this.vm.set_current_node(save_node)
+        this.match_spec := save_spec
+        this.mode := save_mode
+        this.vm.set_processing_mode(save_vm_mode)
+        this.interp.set_eval_region(saved_region)
+        parent.deallocate_exclusive_page(scratch)
+    }
+
+    ; processChildren: process each child of the current node in `mode`. If the
+    ; current node has no children but is the grove root, descend to the
+    ; document element (mirrors getDocumentElement).
+    procedure process_children(mutable this: ref[ProcessContext], mutable mode: ref[ProcessingMode]?)
+    {
+        let node this.vm.get_current_node()
+        if node = null
+            return
+        ; processChildren (ProcessContext.cxx:168): the children AXIS first, and
+        ; ONLY where it fails — i.e. at the sgml-document node, whose class has
+        ; no children property — the getDocumentElement fallback. So a
+        ; (root …) rule's process-children reaches the document element and
+        ; NOTHING else: the prolog and epilog PIs are never processed there.
+        let n node.axis_child_count()
+        if n = 0
+        {
+            if node.get_class() = GN_DOCUMENT
+            {
+                let di node.document_element_index()
+                if di >= 0
+                    this.process_node(node.child_at(di), mode as ref[ProcessingMode])
+            }
+            return
+        }
+        var i 0
+        while i < n
+        {
+            this.process_node(node.axis_child_at(i), mode as ref[ProcessingMode])
+            i := i + 1
+        }
+    }
+
+    ; input-whitespace? — the builtin char-property set (charProps.h
+    ; INPUT_WHITESPACE, non-strict mode; user char-property declarations
+    ; are unported, so this is the fixed reference table).
+    function is_input_whitespace(c: u32) returns bool
+    {
+        if c >= 0x0009
+        {
+            if c <= 0x000D
+                return true
+        }
+        if c = 0x0020 or c = 0x00A0
+            return true
+        if c >= 0x2000
+        {
+            if c <= 0x200B
+                return true
+        }
+        match c
+            case 0x2028 case 0x2029 case 0x3000: return true
+        false
+    }
+
+    ; onlyWhiteSpaceFollows: scan the siblings after index i — an element
+    ; blocks, non-whitespace data blocks, PIs are transparent.
+    procedure only_whitespace_follows(this: ref[ProcessContext], mutable parent: ref[GroveNode], i: int) returns bool
+    {
+        let n parent.child_count()
+        var k i + 1
+        while k < n
+        {
+            let sib parent.child_at(k)
+            let cls sib.get_class()
+            if cls = GN_DATA
+            {
+                let c sib.get_chars()
+                let sz c.get_size()
+                var j: size_t 0
+                while j < sz
+                {
+                    if ProcessContext.is_input_whitespace(c.get(j)) = false
+                        return false
+                    j := j + 1
+                }
+            }
+            else if cls = GN_SDATA
+            {
+                ; onlyWhiteSpaceFollows tests charChunk, which an sdata node
+                ; answers with its ONE mapped character.
+                if ProcessContext.is_input_whitespace(Primitive.sdata_char(this.interp, sib as ref[GroveNode])) = false
+                    return false
+            }
+            else if cls = GN_ELEMENT
+                return false
+            k := k + 1
+        }
+        true
+    }
+
+    ; processChildrenTrim: like processChildren, but data flows through
+    ; directly (no rule matching) with the paragraph's leading and trailing
+    ; input-whitespace trimmed. The trailing trim RETURNS — remaining
+    ; all-whitespace data (and any PIs after it) are skipped, as in the
+    ; reference.
+    procedure process_children_trim(mutable this: ref[ProcessContext], mutable mode: ref[ProcessingMode])
+    {
+        let node this.vm.get_current_node()
+        if node = null
+            return
+        ; the children AXIS, and — unlike processChildren — with NO
+        ; getDocumentElement fallback (ProcessContext.cxx:206 has none), so
+        ; process-children-trim at the grove root emits nothing at all.
+        let n node.axis_child_count()
+        var at_start true
+        var i 0
+        while i < n
+        {
+            let child node.axis_child_at(i)
+            let cls child.get_class()
+            ; the reference's arm is `charChunk(...) == accessOK`, which is the
+            ; data-char run OR an sdata node's single mapped character.
+            var run StringC()
+            var is_chars false
+            if cls = GN_DATA
+            {
+                run := child.get_chars()
+                is_chars := true
+            }
+            else if cls = GN_SDATA
+            {
+                run := Primitive.sdata_view_string(this.interp, child as ref[GroveNode])
+                is_chars := true
+            }
+            if is_chars
+            {
+                let c run
+                var s c.as_slice()
+                var sz c.get_size()
+                if at_start
+                {
+                    while sz > 0
+                    {
+                        if ProcessContext.is_input_whitespace(s.at(0)) = false
+                            break
+                        s := s.slice_from(1)
+                        sz := sz - 1
+                    }
+                    if sz > 0
+                        at_start := false
+                }
+                if sz > 0
+                {
+                    var trailing false
+                    if ProcessContext.is_input_whitespace(s.at(sz - 1))
+                    {
+                        if this.only_whitespace_follows(node, i)
+                            trailing := true
+                    }
+                    if trailing
+                    {
+                        ; emit up to the last non-whitespace char, then stop.
+                        var k sz - 1
+                        while k > 0
+                        {
+                            if ProcessContext.is_input_whitespace(s.at(k - 1)) = false
+                            {
+                                this.emit_characters_node(child, s.slice_to(k))
+                                return
+                            }
+                            k := k - 1
+                        }
+                        return
+                    }
+                    this.emit_characters_node(child, s)
+                }
+            }
+            else
+            {
+                if cls = GN_ELEMENT
+                    at_start := false
+                this.process_node(child, mode)
+            }
+            i := i + 1
+        }
+    }
+
+    ; nextMatch: resume the current node's rule scan at the next lower rule.
+    procedure next_match(mutable this: ref[ProcessContext])
+    {
+        let host this.interp.get_host()
+        let node this.vm.get_current_node()
+        let save_spec this.match_spec
+        let rule: ref[Rule]? this.mode.find_match(node, host, this.interp, &this.match_spec)
+        if rule = null
+            this.process_children(this.mode)
+        else
+        {
+            let obj this.vm.eval(rule.get_rule_insn(), null, null)
+            if this.interp.is_error(obj)
+                this.process_children(this.mode)
+            else
+                this.process_sosofo(obj)
+        }
+        this.match_spec := save_spec
+    }
+
+    ; processNodeList: process every node of a node-list value (ProcessNodeList
+    ; SosofoObj::process). currentNode is saved/restored per node by processNode.
+    procedure process_node_list(mutable this: ref[ProcessContext], mutable nl: ref[ELObj]?, mutable mode: ref[ProcessingMode])
+    {
+        if nl = null
+            return
+        if nl.is_node_list_p() = false
+            return
+        ; CHUNK-WISE, like the reference: ProcessContext walks a node-list with
+        ; nodeListChunkRest, so a data run is processed ONCE as a whole
+        ; (charChunk) and the remaining per-character views of that chunk are
+        ; skipped. Measured: `(process-node-list (children p))` over
+        ; `First <em>inner</em> text.` emits "First " and " text." once each,
+        ; not once per character.
+        let n nl.node_list_count()
+        var i 0
+        var last_chunk: ref[GroveNode]? null
+        while i < n
+        {
+            let node nl.node_list_node(i)
+            if node <> null
+            {
+                if node.get_class() = GN_DATA
+                {
+                    let ch node.data_chunk()
+                    if ch <> last_chunk
+                    {
+                        last_chunk := ch
+                        this.process_node_safe(node, mode)
+                    }
+                }
+                else
+                {
+                    last_chunk := null
+                    this.process_node_safe(node, mode)
+                }
+            }
+            i := i + 1
+        }
+    }
+
+    ; ProcessContext::processNodeSafe (ProcessContext.cxx:37) — the loop guard
+    ; on the ONE path that can build one: `process-node-list` can hand back a
+    ; node that is already being processed in the same mode, and without this
+    ; the recursion has no bottom. The reference keys on (elementIndex,
+    ; groveIndex, mode) and only guards nodes that HAVE an element index —
+    ; a data or PI node cannot be the head of a loop because nothing can
+    ; select it again from inside itself.
+    ; ★Ported 2026-08-08 with its diagnostic; before that the port called
+    ; process_node directly, so a looping stylesheet ran until the stack gave
+    ; out instead of reporting `node processing loop detected`.
+    procedure process_node_safe(mutable this: ref[ProcessContext], mutable node: ref[GroveNode], mutable mode: ref[ProcessingMode])
+    {
+        let ei node.get_element_index()
+        if ei < 0
+        {
+            this.process_node(node, mode)
+            return
+        }
+        let gx GroveInfo.index_of(node)
+        let host Page.get(this)
+        if this.node_stack = null
+            this.node_stack := Array[NodeStackEntry]^host()
+        let st this.node_stack
+        let sb st.as_slice()
+        let depth this.node_stack_depth
+        var j 0
+        while j < depth
+        {
+            let e sb[j]
+            if (e.element_index = ei) and (e.grove_index = gx) and (e.mode = mode)
+            {
+                this.interp.set_next_location(node.get_loc())
+                this.interp.message0(InterpreterMessages.processNodeLoop())
+                return
+            }
+            j := j + 1
+        }
+        ; ★the stack GROWS but never shrinks: `Array` has no remove, and adding
+        ; one would be a new stdlib entry point that only dazzle calls — which
+        ; the `--jit` leg cannot resolve. The
+        ; depth counter is the pop, and the slots are reused.
+        var ent NodeStackEntry()
+        ent.element_index := ei
+        ent.grove_index := gx
+        ent.mode := mode
+        if (depth as size_t) < st.get_length()
+            st.put(depth as size_t, ent)
+        else
+            st.add(ent)
+        this.node_stack_depth := depth + 1
+        this.process_node(node, mode)
+        this.node_stack_depth := depth
+    }
+
+    ; the mode a process-* sosofo captured at eval time (stashed in the parts
+    ; slot as an opaque pointer — see ELObj); null falls back to the context's
+    ; current mode.
+    function sosofo_mode(this: ref[ProcessContext], sosofo: ref[ELObj]) returns ref[ProcessingMode]
+    {
+        let m sosofo.sosofo_parts() as ref[ProcessingMode]?
+        if m = null
+            return this.mode as ref[ProcessingMode]
+        m as ref[ProcessingMode]
+    }
+
+    ; SosofoObj::process — the sosofo interpreter. Dispatches on kind.
+    procedure process_sosofo(mutable this: ref[ProcessContext], mutable sosofo: ref[ELObj]?)
+    {
+        if sosofo = null
+            return
+        if sosofo.is_sosofo_p() = false
+            return
+        let kind sosofo.sosofo_kind()
+        if kind = SOSO_APPEND
+        {
+            let parts sosofo.sosofo_parts()
+            if parts = null
+                return
+            let n parts.get_length()
+            var i: size_t 0
+            while i < n
+            {
+                this.process_sosofo(parts[i])
+                i := i + 1
+            }
+            return
+        }
+        if kind = SOSO_LITERAL
+        {
+            let str_obj sosofo.sosofo_aux()
+            if str_obj = null
+                return
+            let host this.interp.get_host()
+            let s str_obj.string_data(host)
+            this.emit_characters(s.as_slice())
+            return
+        }
+        if kind = SOSO_PROCESS_CHILDREN
+        {
+            this.process_children(this.sosofo_mode(sosofo))
+            return
+        }
+        if kind = SOSO_PROCESS_CHILDREN_TRIM
+        {
+            this.process_children_trim(this.sosofo_mode(sosofo))
+            return
+        }
+        if kind = SOSO_PROCESS_NODE_LIST
+        {
+            this.process_node_list(sosofo.sosofo_aux(), this.sosofo_mode(sosofo))
+            return
+        }
+        if kind = SOSO_PROCESS_NODE
+        {
+            let nl sosofo.sosofo_aux()
+            if nl <> null
+            {
+                let nd nl.node_list_node(0)
+                if nd <> null
+                    this.process_node(nd, this.sosofo_mode(sosofo))
+            }
+            return
+        }
+        if kind = SOSO_NEXT_MATCH
+        {
+            this.next_match()
+            return
+        }
+        if kind = SOSO_PAGE_NUMBER
+        {
+            ; FOTBuilder::pageNumber is a no-op outside the fot backend.
+            let sg this.sgml_sink()
+            if sg <> null
+                sg.page_number()
+            return
+        }
+        if kind = SOSO_CURRENT_NODE_PAGE_NUMBER
+        {
+            let sg this.sgml_sink()
+            if sg <> null
+            {
+                let nl sosofo.sosofo_aux()
+                if nl <> null
+                {
+                    let nd nl.node_list_node(0)
+                    if nd <> null
+                        sg.current_node_page_number(nd)
+                }
+            }
+            return
+        }
+        if kind = SOSO_PAGE_TYPE
+        {
+            ; PageTypeSosofoObj::process — nothing outside a header/footer.
+            if this.have_page_type
+            {
+                let parts sosofo.sosofo_parts()
+                let flag_obj sosofo.sosofo_aux()
+                if (parts <> null) and (flag_obj <> null)
+                {
+                    var pick 1
+                    if (this.page_type & flag_obj.exact_integer_value()) <> 0
+                        pick := 0
+                    let pp parts.get(pick as size_t)
+                    if pp <> null
+                        this.process_sosofo(*pp)
+                }
+            }
+            return
+        }
+        if kind = SOSO_LABEL
+        {
+            ; LabelSosofoObj::process — connect, process, disconnect.
+            let ctl: ref[SosofoCtlRec]? sosofo.sosofo_ctl()
+            let content sosofo.sosofo_aux()
+            if ctl <> null
+            {
+                let cloc ctl.get_loc()
+                this.start_connection(ctl.obj as ref[ELObj], cloc)
+            }
+            this.process_sosofo(content)
+            if ctl <> null
+                this.end_connection()
+            return
+        }
+        if kind = SOSO_DISCARD_LABELED
+        {
+            ; DiscardLabeledSosofoObj::process — a one-port connectable whose
+            ; port carries the label and whose sink is thrown away, so
+            ; anything inside that connects to the label vanishes while
+            ; everything else flows on unchanged.
+            let dctl: ref[SosofoCtlRec]? sosofo.sosofo_ctl()
+            let dcontent sosofo.sosofo_aux()
+            if dctl <> null
+                this.start_discard_labeled(dctl.obj)
+            this.process_sosofo(dcontent)
+            if dctl <> null
+                this.end_discard_labeled()
+            return
+        }
+        if kind = SOSO_CONTENT_MAP
+        {
+            ; ContentMapSosofoObj::process.
+            let ctl2: ref[SosofoCtlRec]? sosofo.sosofo_ctl()
+            let content2 sosofo.sosofo_aux()
+            if ctl2 <> null
+            {
+                let mloc ctl2.get_loc()
+                this.start_map_content(ctl2.obj, mloc)
+            }
+            this.process_sosofo(content2)
+            if ctl2 <> null
+                this.end_map_content()
+            return
+        }
+        if kind = SOSO_FLOWOBJ
+            this.process_flow_obj(sosofo)
+    }
+
+    ; process a flow object's content sosofos (held in the `parts` slot).
+    procedure process_flow_obj_content(mutable this: ref[ProcessContext], mutable sosofo: ref[ELObj])
+    {
+        let parts sosofo.sosofo_parts()
+        if parts = null
+            return
+        let n parts.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            this.process_sosofo(parts[i])
+            i := i + 1
+        }
+    }
+
+    ; SOSO_FLOWOBJ — FlowObj::process. ONE dispatch for every backend since
+    ; work package 23: the reference has no per-backend flow-object walk at
+    ; all (FlowObj.cxx:32), so the transform run gets the style push, the port
+    ; decomposition and the connection machinery exactly like the print ones,
+    ; and only the leaf calls differ (FotSink).
+    procedure process_flow_obj(mutable this: ref[ProcessContext], mutable sosofo: ref[ELObj])
+    {
+        let fo: ref[FlowObj]? sosofo.sosofo_flowobj()
+        if fo = null
+            return
+        let foc fo.get_foc()
+        ; the flow-object-level bracket (the principal-port save queues flush
+        ; as the level unwinds).
+        this.start_flow_obj()
+        this.process_flow_obj_fot(sosofo, fo, foc)
+        this.end_flow_obj()
+    }
+
+
+    ; --- the fot path (Inc 8) -------------------------------------------------
+    ; FlowObj::process — push the attached style (emitting set_ic for every
+    ; spec pushed at this level), emit the flow object, process content, pop.
+    procedure push_fo_style(mutable this: ref[ProcessContext], fo: ref[FlowObj])
+    {
+        let ss this.current_style_stack()
+        let style fo.get_style()
+        if style = null
+        {
+            ss.push_empty()
+            return
+        }
+        this.push_style_obj(style)
+    }
+
+    ; StyleStack::push(style, vm, fotb) — the raw style push (borders, table
+    ; column/row styles): push + render this level's specs through set_ic.
+    procedure push_style_obj(mutable this: ref[ProcessContext], style: ref[ELObj])
+    {
+        let ss this.current_style_stack()
+        let scratch this.interp.get_host()
+        ss.push_start(scratch)
+        ss.push_continue(style, scratch, null, this.interp)
+        this.push_style_end()
+    }
+
+    ; the pushEnd half on its own, so a STYLE RULE run can push several styles
+    ; between one push_start and one push_end (ProcessContext.cxx:85/121: a
+    ; node's matching style rules are pushed one after the other and the level
+    ; is closed once, before the construction rule builds anything).
+    procedure push_style_end(mutable this: ref[ProcessContext])
+    {
+        let ss this.current_style_stack()
+        let scratch this.interp.get_host()
+        ; pushEnd: re-push outer actual-*-depending specs whose dependencies
+        ; changed at this level, then render the specs pushed at this level in
+        ; push order (VarInheritedC codes evaluate + cache here; a spec whose
+        ; evaluation recorded dependencies keeps depending at this level).
+        ss.push_end_prologue(scratch)
+        let sg this.sgml_sink()
+        let list ss.current_specs()
+        if list <> null
+        {
+            let n list.get_length()
+            var i: size_t 0
+            while i < n
+            {
+                let indp list.get(i)
+                if indp <> null
+                {
+                    let info ss.info_at(*indp)
+                    if info <> null
+                    {
+                        ; resolve_set always runs (VarInheritedC evaluation +
+                        ; dependency tracking are backend-independent); only
+                        ; the RENDERING is fot-sink-specific — the reference
+                        ; calls a backend setter that is a no-op elsewhere
+                        ; (the transform run reaches here since the initial
+                        ; style landed).
+                        let cic VM.resolve_set(ss, info, this.interp)
+                        if cic <> null
+                        {
+                            if sg <> null
+                                sg.set_ic(cic)
+                        }
+                        if info.dependencies.get_length() > 0
+                            ss.note_depending(*indp)
+                    }
+                }
+                i := i + 1
+            }
+        }
+    }
+
+    procedure pop_fo_style(mutable this: ref[ProcessContext], fo: ref[FlowObj])
+    {
+        let ss this.current_style_stack()
+        if fo.get_style() = null
+        {
+            ss.pop_empty()
+            return
+        }
+        ss.pop()
+    }
+
+    ; --- tables (ProcessContext.cxx Table machinery + Table*FlowObj) ---------
+    function in_table(this: ref[ProcessContext]) returns bool
+        table_stack <> null
+
+    function in_table_row(this: ref[ProcessContext]) returns bool
+    {
+        if this.table_stack = null
+            return false
+        this.table_stack.in_row
+    }
+
+    function current_table_column(this: ref[ProcessContext]) returns int
+    {
+        if this.table_stack = null
+            return 0
+        this.table_stack.current_column
+    }
+
+    function table_row_style(this: ref[ProcessContext]) returns ref[ELObj]?
+    {
+        if this.table_stack = null
+            return null
+        this.table_stack.row_style
+    }
+
+    ; ProcessContext::addTableColumn — per-column styles indexed [column][span-1].
+    procedure add_table_column(mutable this: ref[ProcessContext], column_index: int, span: int, style: ref[ELObj]?)
+    {
+        let t this.table_stack
+        if t = null
+            return
+        t.current_column := column_index + span
+        while t.column_styles.get_length() <= (column_index as size_t)
+            t.column_styles.add(null)
+        var tem: ref[Array[ref[ELObj]?]]? null
+        let tp t.column_styles.get(column_index as size_t)
+        if tp <> null
+            tem := *tp
+        if tem = null
+        {
+            let h t.host
+            tem := Array[ref[ELObj]?]^h()
+            t.column_styles.put(column_index as size_t, tem)
+        }
+        if span > 0
+        {
+            while tem.get_length() < (span as size_t)
+                tem.add(null)
+            tem.put((span - 1) as size_t, style)
+        }
+    }
+
+    function table_column_style(this: ref[ProcessContext], column_index: int, span: int) returns ref[ELObj]?
+    {
+        let t this.table_stack
+        if t = null
+            return null
+        if (column_index as size_t) >= t.column_styles.get_length()
+            return null
+        let tp t.column_styles.get(column_index as size_t)
+        if tp = null
+            return null
+        let tem *tp
+        if tem = null
+            return null
+        if span <= 0
+            return null
+        if (span as size_t) > tem.get_length()
+            return null
+        let sp tem.get((span - 1) as size_t)
+        if sp = null
+            return null
+        *sp
+    }
+
+    ; ProcessContext::noteTableCell — record coverage (rowspan countdown).
+    procedure note_table_cell(mutable this: ref[ProcessContext], column_index: int, colspan: int, rowspan: int)
+    {
+        let t this.table_stack
+        if t = null
+            return
+        t.current_column := column_index + colspan
+        while t.covered.get_length() < ((column_index + colspan) as size_t)
+            t.covered.add(0)
+        var i 0
+        while i < colspan
+        {
+            t.covered.put((column_index + i) as size_t, rowspan)
+            i := i + 1
+        }
+        if column_index + colspan > t.n_columns
+            t.n_columns := column_index + colspan
+    }
+
+    procedure start_table_row(mutable this: ref[ProcessContext], style: ref[ELObj]?)
+    {
+        let t this.table_stack
+        if t <> null
+        {
+            t.row_style := style
+            t.current_column := 0
+            t.in_row := true
+            var rcl 0
+            let head this.connection_stack
+            if head <> null
+                rcl := head.connectable_level
+            t.row_connectable_level := rcl
+        }
+        this.sgml_sink().start_table_row()
+    }
+
+    ; ProcessContext::endTableRow — fill uncovered columns with synthesized
+    ; cells (the trailing one is the "missing" dummy), then count down the
+    ; rowspans.
+    procedure end_table_row(mutable this: ref[ProcessContext])
+    {
+        let t this.table_stack
+        if t <> null
+        {
+            var i 0
+            while i < t.n_columns + 1
+            {
+                var cov 0
+                if (i as size_t) < t.covered.get_length()
+                {
+                    let cp t.covered.get(i as size_t)
+                    if cp <> null
+                        cov := *cp
+                }
+                if cov = 0
+                {
+                    t.current_column := i
+                    let scratch this.interp.get_host()
+                    let rec TableCellNIC.make(scratch)
+                    if i >= t.n_columns
+                        rec.missing := true
+                    this.process_table_cell(rec, null, null, null)
+                }
+                if i < t.n_columns
+                {
+                    let cp2 t.covered.get(i as size_t)
+                    if cp2 <> null
+                        t.covered.put(i as size_t, *cp2 - 1)
+                }
+                i := i + 1
+            }
+            t.in_row := false
+        }
+        this.sgml_sink().end_table_row()
+    }
+
+    ; ProcessContext::coverSpannedRows — synthesize empty rows until every
+    ; vertical span is covered (each end_table_row fills + counts down).
+    procedure cover_spanned_rows(mutable this: ref[ProcessContext])
+    {
+        let t this.table_stack
+        if t = null
+            return
+        var n 0
+        let len t.covered.get_length()
+        var i: size_t 0
+        while i < len
+        {
+            let cp t.covered.get(i)
+            if cp <> null
+            {
+                if *cp > n
+                    n := *cp
+            }
+            i := i + 1
+        }
+        while n > 0
+        {
+            this.start_table_row(null)
+            this.end_table_row()
+            n := n - 1
+        }
+    }
+
+    ; the actual value of a border characteristic resolved to the style to
+    ; push (Table*FlowObj::border): #f/#t -> the canned border-present styles,
+    ; a table-border sosofo -> its style, anything else -> null.
+    procedure border_style_actual(mutable this: ref[ProcessContext], mutable name: Slice[char]) returns ref[ELObj]?
+    {
+        let ident this.interp.lookup(StringC(name))
+        let proto ident.get_inherited_c()
+        if proto = null
+            return null
+        let scratch this.interp.get_host()
+        let deps Array[int]^scratch()
+        let ss this.current_style_stack()
+        let obj VM.stack_actual(ss as ref[StyleStack], proto, Location(), this.interp, deps)
+        if obj = null
+            return null
+        if this.interp.is_error(obj)
+            return null
+        if obj = this.interp.make_false()
+            return this.interp.border_false_style()
+        if obj = this.interp.make_true()
+            return this.interp.border_true_style()
+        if Convert.is_table_border_sosofo(obj)
+            return obj.sosofo_flowobj().get_style()
+        null
+    }
+
+    ; FractionFlowObj's bar style (FlowObj.cxx:1735) — the actual value of the
+    ; `fraction-bar` characteristic, resolved through SosofoObj::ruleStyle:
+    ; ONLY a rule flow-object sosofo answers with a style. The characteristic's
+    ; INITIAL value is the `rule` class binding itself (a FlowObj prototype,
+    ; which in the reference is a sosofo too) — it has no style, so the
+    ; unstyled default pushes nothing.
+    procedure fraction_bar_style_actual(mutable this: ref[ProcessContext]) returns ref[ELObj]?
+    {
+        let ident this.interp.lookup(StringC("fraction-bar"))
+        let proto ident.get_inherited_c()
+        if proto = null
+            return null
+        let scratch this.interp.get_host()
+        let deps Array[int]^scratch()
+        let ss this.current_style_stack()
+        let obj VM.stack_actual(ss as ref[StyleStack], proto, Location(), this.interp, deps)
+        if obj = null
+            return null
+        if this.interp.is_error(obj)
+            return null
+        if obj.is_sosofo_p() = false
+            return null
+        if obj.sosofo_kind() <> SOSO_FLOWOBJ
+            return null
+        let rfo obj.sosofo_flowobj()
+        if rfo = null
+            return null
+        if rfo.get_foc() <> FOC_RULE
+            return null
+        rfo.get_style()
+    }
+
+    ; SosofoObj::characterStyle (ProcessContext.cxx:540 + FlowObj.cxx:1383) —
+    ; the `radical:` value's CharacterNIC and style, WITHOUT processing it.
+    ; Only a `character` flow-object sosofo answers (isCharacter); its deferred
+    ; NIC chain has to run first, exactly as a make of it would.
+    procedure character_style_of(mutable this: ref[ProcessContext], mutable val: ref[ELObj], mutable style_out: ref[ref[ELObj]?]) returns ref[CharacterNIC]?
+    {
+        style_out := null
+        if val.is_sosofo_p() = false
+            return null
+        if val.sosofo_kind() <> SOSO_FLOWOBJ
+            return null
+        let cfo val.sosofo_flowobj()
+        if cfo = null
+            return null
+        if cfo.get_foc() <> FOC_CHARACTER
+            return null
+        var rfo cfo
+        if cfo.get_nic_code() <> null
+            rfo := this.resolve_nics(cfo)
+        if rfo = null
+            return null
+        style_out := rfo.get_style()
+        rfo.get_nic() as ref[CharacterNIC]
+    }
+
+    ; TableFlowObj::border — push the NIC style (or the table-border
+    ; fallback), emit the atomic border element, pop.
+    procedure emit_table_border(mutable this: ref[ProcessContext], style_in: ref[ELObj]?, fallback: ref[ELObj]?, which: int)
+    {
+        var style: ref[ELObj]? style_in
+        if style = null
+            style := fallback
+        if style <> null
+            this.push_style_obj(style)
+        let sg this.sgml_sink()
+        if which = 0
+            sg.table_before_row_border()
+        if which = 1
+            sg.table_after_row_border()
+        if which = 2
+            sg.table_before_column_border()
+        if which = 3
+            sg.table_after_column_border()
+        if style <> null
+        {
+            let ss this.current_style_stack()
+            ss.pop()
+        }
+    }
+
+    ; TableCellFlowObj::border — always from the cell-*-border actual value.
+    procedure emit_cell_border(mutable this: ref[ProcessContext], which: int)
+    {
+        var style: ref[ELObj]? null
+        if which = 0
+            style := this.border_style_actual("cell-before-row-border")
+        if which = 1
+            style := this.border_style_actual("cell-after-row-border")
+        if which = 2
+            style := this.border_style_actual("cell-before-column-border")
+        if which = 3
+            style := this.border_style_actual("cell-after-column-border")
+        if style <> null
+            this.push_style_obj(style)
+        let sg this.sgml_sink()
+        if which = 0
+            sg.table_cell_before_row_border()
+        if which = 1
+            sg.table_cell_after_row_border()
+        if which = 2
+            sg.table_cell_before_column_border()
+        if which = 3
+            sg.table_cell_after_column_border()
+        if style <> null
+        {
+            let ss this.current_style_stack()
+            ss.pop()
+        }
+    }
+
+    ; SetNonInheritedCsSosofoObj::resolve — evaluate a flow object's lazy NIC
+    ; code against a fresh copy (NIC payloads deep-copied — the chain mutates
+    ; the copy only), the CURRENT style stack at its post-push level
+    ; (inherited-*/actual-* in NIC values read the pushed context) and the
+    ; make-time display vars + current node. Returns null when a value
+    ; expression yields an error (the FO then emits nothing; its style
+    ; push/pop still happened — reference semantics).
+    procedure resolve_nics(mutable this: ref[ProcessContext], mutable fo: ref[FlowObj]) returns ref[FlowObj]?
+    {
+        let interp this.interp
+        let host interp.get_host()
+        let copy fo.shallow_copy(host)
+        let dn fo.get_dnic()
+        if dn <> null
+            copy.set_dnic(dn.copy(host))
+        let foc fo.get_foc()
+        if foc = FOC_TABLE
+        {
+            let tp fo.get_nic() as ref[TableNIC]?
+            if tp <> null
+                copy.set_nic(tp.copy(host) as NICRef)
+        }
+        if foc = FOC_TABLE_COLUMN
+        {
+            let cp fo.get_nic() as ref[TableColumnNIC]?
+            if cp <> null
+                copy.set_nic(cp.copy(host) as NICRef)
+        }
+        if foc = FOC_TABLE_CELL
+        {
+            let ep fo.get_nic() as ref[TableCellNIC]?
+            if ep <> null
+                copy.set_nic(ep.copy(host) as NICRef)
+        }
+        if foc = FOC_RULE
+        {
+            let rp fo.get_nic() as ref[RuleNIC]?
+            if rp <> null
+                copy.set_nic(rp.copy(host) as NICRef)
+        }
+        if ((foc >= FOC_LINK) and (foc <= FOC_COLUMN_SET_SEQUENCE)) or (foc = FOC_LINE_FIELD)
+        {
+            let np fo.get_nic()
+            if np <> null
+                copy.set_nic(Convert.copy_fo_nic(foc, np, host))
+        }
+        var hj 0
+        while hj < 6
+        {
+            let hv fo.get_hf(hj)
+            if hv <> null
+                copy.set_hf(host, hj, hv)
+            hj := hj + 1
+        }
+        let vm VM.make(host, interp)
+        var disp: pointer[pointer[ELObj]] null
+        let style fo.get_style()
+        if style <> null
+        {
+            let rec style.style_spec()
+            if rec <> null
+            {
+                vm.set_current_node(rec.node as ref[GroveNode])
+                disp := rec.display
+            }
+        }
+        ; every backend owns a style stack since work package 23 (the guard is
+        ; kept for a context built without one).
+        let ss this.current_style_stack()
+        if ss <> null
+        {
+            vm.style_stack := ss
+            vm.spec_level := ss.get_level()
+        }
+        let deps Array[int]^host()
+        vm.actual_deps := deps
+        let seed ELObj.make_flowobj_box(host, copy)
+        let ret vm.eval(fo.get_nic_code() as ref[Insn], disp, seed)
+        if ret = null
+            return null
+        if interp.is_error(ret)
+            return null
+        copy
+    }
+
+    ; MacroFlowObj::Definition::process — evaluate the macro's body with the
+    ; characteristic values (and the content sosofo) bound, then process the
+    ; sosofo it yields. The CONTEXT's VM is used, not a fresh one: the body
+    ; sees the current node and the current processing mode, exactly like the
+    ; construction rule around it. Only the style stack, the spec level and
+    ; the actual-* dependency record are swapped in and out.
+    procedure process_macro(mutable this: ref[ProcessContext], mutable sosofo: ref[ELObj], mutable fo: ref[FlowObj])
+    {
+        let interp this.interp
+        let host interp.get_host()
+        let def fo.get_macro_def()
+        if def = null
+            return
+        let code Expression.macro_code(def, interp)
+        if code = null
+            return
+        let vm this.vm
+        let save_stack vm.style_stack
+        let save_level vm.spec_level
+        let save_deps vm.actual_deps
+        ; the transform run has its own style stack since work package 23, so
+        ; a macro takes its style there too (the setters are the no-op base).
+        let ss this.current_style_stack()
+        if ss <> null
+        {
+            vm.style_stack := ss
+            vm.spec_level := ss.get_level()
+        }
+        let deps Array[int]^host()
+        vm.actual_deps := deps
+        ; the seed the unpack insn reads: this port keeps the content in the
+        ; sosofo, so the whole SOSO_FLOWOBJ goes on the stack (the reference
+        ; passes the MacroFlowObj, which carries its content itself).
+        let seed ELObj.make_flowobj_sosofo(host, fo, sosofo.sosofo_parts())
+        let obj vm.eval(code, null, seed)
+        vm.style_stack := save_stack
+        vm.spec_level := save_level
+        vm.actual_deps := save_deps
+        if obj = null
+            return
+        if interp.is_error(obj)
+            return
+        this.process_sosofo(obj)
+    }
+
+    ; TableCellFlowObj::pushStyle + processInner + popStyle — shared by real
+    ; cells (rec/style from the FO) and the synthesized fillers (defaults,
+    ; null style, no content). `fo` non-null = a real cell whose lazy NICs
+    ; (n-rows-spanned) resolve after the style pushes; a failed resolve skips
+    ; the cell's emission but keeps the push/pop bracket.
+    procedure process_table_cell(mutable this: ref[ProcessContext], mutable rec: ref[TableCellNIC], style: ref[ELObj]?, mutable sosofo: ref[ELObj]?, mutable fo: ref[FlowObj]?)
+    {
+        let sg this.sgml_sink()
+        let ss this.current_style_stack()
+        if this.in_table_row()
+        {
+            if rec.starts_row
+            {
+                this.end_table_row()
+                this.start_table_row(null)
+            }
+        }
+        else
+            this.start_table_row(null)
+        var colnum rec.column_index
+        if rec.has_column_number = false
+            colnum := this.current_table_column()
+        var n_push 0
+        let col_style this.table_column_style(colnum, rec.n_columns_spanned)
+        if col_style <> null
+        {
+            this.push_style_obj(col_style)
+            sg.start_sequence()
+            n_push := n_push + 1
+        }
+        let row_style this.table_row_style()
+        if row_style <> null
+        {
+            this.push_style_obj(row_style)
+            sg.start_sequence()
+            n_push := n_push + 1
+        }
+        if style <> null
+            this.push_style_obj(style)
+        else
+            ss.push_empty()
+        ; the lazy NICs (n-rows-spanned) resolve AFTER the pushes; a failed
+        ; resolve skips processInner (the push/pop bracket still closes).
+        var skip false
+        var xrec rec
+        if fo <> null
+        {
+            if fo.get_nic_code() <> null
+            {
+                let rfo this.resolve_nics(fo)
+                if rfo = null
+                    skip := true
+                else
+                {
+                    let nrec rfo.get_nic() as ref[TableCellNIC]?
+                    if nrec <> null
+                        xrec := nrec as ref[TableCellNIC]
+                }
+            }
+        }
+        if skip = false
+        {
+            if this.in_table() = false
+            {
+                this.interp.message0(InterpreterMessages.tableCellOutsideTable())
+                if sosofo <> null
+                    this.process_flow_obj_content(sosofo)
+            }
+            else
+            {
+                var erec xrec
+                if xrec.has_column_number = false
+                {
+                    erec := xrec.copy(this.interp.get_host())
+                    erec.column_index := colnum
+                }
+                sg.start_table_cell(erec)
+                if xrec.missing = false
+                    this.note_table_cell(colnum, xrec.n_columns_spanned, xrec.n_rows_spanned)
+                this.emit_cell_border(0)
+                this.emit_cell_border(1)
+                this.emit_cell_border(2)
+                this.emit_cell_border(3)
+                if sosofo <> null
+                    this.process_flow_obj_content(sosofo)
+                sg.end_table_cell()
+            }
+        }
+        if style <> null
+            ss.pop()
+        else
+            ss.pop_empty()
+        while n_push > 0
+        {
+            sg.end_sequence()
+            ss.pop()
+            n_push := n_push - 1
+        }
+        if rec.ends_row
+            this.end_table_row()
+    }
+
+    ; the flow-object dispatch — every class, every backend (FlowObj::process
+    ; and the *FlowObj::processInner bodies; the reference has no per-backend
+    ; variant). The SGML-transformation classes sit at the far end, next to
+    ; formatting-instruction. Unknown classes (incl. those same transform
+    ; extensions, bound as FOC_UNKNOWN under a print backend) are
+    ; content-transparent.
+    procedure process_flow_obj_fot(mutable this: ref[ProcessContext], mutable sosofo: ref[ELObj], mutable fo: ref[FlowObj], foc: int)
+    {
+        let sg this.sgml_sink()
+        if foc = FOC_PARAGRAPH
+        {
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var dnic_v rfo.get_dnic()
+                if dnic_v = null
+                    dnic_v := DisplayNIC.make(this.interp.get_host())
+                sg.start_paragraph(dnic_v)
+                this.process_flow_obj_content(sosofo)
+                sg.end_paragraph()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_PARAGRAPH_BREAK
+        {
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var dnic_v rfo.get_dnic()
+                if dnic_v = null
+                    dnic_v := DisplayNIC.make(this.interp.get_host())
+                sg.paragraph_break(dnic_v)
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_RULE
+        {
+            ; RuleFlowObj::processInner — fotb.rule(nic); atomic (no content).
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v rfo.get_nic() as ref[RuleNIC]?
+                if tnic_v = null
+                    tnic_v := RuleNIC.make(this.interp.get_host())
+                var dnic_v rfo.get_dnic()
+                if dnic_v = null
+                    dnic_v := DisplayNIC.make(this.interp.get_host())
+                sg.rule(tnic_v as ref[RuleNIC], dnic_v)
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_DISPLAY_GROUP
+        {
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var dnic_v rfo.get_dnic()
+                if dnic_v = null
+                    dnic_v := DisplayNIC.make(this.interp.get_host())
+                sg.start_display_group(dnic_v as ref[DisplayNIC])
+                this.process_flow_obj_content(sosofo)
+                sg.end_display_group()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_LINE_FIELD
+        {
+            ; the InlineNIC break priorities ride the tnic (the fot dump drops
+            ; them, the TeX backend prints them).
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v rfo.get_nic() as ref[LineFieldNIC]?
+                if tnic_v = null
+                    tnic_v := LineFieldNIC.make(this.interp.get_host())
+                sg.start_line_field(tnic_v)
+                this.process_flow_obj_content(sosofo)
+                sg.end_line_field()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_LINK
+        {
+            ; LinkFlowObj::processInner — startLink(address) + content.
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v rfo.get_nic() as ref[LinkNIC]?
+                if tnic_v = null
+                    tnic_v := LinkNIC.make(this.interp.get_host())
+                sg.start_link(tnic_v as ref[LinkNIC])
+                this.process_flow_obj_content(sosofo)
+                sg.end_link()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_EXTERNAL_GRAPHIC
+        {
+            ; ExternalGraphicFlowObj::processInner — atomic.
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v rfo.get_nic() as ref[ExternalGraphicNIC]?
+                if tnic_v = null
+                    tnic_v := ExternalGraphicNIC.make(this.interp.get_host())
+                var dnic_v rfo.get_dnic()
+                if dnic_v = null
+                    dnic_v := DisplayNIC.make(this.interp.get_host())
+                sg.external_graphic(tnic_v, dnic_v)
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_LEADER
+        {
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v rfo.get_nic() as ref[LeaderNIC]?
+                if tnic_v = null
+                    tnic_v := LeaderNIC.make(this.interp.get_host())
+                sg.start_leader(tnic_v as ref[LeaderNIC])
+                this.process_flow_obj_content(sosofo)
+                sg.end_leader()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_BOX
+        {
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v rfo.get_nic() as ref[BoxNIC]?
+                if tnic_v = null
+                    tnic_v := BoxNIC.make(this.interp.get_host())
+                var dnic_v rfo.get_dnic()
+                if dnic_v = null
+                    dnic_v := DisplayNIC.make(this.interp.get_host())
+                sg.start_box(tnic_v as ref[BoxNIC], dnic_v)
+                this.process_flow_obj_content(sosofo)
+                sg.end_box()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_SCORE
+        {
+            ; ScoreFlowObj::processInner — no type: = a plain sequence pair.
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                let snic rfo.get_nic() as ref[ScoreNIC]?
+                var typed false
+                if snic <> null
+                {
+                    if snic.kind <> SCORE_NONE
+                        typed := true
+                }
+                if typed
+                {
+                    sg.start_score(snic as ref[ScoreNIC])
+                    this.process_flow_obj_content(sosofo)
+                    sg.end_score()
+                }
+                else
+                {
+                    sg.start_sequence()
+                    this.process_flow_obj_content(sosofo)
+                    sg.end_sequence()
+                }
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_SEQUENCE
+        {
+            this.push_fo_style(fo)
+            sg.start_sequence()
+            this.process_flow_obj_content(sosofo)
+            sg.end_sequence()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_MACRO
+        {
+            ; MacroFlowObj::processInner — the body's sosofo inside a
+            ; startSequence/endSequence bracket, under the macro make's own
+            ; style (so `(make my-macro font-weight: 'bold …)` renders as a
+            ; sequence carrying that characteristic).
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                sg.start_sequence()
+                this.process_macro(sosofo, rfo)
+                sg.end_sequence()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_SCROLL
+        {
+            ; ScrollFlowObj::processInner — a plain compound bracket.
+            this.push_fo_style(fo)
+            sg.start_scroll()
+            this.process_flow_obj_content(sosofo)
+            sg.end_scroll()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_PAGE_FLOAT
+        {
+            ; CompoundExtensionFlowObj::processInner — startExtension (no
+            ; ports) + content + endExtension; the TeX builder's
+            ; TeXCompoundExtensionFlowObj::start/end do the work.
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v rfo.get_nic() as ref[PageFloatNIC]?
+                if tnic_v = null
+                    tnic_v := PageFloatNIC.make(this.interp.get_host())
+                sg.start_page_float(tnic_v)
+                this.process_flow_obj_content(sosofo)
+                sg.end_page_float()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_INDEX_ENTRY
+        {
+            ; ExtensionFlowObj::processInner — an ATOMIC flow object:
+            ; currentFOTBuilder().extension(fo, currentNode). The MIF override
+            ; does NOT call the base atomic(), so no format level is pushed.
+            this.push_fo_style(fo)
+            var ifo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                ifo := this.resolve_nics(fo)
+            if ifo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v ifo.get_nic() as ref[IndexEntryNIC]?
+                if tnic_v = null
+                    tnic_v := IndexEntryNIC.make(this.interp.get_host())
+                sg.index_entry(tnic_v)
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_PAGE_FOOTNOTE
+        {
+            this.push_fo_style(fo)
+            sg.start_page_footnote()
+            this.process_flow_obj_content(sosofo)
+            sg.end_page_footnote()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_CHARACTER
+        {
+            ; CharacterFlowObj::processInner — atomic.
+            this.push_fo_style(fo)
+            var cfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                cfo := this.resolve_nics(fo)
+            if cfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v cfo.get_nic() as ref[CharacterNIC]?
+                if tnic_v = null
+                    tnic_v := CharacterNIC.make(this.interp.get_host())
+                sg.character(tnic_v as ref[CharacterNIC])
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_ALIGNMENT_POINT
+        {
+            ; AlignmentPointFlowObj::processInner — atomic, no NIC.
+            this.push_fo_style(fo)
+            sg.alignment_point()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_SIDELINE
+        {
+            ; SidelineFlowObj::processInner — a plain compound bracket.
+            this.push_fo_style(fo)
+            sg.start_sideline()
+            this.process_flow_obj_content(sosofo)
+            sg.end_sideline()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_ANCHOR
+        {
+            ; AnchorFlowObj::processInner (style/Anchor.cxx) — one atomic call.
+            ; ★The class IS a CompoundFlowObj (so `(make anchor (literal …))`
+            ; draws no atomicContent diagnostic) but processInner never calls
+            ; the base, so the content is DISCARDED. Measured.
+            this.push_fo_style(fo)
+            var afo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                afo := this.resolve_nics(fo)
+            if afo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v afo.get_nic() as ref[AnchorNIC]?
+                if tnic_v = null
+                    tnic_v := AnchorNIC.make(this.interp.get_host())
+                sg.anchor(tnic_v as ref[AnchorNIC])
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_GLYPH_ANNOTATION
+        {
+            ; GlyphAnnotationFlowObj::processInner — a NIC-bearing compound
+            ; bracket (the fot dump's start tag is SELF-CLOSING and then closed
+            ; by endFlow — the reference's own quirk, reproduced).
+            this.push_fo_style(fo)
+            var gfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                gfo := this.resolve_nics(fo)
+            if gfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v gfo.get_nic() as ref[GlyphAnnotationNIC]?
+                if tnic_v = null
+                    tnic_v := GlyphAnnotationNIC.make(this.interp.get_host())
+                sg.start_glyph_annotation(tnic_v as ref[GlyphAnnotationNIC])
+                this.process_flow_obj_content(sosofo)
+                sg.end_glyph_annotation()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_EMPHASIZING_MARK
+        {
+            ; EmphasizingMarkFlowObj::processInner + the SerialFOTBuilder
+            ; decomposition: the `mark:` sosofo is processed into a save queue
+            ; (the reference's one-element markfotb[] port, pushed as the
+            ; PRINCIPAL port), replayed inside the mark bracket, and only then
+            ; does the principal content follow.
+            ; ★The reference binary CRASHES on every make of this class — its
+            ; copy constructor leaves emphmark_ indeterminate
+            ; (style/EmphasizingMark.h:28) and processInner dereferences it.
+            ; This port carries the mark; the flowobj fixture documents the
+            ; deviation.
+            this.push_fo_style(fo)
+            var efo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                efo := this.resolve_nics(fo)
+            if efo <> null
+            {
+                ; A NIC is a VALUE in the reference -- `EmphasizingMarkNIC()`
+                ; is default-constructible and `StartEmphasizingMarkCall` holds
+                ; one BY VALUE, so `startEmphasizingMarkSerial(const
+                ; EmphasizingMarkNIC &)` can never be handed nothing. Supply the
+                ; default here, the way the table and table-column cases below
+                ; already do; without it this was the ONE site that passed a
+                ; null NIC on, and every builder's `if nic <> null` guard was
+                ; load-bearing because of it.
+                var erec efo.get_nic() as ref[EmphasizingMarkNIC]?
+                if erec = null
+                    erec := EmphasizingMarkNIC.make(this.interp.get_host())
+                sg.start_emphasizing_mark_serial(erec as ref[EmphasizingMarkNIC])
+                var mark: ref[ELObj]? null
+                if erec <> null
+                    mark := erec.mark
+                let phost this.interp.get_host()
+                let msave SaveFOTBuilder.make(phost)
+                if mark <> null
+                {
+                    this.push_principal_port(msave, phost)
+                    this.process_sosofo(mark)
+                    this.pop_principal_port()
+                }
+                sg.start_emphasizing_mark_mark()
+                sg.emit_saved(msave)
+                sg.end_emphasizing_mark_mark()
+                sg.end_all_emphasizing_mark_mark()
+                this.process_flow_obj_content(sosofo)
+                sg.end_emphasizing_mark_serial()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        ; --- the MATH family (FlowObj.cxx:1708-2115) ---------------------------
+        ; The four port-less brackets first: MathSequence / Unmath /
+        ; Superscript / Subscript are plain CompoundFlowObjs.
+        if foc = FOC_MATH_SEQUENCE
+        {
+            this.push_fo_style(fo)
+            sg.start_math_sequence()
+            this.process_flow_obj_content(sosofo)
+            sg.end_math_sequence()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_UNMATH
+        {
+            this.push_fo_style(fo)
+            sg.start_unmath()
+            this.process_flow_obj_content(sosofo)
+            sg.end_unmath()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_SUPERSCRIPT
+        {
+            this.push_fo_style(fo)
+            sg.start_superscript()
+            this.process_flow_obj_content(sosofo)
+            sg.end_superscript()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_SUBSCRIPT
+        {
+            this.push_fo_style(fo)
+            sg.start_subscript()
+            this.process_flow_obj_content(sosofo)
+            sg.end_subscript()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_FRACTION
+        {
+            ; FractionFlowObj::processInner + SerialFOTBuilder::start/endFraction.
+            ; ★The FRACTION BAR sits between the serial bracket and the ports:
+            ; the `fraction-bar` inherited characteristic's actual value is a
+            ; rule sosofo whose style is pushed around the atomic bar call.
+            ; ★And fraction is the ONE class that passes 0 for pushPorts'
+            ; hasPrincipalPort flag — the reference IGNORES the argument
+            ; ("FIXME deal with !hasPrincipalPort", ProcessContext.cxx:382), so
+            ; unlabelled content still lands in the enclosing stream, directly
+            ; after the bar and BEFORE the numerator port. Reproduced as
+            ; measured, not as documented.
+            this.push_fo_style(fo)
+            sg.start_fraction_serial()
+            let bar_style this.fraction_bar_style_actual()
+            if bar_style <> null
+                this.push_style_obj(bar_style)
+            sg.fraction_bar()
+            if bar_style <> null
+            {
+                let bss this.current_style_stack()
+                bss.pop()
+            }
+            let fhost this.interp.get_host()
+            let num_save SaveFOTBuilder.make(fhost)
+            let den_save SaveFOTBuilder.make(fhost)
+            let flabels Array[ref[ELObj]?]^fhost()
+            flabels.add(this.interp.make_symbol(StringC("numerator")))
+            flabels.add(this.interp.make_symbol(StringC("denominator")))
+            let fsaves Array[ref[SaveFOTBuilder]?]^fhost()
+            fsaves.add(num_save)
+            fsaves.add(den_save)
+            this.push_ports(flabels, fsaves, fhost)
+            this.process_flow_obj_content(sosofo)
+            this.pop_ports()
+            sg.start_fraction_numerator()
+            sg.emit_saved(num_save)
+            sg.end_fraction_numerator()
+            sg.start_fraction_denominator()
+            sg.emit_saved(den_save)
+            sg.end_fraction_denominator()
+            sg.end_fraction_serial()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_SCRIPT
+        {
+            ; ScriptFlowObj::processInner + SerialFOTBuilder::start/endScript —
+            ; six ports, replayed in declaration order.
+            this.push_fo_style(fo)
+            sg.start_script_serial()
+            let shost this.interp.get_host()
+            let slabels Array[ref[ELObj]?]^shost()
+            slabels.add(this.interp.make_symbol(StringC("pre-sup")))
+            slabels.add(this.interp.make_symbol(StringC("pre-sub")))
+            slabels.add(this.interp.make_symbol(StringC("post-sup")))
+            slabels.add(this.interp.make_symbol(StringC("post-sub")))
+            slabels.add(this.interp.make_symbol(StringC("mid-sup")))
+            slabels.add(this.interp.make_symbol(StringC("mid-sub")))
+            let ssaves Array[ref[SaveFOTBuilder]?]^shost()
+            var si 0
+            while si < 6
+            {
+                ssaves.add(SaveFOTBuilder.make(shost))
+                si := si + 1
+            }
+            this.push_ports(slabels, ssaves, shost)
+            this.process_flow_obj_content(sosofo)
+            this.pop_ports()
+            sg.start_script_pre_sup()
+            sg.emit_saved((*ssaves.get(0)) as ref[SaveFOTBuilder])
+            sg.end_script_pre_sup()
+            sg.start_script_pre_sub()
+            sg.emit_saved((*ssaves.get(1)) as ref[SaveFOTBuilder])
+            sg.end_script_pre_sub()
+            sg.start_script_post_sup()
+            sg.emit_saved((*ssaves.get(2)) as ref[SaveFOTBuilder])
+            sg.end_script_post_sup()
+            sg.start_script_post_sub()
+            sg.emit_saved((*ssaves.get(3)) as ref[SaveFOTBuilder])
+            sg.end_script_post_sub()
+            sg.start_script_mid_sup()
+            sg.emit_saved((*ssaves.get(4)) as ref[SaveFOTBuilder])
+            sg.end_script_mid_sup()
+            sg.start_script_mid_sub()
+            sg.emit_saved((*ssaves.get(5)) as ref[SaveFOTBuilder])
+            sg.end_script_mid_sub()
+            sg.end_script_serial()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_MARK
+        {
+            ; MarkFlowObj::processInner + SerialFOTBuilder::start/endMark.
+            this.push_fo_style(fo)
+            sg.start_mark_serial()
+            let mhost this.interp.get_host()
+            let over_save SaveFOTBuilder.make(mhost)
+            let under_save SaveFOTBuilder.make(mhost)
+            let mlabels Array[ref[ELObj]?]^mhost()
+            mlabels.add(this.interp.make_symbol(StringC("over-mark")))
+            mlabels.add(this.interp.make_symbol(StringC("under-mark")))
+            let msaves Array[ref[SaveFOTBuilder]?]^mhost()
+            msaves.add(over_save)
+            msaves.add(under_save)
+            this.push_ports(mlabels, msaves, mhost)
+            this.process_flow_obj_content(sosofo)
+            this.pop_ports()
+            sg.start_mark_over()
+            sg.emit_saved(over_save)
+            sg.end_mark_over()
+            sg.start_mark_under()
+            sg.emit_saved(under_save)
+            sg.end_mark_under()
+            sg.end_mark_serial()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_FENCE
+        {
+            ; FenceFlowObj::processInner + SerialFOTBuilder::start/endFence.
+            this.push_fo_style(fo)
+            sg.start_fence_serial()
+            let nhost this.interp.get_host()
+            let open_save SaveFOTBuilder.make(nhost)
+            let close_save SaveFOTBuilder.make(nhost)
+            let nlabels Array[ref[ELObj]?]^nhost()
+            nlabels.add(this.interp.make_symbol(StringC("open")))
+            nlabels.add(this.interp.make_symbol(StringC("close")))
+            let nsaves Array[ref[SaveFOTBuilder]?]^nhost()
+            nsaves.add(open_save)
+            nsaves.add(close_save)
+            this.push_ports(nlabels, nsaves, nhost)
+            this.process_flow_obj_content(sosofo)
+            this.pop_ports()
+            sg.start_fence_open()
+            sg.emit_saved(open_save)
+            sg.end_fence_open()
+            sg.start_fence_close()
+            sg.emit_saved(close_save)
+            sg.end_fence_close()
+            sg.end_fence_serial()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_RADICAL
+        {
+            ; RadicalFlowObj::processInner + SerialFOTBuilder::start/endRadical.
+            ; ★The `radical:` sosofo is not processed — its CharacterNIC and
+            ; style are EXTRACTED (SosofoObj::characterStyle) and handed to the
+            ; backend as one atomic call; without one, radicalRadicalDefaulted.
+            ; Both open the principal port in the fot backend.
+            this.push_fo_style(fo)
+            var rdfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rdfo := this.resolve_nics(fo)
+            if rdfo <> null
+            {
+                sg.start_radical_serial()
+                var rad: ref[ELObj]? null
+                let rrec rdfo.get_nic() as ref[RadicalNIC]?
+                if rrec <> null
+                    rad := rrec.radical
+                var rnic: ref[CharacterNIC]? null
+                var rstyle: ref[ELObj]? null
+                if rad <> null
+                    rnic := this.character_style_of(rad, &rstyle)
+                if rnic <> null
+                {
+                    if rstyle <> null
+                        this.push_style_obj(rstyle)
+                    sg.radical_radical(rnic)
+                    if rstyle <> null
+                    {
+                        let rss this.current_style_stack()
+                        rss.pop()
+                    }
+                }
+                else
+                    sg.radical_radical_defaulted()
+                let dhost this.interp.get_host()
+                let deg_save SaveFOTBuilder.make(dhost)
+                let dlabels Array[ref[ELObj]?]^dhost()
+                dlabels.add(this.interp.make_symbol(StringC("degree")))
+                let dsaves Array[ref[SaveFOTBuilder]?]^dhost()
+                dsaves.add(deg_save)
+                this.push_ports(dlabels, dsaves, dhost)
+                this.process_flow_obj_content(sosofo)
+                this.pop_ports()
+                sg.start_radical_degree()
+                sg.emit_saved(deg_save)
+                sg.end_radical_degree()
+                sg.end_radical_serial()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_MATH_OPERATOR
+        {
+            ; MathOperatorFlowObj::processInner + the three-port serial
+            ; decomposition.
+            this.push_fo_style(fo)
+            sg.start_math_operator_serial()
+            let ohost this.interp.get_host()
+            let op_save SaveFOTBuilder.make(ohost)
+            let lo_save SaveFOTBuilder.make(ohost)
+            let up_save SaveFOTBuilder.make(ohost)
+            let olabels Array[ref[ELObj]?]^ohost()
+            olabels.add(this.interp.make_symbol(StringC("operator")))
+            olabels.add(this.interp.make_symbol(StringC("lower-limit")))
+            olabels.add(this.interp.make_symbol(StringC("upper-limit")))
+            let osaves Array[ref[SaveFOTBuilder]?]^ohost()
+            osaves.add(op_save)
+            osaves.add(lo_save)
+            osaves.add(up_save)
+            this.push_ports(olabels, osaves, ohost)
+            this.process_flow_obj_content(sosofo)
+            this.pop_ports()
+            sg.start_math_operator_operator()
+            sg.emit_saved(op_save)
+            sg.end_math_operator_operator()
+            sg.start_math_operator_lower_limit()
+            sg.emit_saved(lo_save)
+            sg.end_math_operator_lower_limit()
+            sg.start_math_operator_upper_limit()
+            sg.emit_saved(up_save)
+            sg.end_math_operator_upper_limit()
+            sg.end_math_operator_serial()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_GRID
+        {
+            ; GridFlowObj::processInner — a NIC-bearing compound bracket.
+            this.push_fo_style(fo)
+            var gfo2: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                gfo2 := this.resolve_nics(fo)
+            if gfo2 <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v gfo2.get_nic() as ref[GridNIC]?
+                if tnic_v = null
+                    tnic_v := GridNIC.make(this.interp.get_host())
+                sg.start_grid(tnic_v as ref[GridNIC])
+                this.process_flow_obj_content(sosofo)
+                sg.end_grid()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_GRID_CELL
+        {
+            ; GridCellFlowObj::processInner — likewise.
+            this.push_fo_style(fo)
+            var gcfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                gcfo := this.resolve_nics(fo)
+            if gcfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v gcfo.get_nic() as ref[GridCellNIC]?
+                if tnic_v = null
+                    tnic_v := GridCellNIC.make(this.interp.get_host())
+                sg.start_grid_cell(tnic_v as ref[GridCellNIC])
+                this.process_flow_obj_content(sosofo)
+                sg.end_grid_cell()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        ; --- the LAYOUT-COMPOSITE family --------------------------------------
+        ; Five plain CompoundFlowObj brackets — no ports, no serial
+        ; decomposition (style/{EmbeddedText,IncludedContainerArea,SideBySide,
+        ; SideBySideItem,AlignedColumn}.cxx, each a three-line processInner).
+        if foc = FOC_EMBEDDED_TEXT
+        {
+            this.push_fo_style(fo)
+            var efo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                efo := this.resolve_nics(fo)
+            if efo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v efo.get_nic() as ref[EmbeddedTextNIC]?
+                if tnic_v = null
+                    tnic_v := EmbeddedTextNIC.make(this.interp.get_host())
+                sg.start_embedded_text(tnic_v as ref[EmbeddedTextNIC])
+                this.process_flow_obj_content(sosofo)
+                sg.end_embedded_text()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_INCLUDED_CONTAINER_AREA
+        {
+            ; the one class of the family whose NIC derives from DisplayNIC:
+            ; its own record and the shared display record travel together.
+            this.push_fo_style(fo)
+            var ifo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                ifo := this.resolve_nics(fo)
+            if ifo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var tnic_v ifo.get_nic() as ref[IncludedContainerAreaNIC]?
+                if tnic_v = null
+                    tnic_v := IncludedContainerAreaNIC.make(this.interp.get_host())
+                var dnic_v ifo.get_dnic()
+                if dnic_v = null
+                    dnic_v := DisplayNIC.make(this.interp.get_host())
+                sg.start_included_container_area(tnic_v as ref[IncludedContainerAreaNIC], dnic_v)
+                this.process_flow_obj_content(sosofo)
+                sg.end_included_container_area()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_SIDE_BY_SIDE
+        {
+            this.push_fo_style(fo)
+            var bfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                bfo := this.resolve_nics(fo)
+            if bfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var dnic_v bfo.get_dnic()
+                if dnic_v = null
+                    dnic_v := DisplayNIC.make(this.interp.get_host())
+                sg.start_side_by_side(dnic_v)
+                this.process_flow_obj_content(sosofo)
+                sg.end_side_by_side()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_SIDE_BY_SIDE_ITEM
+        {
+            ; SideBySideItemFlowObj has no hasNonInheritedC at all — every
+            ; characteristic name is an unknown keyword.
+            this.push_fo_style(fo)
+            sg.start_side_by_side_item()
+            this.process_flow_obj_content(sosofo)
+            sg.end_side_by_side_item()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_ALIGNED_COLUMN
+        {
+            this.push_fo_style(fo)
+            var afo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                afo := this.resolve_nics(fo)
+            if afo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var dnic_v afo.get_dnic()
+                if dnic_v = null
+                    dnic_v := DisplayNIC.make(this.interp.get_host())
+                sg.start_aligned_column(dnic_v)
+                this.process_flow_obj_content(sosofo)
+                sg.end_aligned_column()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        ; --- the ONLINE family ------------------------------------------------
+        if foc = FOC_MARGINALIA
+        {
+            ; MarginaliaFlowObj::processInner — a bare bracket, no
+            ; characteristics of its own (its four are inherited ones).
+            this.push_fo_style(fo)
+            sg.start_marginalia()
+            this.process_flow_obj_content(sosofo)
+            sg.end_marginalia()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_MULTI_MODE
+        {
+            ; MultiModeFlowObj::processInner + SerialFOTBuilder::start/endMulti-
+            ; Mode. ★The only class whose PORTS are decided at run time: the
+            ; `multi-modes:` list names them, and each named mode becomes one
+            ; port replayed inside its own start/endMultiModeMode bracket.
+            ; ★Like `fraction`, the reference passes hasPrincipalMode to
+            ; pushPorts and never reads it, so unlabelled content flows into
+            ; the enclosing stream even when no principal mode was asked for.
+            this.push_fo_style(fo)
+            var mfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                mfo := this.resolve_nics(fo)
+            if mfo <> null
+            {
+                let mhost this.interp.get_host()
+                let nic mfo.get_nic() as ref[MultiModeNIC]?
+                var principal: ref[MultiModeRec]? null
+                if nic <> null
+                {
+                    if nic.has_principal_mode
+                    {
+                        let pm MultiModeRec.make(mhost)
+                        pm.has_desc := nic.principal_has_desc
+                        pm.desc := nic.principal_desc
+                        principal := pm
+                    }
+                }
+                sg.start_multi_mode_serial(principal)
+                let mlabels Array[ref[ELObj]?]^mhost()
+                let msaves Array[ref[SaveFOTBuilder]?]^mhost()
+                var n_modes: size_t 0
+                if nic <> null
+                    n_modes := nic.named.get_length()
+                var mi: size_t 0
+                while mi < n_modes
+                {
+                    let mp nic.named.get(mi)
+                    if mp <> null
+                    {
+                        let md *mp
+                        mlabels.add(this.interp.make_symbol(md.name))
+                        msaves.add(SaveFOTBuilder.make(mhost))
+                    }
+                    mi := mi + 1
+                }
+                this.push_ports(mlabels, msaves, mhost)
+                this.process_flow_obj_content(sosofo)
+                this.pop_ports()
+                var mj: size_t 0
+                while mj < msaves.get_length()
+                {
+                    let mp2 nic.named.get(mj)
+                    let sp msaves.get(mj)
+                    if (mp2 <> null) and (sp <> null)
+                    {
+                        sg.start_multi_mode_mode(*mp2)
+                        sg.emit_saved((*sp) as ref[SaveFOTBuilder])
+                        sg.end_multi_mode_mode()
+                    }
+                    mj := mj + 1
+                }
+                sg.end_multi_mode_serial()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        ; --- the PAGE/COLUMN MODEL --------------------------------------------
+        ; Two plain CompoundFlowObj brackets (style/PageSequence.cxx:23 and
+        ; style/ColumnSetSequence.cxx:10, each a three-line processInner) whose
+        ; SerialFOTBuilder decomposition is a straight forward to the *Serial
+        ; pair — no ports, no buffering.
+        if foc = FOC_PAGE_SEQUENCE
+        {
+            ; PageSequenceFlowObj takes NO non-inherited characteristic at
+            ; all: its six are inherited ones and reach the backend through
+            ; the ics buffer, so there is nothing to resolve here.
+            this.push_fo_style(fo)
+            sg.start_page_sequence()
+            this.process_flow_obj_content(sosofo)
+            sg.end_page_sequence()
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_COLUMN_SET_SEQUENCE
+        {
+            this.push_fo_style(fo)
+            var qfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                qfo := this.resolve_nics(fo)
+            if qfo <> null
+            {
+                ; NIC absent == the reference's default-constructed record.
+                var dnic_v qfo.get_dnic()
+                if dnic_v = null
+                    dnic_v := DisplayNIC.make(this.interp.get_host())
+                sg.start_column_set_sequence(dnic_v)
+                this.process_flow_obj_content(sosofo)
+                sg.end_column_set_sequence()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_SIMPLE_PAGE_SEQUENCE
+        {
+            ; SimplePageSequenceFlowObj::processInner + the SerialFOTBuilder
+            ; decomposition, collapsed: the reference buffers each of the 24
+            ; header/footer parts in a SaveFOTBuilder and replays them in
+            ; k = pageType | (part << 2) order into the hf string buffer;
+            ; processing directly under the output redirect partitions the
+            ; stream identically, so each part is extracted right after it
+            ; is processed.
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                sg.start_simple_page_sequence()
+                var i 0
+                while i < 4
+                {
+                    this.have_page_type := true
+                    this.page_type := i
+                    var j 0
+                    while j < 6
+                    {
+                        let part rfo.get_hf(j)
+                        sg.start_simple_page_sequence_header_footer(i | (j * 4))
+                        if part <> null
+                            this.process_sosofo(part)
+                        sg.end_simple_page_sequence_header_footer(i | (j * 4))
+                        j := j + 1
+                    }
+                    i := i + 1
+                }
+                sg.end_all_simple_page_sequence_header_footer()
+                this.process_flow_obj_content(sosofo)
+                sg.end_simple_page_sequence()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_TABLE
+        {
+            ; TableFlowObj::processInner: table state pushed, the four border
+            ; flow objects (NIC style, else the table-border actual), content,
+            ; the dangling row closed, spanned rows covered.
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                this.table_stack := TableRec.make(this.interp.get_host(), this.table_stack)
+                var rec rfo.get_nic() as ref[TableNIC]?
+                if rec = null
+                    rec := TableNIC.make(this.interp.get_host())
+                ; Same for the display NIC: `get_dnic` answers `pointer[void]`
+                ; and may be null, so the non-optional cast was a claim the
+                ; accessor does not support.
+                var tdn rfo.get_dnic()
+                if tdn = null
+                    tdn := DisplayNIC.make(this.interp.get_host())
+                sg.start_table(rec as ref[TableNIC], tdn)
+                let fallback this.border_style_actual("table-border")
+                this.emit_table_border(rec.before_row_border, fallback, 0)
+                this.emit_table_border(rec.after_row_border, fallback, 1)
+                this.emit_table_border(rec.before_column_border, fallback, 2)
+                this.emit_table_border(rec.after_column_border, fallback, 3)
+                this.process_flow_obj_content(sosofo)
+                if this.in_table_row()
+                    this.end_table_row()
+                this.cover_spanned_rows()
+                this.table_stack := this.table_stack.prev
+                sg.end_table()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_TABLE_PART
+        {
+            ; TablePartFlowObj::processInner + the SerialFOTBuilder header/
+            ; footer decomposition: the header/footer ports (label:) capture
+            ; into buffers replayed after the principal content.
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                let t this.table_stack
+                if t <> null
+                {
+                    t.current_column := 0
+                    t.row_style := null
+                    let h t.host
+                    t.column_styles := Array[ref[Array[ref[ELObj]?]]?]^h()
+                    t.covered := Array[int]^h()
+                    t.n_columns := 0
+                }
+                ; NIC absent == the reference's default-constructed record.
+                var dnic_v rfo.get_dnic()
+                if dnic_v = null
+                    dnic_v := DisplayNIC.make(this.interp.get_host())
+                sg.start_table_part_serial(dnic_v)
+                let phost this.interp.get_host()
+                let hdr_save SaveFOTBuilder.make(phost)
+                let ftr_save SaveFOTBuilder.make(phost)
+                let hdr_sym this.interp.make_symbol(StringC("header"))
+                let ftr_sym this.interp.make_symbol(StringC("footer"))
+                let labels Array[ref[ELObj]?]^phost()
+                labels.add(hdr_sym)
+                labels.add(ftr_sym)
+                let saves Array[ref[SaveFOTBuilder]?]^phost()
+                saves.add(hdr_save)
+                saves.add(ftr_save)
+                this.push_ports(labels, saves, phost)
+                this.process_flow_obj_content(sosofo)
+                this.pop_ports()
+                if this.in_table_row()
+                    this.end_table_row()
+                this.cover_spanned_rows()
+                sg.start_table_part_header()
+                sg.emit_saved(hdr_save)
+                sg.end_table_part_header()
+                sg.start_table_part_footer()
+                sg.emit_saved(ftr_save)
+                sg.end_table_part_footer()
+                sg.end_table_part_serial()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_TABLE_COLUMN
+        {
+            this.push_fo_style(fo)
+            var rfo: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfo := this.resolve_nics(fo)
+            if rfo <> null
+            {
+                var rec2 rfo.get_nic() as ref[TableColumnNIC]?
+                if rec2 = null
+                    rec2 := TableColumnNIC.make(this.interp.get_host())
+                let col_fo_style fo.get_style()
+                if rec2.has_column_number
+                {
+                    sg.table_column(rec2 as ref[TableColumnNIC])
+                    this.add_table_column(rec2.column_index, rec2.n_columns_spanned, col_fo_style)
+                }
+                else
+                {
+                    let rec3 rec2.copy(this.interp.get_host())
+                    rec3.column_index := this.current_table_column()
+                    sg.table_column(rec3)
+                    this.add_table_column(rec3.column_index, rec2.n_columns_spanned, col_fo_style)
+                }
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_TABLE_ROW
+        {
+            ; TableRowFlowObj: pushStyle/popStyle are empty — the row style is
+            ; stored and pushed per cell.
+            if this.in_table() = false
+            {
+                this.interp.message0(InterpreterMessages.tableRowOutsideTable())
+                this.process_flow_obj_content(sosofo)
+                return
+            }
+            if this.in_table_row()
+                this.end_table_row()
+            let row_fo_style fo.get_style()
+            this.start_table_row(row_fo_style)
+            this.process_flow_obj_content(sosofo)
+            if this.in_table_row()
+                this.end_table_row()
+            return
+        }
+        if foc = FOC_TABLE_CELL
+        {
+            var rec4 fo.get_nic() as ref[TableCellNIC]?
+            if rec4 = null
+                rec4 := TableCellNIC.make(this.interp.get_host())
+            let cell_fo_style fo.get_style()
+            this.process_table_cell(rec4 as ref[TableCellNIC], cell_fo_style, sosofo, fo)
+            return
+        }
+        ; TableBorderFlowObj::process is empty — a pure style carrier.
+        if foc = FOC_TABLE_BORDER
+            return
+        ; --- the SGML-transformation extension classes -----------------------
+        ; jade.cxx installs these only for `-t sgml`/`-t xml`, so under a print
+        ; backend they bind as FOC_UNKNOWN and never arrive here; the one
+        ; exception is formatting-instruction, which every backend installs and
+        ; whose sink call dead-ends in the FOTBuilder base everywhere else.
+        ; Each is an ExtensionFlowObj, hence still a FlowObj: the style push of
+        ; FlowObj::process applies (its setters are the no-op base on the
+        ; transform builder, but a lazy characteristic still EVALUATES there —
+        ; measured).
+        if foc = FOC_ELEMENT
+        {
+            this.push_fo_style(fo)
+            var rel: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rel := this.resolve_nics(fo)
+            if rel <> null
+            {
+                let gi this.element_gi(rel)
+                sg.start_element(gi, rel.get_atts())
+                this.process_flow_obj_content(sosofo)
+                sg.end_element()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_EMPTY_ELEMENT
+        {
+            this.push_fo_style(fo)
+            var ree: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                ree := this.resolve_nics(fo)
+            if ree <> null
+            {
+                let gi this.element_gi(ree)
+                sg.empty_element(gi, ree.get_atts())
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_ENTITY
+        {
+            this.push_fo_style(fo)
+            var ren: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                ren := this.resolve_nics(fo)
+            if ren <> null
+            {
+                sg.start_entity(ren.get_system_id())
+                ; A REGION PER GENERATED FILE (lever 2),
+                ; the eval half. process_node brackets a NODE's
+                ; transients, but the content of an entity is evaluated inside
+                ; whatever node's bracket emitted the entity — a rule that
+                ; writes many files holds all of their transients until it
+                ; returns. Here that content gets a region of its own, so it
+                ; dies with the file. Measured on a 1804-file codegen: up to
+                ; 40 MB per file, freed 1804 times.
+                ; Nothing the content allocates outlives the file: what does —
+                ; the output buffer, the filename, the directory stack — the
+                ; sink builds on the run region (or, for the buffer, on the
+                ; file's own region, released in end_entity).
+                let saved_region this.interp.get_eval_region()
+                let file_parent this.interp.get_host()
+                let file_region file_parent.allocate_exclusive_page()
+                this.interp.set_eval_region(file_region)
+                this.process_flow_obj_content(sosofo)
+                this.interp.set_eval_region(saved_region)
+                file_parent.deallocate_exclusive_page(file_region)
+                sg.end_entity()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_ENTITY_REF
+        {
+            this.push_fo_style(fo)
+            var rer: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rer := this.resolve_nics(fo)
+            if rer <> null
+                sg.entity_ref(rer.get_name())
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_PROCESSING_INSTRUCTION
+        {
+            this.push_fo_style(fo)
+            var rpi: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rpi := this.resolve_nics(fo)
+            if rpi <> null
+                sg.processing_instruction(rpi.get_data())
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_DOCUMENT_TYPE
+        {
+            this.push_fo_style(fo)
+            var rdt: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rdt := this.resolve_nics(fo)
+            if rdt <> null
+                sg.document_type(rdt.get_name(), rdt.get_public_id(), rdt.get_system_id())
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_DIRECTORY
+        {
+            this.push_fo_style(fo)
+            var rdi: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rdi := this.resolve_nics(fo)
+            if rdi <> null
+            {
+                sg.start_directory(rdi.get_path())
+                this.process_flow_obj_content(sosofo)
+                sg.end_directory()
+            }
+            this.pop_fo_style(fo)
+            return
+        }
+        if foc = FOC_FORMATTING_INSTRUCTION
+        {
+            this.push_fo_style(fo)
+            var rfi: ref[FlowObj]? fo
+            if fo.get_nic_code() <> null
+                rfi := this.resolve_nics(fo)
+            if rfi <> null
+                sg.formatting_instruction(rfi.get_data())
+            this.pop_fo_style(fo)
+            return
+        }
+        ; FOC_UNKNOWN and anything unported: content only.
+        this.process_flow_obj_content(sosofo)
+    }
+
+    ; the element GI: the explicit `gi:` characteristic, else the current node's
+    ; generic identifier (ElementFlowObj's default-to-node behaviour).
+    function element_gi(this: ref[ProcessContext], fo: ref[FlowObj]) returns StringC
+    {
+        let gi fo.get_gi()
+        if gi.get_size() > 0
+            return gi
+        let node this.vm.get_current_node()
+        if node <> null
+            return node.get_gi()
+        gi
+    }
+}

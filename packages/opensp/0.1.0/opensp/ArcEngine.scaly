@@ -1,0 +1,1457 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.ParserState.ParserState
+use opensp.ParserOptions.ParserOptions
+use opensp.Event.Event
+use opensp.Attribute.Attribute
+use opensp.Attribute.AttributeValue
+use opensp.Attribute.AttributeSemantics
+use opensp.Attribute.AttributeContext
+use opensp.Attribute.AttributeDefinition
+use opensp.Attribute.DeclaredValue
+use opensp.Attribute.Text
+use opensp.ParserMessages.ParserMessages
+use opensp.ArcEngineMessages.ArcEngineMessages
+use opensp.Message.MessageType
+use opensp.Id.Id
+use opensp.Id.IdTable
+use opensp.AttributeList.AttributeList
+use opensp.AttributeList.AttributeDefinitionList
+use opensp.ElementType.ElementType
+use opensp.ElementType.ElementDefinition
+use opensp.Entity.Entity
+use opensp.Notation.Notation
+use opensp.ExternalId.ExternalId
+use opensp.Dtd.Dtd
+use opensp.Syntax.Syntax
+use opensp.Sd.Sd
+use opensp.OpenElement.OpenElement
+use opensp.ContentState.ContentState
+use opensp.Parser.Parser
+use opensp.ModeInfo.ModeInfo
+use opensp.Location.InputSource
+use opensp.Location.Origin
+use opensp.Storage.Storage
+
+; ArcEngine — a Scaly port of James Clark's OpenSP ArcEngine (lib/ArcEngine.cxx
+; + lib/ArcProcessor.h), the -A architectural-form processor (ISO/IEC 10744
+; AFDR). Unlike the reference's streaming EventHandler chain, this runs as a
+; POST-PARSE PASS over the materialized event queue (ParserState.events) — the
+; same shape the RAST writer uses (Rast.scaly). The base document's events
+; drive one ArcProcessor per ArcBase architecture; the processor consults a
+; META-DTD (parsed on demand from the architecture's ArcDTD entity), maps each
+; base element/attribute onto its architectural form, and GENERATES a fresh
+; event stream. For the -A <name> selection (SelectOneArcDirector) only the
+; matching architecture's generated stream is rendered; the base stream and any
+; non-selected architecture go to a null sink.
+;
+; STATUS: the af-1 core path (single ArcBase, ArcFormA=architecture name, plain
+; CDATA/#REQUIRED attribute mapping via buildAttributeMapRest, no suppression /
+; renamer / token-map / #CONTENT / notation-data-form), PLUS since 2026-08-09
+; the VALIDATING half: the meta-DTD content check (undefinedElement /
+; elementExcluded / invalidElement / unfinishedElement), the `included` flag and
+; the arch-space id table with missingId — before that, ArcEngineMessages had
+; forty accessors and not one caller. With it came its three prerequisites,
+; each of which had been silently wrong: ArcOpt -> options.includes (or every
+; marked section of the meta-DTD resolves to IGNORE), the PARAMETER form of
+; ArcDTD plus the catalog-resolved FSI (or the DSSSL architecture resolves to
+; nothing at all), and the end tag's markup location in the parser.
+;
+; Since 2026-08-09 also mungeMetaDtd/mungeDataEntity plus the arch-space
+; ENTITY/NOTATION attribute semantics (note_semantics): the meta-DTD has no
+; entity table of its own, so without the copy every ENTITY-declared
+; architectural attribute came out as a bare token (`ACONTENT TOKEN body-ent`
+; instead of `ACONTENT ENTITY body-ent`) — and the DSSSL specification's
+; `document`/`content` attributes are exactly that, which is what a routing of
+; the spec parse through this engine depends on.
+;
+; And the meta-DTD-resolution diagnostics (noArcDTDAtt / arcDtdNotDeclared-
+; Parameter / arcDtdNotDeclaredGeneral / arcDtdNotExternal /
+; arcGenerateSystemId): every one of them used to be a silent `return` in
+; setup, which the routing turns into "the stylesheet has no rules and nobody
+; said why".
+;
+; NOT ported, and each is why a message here still has no caller:
+; considerSupr/considerIgnD (so invalidData/invalidSuppress/invalidIgnD and the
+; documentElementNotArc branch are unreachable), considerNamer + token maps
+; (the rename diagnostics), #ARCCONT/emitArcContent, ArcQuant, and PI-declared
+; architectures. `noArcNotation` also stays uncalled: the reference anchors it
+; at the ArcBase PI's per-NAME offset and scan_arcbase_names keeps only the
+; names — and on the DSSSL path the gate reports specNotArc for that case
+; anyway. Also deliberately not carried across: the GRPCNT tally of the
+; arch list's idref/entity-name tokens (idrefGrpcnt/entityNameGrpcnt). The
+; reference counts inside setValue, i.e. before finish; this port's semantics
+; walk runs AFTER finish, so the count would have to be re-plumbed for a
+; message that needs more than 32 tokens in one architectural attribute to
+; fire, and there is no fixture that reaches it.
+
+; openElementFlags_ bits (ArcEngine.cxx suppressForm/…): only the ones the
+; af-1 path needs plus the frame marker.
+define ARC_IS_ARC: u32 0x0001
+define ARC_IGNORE_DATA: u32 0x0002
+define ARC_RECOVER_DATA: u32 0x0004
+
+define ArcProcessor
+(
+    var valid: bool
+    name: StringC
+    var doc_dtd: ref[Dtd]?
+    var meta_dtd: ref[Dtd]?
+    var doc_sd: ref[Sd]?
+    var doc_syntax: ref[Syntax]?
+    var meta_syntax: ref[Syntax]?
+    var cs: ref[ContentState]?
+    var ctx: ref[AttributeContext]?
+    var form_att_name: StringC
+    var namer_att: StringC
+    var supr_att: StringC
+    var ignd_att: StringC
+    var arc_doc_f: StringC
+    var supr_f: StringC
+    var brid_f: StringC
+    var data_f: StringC
+    ; supportAttsText_[rArcDataF]->charLocation(0) — the only support attribute
+    ; whose VALUE anchors a diagnostic (noArcDataF, ArcEngine.cxx:940).
+    var data_f_loc: Location
+    var arc_auto: bool
+    var host: ref[Page]
+    var ps: ref[ParserState]?
+    var cur_loc: Location
+    out: ref[Array[ref[Event]?]]?
+    open_flags: ref[Array[u32]]
+    var n_flags: size_t
+    ; the ARCH-SPACE id table (ArcProcessor::idTable_, ArcProcessor.h). It is a
+    ; SECOND table, independent of the document's: the same IDREF is reported
+    ; twice when it resolves in neither space, once by the parser
+    ; (ParserMessages.missingId) and once here (ArcEngineMessages.missingId).
+    var id_table: ref[IdTable]?
+    var error_idref: bool
+)
+{
+    function make(host: ref[Page], name: StringC) returns ref[ArcProcessor]
+    {
+        let p &ArcProcessor^host(false, name, null, null, null, null, null, null, null, StringC(), StringC(), StringC(), StringC(), StringC(), StringC(), StringC(), StringC(), Location(), true, host, null, Location(), null, Array[u32]^host(), 0, null, true)
+        p
+    }
+
+    procedure flags_push(mutable this: ref[ArcProcessor], v: u32)
+    {
+        if this.n_flags < this.open_flags.get_length()
+            this.open_flags.put(this.n_flags, v)
+        else
+            this.open_flags.add(v)
+        this.n_flags := this.n_flags + 1
+    }
+
+    function flags_top(this: ArcProcessor) returns u32
+    {
+        if n_flags = 0
+            return 0 as u32
+        open_flags[(n_flags - 1)]
+    }
+
+    procedure flags_pop(mutable this: ref[ArcProcessor])
+    {
+        if this.n_flags > 0
+            this.n_flags := this.n_flags - 1
+    }
+
+    ; init (ArcProcessor::init, ArcEngine.cxx:779): resolve the ArcBase notation,
+    ; read the ArcDTD support attribute, parse the meta-DTD, set up content state.
+    procedure setup(mutable this: ref[ArcProcessor], host: ref[Page], ps: ref[ParserState], mutable doc_dtd: ref[Dtd], mutable sd: ref[Sd]?, mutable syntax: ref[Syntax])
+    {
+        this.doc_dtd := doc_dtd
+        this.doc_sd := sd
+        this.doc_syntax := syntax
+        this.meta_syntax := syntax
+        this.host := host
+        this.ps := ps
+
+        let notation doc_dtd.lookup_notation(this.name)
+        if notation = null
+            return
+        var arc_opts: ref[Array[StringC]] Array[StringC]^host()
+
+        ; read the support attributes off the notation's attribute definition
+        ; (supportAttributes, ArcEngine.cxx:1093, notation column). The doc-side
+        ; attribute names (ArcFormA/ArcNamrA/ArcSuprA/ArcIgnDA) fold with the doc
+        ; general subst table; the meta-side element/notation names (ArcDocF/
+        ; ArcSuprF/ArcBridF/ArcDataF) with the meta table (= doc table here).
+        let nad notation.get_attribute_def()
+        var arc_dtd StringC()
+        ; the ArcDTD value's own location — supportAttsText_[rArcDTD]->charLocation(0),
+        ; where the reference anchors arcDtdNotDeclared* (ArcEngine.cxx:971)
+        var arc_dtd_loc Location()
+        if nad <> null
+        {
+            let al AttributeList.make(host, nad)
+            let nctx AttributeContext.make(host, syntax, false, true)
+            al.finish(nctx)
+            this.form_att_name := ArcEngine.support_att(host, syntax, al, StringC("ArcFormA"), true)
+            this.namer_att := ArcEngine.support_att(host, syntax, al, StringC("ArcNamrA"), true)
+            this.supr_att := ArcEngine.support_att(host, syntax, al, StringC("ArcSuprA"), true)
+            this.ignd_att := ArcEngine.support_att(host, syntax, al, StringC("ArcIgnDA"), true)
+            this.arc_doc_f := ArcEngine.support_att(host, syntax, al, StringC("ArcDocF"), true)
+            this.supr_f := ArcEngine.support_att(host, syntax, al, StringC("ArcSuprF"), true)
+            this.brid_f := ArcEngine.support_att(host, syntax, al, StringC("ArcBridF"), true)
+            this.data_f := ArcEngine.support_att(host, syntax, al, StringC("ArcDataF"), true)
+            this.data_f_loc := ArcEngine.support_att_loc(host, syntax, al, StringC("ArcDataF"))
+            arc_dtd := ArcEngine.support_att(host, syntax, al, StringC("ArcDTD"), false)
+            arc_dtd_loc := ArcEngine.support_att_loc(host, syntax, al, StringC("ArcDTD"))
+            ; ArcAuto: "ArcAuto" (default, auto on) vs "nArcAuto" (auto off).
+            let auto_v ArcEngine.support_att(host, syntax, al, StringC("ArcAuto"), true)
+            if auto_v.get_size() > 0
+            {
+                if auto_v.equals(ArcEngine.fold_sc(host, syntax, StringC("nArcAuto")))
+                    this.arc_auto := false
+            }
+            ; processArcOpts (ArcEngine.cxx:1192): ArcOptSA names the attributes
+            ; that carry the architecture's OPTIONS; without it the single name
+            ; is `ArcOpt`. Each named attribute's tokens become parameter
+            ; entities defined as INCLUDE while the meta-DTD is parsed
+            ; (options.includes, ArcEngine.cxx:906) — i.e. the meta-DTD's own
+            ; marked sections select its content models, so this is a
+            ; PREREQUISITE for validating against it at all.
+            let opt_sa ArcEngine.support_att(host, syntax, al, StringC("ArcOptSA"), false)
+            var opt_names: ref[Array[StringC]]? null
+            if opt_sa.get_size() > 0
+                opt_names := ArcEngine.split_ws(host, syntax, opt_sa)
+            else
+            {
+                opt_names := Array[StringC]^host()
+                opt_names.add(StringC^host("ArcOpt"))
+            }
+            var oi: size_t 0
+            while oi < opt_names.get_length()
+            {
+                let on opt_names[oi]
+                let ov ArcEngine.support_att(host, syntax, al, on, false)
+                if ov.get_size() > 0
+                {
+                    let toks ArcEngine.split_ws(host, syntax, ov)
+                    var ti: size_t 0
+                    while ti < toks.get_length()
+                    {
+                        arc_opts.add(toks[ti])
+                        ti := ti + 1
+                    }
+                }
+                oi := oi + 1
+            }
+        }
+        ; makeDtdEntity (ArcEngine.cxx:864). ★These four exits used to be SILENT,
+        ; and while the architecture was only a GATE that was survivable: the
+        ; base events were processed either way. Once the DSSSL specification is
+        ; ROUTED through this engine (dazzle/DssslSpecEventHandler.scaly), an
+        ; architecture whose meta-DTD does not resolve produces NO construction
+        ; rules at all — so a stylesheet would lose every rule with nobody
+        ; saying why. Measured against the reference on a spec that declares the
+        ; architecture without an ArcDTD attribute: it warns and processes with
+        ; default rules; the port did neither.
+        if arc_dtd.get_size() = 0
+        {
+            this.arc_report0(ArcEngineMessages.noArcDTDAtt(), notation.get_def_location())
+            return
+        }
+
+        ; ArcDocF and ArcFormA default to the architecture name (subst'd).
+        if this.arc_doc_f.get_size() = 0
+            this.arc_doc_f := this.name
+        if this.form_att_name.get_size() = 0
+            this.form_att_name := this.name
+
+        ; the meta-DTD entity. ★ArcDTD may name a PARAMETER entity: a value
+        ; that begins with the PERO delimiter loses it and is looked up in the
+        ; parameter table (ArcEngine.cxx:1168, arcDtdIsParam_). The DSSSL
+        ; architecture itself is declared that way (`ArcDTD CDATA #FIXED
+        ; "%DSSSLDTD"` in style-sheet.dtd), so without this the whole DSSSL
+        ; architecture resolves to nothing.
+        var arc_dtd_is_param false
+        let pero_len syntax.delim_general_len(dPERO)
+        if (pero_len > 0) and (arc_dtd.get_size() >= pero_len)
+        {
+            var pi2: size_t 0
+            var matched true
+            while pi2 < pero_len
+            {
+                if syntax.fold(arc_dtd.get(pi2)) <> syntax.delim_general_char(dPERO, pi2)
+                    matched := false
+                pi2 := pi2 + 1
+            }
+            if matched
+            {
+                arc_dtd_is_param := true
+                ; ★page-hosted, not `substr`: the copying init allocates through
+                ; Page.get(this) = this frame's return slot, and the value is
+                ; kept past the expression.
+                let tail StringC^host(arc_dtd.as_slice().slice_from(pero_len))
+                arc_dtd := *tail
+            }
+        }
+        let ent doc_dtd.lookup_entity(arc_dtd_is_param, arc_dtd)
+        if ent = null
+        {
+            if arc_dtd_is_param
+                this.arc_report1(ArcEngineMessages.arcDtdNotDeclaredParameter(), arc_dtd, arc_dtd_loc)
+            else
+                this.arc_report1(ArcEngineMessages.arcDtdNotDeclaredGeneral(), arc_dtd, arc_dtd_loc)
+            return
+        }
+        if ent.is_external() = false
+        {
+            ; ★ps.entity_def_location, not ent.get_def_location(): an INTERNAL
+            ; entity carries no declaration location in its union arm (the port
+            ; keeps them in a ParserState side table), so the direct accessor
+            ; answers an invalid Location — and an internal entity is exactly
+            ; what this branch reports on.
+            this.arc_report1(ArcEngineMessages.arcDtdNotExternal(), arc_dtd, ps.entity_def_location(ent))
+            return
+        }
+        ; ★an architecture may be declared by PUBLIC identifier alone (the DSSSL
+        ; one is: `<!ENTITY % DSSSLDTD PUBLIC "ISO/IEC 10179:1996//DTD DSSSL
+        ; Architecture//EN">`), so the declared system id is empty and the
+        ; catalog's answer — stamped on the entity when it was declared — is the
+        ; only way to the file. It is already fully resolved, so it must NOT be
+        ; joined with the declaration's base directory.
+        let xid ent.get_external_id()
+        var meta_sysid xid.get_system_id()
+        var base_dir ps.get_decl_base_dir()
+        if xid.has_effective_system()
+        {
+            let eff xid.get_effective_system()
+            if eff.get_length() > 0
+            {
+                ; the stamped id is an FSI (`<OSFILE>path`), not a path — the
+                ; storage manager wants the bare path. Only the plain OSFILE
+                ; form is opened here; a SOIBASE or CATALOG-DELEGATE FSI keeps
+                ; the declared system id and fails as before.
+                let rp Parser.make(host, ps)
+                var kind 0
+                var pas: size_t 0
+                var pal: size_t 0
+                var pbs: size_t 0
+                var pbl: size_t 0
+                rp.fsi_parse(eff, &kind, &pas, &pal, &pbs, &pbl)
+                if kind = 0
+                {
+                    meta_sysid := rp.substr(eff, pas, pal)
+                    base_dir := String()
+                }
+            }
+        }
+
+        ; ArcEngine.cxx:881: the reference falls back to a catalog lookup when
+        ; the effective system id is empty and reports arcGenerateSystemId when
+        ; that fails too. This port's catalog answer is already STAMPED on the
+        ; entity at declaration time (the effective system id read above), so
+        ; "still empty here" is the same condition — and the same silent exit
+        ; the routing turned into a stylesheet without rules.
+        if meta_sysid.get_length() = 0
+        {
+            this.arc_report1(ArcEngineMessages.arcGenerateSystemId(), this.name, ps.entity_def_location(ent))
+            return
+        }
+
+        let mdtd ArcEngine.parse_meta_dtd(host, ps, this.arc_doc_f, base_dir, meta_sysid, sd, syntax, arc_opts)
+        if mdtd = null
+            return
+        this.meta_dtd := mdtd
+
+        let doc_et mdtd.get_document_element_type()
+        if doc_et = null
+            return
+        let def doc_et.get_definition()
+        if def = null
+            return
+        if def.undefined()
+            return
+
+        ; ★The attribute context must exist BEFORE munge_meta_dtd: a data
+        ; entity's mapped attribute list is finished against it (the reference
+        ; IS the context, so it cannot have this ordering problem). Setting it
+        ; after cost a SIGSEGV in synth-arc-16, whose document DTD declares its
+        ; meta-DTD as an external data entity — i.e. every nested-architecture
+        ; model reaches this path.
+        this.ctx := AttributeContext.make(host, this.meta_syntax, true, true)
+
+        ; ArcEngine.cxx:926 — between accepting the meta-DTD and starting its
+        ; content. It must run before the content state exists because it can
+        ; ADD to the meta-DTD (the ArcDataF notation).
+        this.munge_meta_dtd(host)
+
+        let opts ps.get_options()
+        let cs ContentState.make(host)
+        cs.start_content(host, mdtd, opts.cm_scratch)
+        this.cs := cs
+        ; errorIdref_ = parentParser->options().errorIdref (ArcEngine.cxx:904):
+        ; -wno-idref silences the arch-space missingId exactly as it does the
+        ; document's.
+        this.id_table := IdTable.make(host)
+        this.error_idref := opts.error_idref
+        this.valid := true
+    }
+
+    ; --- diagnostics -------------------------------------------------------
+    ; ArcProcessor is a Messenger in the reference; here the post-parse pass
+    ; borrows the Parser's reporter, the same way the attribute-group check
+    ; below already does.
+    procedure arc_report1(mutable this: ref[ArcProcessor], mt: MessageType, a1: StringC, loc: Location)
+    {
+        let rep Parser.make(this.host, this.ps)
+        rep.report1_at(mt, a1, loc)
+    }
+
+    procedure arc_report0(mutable this: ref[ArcProcessor], mt: MessageType, loc: Location)
+    {
+        let rep Parser.make(this.host, this.ps)
+        rep.report0_at(mt, loc)
+    }
+
+    ; --- mungeMetaDtd (ArcEngine.cxx:936) ----------------------------------
+    ; The architectural stream is parsed against the meta-DTD, so an ENTITY-
+    ; declared architectural attribute resolves its tokens in the META-DTD's
+    ; general entity table (getAttributeEntity, :671) — a table the meta-DTD
+    ; source never fills, because the entities are the DOCUMENT's. This copies
+    ; them across, and re-points each external DATA entity at the
+    ; architecture's own data form; without it every ENTITY attribute in the
+    ; arch space comes out as a plain token (`ACONTENT TOKEN body-ent` instead
+    ; of `ACONTENT ENTITY body-ent`), which is precisely what the DSSSL
+    ; specification's `document` and `content` attributes are.
+    procedure munge_meta_dtd(mutable this: ref[ArcProcessor], host: ref[Page])
+    {
+        let mdtd this.meta_dtd
+        let ddtd this.doc_dtd
+        ; ArcEngine.cxx:938 — the data form must EXIST in the meta-DTD; when it
+        ; does not, the reference reports it and declares it anyway, so the
+        ; entities below still get a notation to point at.
+        if this.data_f.get_size() > 0
+        {
+            if mdtd.lookup_notation(this.data_f) = null
+            {
+                this.arc_report1(ArcEngineMessages.noArcDataF(), this.data_f, this.data_f_loc)
+                mdtd.insert_notation(Notation.make(host, this.data_f, mdtd.get_name(), mdtd.get_is_base()))
+            }
+        }
+        ; (the reference's `// FIXME check for ArcAutoF` sits here too)
+        ; ★Dtd::generalEntityIter is the NamedTable's BUCKET order, not the
+        ; declaration order, and it decides the INSERTION order of the copies
+        ; below — which is in turn what the meta-DTD's own bucket order comes
+        ; out of, and that is what `-A <arch> -oentity` prints. Invisible
+        ; without -oentity (the ESIS writer declares an entity on first
+        ; reference), so this is faithfulness rather than a fix.
+        let ents ArcEngine.general_entities_in_bucket_order(host, ddtd as ref[Dtd])
+        let n ents.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let ent ents[i]
+            if ent <> null
+            {
+                ; a COPY, not the document's entity: munge_data_entity rewrites
+                ; the notation, and the document's own stream must keep seeing
+                ; its declared one.
+                let copy ent.copy_with_name(host, ent.get_name())
+                var keep true
+                if copy.is_external_data()
+                    keep := this.munge_data_entity(host, copy)
+                if keep
+                    mdtd.insert_entity(copy, false, true)
+            }
+            i := i + 1
+        }
+    }
+
+    ; mungeDataEntity (ArcEngine.cxx:960): map the entity's DOCUMENT notation
+    ; onto an architectural one and its data attributes with it. False = the
+    ; architecture has no form for this notation, and the reference then does
+    ; not copy the entity into the meta-DTD at all.
+    procedure munge_data_entity(mutable this: ref[ArcProcessor], host: ref[Page], mutable ent: ref[Entity]) returns bool
+    {
+        let doc_nt ent.get_data_notation()
+        if doc_nt = null
+            return false
+        let from_atts ent.get_data_attributes() as ref[AttributeList]
+        let meta_nt this.consider_form_notation(from_atts, doc_nt)
+        if meta_nt = null
+            return false
+        let to this.map_attributes_def(host, from_atts, meta_nt.get_attribute_def())
+        ent.set_data_notation(meta_nt, to)
+        true
+    }
+
+    ; considerForm/autoForm in their isNotation form (ArcEngine.cxx:1770/1819).
+    ; ★Two differences from the element side, both load-bearing: there is no
+    ; CONSTDTD fallback (an unknown form yields nothing, so the entity is
+    ; dropped rather than declared against an undefined notation), and the
+    ; auto path falls back to ArcDataF — which is how the DSSSL architecture
+    ; maps a `CDATA DSSSL` entity onto its `dsssl-specification` notation.
+    procedure consider_form_notation(mutable this: ref[ArcProcessor], atts: ref[AttributeList], doc_nt: ref[Notation]) returns ref[Notation]?
+    {
+        let idx atts.attribute_index(this.form_att_name)
+        if idx >= 0
+        {
+            let val atts.value(idx as size_t)
+            if val = null
+                return null
+            let txt val.get_text()
+            if txt = null
+                return null
+            let meta_name ArcEngine.fold_sc(this.host, this.meta_syntax as ref[Syntax], (*txt).string())
+            return this.meta_dtd.lookup_notation(meta_name)
+        }
+        var nt: ref[Notation]? null
+        if this.arc_auto
+            nt := this.meta_dtd.lookup_notation(doc_nt.get_name())
+        if nt <> null
+            return nt
+        if this.data_f.get_size() > 0
+            return this.meta_dtd.lookup_notation(this.data_f)
+        null
+    }
+
+    ; TokenizedAttributeValue::tokenLocation(k) as an OFFSET into the value's
+    ; text: token 0 starts at 0, every later one one past its preceding
+    ; separator.
+    function token_offset(v: ref[AttributeValue], k: size_t) returns size_t
+    {
+        if k = 0
+            return 0 as size_t
+        let si v.get_space_index()
+        si[(k - 1)] + 1
+    }
+
+    ; --- the arch-space attribute semantics --------------------------------
+    ; defineId/noteIdref (ArcEngine.cxx:695/709) plus getAttributeEntity /
+    ; getAttributeNotation (:671/663). In the reference all four are
+    ; AttributeContext overrides that the mapped list's own setValue/finish
+    ; calls into; this port books id and entity semantics in the parser's
+    ; attribute tokenizer (Parser.check_value_semantics) rather than in the
+    ; context, so the arch side does the same walk over the FINISHED list.
+    ; ★The resolution TABLES are the architecture's, not the document's: the
+    ; id table is a second one (field comment above) and the entity/notation
+    ; lookups go to the meta-DTD, which munge_meta_dtd filled.
+    procedure note_semantics(mutable this: ref[ArcProcessor], host: ref[Page], mutable to: ref[AttributeList])
+    {
+        if this.id_table = null
+            return
+        let n to.size()
+        var i: size_t 0
+        while i < n
+        {
+            this.note_semantics_one(host, to, i)
+            i := i + 1
+        }
+    }
+
+    procedure note_semantics_one(mutable this: ref[ArcProcessor], host: ref[Page], mutable to: ref[AttributeList], i: size_t)
+    {
+        let v to.value(i)
+        if v = null
+            return
+        let txt (*v).get_text()
+        if txt = null
+            return
+        ; TokenizedAttributeValue::makeSemantics (Attribute.cxx:1077) — an empty
+        ; value has no semantics: no lookups, no messages.
+        if (*txt).size() = 0
+            return
+        if to.id(i)
+        {
+            let name (*v).get_string()
+            if name.get_size() > 0
+            {
+                let id this.id_table.lookup_create(this.host, name)
+                if id.defined()
+                    this.arc_report1(ParserMessages.duplicateId(), name, (*txt).loc_at(0))
+                else
+                    id.mark_defined((*txt).loc_at(0))
+            }
+            return
+        }
+        if to.idref(i)
+        {
+            if this.error_idref = false
+                return
+            let m (*v).n_tokens()
+            var k: size_t 0
+            while k < m
+            {
+                let tok (*v).token(k)
+                if tok.get_size() > 0
+                {
+                    let off ArcProcessor.token_offset(v, k)
+                    let id this.id_table.lookup_create(this.host, tok)
+                    if id.defined() = false
+                        id.add_pending_ref((*txt).loc_at(off))
+                }
+                k := k + 1
+            }
+            return
+        }
+        if to.notation(i)
+        {
+            ; NotationDeclaredValue::makeSemantics (Attribute.cxx:430) — the
+            ; WHOLE value is the name; unknown leaves no semantics.
+            let s (*v).get_string()
+            let nt this.meta_dtd.lookup_notation(s)
+            if nt = null
+                this.arc_report1(ParserMessages.invalidNotationAttribute(), s, (*txt).loc_at(0))
+            else
+                to.attribute(i).set_semantics(AttributeSemantics.make_notation(host, nt))
+            return
+        }
+        if to.entity(i) = false
+            return
+        ; EntityDeclaredValue::makeSemantics (Attribute.cxx:472): ALL tokens must
+        ; resolve to a data-or-subdoc entity, and a single bad one leaves the
+        ; value with NO semantics — the ESIS line then says TOKEN, which is the
+        ; state this whole seam exists to get out of.
+        let m (*v).n_tokens()
+        var ok true
+        let ents Array[ref[Entity]?]^host()
+        var k: size_t 0
+        while k < m
+        {
+            let tok (*v).token(k)
+            let off ArcProcessor.token_offset(v, k)
+            let e this.meta_dtd.lookup_entity(false, tok)
+            if e = null
+            {
+                this.arc_report1(ParserMessages.invalidEntityAttribute(), tok, (*txt).loc_at(off))
+                ok := false
+            }
+            else if e.is_data_or_subdoc() = false
+            {
+                this.arc_report1(ParserMessages.notDataOrSubdocEntity(), tok, (*txt).loc_at(off))
+                ok := false
+            }
+            else
+                ents.add(e)
+            k := k + 1
+        }
+        if ok
+            to.attribute(i).set_semantics(AttributeSemantics.make_entity(host, &ents))
+    }
+
+    ; checkIdrefs (ArcEngine.cxx:728), run when the base stream is exhausted —
+    ; the reference does it in ~ArcEngineImpl for every VALID processor.
+    ; ★The iteration is the id table's raw bucket order, not document order,
+    ; exactly as the parser's own check_idrefs: that order IS the message order
+    ; the reference prints (useloss reports OTHER before NOSUCHPART).
+    procedure check_idrefs(mutable this: ref[ArcProcessor])
+    {
+        if this.id_table = null
+            return
+        let t this.id_table
+        let n t.bucket_count()
+        var i: size_t 0
+        while i < n
+        {
+            let id t.bucket_at(i)
+            if id <> null
+            {
+                let m id.n_pending_refs()
+                var j: size_t 0
+                while j < m
+                {
+                    this.arc_report1(ArcEngineMessages.missingId(), id.get_name(), id.pending_ref_at(j))
+                    j := j + 1
+                }
+            }
+            i := i + 1
+        }
+    }
+
+    ; considerForm (ArcEngine.cxx:1727, af-1 subset): the ArcFormA attribute on
+    ; the base element names the architectural element type.
+    procedure consider_form(mutable this: ref[ArcProcessor], mutable atts: ref[AttributeList], base_et: ref[ElementType]?) returns ref[ElementType]?
+    {
+        let idx atts.attribute_index(this.form_att_name)
+        if idx >= 0
+        {
+            let val atts.value(idx as size_t)
+            if val <> null
+            {
+                let txt val.get_text()
+                if txt <> null
+                {
+                    let meta_name ArcEngine.fold_sc(this.host, this.meta_syntax as ref[Syntax], (*txt).string())
+                    let found this.meta_dtd.lookup_element_type(meta_name)
+                    if found <> null
+                        return found
+                    ; ArcEngine.cxx:1769 (CONSTDTD): a form the meta-DTD
+                    ; does not declare still MAPS — to a freshly created
+                    ; UNDEFINED element type, so the element is generated
+                    ; and processStartElement reports undefinedElement.
+                    ; Returning null here instead made the whole element
+                    ; non-architectural and swallowed the diagnostic.
+                    return this.cs.lookup_create_undefined_element(this.host, meta_name, Location(), this.meta_dtd as ref[Dtd], true)
+                }
+            }
+        }
+        ; autoForm (ArcEngine.cxx:1782): no explicit ArcFormA — the document
+        ; element maps to the meta document element; otherwise (ArcAuto on) the
+        ; base element name selects the meta element type of the same name;
+        ; failing that, a base element with a specified ID maps to ArcBridF.
+        this.auto_form(base_et, atts)
+    }
+
+    function auto_form(this: ref[ArcProcessor], base_et: ref[ElementType]?, atts: ref[AttributeList]) returns ref[ElementType]?
+    {
+        if this.n_flags = 0
+            return this.meta_dtd.get_document_element_type()
+        var et: ref[ElementType]? null
+        if this.arc_auto
+        {
+            if base_et <> null
+                et := this.meta_dtd.lookup_element_type((*base_et).get_name())
+        }
+        if et <> null
+            return et
+        if (this.brid_f.get_size() > 0)
+        {
+            let def atts.get_def()
+            if def <> null
+            {
+                let idx def.get_id_index()
+                if idx <> ADL_NONE
+                {
+                    if atts.specified(idx)
+                        return this.meta_dtd.lookup_element_type(this.brid_f)
+                }
+            }
+        }
+        null
+    }
+
+    ; mapAttributes (ArcEngine.cxx:1432) + buildAttributeMapRest (af-1 subset):
+    ; each architectural attribute takes its value from the same-named base
+    ; attribute.
+    ; copy one base attribute's text value into the meta attribute at to_idx.
+    procedure copy_att(mutable this: ref[ArcProcessor], host: ref[Page], mutable from_atts: ref[AttributeList], from_idx: size_t, mutable to: ref[AttributeList], to_idx: size_t)
+    {
+        let val from_atts.value(from_idx)
+        if val <> null
+        {
+            let txt val.get_text()
+            if txt <> null
+            {
+                to.set_spec(to_idx, this.ctx as ref[AttributeContext])
+                to.set_value(host, to_idx, txt, this.ctx as ref[AttributeContext])
+            }
+        }
+    }
+
+    ; buildAttributeMapRename (ArcEngine.cxx:1849, name-pair subset): the renamer
+    ; attribute's value is space-separated pairs `metaAtt baseAtt` — map each meta
+    ; attribute from the named base attribute and mark it renamed. (#ARCCONT /
+    ; #CONTENT / #DEFAULT / #MAPTOKEN forms are not yet handled.)
+    procedure apply_rename(mutable this: ref[ArcProcessor], host: ref[Page], spec: StringC, mutable from_atts: ref[AttributeList], mutable to: ref[AttributeList], meta_def: ref[AttributeDefinitionList], mutable renamed: ref[Array[u8]])
+    {
+        let toks ArcEngine.split_ws(host, this.doc_syntax, spec)
+        let nt toks.get_length()
+        var i: size_t 0
+        while (i + 1) < nt
+        {
+            let to_name ArcEngine.fold_sc(host, this.meta_syntax as ref[Syntax], toks[i])
+            let from_name ArcEngine.fold_sc(host, this.doc_syntax as ref[Syntax], toks[(i + 1)])
+            let to_idx meta_def.attribute_index(to_name)
+            let from_idx from_atts.attribute_index(from_name)
+            if (to_idx >= 0) and (from_idx >= 0)
+            {
+                this.copy_att(host, from_atts, from_idx as size_t, to, to_idx as size_t)
+                renamed.put(to_idx as size_t, 1)
+            }
+            i := i + 2
+        }
+    }
+
+    ; mapAttributes (ArcEngine.cxx:1432): apply the renamer (considerNamer +
+    ; buildAttributeMapRename) then fill the remaining meta attributes by
+    ; same-name match (buildAttributeMapRest).
+    ; ★The reference's `map.attributed` is an ElementType OR a Notation
+    ; (buildMetaMap takes both — mungeDataEntity goes through the notation
+    ; side), and everything below reads only its attributeDef(), so the
+    ; attribute def is the parameter and `map_attributes` is the element-typed
+    ; caller.
+    procedure map_attributes(mutable this: ref[ArcProcessor], host: ref[Page], mutable from_atts: ref[AttributeList]?, mutable meta_et: ref[ElementType]) returns ref[AttributeList]
+        this.map_attributes_def(host, from_atts as ref[AttributeList], meta_et.get_attribute_def())
+
+    procedure map_attributes_def(mutable this: ref[ArcProcessor], host: ref[Page], mutable from_atts: ref[AttributeList], mutable meta_def: ref[AttributeDefinitionList]?) returns ref[AttributeList]
+    {
+        let to AttributeList.make(host, meta_def)
+        if meta_def <> null
+        {
+            let ndefs meta_def.size()
+            let renamed Array[u8]^host()
+            var ri: size_t 0
+            while ri < ndefs
+            {
+                renamed.add(0)
+                ri := ri + 1
+            }
+            ; considerNamer: the renamer attribute on the base element.
+            if this.namer_att.get_size() > 0
+            {
+                let nidx from_atts.attribute_index(this.namer_att)
+                if nidx >= 0
+                {
+                    let nval from_atts.value(nidx as size_t)
+                    if nval <> null
+                    {
+                        let ntext nval.get_text()
+                        if ntext <> null
+                            this.apply_rename(host, (*ntext).string(), from_atts, to, meta_def, renamed)
+                    }
+                }
+            }
+            ; buildAttributeMapRest: same-name for non-renamed meta attributes.
+            var i: size_t 0
+            while i < ndefs
+            {
+                if renamed[i] = 0
+                {
+                    let mdef meta_def.def(i)
+                    if mdef <> null
+                    {
+                        let fidx from_atts.attribute_index((*mdef).get_name())
+                        if fidx >= 0
+                            this.copy_att(host, from_atts, fidx as size_t, to, i)
+                    }
+                }
+                i := i + 1
+            }
+            ; validate enumerated (name-token-group) meta attributes against
+            ; their allowed value list. The reference emits attributeValueNotInGroup
+            ; from the parser's own attribute path; here it flows through the
+            ; parent parser state, so it prints with the element's location and
+            ; counts toward the exit status (a non-conforming arch instance).
+            var vi: size_t 0
+            while vi < ndefs
+            {
+                if to.specified(vi)
+                {
+                    let mdef2 meta_def.def(vi)
+                    if mdef2 <> null
+                    {
+                        let dv (*mdef2).get_declared_value()
+                        if dv <> null
+                        {
+                            let allowed (*dv).get_tokens()
+                            if (allowed <> null) and ((*dv).is_notation() = false)
+                            {
+                                let vval to.value(vi)
+                                if vval <> null
+                                {
+                                    let vs (*vval).get_string()
+                                    if ArcEngine.in_group(vs, allowed as ref[Array[StringC]]) = false
+                                    {
+                                        let rep Parser.make(host, this.ps)
+                                        rep.report2_vec_at(ParserMessages.attributeValueNotInGroup(), vs, (*mdef2).get_name(), allowed, this.cur_loc)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                vi := vi + 1
+            }
+        }
+        to.finish(this.ctx as ref[AttributeContext])
+        to
+    }
+
+    ; processStartElement (ArcEngine.cxx:1286, af-1 subset).
+    procedure process_start_element(mutable this: ref[ArcProcessor], host: ref[Page], mutable ev: ref[Event])
+    {
+        this.cur_loc := ev.get_markup_loc()
+        let atts ev.get_attributes()
+        var meta_et this.consider_form(atts as ref[AttributeList], ev.get_element_type())
+        var to: ref[AttributeList]? null
+        if meta_et = null
+        {
+            ; ArcEngine.cxx:1306 — no architectural form. Everywhere but at the
+            ; very top that just means "not architectural"; on the DOCUMENT
+            ; element the reference reports documentElementNotArc and carries on
+            ; with the meta-DTD's own document element type, so the rest of the
+            ; instance is still validated against it.
+            ; ★both operands in LOCALS: a parenless CHAINED call as the right
+            ; operand of `or` collapses to the chain's FIRST call and silently
+            ; drops the rest — here `current_element()` alone, which then emits
+            ; a `phi i1 [.., ptr]` that only `opt`'s verifier rejects.
+            let lvl this.cs.tag_level_of()
+            let cur this.cs.current_element()
+            let fin cur.is_finished()
+            if (lvl <> 0) or fin
+            {
+                this.flags_push(0)
+                return
+            }
+            meta_et := this.meta_dtd.get_document_element_type()
+            if meta_et = null
+            {
+                this.flags_push(0)
+                return
+            }
+            this.arc_report1(ArcEngineMessages.documentElementNotArc(), meta_et.get_name(), this.cur_loc)
+            to := AttributeList.make(host, meta_et.get_attribute_def())
+            to.finish(this.ctx as ref[AttributeContext])
+        }
+        else
+            to := this.map_attributes(host, atts, meta_et)
+        this.note_semantics(host, to as ref[AttributeList])
+        ; ★the generated event's location is the base event's MARKUP location:
+        ; the reference builds it with `event.location()`, and a StartElementEvent's
+        ; location() IS markupLocation() (parseInstance.cxx:468) — the STAGO. This
+        ; port's Event carries TWO locations, so reading `loc` (past the GI name)
+        ; here moved every consumer of an architectural element's position by the
+        ; width of the tag: the DSSSL handler's missingPart anchor reported column
+        ; 23 of `<external-specification …` instead of column 0.
+        let gen Event.make_start(host, meta_et, ev.get_markup_loc())
+        gen.set_attributes(to)
+        ; ArcEngine.cxx:1337-1352 — the meta-DTD content check. Note the ORDER:
+        ; an undefined or excluded type is reported and does NOT advance the
+        ; content state, an included one does not advance it either (it is
+        ; allowed anywhere), and only the remaining case consults the model.
+        var included false
+        let def meta_et.get_definition()
+        var undef true
+        if def <> null
+            undef := def.undefined()
+        if undef
+            this.arc_report1(ArcEngineMessages.undefinedElement(), meta_et.get_name(), this.cur_loc)
+        else if this.cs.element_is_excluded(meta_et as ref[ElementType])
+            this.arc_report1(ArcEngineMessages.elementExcluded(), meta_et.get_name(), this.cur_loc)
+        else if this.cs.element_is_included(meta_et as ref[ElementType])
+        {
+            included := true
+            gen.set_included()
+        }
+        else if this.cs.current_element().try_transition(meta_et) = false
+            this.arc_report1(ArcEngineMessages.invalidElement(), meta_et.get_name(), this.cur_loc)
+        this.cs.push_element(OpenElement.make(host, meta_et, false, included, this.cs.get_the_empty_map(), ev.get_markup_loc()))
+        this.out.add(gen)
+        this.flags_push(ARC_IS_ARC)
+    }
+
+    ; processData (ArcEngine.cxx:1409, af-1 subset): architectural iff the
+    ; current architectural element admits PCDATA.
+    procedure process_data_arc(mutable this: ref[ArcProcessor]) returns bool
+    {
+        if (this.flags_top() & ARC_IGNORE_DATA) <> 0
+            return false
+        let ce this.cs.current_element()
+        if (ce.declared_empty() = false) and ce.try_transition_pcdata()
+            return true
+        false
+    }
+
+    ; processEndElement (ArcEngine.cxx:2029).
+    procedure process_end_element(mutable this: ref[ArcProcessor], host: ref[Page], mutable ev: ref[Event])
+    {
+        this.cur_loc := ev.get_markup_loc()
+        let was_arc (this.flags_top() & ARC_IS_ARC) <> 0
+        this.flags_pop()
+        if was_arc
+        {
+            let ce this.cs.current_element()
+            let et ce.get_type()
+            ; markup location, for the same reason as the start event above
+            let gen Event.make_end(host, et, ev.get_markup_loc())
+            if ce.get_included()
+                gen.set_included()
+            this.out.add(gen)
+            ; ArcEngine.cxx:2043 — the element closed before its content model
+            ; was satisfied. Reported AFTER the end event is generated and
+            ; BEFORE the pop, so the location is this element's, not its
+            ; parent's.
+            if ce.is_finished() = false
+                this.arc_report1(ArcEngineMessages.unfinishedElement(), et.get_name(), this.cur_loc)
+            this.cs.pop_element()
+        }
+    }
+}
+
+define ArcEngine ( )
+{
+    ; fold a StringC through the general substitution table (NAMECASE GENERAL).
+    ; ★The result must be PAGE-HOSTED on `host`, not built as the plain return
+    ; expression: `StringC(buf, n)` runs the copying init, which allocates
+    ; through `Page.get(this)` — and as a return value `this` is the CALLER's
+    ; return slot, i.e. a stack temporary, so the characters land on the
+    ; caller's region FRAME page and dangle the moment that frame pops.
+    ; `setup` stores these folded names in long-lived
+    ; fields (form_att_name/namer_att/…), so the dangling buffer is read on
+    ; every later element: `consider_form` stopped finding the ArcFormA
+    ; attribute and silently dropped the element, which is exactly how
+    ; synth-arc-07/08/11 lost their children — LATENT, because it only bites
+    ; once something reuses the recycled frame page (more renamer tokens =
+    ; more reuse = the second element fails where the first still worked).
+    function fold_sc(host: ref[Page], syntax: ref[Syntax], s: StringC) returns StringC
+    {
+        let n s.get_size()
+        let buf allocate_slice[u32](host, n + 1)
+        var i: size_t 0
+        while i < n
+        {
+            buf.put(i, syntax.fold(s.get(i)))
+            i := i + 1
+        }
+        let p StringC^host(buf.subslice(0, n))
+        *p
+    }
+
+    ; read a named support attribute's value from a finished attribute list.
+    ; The lookup name folds through the general subst table; the returned value
+    ; is folded too when do_fold (doc/meta names), left raw otherwise (ArcDTD =
+    ; an entity name, entity-subst not general-subst — identity for the corpus).
+    function support_att(host: ref[Page], syntax: ref[Syntax], al: ref[AttributeList], name: StringC, do_fold: bool) returns StringC
+    {
+        let folded ArcEngine.fold_sc(host, syntax, name)
+        let idx al.attribute_index(folded)
+        if idx < 0
+            return StringC()
+        let v al.value(idx as size_t)
+        if v = null
+            return StringC()
+        let t v.get_text()
+        if t = null
+            return StringC()
+        let s (*t).string()
+        if do_fold
+            return ArcEngine.fold_sc(host, syntax, s)
+        s
+    }
+
+    ; Dtd::generalEntityIter's order — the NamedTable BUCKET order, re-derived
+    ; through an IdTable exactly as Parser.parse_end_prolog and
+    ; Parser.check_dtd_notations do it (the same insertion sequence feeds the
+    ; same hash and the same growth, so the buckets land the same way).
+    function general_entities_in_bucket_order(host: ref[Page], dtd: ref[Dtd]) returns ref[Array[ref[Entity]?]]
+    {
+        let out Array[ref[Entity]?]^host()
+        let n dtd.n_entities(false)
+        let t IdTable.make(host)
+        var i: size_t 0
+        while i < n
+        {
+            let ent dtd.entity_at(false, i)
+            if ent <> null
+            {
+                let name ent.get_name()
+                t.lookup_create(host, name)
+            }
+            i := i + 1
+        }
+        let nb t.bucket_count()
+        var b: size_t 0
+        while b < nb
+        {
+            let slot t.bucket_at(b)
+            if slot <> null
+            {
+                let e dtd.lookup_entity(false, slot.get_name())
+                if e <> null
+                    out.add(e)
+            }
+            b := b + 1
+        }
+        out
+    }
+
+    ; the LOCATION a support attribute's diagnostics anchor at:
+    ; supportAttsText_[i]->charLocation(0) (ArcEngine.cxx:940) — the first
+    ; character of the attribute's value, not the notation's declaration. An
+    ; unset attribute has no text and answers an invalid Location, which is
+    ; what the reference would print for a value it never read.
+    function support_att_loc(host: ref[Page], syntax: ref[Syntax], al: ref[AttributeList], name: StringC) returns Location
+    {
+        let folded ArcEngine.fold_sc(host, syntax, name)
+        let idx al.attribute_index(folded)
+        if idx < 0
+            return Location()
+        let v al.value(idx as size_t)
+        if v = null
+            return Location()
+        let t v.get_text()
+        if t = null
+            return Location()
+        (*t).loc_at(0)
+    }
+
+    ; split a StringC on whitespace into raw (unfolded) tokens. ★The tokens are
+    ; page-hosted for the same reason as fold_sc above: `substr` builds its
+    ; result with the copying init, so as a plain temporary its characters would
+    ; land on THIS frame's region page and dangle as soon as split_ws returns —
+    ; and the array outlives the call by construction.
+    function split_ws(host: ref[Page], syntax: ref[Syntax]?, s: StringC) returns ref[Array[StringC]]
+    {
+        let out Array[StringC]^host()
+        let n s.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            while (i < n) and ArcEngine.is_s(syntax as ref[Syntax], s.get(i))
+                i := i + 1
+            if i < n
+            {
+                let start i
+                while (i < n) and (ArcEngine.is_s(syntax as ref[Syntax], s.get(i)) = false)
+                    i := i + 1
+                let tok StringC^host(s.as_slice().subslice(start, i))
+                out.add(*tok)
+            }
+        }
+        out
+    }
+
+    function in_group(v: StringC, allowed: ref[Array[StringC]]) returns bool
+    {
+        let n allowed.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            if (allowed[i]).equals(v)
+                return true
+            i := i + 1
+        }
+        false
+    }
+
+    function is_s(syntax: ref[Syntax], c: u32) returns bool
+    {
+        if c = syntax.standard_function(fSPACE)
+            return true
+        if c = syntax.standard_function(fRS) or c = syntax.standard_function(fRE) or c = 9
+            return true
+        false
+    }
+
+    ; parse an external meta-DTD file into a fresh Dtd (ArcProcessor::init's
+    ; sub-parse; models SgmlParser::Params{entityType=dtd}). Reuses the port's
+    ; declaration-subset parser on a child ParserState sharing the parent's
+    ; entity manager / catalog / options; the Dtd is queried straight off the
+    ; local pointer (no end_dtd, which would move it to the stack).
+    procedure parse_meta_dtd(host: ref[Page], ps: ref[ParserState], mutable doctype_name: StringC, base_dir: String, mutable sysid: String, mutable sd: ref[Sd]?, syntax: ref[Syntax], includes: ref[Array[StringC]]?) returns ref[Dtd]?
+    {
+        let child ParserState.make(host, null, 0, PHASE_DECL_SUBSET)
+        child.set_sd(sd as ref[Sd])
+        ; options.includes = arcOpts_ (ArcEngine.cxx:906) — the architecture's
+        ; options are parameter entities defined as INCLUDE for this parse.
+        if includes <> null
+        {
+            if includes.get_length() > 0
+            {
+                let copts child.get_options()
+                copts.includes := includes
+            }
+        }
+        ; a Syntax is BUILT from the declaration, so this one cannot be
+        ; nothing -- the unwrap says so where the requirement is.
+        let meta_syn Syntax^host(sd as ref[Sd])
+        ; the meta-DTD parses under the same (implied) SGML declaration as the
+        ; document: an implied declaration uses the ParserOptions near-unlimited
+        ; quantities (NAMELEN 99999999 etc.), not the reference set — otherwise a
+        ; long parameter-entity name in the meta-DTD wrongly trips NAMELEN.
+        meta_syn.set_options_quantities()
+        child.set_syntax(meta_syn)
+
+        let mdtd Dtd.make(host, doctype_name, true)
+        child.set_def_dtd(mdtd)
+        child.set_current_dtd(mdtd)
+
+        let p Parser.make(host, child)
+        let table ModeInfo.build_table(host)
+        p.install_recognizers(table)
+        ; ★this parse does NOT go through parse_doctype, so the two `-i` hooks
+        ; there never run for it: the architecture's options have to be planted
+        ; here or the meta-DTD's own marked sections all resolve to IGNORE and
+        ; every content model is the wrong one.
+        p.insert_include_entities(mdtd)
+
+        let storage Storage.OsFile(base_dir)
+        let bytes storage.read(sysid)
+        if bytes.get_length() = 0
+            return null
+
+        ; a sentinel bottom input (empty) stands in for the document entity: the
+        ; external-subset end-of-entity handling pops the meta-DTD source and
+        ; checks input_level < subset_level, so the meta-DTD must sit ABOVE
+        ; something — otherwise the pop empties the stack and the next
+        ; current_input() dereferences null (parse_doctype keeps the doc entity
+        ; below the external subset for the same reason).
+        let borg &Origin^host()
+        let bsrc &InputSource^host(borg)
+        child.push_input(bsrc)
+
+        let bn bytes.get_length()
+        let buf allocate_slice[u32](host, bn)
+        var ci: size_t 0
+        while ci < bn
+        {
+            buf.put(ci, bytes.get(ci) as u32)
+            ci := ci + 1
+        }
+        let org &Origin^host()
+        let src &InputSource^host(org, buf)
+        child.push_input(src)
+        p.parse_decl_subset(child.get_input_level(), true)
+        mdtd
+    }
+
+    ; scan a PI's data for `IS10744 ArcBase name...` and append one ArcProcessor
+    ; per architecture name (ArcEngineImpl::pi, ArcEngine.cxx:220, ArcBase form).
+    procedure scan_arcbase_pi(host: ref[Page], syntax: ref[Syntax], data: StringC, is10744: StringC, arc_base: StringC, mutable procs: ref[Array[ref[ArcProcessor]?]])
+    {
+        let names Array[StringC]^host()
+        ArcEngine.scan_arcbase_names(host, syntax, data, is10744, arc_base, names)
+        let nn names.get_length()
+        var ni: size_t 0
+        while ni < nn
+        {
+            procs.add(ArcProcessor.make(host, names[ni]))
+            ni := ni + 1
+        }
+    }
+
+    ; the name half of scan_arcbase_pi: append each architecture name the PI
+    ; declares as a BASE architecture (folded through the general subst table,
+    ; the form lookupNotation then keys on).
+    procedure scan_arcbase_names(host: ref[Page], syntax: ref[Syntax], data: StringC, is10744: StringC, arc_base: StringC, mutable names: ref[Array[StringC]])
+    {
+        let dn data.get_size()
+        let i10n is10744.get_size()
+        if dn <= i10n
+            return
+        var j: size_t 0
+        while j < i10n
+        {
+            if syntax.fold(data.get(j)) <> is10744.get(j)
+                return
+            j := j + 1
+        }
+        var i i10n
+        if ArcEngine.is_s(syntax, data.get(i)) = false
+            return
+        while (i < dn) and ArcEngine.is_s(syntax, data.get(i))
+            i := i + 1
+        if i >= dn
+            return
+        var start i
+        while (i < dn) and (ArcEngine.is_s(syntax, data.get(i)) = false)
+            i := i + 1
+        let tok ArcEngine.fold_sc(host, syntax, data.substr(start, i - start))
+        if tok.equals(arc_base) = false
+            return
+        var more true
+        while more
+        {
+            while (i < dn) and ArcEngine.is_s(syntax, data.get(i))
+                i := i + 1
+            if i >= dn
+                more := false
+            else
+            {
+                start := i
+                while (i < dn) and (ArcEngine.is_s(syntax, data.get(i)) = false)
+                    i := i + 1
+                let nm ArcEngine.fold_sc(host, syntax, data.substr(start, i - start))
+                names.add(nm)
+            }
+        }
+    }
+
+    ; declares_base_architecture — the gate the reference's gotArc_ flag records
+    ; (style/DssslSpecEventHandler.cxx:88 loadDoc): does the document declare, as
+    ; a BASE architecture, an architecture whose notation carries `pubid` as its
+    ; public identifier?
+    ;
+    ; It is the conjunction of three reference steps, all of which must hold:
+    ;   1. ArcEngineImpl::pi (ArcEngine.cxx:220) sees an `IS10744 ArcBase name…`
+    ;      PI and builds one ArcProcessor per name;
+    ;   2. ArcProcessor::init (ArcEngine.cxx:838) resolves that name against the
+    ;      document DTD's notations — `docDtd_->lookupNotation(name_)`;
+    ;   3. the nested ArcEngineImpl hands that notation to the director, and the
+    ;      director matches on its public id (SelectOneArcDirector /
+    ;      DssslSpecEventHandler::arcEventHandler, which sets gotArc_).
+    ;
+    ; ★DECLARING THE NOTATION IS NOT DECLARING THE ARCHITECTURE. Without an
+    ; ArcBase PI no ArcProcessor exists, step 3 never runs, and the reference
+    ; reports its "not a base architecture" error — the notation-only test this
+    ; replaces passed such a document (tests/dazzle/cli/notarc.dsl).
+    ;
+    ; The PI-declared form (`<?IS10744 ArcDecl …>` / ArcPubid support attribute)
+    ; deliberately does NOT count: there ArcProcessor::init leaves `notation`
+    ; null and the DSSSL director returns 0 without setting gotArc_.
+    ;
+    ; DEVIATION: the reference recognizes an ArcBase PI only at stage_ == 1, i.e.
+    ; between startDtd and endDtd; the port's event queue has no DTD brackets, so
+    ; PIs are taken up to the first start element (the prolog). A PI sitting
+    ; between the DTD and the document element would wrongly count.
+    function declares_base_architecture(host: ref[Page], ps: ref[ParserState], pubid: Slice[char]) returns bool
+    {
+        let doc_dtd ps.base_dtd()
+        if doc_dtd = null
+            return false
+        let syntax ps.get_instance_syntax()
+        if syntax = null
+            return false
+
+        let arc_base ArcEngine.fold_sc(host, syntax, StringC("ArcBase"))
+        let is10744 ArcEngine.fold_sc(host, syntax, StringC("IS10744"))
+
+        let names Array[StringC]^host()
+        let n ps.n_events()
+        var k: size_t 0
+        while k < n
+        {
+            let ev ps.get_event(k)
+            let ty ev.get_type()
+            if ty = EV_START_ELEMENT
+                break
+            if ty = EV_PI
+                ArcEngine.scan_arcbase_names(host, syntax, ev.get_data(), is10744, arc_base, names)
+            k := k + 1
+        }
+
+        let nn names.get_length()
+        var ni: size_t 0
+        while ni < nn
+        {
+            let nt doc_dtd.lookup_notation(names[ni])
+            if nt <> null
+            {
+                let xid nt.get_external_id()
+                if xid.has_public_id()
+                {
+                    let pid xid.get_public_id()
+                    if pid.equals(String(pubid.data, pubid.length))
+                        return true
+                }
+            }
+            ni := ni + 1
+        }
+        false
+    }
+
+    ; the arch stream's END-PROLOG (ArcEngine.cxx:931 — the last thing
+    ; ArcProcessor::init does, so it precedes every generated element). It
+    ; carries the META-DTD, which is what makes `-A <arch> -oentity` list the
+    ; architecture's entities (the munged copies) instead of the document's, and
+    ; it is what an event consumer reads for the document's own location — the
+    ; DSSSL specification handler anchors its `noParts` diagnostic there.
+    ;
+    ; The LOCATION is the base end-prolog's (`event.location()`); LINK plays no
+    ; part in an architectural stream (the reference passes only dtd + loc), so
+    ; the lpd and simple-link columns stay null.
+    procedure emit_end_prolog(host: ref[Page], ps: ref[ParserState], p: ref[ArcProcessor], mutable out: ref[Array[ref[Event]?]])
+    {
+        var loc Location()
+        let n ps.n_events()
+        var k: size_t 0
+        while k < n
+        {
+            let ev ps.get_event(k)
+            if ev.get_type() = EV_END_PROLOG
+            {
+                loc := ev.get_loc()
+                k := n
+            }
+            else
+                k := k + 1
+        }
+        let gen Event.make_end_prolog(host, null, null, null, loc)
+        if ps.output_flag(OF_ENTITY)
+            gen.set_general_entities(ArcEngine.general_entities_in_bucket_order(host, p.meta_dtd as ref[Dtd]))
+        out.add(gen)
+    }
+
+    ; drive the base event stream through a processor, generating the
+    ; architectural stream into p.out.
+    procedure run_events(host: ref[Page], mutable ps: ref[ParserState], mutable p: ref[ArcProcessor])
+    {
+        let n ps.n_events()
+        var k: size_t 0
+        while k < n
+        {
+            let ev ps.get_event(k)
+            let ty ev.get_type()
+            if ty = EV_START_ELEMENT
+                p.process_start_element(host, ev as ref[Event])
+            else if ty = EV_END_ELEMENT
+                p.process_end_element(host, ev as ref[Event])
+            else if ty = EV_DATA
+            {
+                if p.process_data_arc()
+                    p.out.add(Event.make_data(host, ev.get_data(), ev.get_loc()))
+            }
+            else if ty = EV_SDATA
+            {
+                if p.process_data_arc()
+                    p.out.add(Event.make_sdata(host, ev.get_data(), ev.get_loc()))
+            }
+            k := k + 1
+        }
+    }
+
+    ; ArcEngine::parseAll + SelectOneArcDirector (ArcEngine.cxx:147/157): build
+    ; the processors from the ArcBase PIs, init each, and replace the event
+    ; queue with the SELECTED architecture's generated stream (empty when the
+    ; selection matches no architecture — the reference's null handler).
+    procedure transform(host: ref[Page], mutable ps: ref[ParserState], arc_names: ref[Array[String]]?) returns bool
+    {
+        if arc_names = null
+            return false
+        if arc_names.get_length() = 0
+            return false
+        let doc_dtd ps.base_dtd()
+        if doc_dtd = null
+            return false
+        let sd ps.get_sd()
+        let syntax ps.get_instance_syntax()
+        if syntax = null
+            return false
+
+        let arc_base ArcEngine.fold_sc(host, syntax, StringC("ArcBase"))
+        let is10744 ArcEngine.fold_sc(host, syntax, StringC("IS10744"))
+
+        let procs Array[ref[ArcProcessor]?]^host()
+        let n ps.n_events()
+        var k: size_t 0
+        while k < n
+        {
+            let ev ps.get_event(k)
+            if ev.get_type() = EV_PI
+                ArcEngine.scan_arcbase_pi(host, syntax, ev.get_data(), is10744, arc_base, procs)
+            k := k + 1
+        }
+
+        let sel ArcEngine.fold_sc(host, syntax, StringC((*(arc_names.get_buffer())).to_c_string()))
+        let result Array[ref[Event]?]^host()
+        var pi: size_t 0
+        while pi < procs.get_length()
+        {
+            let p procs[pi]
+            p.setup(host, ps, doc_dtd, sd, syntax)
+            if p.name.equals(sel)
+            {
+                if p.valid
+                {
+                    p.out := result
+                    ArcEngine.emit_end_prolog(host, ps, p as ref[ArcProcessor], result)
+                    ArcEngine.run_events(host, ps, p as ref[ArcProcessor])
+                    ; ~ArcEngineImpl (ArcEngine.cxx:213) checks the pending
+                    ; arch-space IDREFs of every valid processor once the base
+                    ; stream is exhausted.
+                    p.check_idrefs()
+                }
+            }
+            pi := pi + 1
+        }
+        ps.set_events(result)
+        true
+    }
+}

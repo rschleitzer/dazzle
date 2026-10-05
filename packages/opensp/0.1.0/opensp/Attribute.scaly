@@ -1,0 +1,1298 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.Syntax.Syntax
+use opensp.Sd.Sd
+use opensp.Location.Location
+use opensp.Entity.Entity
+use opensp.Entity.InternalEntity
+use opensp.AttributeList.AttributeList
+use opensp.Notation.Notation
+
+; Attributes — Attribute.cs / Attribute.cxx (the declared-value classification,
+; the AttributeDefinition family, the produced AttributeValue / semantics, the
+; per-spec Attribute, and the AttributeContext Messenger).
+;
+; PORT SHAPE — the C++ class hierarchies here (DeclaredValue -> Cdata/Tokenized
+; -> Group -> NameTokenGroup/Notation, plus Entity/Id/Idref; AttributeDefinition
+; -> Required/Current/Implied -> Conref, Default -> Fixed; AttributeValue ->
+; Implied/Cdata/Tokenized -> Data; AttributeSemantics -> Entity/Notation) are
+; FLATTENED into page-hosted structs tagged by a `*_kind` int, exactly as the
+; ContentToken increment flattened its node hierarchy. Rationale identical: the
+; subclasses differ only by a handful of flags / one extra field, share most of
+; their state, are cross-referenced by pointer (a definition owns a declared
+; value; a value owns a Text), and live to run end (one region per run) — a
+; Scaly union would duplicate the shared fields across every variant and model
+; the shared graph awkwardly. The tag replaces C++ virtual dispatch.
+;
+; Entities and Notations are referenced by IDENTITY only (a borrowed
+; reference); their concepts land in LATER modules, which a `use` bridges.
+; `Text` is a
+; minimal seed here (a StringC plus fixed-equality) — the full content Text
+; (TextIter/TextItem, per-char locations, subst tables) lands with the parser
+; stage, which is also where the message-emitting value NORMALISATION/VALIDATION
+; (makeValue's category checks, length limits, allowed-value/notation/entity/id
+; resolution through the live AttributeContext) is driven. This increment ports
+; the type structure, the pure classification/`buildDesc` logic, the missing-
+; value selection, and the tokenized-value token splitting; it is exercised by
+; a synthetic AttributeContext with no live parser behind it.
+
+; --- Text (minimal seed) --------------------------------------------------
+; The full content Text lands with the parser; the attribute layer needs only
+; the normalized string and content equality.
+define Text (str: StringC, locs: pointer[Location](null), sdata_runs: ref[Array[size_t]]?(null), nonsgml_items: ref[Array[size_t]]?(null), var delim_loc: Location(Location()))
+{
+    init(str: StringC)
+    {
+        this.str := str
+        this.locs := null
+        this.sdata_runs := null
+        this.nonsgml_items := null
+        this.delim_loc := Location()
+    }
+
+    ; The reference Text records a Location per stored char (addChar); ours is
+    ; optional (an empty view = untracked) and only the attribute-literal path
+    ; fills it — the consumers are the ID/IDREF token locations
+    ; (tokenLocation(i)), which must survive entity expansion and value
+    ; normalization, so a source-offset reconstruction cannot stand in. One
+    ; Location per stored char, so the view's length IS `str`'s size — which
+    ; is why the FIELD stays a bare pointer: a `Slice` here is +8 bytes on
+    ; every attribute-value record (+4.6 MB on the ClaML transform, measured
+    ; and taken back, history 2026-09-06 (27)); the view lives in get_locs().
+    init(str: StringC, locs: Slice[Location])
+    {
+        this.str := str
+        this.locs := locs.data
+        this.sdata_runs := null
+        this.nonsgml_items := null
+        this.delim_loc := Location()
+    }
+
+    ; Literal text with SDATA item runs (Text::addSdata): flat (start,end)
+    ; char-index pairs into str, in order — the ESIS attribute writer renders
+    ; those ranges between `\|` markers. null/empty = no sdata items.
+    init(str: StringC, locs: Slice[Location], sdata_runs: ref[Array[size_t]]?)
+    {
+        this.str := str
+        this.locs := locs.data
+        this.sdata_runs := sdata_runs
+        this.nonsgml_items := null
+        this.delim_loc := Location()
+    }
+
+    ; Literal text with SDATA runs AND non-SGML items (Text::addNonSgmlChar):
+    ; nonsgml_items is a flat (char-index, char-code) pair list — the port
+    ; drops the char from str (the plain writer never prints it), so the index
+    ; names the position BETWEEN str chars where the item sits; -ononsgml
+    ; renders `\%N;` there.
+    init(str: StringC, locs: Slice[Location], sdata_runs: ref[Array[size_t]]?, nonsgml_items: ref[Array[size_t]]?)
+    {
+        this.str := str
+        this.locs := locs.data
+        this.sdata_runs := sdata_runs
+        this.nonsgml_items := nonsgml_items
+        this.delim_loc := Location()
+    }
+
+    ; the SDATA (start,end) run pairs, null when the text has none.
+    function get_sdata_runs(this: Text) returns ref[Array[size_t]]?
+        sdata_runs
+
+    ; the non-SGML (index, char) pairs, null when the text has none.
+    function get_nonsgml_items(this: Text) returns ref[Array[size_t]]?
+        nonsgml_items
+
+    ; Text::addStartDelim (literalDelimInfo): the literal's opening delimiter
+    ; location — recorded only when markup capture is on (the -o axis:
+    ; -otagomit instance markup / -ocomment prolog markup). It is the FIRST
+    ; Text item, so handleAsUnterminated's startLoc anchors here (the quote)
+    ; instead of the first char — a probed reference column shift.
+    function get_delim_loc(this: Text) returns Location
+        delim_loc
+
+    procedure set_delim_loc(mutable this: ref[Text], l: Location)
+        this.delim_loc := l
+
+    function has_locs(this: Text) returns bool
+        locs <> null
+
+    ; the per-char location view (empty = untracked), one Location per char of
+    ; `str` — callers copying locations use this rather than loc_at: a struct
+    ; returned by value reads as local-page to the escape checker when stored
+    ; through a pointer.
+    function get_locs(this: Text) returns Slice[Location]
+    {
+        if locs = null
+            return Slice[Location]()
+        Slice[Location](str.get_size(), locs)
+    }
+
+    ; Location of the i-th stored char (Text::charLocation analog); a null
+    ; Location for untracked text.
+    function loc_at(this: Text, i: size_t) returns Location
+    {
+        if locs = null
+            return Location()
+        if i >= str.get_size()
+            return Location()
+        *(locs + i)
+    }
+
+    function string(this: Text) returns StringC
+        str
+
+    function size(this: Text) returns size_t
+        str.get_size()
+
+    ; Text::fixedEqual compares content ignoring location; string equality is
+    ; the faithful essence here.
+    function fixed_equal(this: Text, other: ref[Text]) returns bool
+        str.equals(other.string())
+}
+
+; --- DeclaredValue kinds (DVK_*) ------------------------------------------
+define DVK_CDATA: int 0
+define DVK_TOKENIZED: int 1
+define DVK_GROUP: int 2
+define DVK_NAMETOKENGROUP: int 3
+define DVK_NOTATION: int 4
+define DVK_ENTITY: int 5
+define DVK_ID: int 6
+define DVK_IDREF: int 7
+define DVK_DATA: int 8
+
+; TokenizedDeclaredValue::TokenType (same order as AttributeDefinitionDesc).
+define TT_NAME: int 0
+define TT_NUMBER: int 1
+define TT_NAMETOKEN: int 2
+define TT_NUMBERTOKEN: int 3
+define TT_ENTITYNAME: int 4
+
+; AttributeDefinitionDesc::DeclaredValue enum (the declaration-dump target).
+define ADV_CDATA: int 0
+define ADV_NAME: int 1
+define ADV_NUMBER: int 2
+define ADV_NMTOKEN: int 3
+define ADV_NUTOKEN: int 4
+define ADV_ENTITY: int 5
+define ADV_IDREF: int 6
+define ADV_NAMES: int 7
+define ADV_NUMBERS: int 8
+define ADV_NMTOKENS: int 9
+define ADV_NUTOKENS: int 10
+define ADV_ENTITIES: int 11
+define ADV_IDREFS: int 12
+define ADV_ID: int 13
+define ADV_NOTATION: int 14
+define ADV_NAMETOKENGROUP: int 15
+
+; AttributeDefinitionDesc::DefaultValueType.
+define DVT_REQUIRED: int 0
+define DVT_CURRENT: int 1
+define DVT_IMPLIED: int 2
+define DVT_CONREF: int 3
+define DVT_DEFAULTED: int 4
+define DVT_FIXED: int 5
+
+; AttributeValue::Type.
+define AVT_IMPLIED: int 0
+define AVT_CDATA: int 1
+define AVT_TOKENIZED: int 2
+
+; AttributeValue kinds (AVK_*).
+define AVK_IMPLIED: int 0
+define AVK_CDATA: int 1
+define AVK_TOKENIZED: int 2
+define AVK_DATA: int 3
+
+; AttributeSemantics kinds (ASK_*).
+define ASK_ENTITY: int 0
+define ASK_NOTATION: int 1
+
+; AttributeDefinition kinds (ADK_*).
+define ADK_REQUIRED: int 0
+define ADK_CURRENT: int 1
+define ADK_IMPLIED: int 2
+define ADK_CONREF: int 3
+define ADK_DEFAULT: int 4
+define ADK_FIXED: int 5
+
+; --- AttributeDefinitionDesc ---------------------------------------------
+; The plain declaration-dump struct getDesc() fills.
+define AttributeDefinitionDesc
+(
+    var declared_value: int
+    var default_value_type: int
+    var current_index: size_t
+    var allowed_values: ref[Array[StringC]]?
+    var orig_allowed_values: ref[Array[StringC]]?
+)
+{
+    function make(host: ref[Page]) returns ref[AttributeDefinitionDesc]
+    {
+        let d &AttributeDefinitionDesc^host(ADV_CDATA, DVT_REQUIRED, 0, null, null)
+        d
+    }
+}
+
+; --- DeclaredValue --------------------------------------------------------
+define DeclaredValue
+(
+    var dv_kind: int
+    var token_type: int
+    var is_list: bool
+    var initial_categories: int
+    var subsequent_categories: int
+    var allowed_values: ref[Array[StringC]]?
+    var orig_allowed_values: ref[Array[StringC]]?
+    ; DataDeclaredValue (Attribute.h:534) — the WWW `DATA notation [specs]`
+    ; declared value: a CDATA value that carries its notation + the data-
+    ; attribute list, both borrowed like ExternalDataEntity's.
+    var data_notation: ref[Notation]?
+    var data_attributes: ref[AttributeList]?
+)
+{
+    function alloc(host: ref[Page]) returns ref[DeclaredValue]
+    {
+        let p &DeclaredValue^host(DVK_CDATA, TT_NAME, false, 0, 0, null, null, null, null)
+        p
+    }
+
+    ; DataDeclaredValue::DataDeclaredValue (Attribute.cxx:126).
+    ; DataDeclaredValue's payload (the -odata-attribute A-record shape and the
+    ; D records): the declared notation + the finished data-attribute list —
+    ; makeValue shares them into every DataAttributeValue.
+    function get_data_notation(this: DeclaredValue) returns ref[Notation]?
+        data_notation
+
+    function get_data_attributes(this: DeclaredValue) returns ref[AttributeList]?
+        data_attributes
+
+    function make_data(host: ref[Page], notation: ref[Notation]?, attributes: ref[AttributeList]?) returns ref[DeclaredValue]
+    {
+        let p alloc(host)
+        p.dv_kind := DVK_DATA
+        p.data_notation := notation
+        p.data_attributes := attributes
+        p
+    }
+
+    ; The TokenizedDeclaredValue ctor's category selection per TokenType.
+    procedure set_categories(mutable p: ref[DeclaredValue], type: int)
+    {
+        p.token_type := type
+        if type = TT_NUMBER
+        {
+            p.initial_categories := CAT_DIGIT
+            p.subsequent_categories := CAT_DIGIT
+            return
+        }
+        if type = TT_NAMETOKEN
+        {
+            p.initial_categories := CAT_NAMESTART | CAT_DIGIT | CAT_OTHERNAME
+            p.subsequent_categories := CAT_NAMESTART | CAT_DIGIT | CAT_OTHERNAME
+            return
+        }
+        if type = TT_NUMBERTOKEN
+        {
+            p.initial_categories := CAT_DIGIT
+            p.subsequent_categories := CAT_NAMESTART | CAT_DIGIT | CAT_OTHERNAME
+            return
+        }
+        ; TT_NAME and TT_ENTITYNAME
+        p.initial_categories := CAT_NAMESTART
+        p.subsequent_categories := CAT_NAMESTART | CAT_DIGIT | CAT_OTHERNAME
+    }
+
+    function make_cdata(host: ref[Page]) returns ref[DeclaredValue]
+    {
+        let p alloc(host)
+        p.dv_kind := DVK_CDATA
+        p
+    }
+
+    function make_tokenized(host: ref[Page], type: int, is_list: bool) returns ref[DeclaredValue]
+    {
+        let p alloc(host)
+        p.dv_kind := DVK_TOKENIZED
+        p.is_list := is_list
+        set_categories(p, type)
+        p
+    }
+
+    function make_group(host: ref[Page], type: int, allowed: ref[Array[StringC]]) returns ref[DeclaredValue]
+    {
+        let p alloc(host)
+        p.dv_kind := DVK_GROUP
+        p.is_list := false
+        set_categories(p, type)
+        p.allowed_values := allowed
+        p
+    }
+
+    procedure make_name_token_group(host: ref[Page], mutable allowed: ref[Array[StringC]]) returns ref[DeclaredValue]
+    {
+        let p make_group(host, TT_NAMETOKEN, allowed)
+        p.dv_kind := DVK_NAMETOKENGROUP
+        p
+    }
+
+    procedure make_notation(host: ref[Page], mutable allowed: ref[Array[StringC]]) returns ref[DeclaredValue]
+    {
+        let p make_group(host, TT_NAME, allowed)
+        p.dv_kind := DVK_NOTATION
+        p
+    }
+
+    function make_entity(host: ref[Page], is_list: bool) returns ref[DeclaredValue]
+    {
+        let p make_tokenized(host, TT_ENTITYNAME, is_list)
+        p.dv_kind := DVK_ENTITY
+        p
+    }
+
+    function make_id(host: ref[Page]) returns ref[DeclaredValue]
+    {
+        let p make_tokenized(host, TT_NAME, false)
+        p.dv_kind := DVK_ID
+        p
+    }
+
+    function make_idref(host: ref[Page], is_list: bool) returns ref[DeclaredValue]
+    {
+        let p make_tokenized(host, TT_NAME, is_list)
+        p.dv_kind := DVK_IDREF
+        p
+    }
+
+    function tokenized(this: DeclaredValue) returns bool
+    {
+        if dv_kind = DVK_CDATA
+            return false
+        if dv_kind = DVK_DATA
+            return false
+        true
+    }
+
+    function is_notation(this: DeclaredValue) returns bool
+        dv_kind = DVK_NOTATION
+
+    function is_entity(this: DeclaredValue) returns bool
+        dv_kind = DVK_ENTITY
+
+    function is_id(this: DeclaredValue) returns bool
+        dv_kind = DVK_ID
+
+    function is_idref(this: DeclaredValue) returns bool
+        dv_kind = DVK_IDREF
+
+    function get_initial_categories(this: DeclaredValue) returns int
+        initial_categories
+
+    function get_subsequent_categories(this: DeclaredValue) returns int
+        subsequent_categories
+
+    function get_is_list(this: DeclaredValue) returns bool
+        is_list
+
+    function contains_token(this: DeclaredValue, token: StringC) returns bool
+    {
+        if allowed_values = null
+            return false
+
+        let n allowed_values.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            if (allowed_values[i]).equals(token)
+                return true
+            i := i + 1
+        }
+        false
+    }
+
+    function get_tokens(this: DeclaredValue) returns ref[Array[StringC]]?
+        allowed_values
+
+    function get_orig_tokens(this: DeclaredValue) returns ref[Array[StringC]]
+        orig_allowed_values as ref[Array[StringC]]
+
+    ; The base TokenizedDeclaredValue::buildDesc arithmetic:
+    ;   (type - TokenType.name) + (isList ? names : name)
+    function tokenized_adv(this: DeclaredValue) returns int
+    {
+        if is_list
+            return token_type + ADV_NAMES
+
+        token_type + ADV_NAME
+    }
+
+    ; DeclaredValue::buildDesc (all variants). Fills desc.declared_value plus,
+    ; for the group family, the allowed-value vectors.
+    procedure build_desc(this: DeclaredValue, mutable desc: ref[AttributeDefinitionDesc])
+    {
+        if dv_kind = DVK_CDATA
+        {
+            desc.declared_value := ADV_CDATA
+            return
+        }
+        if dv_kind = DVK_DATA
+        {
+            desc.declared_value := ADV_CDATA
+            return
+        }
+        if dv_kind = DVK_ID
+        {
+            desc.declared_value := ADV_ID
+            return
+        }
+        if dv_kind = DVK_IDREF
+        {
+            let base tokenized_adv()
+            if base = ADV_NAME
+                desc.declared_value := ADV_IDREF
+            else
+                desc.declared_value := ADV_IDREFS
+            return
+        }
+        if dv_kind = DVK_NOTATION
+        {
+            desc.allowed_values := allowed_values
+            desc.orig_allowed_values := orig_allowed_values
+            desc.declared_value := ADV_NOTATION
+            return
+        }
+        if dv_kind = DVK_NAMETOKENGROUP
+        {
+            desc.allowed_values := allowed_values
+            desc.orig_allowed_values := orig_allowed_values
+            desc.declared_value := ADV_NAMETOKENGROUP
+            return
+        }
+        if dv_kind = DVK_GROUP
+        {
+            desc.allowed_values := allowed_values
+            desc.orig_allowed_values := orig_allowed_values
+            return
+        }
+        ; DVK_TOKENIZED and DVK_ENTITY use the base formula.
+        desc.declared_value := tokenized_adv()
+    }
+
+    ; DeclaredValue::copy — shallow in one region (allowed-value vectors shared).
+    function copy(this: DeclaredValue, host: ref[Page]) returns ref[DeclaredValue]
+    {
+        let p alloc(host)
+        p.dv_kind := dv_kind
+        p.token_type := token_type
+        p.is_list := is_list
+        p.initial_categories := initial_categories
+        p.subsequent_categories := subsequent_categories
+        p.allowed_values := allowed_values
+        p.orig_allowed_values := orig_allowed_values
+        p
+    }
+
+    function test() returns int
+    {
+        let host Page.get(StringC("x").data_ptr())
+
+        ; CDATA is not tokenized; its declared-value is cdata.
+        let cd DeclaredValue.make_cdata(host)
+        if cd.tokenized()
+            return -1
+        let d1 AttributeDefinitionDesc.make(host)
+        cd.build_desc(d1)
+        if d1.declared_value <> ADV_CDATA
+            return -2
+
+        ; a plain NAME tokenized value: tokenized, initial category = nameStart.
+        let nm DeclaredValue.make_tokenized(host, TT_NAME, false)
+        if nm.tokenized() = false
+            return -3
+        if nm.initial_categories <> CAT_NAMESTART
+            return -4
+        let d2 AttributeDefinitionDesc.make(host)
+        nm.build_desc(d2)
+        if d2.declared_value <> ADV_NAME
+            return -5
+
+        ; ENTITIES (list of entity names) -> ADV_ENTITIES, is_entity.
+        let en DeclaredValue.make_entity(host, true)
+        if en.is_entity() = false
+            return -6
+        let d3 AttributeDefinitionDesc.make(host)
+        en.build_desc(d3)
+        if d3.declared_value <> ADV_ENTITIES
+            return -7
+
+        ; IDREF (single) -> ADV_IDREF; ID -> ADV_ID.
+        let ir DeclaredValue.make_idref(host, false)
+        if ir.is_idref() = false
+            return -8
+        let d4 AttributeDefinitionDesc.make(host)
+        ir.build_desc(d4)
+        if d4.declared_value <> ADV_IDREF
+            return -9
+        let id DeclaredValue.make_id(host)
+        if id.is_id() = false
+            return -10
+        let d5 AttributeDefinitionDesc.make(host)
+        id.build_desc(d5)
+        if d5.declared_value <> ADV_ID
+            return -11
+
+        ; enumerated group (a|b) -> containsToken, nameTokenGroup dump.
+        var vals Array[StringC]^host()
+        vals.add(StringC("a"))
+        vals.add(StringC("b"))
+        let grp DeclaredValue.make_name_token_group(host, &vals)
+        if grp.contains_token(StringC("a")) = false
+            return -12
+        if grp.contains_token(StringC("c"))
+            return -13
+        let d6 AttributeDefinitionDesc.make(host)
+        grp.build_desc(d6)
+        if d6.declared_value <> ADV_NAMETOKENGROUP
+            return -14
+        if d6.allowed_values = null
+            return -15
+
+        ; NOTATION group -> is_notation, ADV_NOTATION.
+        var nvals Array[StringC]^host()
+        nvals.add(StringC("gif"))
+        let notn DeclaredValue.make_notation(host, &nvals)
+        if notn.is_notation() = false
+            return -16
+        let d7 AttributeDefinitionDesc.make(host)
+        notn.build_desc(d7)
+        if d7.declared_value <> ADV_NOTATION
+            return -17
+
+        0
+    }
+}
+
+; --- AttributeValue -------------------------------------------------------
+define AttributeValue
+(
+    av_kind: int
+    text: ref[Text]?
+    space_index: ref[Array[size_t]]?
+    notation: ref[Notation]?
+    data_attributes: ref[AttributeList]?
+)
+{
+    function make_implied(host: ref[Page]) returns ref[AttributeValue]
+    {
+        let v &AttributeValue^host(AVK_IMPLIED, null, null, null, null)
+        v
+    }
+
+    function make_cdata(host: ref[Page], text: ref[Text]) returns ref[AttributeValue]
+    {
+        let v &AttributeValue^host(AVK_CDATA, text, null, null, null)
+        v
+    }
+
+    ; DataAttributeValue (Attribute.cxx:1129) — a CDATA value carrying the DATA
+    ; declared value's notation + shared data-attribute list (-odata-attribute).
+    function make_cdata_data(host: ref[Page], text: ref[Text], notation: ref[Notation]?, data_attributes: ref[AttributeList]?) returns ref[AttributeValue]
+    {
+        let v &AttributeValue^host(AVK_CDATA, text, null, notation, data_attributes)
+        v
+    }
+
+    function make_tokenized(host: ref[Page], text: ref[Text], space_index: ref[Array[size_t]]?) returns ref[AttributeValue]
+    {
+        let v &AttributeValue^host(AVK_TOKENIZED, text, space_index, null, null)
+        v
+    }
+
+    ; CdataAttributeValue::notation / DataAttributeValue::attributes.
+    function get_cdata_notation(this: AttributeValue) returns ref[Notation]?
+        notation
+
+    function get_data_attributes(this: AttributeValue) returns ref[AttributeList]?
+        data_attributes
+
+    ; AttributeValue::info -> the Type discriminant.
+    function value_type(this: AttributeValue) returns int
+    {
+        if av_kind = AVK_IMPLIED
+            return AVT_IMPLIED
+        if av_kind = AVK_TOKENIZED
+            return AVT_TOKENIZED
+        AVT_CDATA
+    }
+
+    function get_text(this: AttributeValue) returns ref[Text]?
+        text
+
+    function is_tokenized(this: AttributeValue) returns bool
+        av_kind = AVK_TOKENIZED
+
+    ; The normalized value string (tokenized values return their Text string).
+    function get_string(this: AttributeValue) returns StringC
+    {
+        if text = null
+            return StringC()
+
+        (*text).string()
+    }
+
+    function get_space_index(this: AttributeValue) returns ref[Array[size_t]]?
+        space_index
+
+    function n_tokens(this: AttributeValue) returns size_t
+    {
+        if space_index = null
+            return 1 as size_t
+
+        space_index.get_length() + 1
+    }
+
+    ; TokenizedAttributeValue::token — the i-th whitespace-separated token.
+    function token(this: AttributeValue, i: size_t) returns StringC
+    {
+        if text = null
+            return StringC()
+
+        ; ★a tokenized value with no separator carries NO space index (see
+        ; AttributeList.set_value) — `n_tokens` already answers 1 for that
+        ; shape, so `token(0)` must answer the whole value instead of
+        ; dereferencing the null index. Latent until the arch-space id walk
+        ; became the first caller of this pair: the parser tokenizes attribute
+        ; values in its own loop and never asks.
+        if space_index = null
+            return (*text).string()
+
+        let ns space_index.get_length()
+        var start: size_t 0
+        if i <> 0
+            start := space_index[(i - 1)] + 1
+        var stop (*text).size()
+        if i < ns
+            stop := space_index[i]
+        (*text).string().substr(start, stop - start)
+    }
+
+    function test() returns int
+    {
+        let host Page.get(StringC("x").data_ptr())
+
+        ; implied value
+        let iv AttributeValue.make_implied(host)
+        if iv.value_type() <> AVT_IMPLIED
+            return -1
+
+        ; cdata value carries its text
+        let t1 &Text^host(StringC("hello"))
+        let cv AttributeValue.make_cdata(host, t1)
+        if cv.value_type() <> AVT_CDATA
+            return -2
+        if cv.get_string().equals(StringC("hello")) = false
+            return -3
+
+        ; tokenized value "a b c" (spaces at index 1 and 3) -> 3 tokens
+        let t2 &Text^host(StringC("a b c"))
+        var si Array[size_t]^host()
+        si.add(1)
+        si.add(3)
+        let tv AttributeValue.make_tokenized(host, t2, &si)
+        if tv.value_type() <> AVT_TOKENIZED
+            return -4
+        if tv.n_tokens() <> 3
+            return -5
+        if tv.token(0).equals(StringC("a")) = false
+            return -6
+        if tv.token(1).equals(StringC("b")) = false
+            return -7
+        if tv.token(2).equals(StringC("c")) = false
+            return -8
+
+        0
+    }
+}
+
+; --- AttributeSemantics ---------------------------------------------------
+; Entity/Notation identities are borrowed pointers (their concepts land with
+; the Dtd increment); this holds them for later drop-in resolution.
+define AttributeSemantics
+(
+    as_kind: int
+    entities: ref[Array[ref[Entity]?]]?
+    notation: ref[Notation]?
+)
+{
+    function make_entity(host: ref[Page], entities: ref[Array[ref[Entity]?]]) returns ref[AttributeSemantics]
+    {
+        let s &AttributeSemantics^host(ASK_ENTITY, entities, null)
+        s
+    }
+
+    function make_notation(host: ref[Page], notation: ref[Notation]?) returns ref[AttributeSemantics]
+    {
+        let s &AttributeSemantics^host(ASK_NOTATION, null, notation)
+        s
+    }
+
+    function n_entities(this: AttributeSemantics) returns size_t
+    {
+        if entities = null
+            return 0 as size_t
+
+        entities.get_length()
+    }
+
+    function entity(this: AttributeSemantics, i: size_t) returns ref[Entity]?
+    {
+        if entities = null
+            return null
+
+        entities[i]
+    }
+
+    function get_notation(this: AttributeSemantics) returns ref[Notation]?
+        notation
+
+    function test() returns int
+    {
+        let host Page.get(StringC("x").data_ptr())
+
+        ; two borrowed entity identities. Page-hosted on purpose: their
+        ; ADDRESSES go into `ents`, which lives on `host` and outlives this
+        ; frame, so a frame-local here would be an escape -- and under the old
+        ; untyped element the checker could not see the store at all, which is
+        ; what the typed element buys here.
+        let e1_v Entity.Internal^host(InternalEntity(StringC("e1"), StringC("t1"), DT_CDATA))
+        let e1 &e1_v
+        let e2_v Entity.Internal^host(InternalEntity(StringC("e2"), StringC("t2"), DT_CDATA))
+        let e2 &e2_v
+        var ents Array[ref[Entity]?]^host()
+        ents.add(e1)
+        ents.add(e2)
+        let es AttributeSemantics.make_entity(host, &ents)
+        if es.n_entities() <> 2
+            return -1
+        if es.entity(0) <> e1
+            return -2
+
+        ; notation identity
+        let nt Notation.make(host, StringC("gif"), StringC("base"), true)
+        let ns AttributeSemantics.make_notation(host, nt)
+        if ns.get_notation() <> nt
+            return -3
+
+        0
+    }
+}
+
+; --- Attribute (a single spec slot) ---------------------------------------
+define Attribute
+(
+    var spec_index_plus: size_t
+    var value: ref[AttributeValue]?
+    var semantics: ref[AttributeSemantics]?
+)
+{
+    function make(host: ref[Page]) returns ref[Attribute]
+    {
+        let a &Attribute^host(0, null, null)
+        a
+    }
+
+    function specified(this: Attribute) returns bool
+        spec_index_plus <> 0
+
+    function spec_index(this: Attribute) returns size_t
+        spec_index_plus - 1
+
+    function get_value(this: Attribute) returns ref[AttributeValue]?
+        value
+
+    function get_semantics(this: Attribute) returns ref[AttributeSemantics]?
+        semantics
+
+    procedure set_spec(mutable this: ref[Attribute], index: size_t)
+        this.spec_index_plus := index + 1
+
+    procedure set_value(mutable this: ref[Attribute], value: ref[AttributeValue]?)
+        this.value := value
+
+    procedure set_semantics(mutable this: ref[Attribute], semantics: ref[AttributeSemantics])
+        this.semantics := semantics
+
+    procedure clear(mutable this: ref[Attribute])
+    {
+        this.spec_index_plus := 0
+        this.value := null
+        this.semantics := null
+    }
+
+    function test() returns int
+    {
+        let host Page.get(StringC("x").data_ptr())
+        let a Attribute.make(host)
+        if a.specified()
+            return -1
+
+        a.set_spec(2)
+        if a.specified() = false
+            return -2
+        if a.spec_index() <> 2
+            return -3
+
+        let iv AttributeValue.make_implied(host)
+        a.set_value(iv)
+        if a.get_value() <> iv
+            return -4
+
+        a.clear()
+        if a.specified()
+            return -5
+        if a.get_value() <> null
+            return -6
+
+        0
+    }
+}
+
+; --- AttributeContext (Messenger) -----------------------------------------
+; A minimal concrete context: the flags the missing-value / validation paths
+; consult plus a message counter for test observability. The parser stage
+; supplies the live subclass (id table, entity/notation lookup, current-value
+; store); the getters here return the abstract defaults.
+define AttributeContext
+(
+    host: ref[Page]
+    var syntax: ref[Syntax]?
+    var do_validate: bool
+    var may_default: bool
+    var n_messages: int
+    var implied_value: ref[AttributeValue]?
+    var current_values: Slice[ref[AttributeValue]?]
+    var n_current: size_t
+)
+{
+    function make(host: ref[Page], syntax: ref[Syntax]?, do_validate: bool, may_default: bool) returns ref[AttributeContext]
+    {
+        let c &AttributeContext^host(host, syntax, do_validate, may_default, 0, null, null, 0)
+        c
+    }
+
+    function validate(this: AttributeContext) returns bool
+        do_validate
+
+    function may_default_attribute(this: AttributeContext) returns bool
+        may_default
+
+    function attribute_syntax(this: AttributeContext) returns ref[Syntax]?
+        syntax
+
+    ; Flags/syntax setters — the live ParserState wires these from the Sd
+    ; (mayDefaultAttribute = omittag||attributeDefault; validate = typeValid)
+    ; and the concrete syntax once they are known (ParserState.setSd/setSyntax).
+    procedure set_validate(mutable this: ref[AttributeContext], b: bool)
+        this.do_validate := b
+
+    procedure set_may_default(mutable this: ref[AttributeContext], b: bool)
+        this.may_default := b
+
+    procedure set_syntax(mutable this: ref[AttributeContext], syn: ref[Syntax]?)
+        this.syntax := syn
+
+    procedure message(mutable this: ref[AttributeContext])
+        this.n_messages := this.n_messages + 1
+
+    ; AttributeContext::makeImpliedAttributeValue — cached ImpliedAttributeValue.
+    procedure make_implied_attribute_value(mutable this: ref[AttributeContext]) returns ref[AttributeValue]
+    {
+        if this.implied_value = null
+            this.implied_value := AttributeValue.make_implied(this.host)
+
+        this.implied_value as ref[AttributeValue]
+    }
+
+    ; The CURRENT-attribute value store (ParserState::currentAttributes_,
+    ; ParserState.cxx:474): sized to the DTD's nCurrentAttribute at instance
+    ; start. Before start_current_store runs the store is null — note/get are
+    ; no-ops, which is the reference's inInstance() gate (noteCurrentAttribute
+    ; and getCurrentAttribute both bail outside the instance).
+    procedure start_current_store(mutable this: ref[AttributeContext], n: size_t)
+    {
+        this.n_current := n
+        if n = 0
+        {
+            ; two member stores, not `Slice[..]()`: a CONSTRUCTION on the right of a
+            ; field store is materialised on a forced frame (scaly_force_frame +
+            ; Page.allocate + release per call -- measured +0.5 MB peak on the
+            ; 977 K parse, one call per element without attributes).
+            this.current_values.data := null
+            this.current_values.length := 0
+            return
+        }
+        let h this.host
+        let buf allocate_slice[ref[AttributeValue]?]^h(h, n)
+        var i: size_t 0
+        while i < n
+        {
+            buf.put(i, null)
+            i := i + 1
+        }
+        this.current_values := buf
+    }
+
+    ; ParserState::noteCurrentAttribute — remember the last specified value of
+    ; a CURRENT attribute (called from the checkValue path on specified values).
+    procedure note_current_attribute(mutable this: ref[AttributeContext], index: size_t, v: ref[AttributeValue]?)
+    {
+        if this.current_values.data = null
+            return
+        if index >= this.n_current
+            return
+        this.current_values.put(index, v)
+    }
+
+    ; How many CURRENT-attribute slots this context carries (0 before
+    ; start_current_store, and for every DTD that declares none).
+    ; ParserState.attribute_host reads it: a CURRENT value is stored by RAW
+    ; POINTER in note_current_attribute above and reused by a LATER element, so
+    ; it must not live on a drainable region.
+    function n_current_store(this: AttributeContext) returns size_t
+        n_current
+
+    ; ParserState::getCurrentAttribute — the value a missing CURRENT attribute
+    ; reuses (null until the attribute was specified once).
+    function get_current_attribute(this: AttributeContext, index: size_t) returns ref[AttributeValue]?
+    {
+        if current_values.data = null
+            return null
+        if index >= n_current
+            return null
+        this.current_values[index]
+    }
+
+    function get_attribute_entity(this: AttributeContext, name: StringC) returns ref[Entity]?
+        null
+
+    function get_attribute_notation(this: AttributeContext, name: StringC) returns ref[Notation]?
+        null
+
+    function test() returns int
+    {
+        let host Page.get(StringC("x").data_ptr())
+        let syn &Syntax^host(Sd())
+        let ctx AttributeContext.make(host, syn, true, false)
+        if ctx.validate() = false
+            return -1
+        if ctx.may_default_attribute()
+            return -2
+
+        ctx.message()
+        ctx.message()
+        if ctx.n_messages <> 2
+            return -3
+
+        ; the implied value is cached (same pointer on repeat).
+        let v1 ctx.make_implied_attribute_value()
+        let v2 ctx.make_implied_attribute_value()
+        if v1 <> v2
+            return -4
+
+        0
+    }
+}
+
+; --- AttributeDefinition --------------------------------------------------
+define AttributeDefinition
+(
+    ad_kind: int
+    var is_implicit: bool
+    var is_all: bool
+    name: StringC
+    var orig_name: StringC
+    declared_value: ref[DeclaredValue]?
+    var current_index: size_t
+    var default_value: ref[AttributeValue]?
+)
+{
+    function alloc(host: ref[Page], ad_kind: int, name: StringC, value: ref[DeclaredValue]?) returns ref[AttributeDefinition]
+    {
+        let d &AttributeDefinition^host(ad_kind, false, false, StringC^host(name.as_slice()), StringC(), value, 0, null)
+        d
+    }
+
+    function make_required(host: ref[Page], name: StringC, value: ref[DeclaredValue]) returns ref[AttributeDefinition]
+        alloc(host, ADK_REQUIRED, name, value)
+
+    procedure make_current(host: ref[Page], mutable name: StringC, mutable value: ref[DeclaredValue], index: size_t) returns ref[AttributeDefinition]
+    {
+        let d alloc(host, ADK_CURRENT, name, value)
+        d.current_index := index
+        d
+    }
+
+    function make_implied(host: ref[Page], name: StringC, value: ref[DeclaredValue]) returns ref[AttributeDefinition]
+        alloc(host, ADK_IMPLIED, name, value)
+
+    function make_conref(host: ref[Page], name: StringC, value: ref[DeclaredValue]) returns ref[AttributeDefinition]
+        alloc(host, ADK_CONREF, name, value)
+
+    procedure make_default(host: ref[Page], mutable name: StringC, mutable value: ref[DeclaredValue], default_value: ref[AttributeValue]) returns ref[AttributeDefinition]
+    {
+        let d alloc(host, ADK_DEFAULT, name, value)
+        d.default_value := default_value
+        d
+    }
+
+    procedure make_fixed(host: ref[Page], mutable name: StringC, mutable value: ref[DeclaredValue], default_value: ref[AttributeValue]) returns ref[AttributeDefinition]
+    {
+        let d alloc(host, ADK_FIXED, name, value)
+        d.default_value := default_value
+        d
+    }
+
+    function get_name(this: AttributeDefinition) returns StringC
+        name
+
+    ; AttributeDefinition::copy() — a member-wise clone (the AFDR/#ALL merge
+    ; paths append COPIES so the per-copy specified flags stay independent;
+    ; the declared value itself is immutable and shared).
+    procedure copy(mutable this: AttributeDefinition, host: ref[Page]) returns ref[AttributeDefinition]
+    {
+        let d alloc(host, ad_kind, name, declared_value)
+        d.is_implicit := is_implicit
+        d.is_all := is_all
+        d.orig_name := StringC^host(orig_name.as_slice())
+        d.current_index := current_index
+        d.default_value := default_value
+        d
+    }
+
+    function get_declared_value(this: AttributeDefinition) returns ref[DeclaredValue]?
+        declared_value
+
+    function get_orig_name(this: AttributeDefinition) returns StringC
+        orig_name
+
+    procedure set_orig_name(mutable this: ref[AttributeDefinition], orig_name: StringC)
+        this.orig_name := orig_name
+
+    function tokenized(this: AttributeDefinition) returns bool
+    {
+        if declared_value = null
+            return false
+        (*declared_value).tokenized()
+    }
+
+    function is_notation(this: AttributeDefinition) returns bool
+    {
+        if declared_value = null
+            return false
+        (*declared_value).is_notation()
+    }
+
+    function is_entity(this: AttributeDefinition) returns bool
+    {
+        if declared_value = null
+            return false
+        (*declared_value).is_entity()
+    }
+
+    function is_id(this: AttributeDefinition) returns bool
+    {
+        if declared_value = null
+            return false
+        (*declared_value).is_id()
+    }
+
+    function is_idref(this: AttributeDefinition) returns bool
+    {
+        if declared_value = null
+            return false
+        (*declared_value).is_idref()
+    }
+
+    function contains_token(this: AttributeDefinition, token: StringC) returns bool
+    {
+        if declared_value = null
+            return false
+        (*declared_value).contains_token(token)
+    }
+
+    function is_conref(this: AttributeDefinition) returns bool
+        ad_kind = ADK_CONREF
+
+    function is_current(this: AttributeDefinition) returns bool
+        ad_kind = ADK_CURRENT
+
+    function is_fixed(this: AttributeDefinition) returns bool
+        ad_kind = ADK_FIXED
+
+    ; The kind discriminant — the parser's missing-value message sweep
+    ; re-derives the reference's virtual makeMissingValue dispatch from it.
+    function get_ad_kind(this: AttributeDefinition) returns int
+        ad_kind
+
+    function get_current_index(this: AttributeDefinition) returns size_t
+        current_index
+
+    function get_default_value(this: AttributeDefinition) returns ref[AttributeValue]?
+        default_value
+
+    function get_tokens(this: AttributeDefinition) returns ref[Array[StringC]]?
+    {
+        if declared_value = null
+            return null
+        (*declared_value).get_tokens()
+    }
+
+    ; AttributeDefinition::buildDesc — the default-value-type half.
+    procedure build_desc(this: AttributeDefinition, mutable desc: ref[AttributeDefinitionDesc])
+    {
+        if ad_kind = ADK_REQUIRED
+            desc.default_value_type := DVT_REQUIRED
+        if ad_kind = ADK_CURRENT
+        {
+            desc.default_value_type := DVT_CURRENT
+            desc.current_index := current_index
+        }
+        if ad_kind = ADK_IMPLIED
+            desc.default_value_type := DVT_IMPLIED
+        if ad_kind = ADK_CONREF
+            desc.default_value_type := DVT_CONREF
+        if ad_kind = ADK_DEFAULT
+            desc.default_value_type := DVT_DEFAULTED
+        if ad_kind = ADK_FIXED
+            desc.default_value_type := DVT_FIXED
+    }
+
+    ; AttributeDefinition::getDesc — reset, then both buildDesc halves.
+    procedure get_desc(this: AttributeDefinition, mutable desc: ref[AttributeDefinitionDesc])
+    {
+        desc.allowed_values := null
+        desc.orig_allowed_values := null
+        desc.current_index := 0
+        build_desc(desc)
+        if declared_value <> null
+            (*declared_value).build_desc(desc)
+    }
+
+    procedure set_specified(mutable this: ref[AttributeDefinition], is_implicit: bool)
+    {
+        if is_implicit
+            this.is_implicit := true
+        else
+            this.is_all := true
+    }
+
+    procedure is_specified(this: AttributeDefinition, mutable out_implicit: ref[bool]) returns bool
+    {
+        out_implicit := is_implicit
+        is_implicit or is_all
+    }
+
+    ; AttributeDefinition::makeMissingValue — the branch that picks the value a
+    ; missing attribute gets (messages counted through the context).
+    procedure make_missing_value(this: AttributeDefinition, mutable context: ref[AttributeContext]) returns ref[AttributeValue]?
+    {
+        if ad_kind = ADK_IMPLIED
+            return context.make_implied_attribute_value()
+        if ad_kind = ADK_CONREF
+            return context.make_implied_attribute_value()
+        if ad_kind = ADK_REQUIRED
+        {
+            if context.validate()
+                context.message()
+            return null
+        }
+        if ad_kind = ADK_CURRENT
+        {
+            if context.may_default_attribute()
+            {
+                let cur context.get_current_attribute(current_index)
+                if (cur = null) and context.validate()
+                    context.message()
+                return cur
+            }
+            if context.validate()
+                context.message()
+            return null
+        }
+        ; ADK_DEFAULT / ADK_FIXED
+        if context.may_default_attribute()
+            return default_value
+        if context.validate()
+            context.message()
+        null
+    }
+
+    function test() returns int
+    {
+        let host Page.get(StringC("x").data_ptr())
+        let syn &Syntax^host(Sd())
+
+        ; a REQUIRED id attribute: is_id delegates, get_desc dumps id+required.
+        let idv DeclaredValue.make_id(host)
+        let req AttributeDefinition.make_required(host, StringC("num"), idv)
+        if req.is_id() = false
+            return -1
+        var impl bool
+        if req.is_specified(&impl)
+            return -2
+        let d1 AttributeDefinitionDesc.make(host)
+        req.get_desc(d1)
+        if d1.default_value_type <> DVT_REQUIRED
+            return -3
+        if d1.declared_value <> ADV_ID
+            return -4
+
+        ; setSpecified toggles.
+        req.set_specified(true)
+        if req.is_specified(&impl) = false
+            return -5
+        if impl = false
+            return -6
+
+        ; IMPLIED: missing value is the implied value (no message).
+        let cdv DeclaredValue.make_cdata(host)
+        let imp AttributeDefinition.make_implied(host, StringC("class"), cdv)
+        let ctx AttributeContext.make(host, syn, true, false)
+        let mv imp.make_missing_value(ctx)
+        if mv = null
+            return -7
+        if mv.value_type() <> AVT_IMPLIED
+            return -8
+        if ctx.n_messages <> 0
+            return -9
+
+        ; REQUIRED missing under validate: null + one message.
+        let cdv2 DeclaredValue.make_cdata(host)
+        let req2 AttributeDefinition.make_required(host, StringC("id"), cdv2)
+        let mv2 req2.make_missing_value(ctx)
+        if mv2 <> null
+            return -10
+        if ctx.n_messages <> 1
+            return -11
+
+        ; FIXED with mayDefault: yields the fixed default value.
+        let t1 &Text^host(StringC("1.0"))
+        let fixval AttributeValue.make_cdata(host, t1)
+        let cdv3 DeclaredValue.make_cdata(host)
+        let fix AttributeDefinition.make_fixed(host, StringC("version"), cdv3, fixval)
+        if fix.is_fixed() = false
+            return -12
+        let ctx2 AttributeContext.make(host, syn, true, true)
+        let mv3 fix.make_missing_value(ctx2)
+        if mv3 <> fixval
+            return -13
+        let d2 AttributeDefinitionDesc.make(host)
+        fix.get_desc(d2)
+        if d2.default_value_type <> DVT_FIXED
+            return -14
+
+        0
+    }
+}

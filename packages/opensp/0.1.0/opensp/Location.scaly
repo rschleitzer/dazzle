@@ -1,0 +1,1589 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.CodingSystem.CodingSystem
+use opensp.Entity.Entity
+use scaly.memory.runtime.fread
+use scaly.memory.runtime.fclose
+use scaly.memory.runtime.fopen
+
+; stdio seek for the streaming raw window (SourceFill.ensure_raw). Through the
+; eio shim rather than libc's fseek: that one carries a `long` offset, which is
+; 32-bit on Win64, and one committed seed serves every target, so a single
+; declaration cannot describe both (check 4 of tests/abi/run.sh). The whence
+; argument is the LITERAL 0 (SEEK_SET) at the call site, as EntityCatalog spells
+; its 2 for SEEK_END: a module-level `define` for it would be a second strong
+; symbol for a name `scaly.os.File` already defines.
+function scaly_eio_seek(stream: pointer[OpaqueFile], offset: int, whence: int) returns int extern
+
+; Source locations — Location.cs / InputSource.cs.
+;
+; A Location is the fundamental (origin, index) pair. An Origin is where a run
+; of Chars came from; for an input source it also records refLocation_ — the
+; location in the PARENT source where this source was referenced — so a
+; location resolves back up through nested (pushed) sources via parent().
+;
+; `Origin` models InputSourceOrigin (the only origin kind the port needs); the
+; rest of the C++ hierarchy (Proxy/Bracket/Replacement/NumericCharRef/Entity
+; origins) is folded into it. `InputSource` covers BOTH reference forms: without
+; a SourceFill it is InternalInputSource (its whole Char buffer is in memory),
+; with one it is ExternalInputSource — a decoding WINDOW over its entity that
+; refills a read block at a time. See SourceFill.
+;
+; Origins/sources are referenced by pointer and must outlive the Locations that
+; point at them (one parse region — everything lives to run end). `Index` is u32.
+
+; line_col's "no column" sentinel: the resolved position sits ON a record
+; start (its RS), where onsgmls's columnNumber is 0 and printLocation omits
+; the column field entirely.
+define COL_OMITTED: u32 0xFFFFFFFF
+
+; Record types (ExternalInputSource::recordType_) — how a storage object spells
+; its record boundaries; `lf` translates LF to RE and INSERTS the next record's
+; RS, `cr` inserts one after each CR, `crlf` and `asis` insert nothing (see the
+; record-normalization comment on Parser.make_char_source). The reference's
+; `unknown`/`crUnknown` states are not needed: we hold the object's bytes, so
+; the type is detected once up front (Parser.detect_record_type).
+define RT_LF: int 0
+define RT_CRLF: int 1
+define RT_CR: int 2
+define RT_ASIS: int 3
+; "the record type is not decided yet" — only ever seen by the streaming OPEN
+; path, which detects the type from a PREFIX of the entity and falls back to
+; reading the whole object when the prefix holds no record boundary at all.
+define RT_UNKNOWN: int -1
+
+; The most raw bytes any of the port's coding systems consumes for ONE Char
+; (UTF-8's four, the fixed-width systems' four, EUC's three, SJIS's two) —
+; the lookahead SourceFill.ensure_raw must guarantee ahead of the cursor.
+define RAW_CHAR_MAX: size_t 8
+
+; DocSegment — one storage object of a multi-file document entity
+; (EntityManagerImpl::mergeSystemIds: every file argument becomes one storage
+; object of ONE entity; ExternalInfoImpl keeps the per-object boundaries).
+; `start` is the segment's first index in the shared normalized buffer
+; (== the previous segment's end, ExternalInfoImpl::position_[i-1].endOffset);
+; `starts_with_rs` mirrors startsWithRS — the record-normalization RS pending
+; at the previous file's end flushed as this segment's first char, so line
+; counting subtracts it (the segment's text then starts on ITS line 1);
+; `name` is the per-object actualStorageId a diagnostic in this segment
+; displays; `base_dir` is the found file's directory — the base a relative
+; system id in a declaration WITHIN this segment resolves against
+; (FSIParser's defLoc storage object).
+define DocSegment (start: size_t, starts_with_rs: bool, name: StringC, base_dir: String)
+{
+    init()
+    {
+        start := 0
+        starts_with_rs := false
+        name := StringC()
+        base_dir := String()
+    }
+}
+
+define Location (origin: ref[Origin]?(null), index: u32(0))
+{
+    init()
+    {
+        origin := null
+        index := 0
+    }
+
+    ; ★The parameter MIRRORS the field's nullability, and it has to: the field
+    ; is `ref[Origin]?`, so an init declaring a plain `ref[Origin]` matches no
+    ; construction that passes a nullable origin -- `ref[T]?` IS `Option[ref[T]]`,
+    ; a different type -- and the four call sites below (current_location,
+    ; token_start_location, here_location, and the pinning one at line 436, all
+    ; passing an `InputSource.origin` that is itself `ref[Origin]?`) fell through
+    ; to the positional-tuple path with this body never running. Right only
+    ; because the assignments happen to be in FIELD ORDER; silent otherwise.
+    init(origin: ref[Origin]?, index: u32)
+    {
+        this.origin := origin
+        this.index := index
+    }
+
+    function get_index(this: Location) returns u32
+        index
+
+    function get_origin(this: Location) returns ref[Origin]?
+        origin
+
+    function is_null(this: Location) returns bool
+        origin = null
+
+    ; The location where this location's origin was referenced (walk one level
+    ; up the nesting). A null-origin location's parent is itself null.
+    function parent(this: Location) returns Location
+    {
+        if origin = null
+            return Location()
+
+        (*origin).parent()
+    }
+}
+
+; Origin — Stage-1 InputSourceOrigin. ref_location is the location in the
+; parent source where this source was referenced (empty for the top source).
+;
+; entity_decl == InputSourceOrigin::entityDecl(): the entity whose reference
+; opened this source (null for the document entity / the external DTD subset).
+; ParserState.entity_is_open walks the input stack comparing it by IDENTITY —
+; the recursive-entity-reference guard (Entity::checkNotOpen). Entity is
+; declared in a LATER module and uses Location back, so this is a reference
+; cycle across the module boundary — the `use` at the top of this file is
+; what carries it, and the type needs no cast at either end.
+; file_name is the storage id the reference onsgmls DISPLAYS for a location in
+; this source (MessageReporter::printLocation's actualStorageId): the document
+; path for the top source, the system id for an external DTD subset / text
+; entity. Empty when unknown; a message resolves it by walking up the origin
+; chain to the nearest source that names one. Held here (not on InputSource) so
+; a Location — an (origin,index) pair — can name its file without the buffer.
+;
+; contents/length are the resolved backing source's normalized buffer, stashed
+; here (for a REAL source built by make_char_source) so a diagnostic can compute
+; line/col from a location that resolves to an origin LOWER in the input stack
+; than the current top input — the reference's MessageReporter resolves an
+; entity-internal location up the origin chain to the enclosing source and
+; prints line/col from THAT source's buffer, which is generally not the source
+; being scanned. An internal-entity / parameter-entity / literal-expansion
+; origin (empty file_name) leaves these null: its locations resolve up through
+; parent() to a named source before line/col is ever computed. Lifting only the
+; buffer pointer onto Origin keeps line_col stack-independent (data-model option
+; (a) — see the origin-chain-location task) rather than searching the live stack.
+; ref_length is EntityOrigin::refLength_ — the length of the reference markup
+; (`&name;` / `%name;`) that opened this entity origin, captured at the reference
+; site (parseCommon.cxx: currentLocation().index() + currentTokenLength() −
+; startLocation.index()). MessageReporter::locationHeader adds it to the
+; reference location's index when resolving a location up through this origin, so
+; a diagnostic from inside the entity prints the position JUST PAST the reference
+; in the enclosing source. Zero for a real backing source (no reference).
+; segments — the multi-file document entity's storage-object table (null for
+; every single-file source, which keeps the historical line_col path exactly).
+; unopened marks an EXTERNAL source whose storage object was never opened —
+; the reference's lazy-open InputSourceOrigin carries an ExternalInfo whose
+; position_ table is still empty, so externalize() FAILS and printLocation
+; renders "(invalid location)" WITHOUT resolving up to the reference site
+; (the eager-open port needs the flag to reproduce that stop). The -e walk is
+; unaffected: it prints the "In entity" header off the entity_decl first and
+; then fails the anchor the same way.
+; rs_list — the RS-offset list of a real backing source (ExternalInfoImpl's
+; rsList_): the normalized-buffer indexes that hold a record start (0x0A),
+; appended as the buffer is written. line/col is a BINARY SEARCH over it
+; (convertOffset's rsList_.findPreceding), not a scan of the buffer — the scan
+; it replaced was quadratic under -oline for BACKWARD queries (every AUX line
+; "start tag was here" resolves a position below the last one, which defeated
+; the monotonic resume cache that used to live here) and, more importantly, it
+; is what pinned the whole decoded document in memory.
+;
+; TextChunk — one gathered run of a Text object (Text.h class Text): the chars
+; [start, next chunk's start) of the gathered buffer came from `loc`. A
+; TextInputSourceOrigin (DssslSpecEventHandler.cxx) resolves an offset in the
+; gathered text back to the run's own source via this table (Text::charLocation).
+define TextChunk (start: size_t, var loc: Location)
+{
+    init(start: size_t, loc: Location)
+    {
+        this.start := start
+        this.loc := loc
+    }
+}
+
+; `pinned` is the forwarding pointer of Origin.pin — see the comment there. It
+; is NOT parse state: it stays null for the whole of a parse and is written
+; once, by the pin, when a consumer copies this origin onto a longer-lived
+; host. Kept in the record rather than in a side table because the natural key
+; IS the origin's address, and an address is only unique while the arena that
+; holds it lives — a side table would survive that arena and answer for a
+; recycled address.
+define Origin (var ref_location: Location, var entity_decl: ref[Entity]?(null), var file_name: StringC, var contents: pointer[u32](null), var length: size_t(0), var ref_length: size_t(0), var rs_list: ref[Array[u32]]?(null), var segments: ref[Array[DocSegment]]?(null), var unopened: bool(false), var text_chunks: ref[Array[TextChunk]]?(null), var fill_bounds: ref[Array[size_t]]?(null), var has_text: bool(false), var pinned: ref[Origin]?(null), var entity_marked: bool(false))
+{
+    init()
+    {
+        ref_location := Location()
+        entity_decl := null
+        file_name := StringC()
+        contents := null
+        length := 0
+        ref_length := 0
+        rs_list := null
+        segments := null
+        unopened := false
+        text_chunks := null
+        fill_bounds := null
+        has_text := false
+        pinned := null
+        entity_marked := false
+    }
+
+    init(ref_location: Location)
+    {
+        this.ref_location := ref_location
+        entity_decl := null
+        file_name := StringC()
+        contents := null
+        length := 0
+        ref_length := 0
+        rs_list := null
+        segments := null
+        unopened := false
+        text_chunks := null
+        fill_bounds := null
+        has_text := false
+        pinned := null
+        entity_marked := false
+    }
+
+    init(ref_location: Location, entity_decl: ref[Entity]?)
+    {
+        this.ref_location := ref_location
+        this.entity_decl := entity_decl
+        file_name := StringC()
+        contents := null
+        length := 0
+        ref_length := 0
+        rs_list := null
+        segments := null
+        unopened := false
+        text_chunks := null
+        fill_bounds := null
+        has_text := false
+        pinned := null
+        entity_marked := false
+    }
+
+    ; EntityOrigin::make(entity, refLocation, refLength, markup): an entity origin
+    ; carrying the length of the reference that opened it (for location resolution).
+    init(ref_location: Location, entity_decl: ref[Entity]?, ref_length: size_t)
+    {
+        this.ref_location := ref_location
+        this.entity_decl := entity_decl
+        file_name := StringC()
+        contents := null
+        length := 0
+        this.ref_length := ref_length
+        rs_list := null
+        segments := null
+        unopened := false
+        text_chunks := null
+        fill_bounds := null
+        has_text := false
+        pinned := null
+        entity_marked := false
+    }
+
+    ; EntityOrigin::make(entity, Location()) for a cross-package caller (the
+    ; dazzle spec handler's CONTENT= entity body) — a same-package `sizeof
+    ; Origin` construction cannot be written there (the S50 cross-package
+    ; sizeof trap).
+    function make_entity_origin(host: ref[Page], entity_decl: ref[Entity]?) returns ref[Origin]
+    {
+        let org &Origin^host(Location(), entity_decl)
+        org
+    }
+
+    ; TextInputSourceOrigin::TextInputSourceOrigin(Text &) — an origin over
+    ; gathered text whose per-chunk table maps offsets back to the sources the
+    ; chunks were gathered from (defLocation → Text::charLocation).
+    function make_text(host: ref[Page], chunks: ref[Array[TextChunk]]?) returns ref[Origin]
+    {
+        let org &Origin^host(Location(), null, StringC(), null, 0, 0, null, null, false, chunks, null, false, null, false)
+        org
+    }
+
+    ; --- pinning a location onto a longer-lived host -----------------------
+    ;
+    ; ★A Location is an (origin, index) pair, and an origin lives on the arena
+    ; of the PARSE that produced it. Every consumer that keeps a location past
+    ; its parse — the DSSSL spec handler keeps one per gathered text chunk, so
+    ; a runtime diagnostic in the assembled Scheme resolves back into the
+    ; original `.dsl`/`.scm` line — must therefore COPY the chain onto its own
+    ; host first. pin() is that copy, and it is a copy of the chain, because
+    ; resolve_chain walks parent() up to the first origin with a real backing
+    ; source and reads line/col off THAT one.
+    ;
+    ; What is copied is exactly what a POST-parse reader touches: file_name,
+    ; length, ref_length, unopened, has_text, rs_list, segments, fill_bounds
+    ; (line_col + file_name_at + on_segment_leading_rs) and the parent chain.
+    ; Two fields are deliberately NOT carried over, and both would be a stale
+    ; pointer into the released arena rather than data:
+    ;   * `contents` — the whole decoded buffer. line_col computes off rs_list
+    ;     alone; the only readers of get_contents() are the parse itself (the
+    ;     catalog sub-parse and the InputSource clone). Dropped to null, which
+    ;     is exactly the shape a STREAMING source already has.
+    ;   * `entity_decl` — an Entity on the parse arena. The one post-parse
+    ;     reader needs the PROPERTY, not the entity (resolve_chain's index
+    ;     arithmetic: an entity origin re-anchors past the reference, a plain
+    ;     one adds through), so the copy carries `entity_marked` and leaves the
+    ;     pointer null — see is_entity_origin. The parse-side walk that really
+    ;     does dereference it (resolve_location_open's "In entity" header)
+    ;     never sees a pinned origin, and would get a null it already handles
+    ;     if it ever did.
+    ;
+    ; The memo is the `pinned` field of the SOURCE origin (a forwarding
+    ; pointer): the chunk table of one body element holds hundreds of thousands
+    ; of locations over a few thousand distinct origins, so the lookup has to be
+    ; O(1), and the field dies with the arena it lives on — which is the only
+    ; correct lifetime for a memo keyed on an address. A pinned copy forwards to
+    ; ITSELF, so pinning an already-pinned location is the identity.
+    procedure pin(host: ref[Page], mutable o: ref[Origin]?) returns ref[Origin]?
+    {
+        if o = null
+            return null
+        if o.pinned <> null
+            return o.pinned
+        let c host.allocate(sizeof Origin, alignof Origin) as pointer[Origin]
+        ; publish the forwarding pointer BEFORE recursing, so the walk
+        ; terminates even if a chain were ever to close on itself
+        o.pinned := c
+        c.pinned := c
+        c.contents := null
+        c.entity_decl := null
+        c.entity_marked := o.is_entity_origin()
+        c.length := o.length
+        c.ref_length := o.ref_length
+        c.unopened := o.unopened
+        c.has_text := o.has_text
+        c.file_name := StringC()
+        if o.file_name.get_size() > 0
+            c.file_name := StringC^host(o.file_name.as_slice())
+        c.rs_list := null
+        if o.rs_list <> null
+        {
+            let rl Array[u32]^host()
+            let rn o.rs_list.get_length()
+            var ri: size_t 0
+            while ri < rn
+            {
+                rl.add(o.rs_list[ri])
+                ri := ri + 1
+            }
+            c.rs_list := rl
+        }
+        c.fill_bounds := null
+        if o.fill_bounds <> null
+        {
+            let fl Array[size_t]^host()
+            let fn o.fill_bounds.get_length()
+            var fi: size_t 0
+            while fi < fn
+            {
+                fl.add(o.fill_bounds[fi])
+                fi := fi + 1
+            }
+            c.fill_bounds := fl
+        }
+        c.segments := null
+        if o.segments <> null
+        {
+            let sl Array[DocSegment]^host()
+            let sn o.segments.get_length()
+            var si: size_t 0
+            while si < sn
+            {
+                let sg o.segments[si]
+                var sc DocSegment()
+                sc.start := sg.start
+                sc.starts_with_rs := sg.starts_with_rs
+                sc.name := StringC()
+                if sg.name.get_size() > 0
+                    sc.name := StringC^host(sg.name.as_slice())
+                sc.base_dir := String^host(sg.base_dir)
+                sl.add(sc)
+                si := si + 1
+            }
+            c.segments := sl
+        }
+        c.text_chunks := null
+        if o.text_chunks <> null
+        {
+            let tl Array[TextChunk]^host()
+            let tn o.text_chunks.get_length()
+            var ti: size_t 0
+            while ti < tn
+            {
+                ; copy + overwrite, never a fresh TextChunk(...) in argument
+                ; position — that construction is region-allocated per element
+                var ch o.text_chunks[ti]
+                ch.loc := Origin.pin_location(host, ch.loc)
+                tl.add(ch)
+                ti := ti + 1
+            }
+            c.text_chunks := tl
+        }
+        c.ref_location := Origin.pin_location(host, o.ref_location)
+        c
+    }
+
+    ; ★The forwarding-pointer HIT is the hot half — one gathered body element
+    ; pins hundreds of thousands of chunk locations over a few thousand
+    ; distinct origins — so it lives here, in a body small enough to inline,
+    ; and only the miss calls the copy. (One construction of the returned
+    ; Location, per the small-struct return rule.)
+    procedure pin_location(host: ref[Page], mutable loc: Location) returns Location
+    {
+        let o loc.get_origin()
+        var po: ref[Origin]? null
+        if o <> null
+            po := o.pinned
+        if po = null
+            po := Origin.pin(host, o)
+        Location(po, loc.get_index())
+    }
+
+    function get_text_chunks(this: Origin) returns ref[Array[TextChunk]]?
+        text_chunks
+
+    ; resolve_chain — the parser-free half of ParserState.resolve_location (the
+    ; MessageReporter::locationHeader origin walk): resolve `loc` up the origin
+    ; chain to the first origin with a real backing source and compute its
+    ; line/col. The dazzle style engine reports interpreter diagnostics through
+    ; this walk (its Messenger has no parser input stack to fall back to — an
+    ; unresolvable chain returns null and the caller renders the reference's
+    ; "(invalid location)"). Adds the TextInputSourceOrigin arm: a text origin
+    ; maps the offset through its chunk table to the chunk's own source
+    ; (defLocation → Text::charLocation) and the walk continues from there.
+    ; Keep the walk arms in step with resolve_location — that body is byte-
+    ; validated by the onsgmls corpus and stays untouched (it can never see a
+    ; text origin: only gathered style-specification bodies build one).
+    procedure resolve_chain(loc: Location, rs_next_line: bool, mutable out_line: ref[u32], mutable out_col: ref[u32], mutable out_index: ref[size_t]) returns ref[Origin]?
+    {
+        var index loc.get_index()
+        var org loc.get_origin()
+        var resolved: ref[Origin]? null
+        var walking true
+        while walking
+        {
+            if org = null
+                walking := false
+            else if org.get_has_text()
+            {
+                resolved := org
+                walking := false
+            }
+            else if org.is_unopened()
+                walking := false
+            else if org.get_text_chunks() <> null
+            {
+                ; Text::charLocation: the LAST chunk whose start <= index owns
+                ; the offset; re-anchor at the chunk's own source location.
+                let chunks org.get_text_chunks()
+                let n chunks.get_length()
+                if n = 0
+                    walking := false
+                else
+                {
+                    var best: size_t 0
+                    var k: size_t 0
+                    while k < n
+                    {
+                        let ch chunks[k]
+                        if ch.start <= (index as size_t)
+                            best := k
+                        k := k + 1
+                    }
+                    let ch chunks[best]
+                    let cloc ch.loc
+                    if cloc.get_origin() = null
+                        walking := false
+                    else
+                    {
+                        index := cloc.get_index() + (((index as size_t) - ch.start) as u32)
+                        org := cloc.get_origin()
+                    }
+                }
+            }
+            else
+            {
+                let par org.parent()
+                if par.get_origin() = null
+                    walking := false
+                else
+                {
+                    if org.is_entity_origin()
+                        index := par.get_index() + (org.get_ref_length() as u32)
+                    else
+                        index := index + par.get_index()
+                    org := par.get_origin()
+                }
+            }
+        }
+        out_index := index as size_t
+        if resolved <> null
+        {
+            resolved.line_col(index as size_t, rs_next_line, out_line, out_col)
+            return resolved
+        }
+        out_line := 0
+        out_col := 0
+        null
+    }
+
+    function is_unopened(this: Origin) returns bool
+        unopened
+
+    procedure set_unopened(mutable this: ref[Origin])
+        this.unopened := true
+
+    ; Origin.parent() == InputSourceOriginImpl.parent() => refLocation_.
+    function parent(this: Origin) returns Location
+        ref_location
+
+    function get_entity_decl(this: Origin) returns ref[Entity]?
+        entity_decl
+
+    ; "this origin was opened by an entity reference" — the property, as
+    ; opposed to the entity itself. A PINNED origin (Origin.pin) has the
+    ; property without the pointer: its Entity lives on the released parse
+    ; arena, and the only post-parse reader of the field is the index
+    ; arithmetic in resolve_chain, which needs the bit and not the entity.
+    ; So the copy carries the bit and leaves entity_decl NULL — a later
+    ; reader that does dereference it (resolve_location_open's "In entity"
+    ; walk, which is parse-side and never sees a pinned origin) then gets a
+    ; null it must already handle, not freed memory.
+    function is_entity_origin(this: Origin) returns bool
+    {
+        if entity_decl <> null
+            return true
+        entity_marked
+    }
+
+    function get_ref_location(this: Origin) returns Location
+        ref_location
+
+    function get_ref_length(this: Origin) returns size_t
+        ref_length
+
+    function get_file_name(this: Origin) returns StringC
+        file_name
+
+    procedure set_file_name(mutable this: ref[Origin], name: StringC)
+        this.file_name := name
+
+    ; the normalized buffer as a view — `contents` paired with `length`, so
+    ; a reader never spells the pair itself (the window fields stay a pointer
+    ; and a length: the scan cursor walks them by arithmetic).
+    function get_contents(this: Origin) returns Slice[u32]
+        Slice[u32](length, contents)
+
+    ; the normalized buffer's length — 0 for an EMPTY entity, which never got
+    ; its synthetic leading RS (make_char_source flushes it before the first
+    ; Char only). The column-omission rule keys on this: index 0 of a
+    ; non-empty buffer sits ON the inserted RS (columnNumber 0 — onsgmls
+    ; omits the column), while index 0 of an empty buffer is a real position
+    ; rendered as column 0 (`file:1:0:E: end of document in prolog`).
+    function get_buf_length(this: Origin) returns size_t
+        length
+
+    ; make_char_source hands the finished normalized buffer to its origin so a
+    ; resolved location can be turned into line/col without the InputSource.
+    ; The RS-offset list arrives WITH the buffer, never separately: line_col
+    ; reads line/col out of the list alone, so a buffer without one would
+    ; silently report every position as line 1.
+    procedure set_buffer(mutable this: ref[Origin], buf: Slice[u32], rs: ref[Array[u32]])
+    {
+        this.contents := buf.data
+        this.length := buf.length
+        this.rs_list := rs
+        this.has_text := true
+    }
+
+    ; the STREAMING counterpart of set_buffer: a windowed source has text but no
+    ; whole buffer, so `contents` stays null and `length` grows with each fill.
+    ; The two tables arrive empty and are appended to as the entity decodes.
+    procedure set_stream(mutable this: ref[Origin], rs: ref[Array[u32]], bounds: ref[Array[size_t]])
+    {
+        this.contents := null
+        this.length := 0
+        this.rs_list := rs
+        this.fill_bounds := bounds
+        this.has_text := true
+    }
+
+    ; how far the entity has been decoded (the reference's bufLimOffset_ seen
+    ; from the origin). Never shrinks within one pass.
+    procedure note_decoded(mutable this: ref[Origin], n: size_t)
+    {
+        if n > this.length
+            this.length := n
+    }
+
+    ; noteRS: `idx` holds a record start. Called by fill for every 0x0A it
+    ; wrote — collected by a scan of the freshly written window range, for the
+    ; same reason build_rs_list scans (the `crlf` record type deletes a trailing
+    ; record start again, and finished bytes cannot disagree with themselves).
+    procedure append_rs(mutable this: ref[Origin], idx: size_t)
+    {
+        if this.rs_list = null
+            return
+        this.rs_list.add(idx as u32)
+    }
+
+    procedure note_bound(mutable this: ref[Origin], idx: size_t)
+    {
+        if this.fill_bounds = null
+            return
+        this.fill_bounds.add(idx)
+    }
+
+    ; rewind (ExternalInputSource::rewind, which installs a FRESH
+    ; ExternalInfoImpl): the pass-2 re-parse decodes the entity again from the
+    ; start, so both tables and the decoded length start over. Their contents
+    ; are a function of the bytes alone, so pass 2 rebuilds them identically.
+    procedure reset_text(mutable this: ref[Origin])
+    {
+        this.length := 0
+        if this.rs_list <> null
+            this.rs_list.clear()
+        if this.fill_bounds <> null
+            this.fill_bounds.clear()
+    }
+
+    function get_rs_list(this: Origin) returns ref[Array[u32]]
+        rs_list as ref[Array[u32]]
+
+    ; whether this origin HAS a backing source at all — the reference's
+    ; `externalInfo() != 0`. The origin-chain walks resolve a location to the
+    ; first origin that answers true; an internal-entity / parameter-entity /
+    ; literal-expansion origin answers false and its locations resolve one
+    ; level up. This is deliberately NOT "get_contents() <> null": a streaming
+    ; source holds only a WINDOW of its entity, so it has text without having
+    ; the whole buffer.
+    function get_has_text(this: Origin) returns bool
+        has_text
+
+    ; The normalized-buffer indexes where the reference's ExternalInputSource
+    ; would have started a fresh read block (fill() reads 8192 raw bytes at a
+    ; time) — a data token never crosses one (extendData stops at the buffer
+    ; end), which is observable through the grove's data-chunk boundaries.
+    procedure set_fill_bounds(mutable this: ref[Origin], bounds: ref[Array[size_t]]?)
+        this.fill_bounds := bounds
+
+    function get_fill_bounds(this: Origin) returns ref[Array[size_t]]?
+        fill_bounds
+
+    ; ---- the multi-file storage-object table (mergeSystemIds) --------------
+    procedure set_segments(mutable this: ref[Origin], segs: ref[Array[DocSegment]]?)
+        this.segments := segs
+
+    function has_segments(this: Origin) returns bool
+        segments <> null
+
+    ; the storage object `index` sits in: the LAST segment whose start is
+    ; <= index — an empty segment (equal starts) is never selected, exactly
+    ; like ExternalInfoImpl::convertOffset's `off >= endOffset` skip.
+    function segment_index_at(this: Origin, index: size_t) returns size_t
+    {
+        var best: size_t 0
+        if segments = null
+            return best
+        let n segments.get_length()
+        var k: size_t 0
+        while k < n
+        {
+            let sg segments[k]
+            if sg.start <= index
+                best := k
+            k := k + 1
+        }
+        best
+    }
+
+    ; the actualStorageId a diagnostic at `index` displays — the segment's
+    ; found path for a multi-file document, the origin's single storage id
+    ; otherwise.
+    function file_name_at(this: Origin, index: size_t) returns StringC
+    {
+        if segments = null
+            return file_name
+        if segments.get_length() = 0
+            return file_name
+        let sg segments[this.segment_index_at(index)]
+        sg.name
+    }
+
+    ; the directory a relative system id in a declaration at `index` resolves
+    ; against (the defLoc storage object's base). Empty when unsegmented —
+    ; the caller falls back to its stored base.
+    function base_dir_at(this: Origin, index: size_t) returns String
+    {
+        if segments = null
+            return String()
+        if segments.get_length() = 0
+            return String()
+        let sg segments[this.segment_index_at(index)]
+        sg.base_dir
+    }
+
+    ; the multi-file analogue of the buffer-index-0 rule: the position sits ON
+    ; a segment's leading INSERTED RS — line 1, columnNumber 0 of its storage
+    ; object, so printLocation omits the column.
+    function on_segment_leading_rs(this: Origin, index: size_t) returns bool
+    {
+        if segments = null
+            return false
+        if segments.get_length() = 0
+            return false
+        let sg segments[this.segment_index_at(index)]
+        if sg.starts_with_rs = false
+            return false
+        index = sg.start
+    }
+
+    ; the first RS-list position whose offset is >= `v` (findPreceding's binary
+    ; search). Answers the list LENGTH when every offset is smaller.
+    function rs_lower_bound(this: Origin, v: size_t) returns size_t
+    {
+        if rs_list = null
+            return 0
+        var lo: size_t 0
+        var hi rs_list.get_length()
+        while lo < hi
+        {
+            let mid lo + ((hi - lo) / 2)
+            if (rs_list[mid] as size_t) < v
+                lo := mid + 1
+            else
+                hi := mid
+        }
+        lo
+    }
+
+    ; line/col of the char at `index` in this origin's entity — the same
+    ; RS-counting rule as InputSource.line_col (see there), computed from the
+    ; RS-offset list so a diagnostic resolving to this origin (which may be
+    ; below the current top input, and whose chars may already have left the
+    ; window) prints the position onsgmls prints.
+    ;
+    ; `rs_next_line` selects onsgmls's rendering of an index sitting ON an
+    ; inserted RS (a record-start position — e.g. refLocation+refLength of an
+    ; entity referenced by a shortref whose delimiter is the RE):
+    ;   false — a MAIN message: the previous record's line, col one past its
+    ;           RE (verified: `9:9:E: document type does not allow ...`);
+    ;   true  — an AUX line (`start tag was here`): the line the RS opens,
+    ;           columnNumber 0 → COL_OMITTED (verified: `file:10: start ...`).
+    ;
+    ; ★A pushed-back char (`&#RS;` — push_char_ref) needs no exclusion list any
+    ; more: it OVERWRITES a dead slot in the shared buffer AFTER normalization,
+    ; so it never enters the RS list, where the scan this replaced saw it and
+    ; had to skip it explicitly. The reverse hazard — a push overwriting a slot
+    ; that IS in the list, which would leave a stale record start — cannot
+    ; happen: the overwritten slot holds the last char the reference consumed
+    ; (refMode recognizes REFC `;` and RE 0x0D only, and a zero-length refMode
+    ; token leaves a NAME char there), never an RS.
+    procedure line_col(this: Origin, index: size_t, rs_next_line: bool, mutable out_line: ref[u32], mutable out_col: ref[u32])
+    {
+        if has_text = false
+        {
+            out_line := 0
+            out_col := 0
+            return
+        }
+        ; multi-file document entity: line/col restart per storage object
+        ; (ExternalInfoImpl::convertOffset — `lineNumber = j - line1RS + 1 -
+        ; startsWithRS`, colStart clamped to the object's start offset). The
+        ; single-file source is the degenerate one-segment case: its leading
+        ; inserted RS (present whenever the buffer is non-empty) is the
+        ; swr=1 the historical `line = <RS count>` convention subtracted
+        ; implicitly, so the segmentless path stays byte-identical.
+        var seg_start: size_t 0
+        var swr: u32 0
+        if segments <> null
+        {
+            if segments.get_length() > 0
+            {
+                let sg segments[this.segment_index_at(index)]
+                seg_start := sg.start
+                if sg.starts_with_rs
+                    swr := 1
+            }
+            else if length > 0
+                swr := 1
+        }
+        else if length > 0
+            swr := 1
+        var n index
+        if n > length
+            n := length
+        ; convertOffset over rsList_: the record starts in [seg_start, n) are
+        ; one contiguous RUN of the list, so two binary searches give both the
+        ; line count and the last record start (the column origin).
+        let lo this.rs_lower_bound(seg_start)
+        let hi this.rs_lower_bound(n)
+        var line (hi - lo) as u32
+        var last_rs: size_t seg_start
+        if hi > lo
+            last_rs := (rs_list[(hi - 1)] as size_t) + 1
+        if rs_next_line and (index < length)
+        {
+            ; index < length means n == index, so `hi` is the first list entry
+            ; at or after index — the position IS a record start iff it hits.
+            if rs_list <> null
+            {
+                if hi < rs_list.get_length()
+                {
+                    if (rs_list[hi] as size_t) = index
+                    {
+                        out_line := (line + 2) - swr
+                        out_col := COL_OMITTED
+                        return
+                    }
+                }
+            }
+        }
+        line := (line + 1) - swr
+        if line = 0
+            line := 1
+        out_line := line
+        out_col := (index - last_rs) as u32
+    }
+}
+
+; SourceFill — the streaming half of an InputSource (ExternalInputSource's
+; decoder + read-block state). A source WITHOUT one is the reference's
+; InternalInputSource: its whole Char buffer is in memory already and fill()
+; answers end-of-entity. WITH one, the source holds only a WINDOW of its
+; entity — fill() decodes the next read block of raw bytes into the window,
+; record-normalizes them and slides the window forward, so a 13 MB document
+; costs one window plus an RS-offset list instead of 4 bytes per char (plus the
+; same again in worst-case reserve) for the whole text.
+;
+; The two one-shot pre-passes stay OUTSIDE, in Parser: `resolve_input`'s decoder
+; split (cs_first up to switch_at, cs_rest after, raw_start bytes skipped for a
+; BOM / XML declaration) and the record type. Both need CodingSystemKit, which
+; is declared AFTER this module; everything fill() itself needs is a plain
+; CodingSystem method.
+;
+; `raw` must OUTLIVE the source — the entity is decoded from it for the whole
+; parse, not once at open time.
+; `next_bound` is the next RAW BYTE offset that opens a read block, counted
+; from byte 0 of the object (not from raw_start), because that is where the
+; reference's fill() boundaries fall; the origin's fill_bounds records the
+; normalized index each block starts at.
+;
+; --- the two RAW shapes -------------------------------------------------------
+; `raw` is either the WHOLE entity in memory (`fp` null: an internal entity, a
+; literal, stdin, a merged multi-file document) or a WINDOW of a file that stays
+; on disk (`fp` non-null: PosixStorageObject::read). In the in-memory shape
+; raw_base is 0 and raw_valid is raw_len, so every index below is an entity
+; offset that indexes `raw` directly — that is why the decode loop reads
+; identically for both.
+; In the file shape `raw` is a reusable window (its `length` is the capacity) holding
+; raw_valid bytes of the entity starting at entity offset raw_base; ensure_raw
+; slides it. `path` is kept so a REWIND can reopen the entity after fp was
+; closed at end of entity (the fd is not held for the whole parse — a document
+; with hundreds of external entities would otherwise run the process out).
+define SourceFill (host: ref[Page], raw: Slice[u8], raw_len: size_t, raw_start: size_t, var raw_pos: size_t, cs_first: CodingSystem, switch_at: size_t, cs_rest: CodingSystem, rt: int, var pending: bool, block: size_t, var next_bound: size_t, var win_cap: size_t, var fp: pointer[OpaqueFile], path: String, var raw_base: size_t, var raw_valid: size_t)
+{
+    init(host: ref[Page], raw: Slice[u8], raw_len: size_t, raw_start: size_t, raw_pos: size_t, cs_first: CodingSystem, switch_at: size_t, cs_rest: CodingSystem, rt: int, pending: bool, block: size_t, next_bound: size_t, win_cap: size_t, fp: pointer[OpaqueFile], path: String, raw_base: size_t, raw_valid: size_t)
+    {
+        this.host := host
+        this.raw := raw
+        this.raw_len := raw_len
+        this.raw_start := raw_start
+        this.raw_pos := raw_pos
+        this.cs_first := cs_first
+        this.switch_at := switch_at
+        this.cs_rest := cs_rest
+        this.rt := rt
+        this.pending := pending
+        this.block := block
+        this.next_bound := next_bound
+        this.win_cap := win_cap
+        this.fp := fp
+        this.path := path
+        this.raw_base := raw_base
+        this.raw_valid := raw_valid
+    }
+
+    ; Make the entity bytes at [pos, pos+want) present in the raw window,
+    ; clipped to the entity end. A NO-OP for an in-memory source: its window IS
+    ; the entity, so the caller's guard never fires. For a file source this is
+    ; PosixStorageObject::read — one seek + one buffer fill; the buffer is
+    ; several read blocks wide so a per-block fill() does not mean a syscall per
+    ; block.
+    procedure ensure_raw(mutable this: ref[SourceFill], pos: size_t, want: size_t)
+    {
+        if this.fp = null
+            return
+        if pos >= this.raw_base
+        {
+            var need want
+            if (pos + need) > this.raw_len
+                need := this.raw_len - pos
+            if (pos + need) <= (this.raw_base + this.raw_valid)
+                return
+        }
+        let sought scaly_eio_seek(this.fp, pos as i64, 0)
+        let got fread(this.raw.data as pointer[void], 1 as size_t, this.raw.length, this.fp)
+        this.raw_base := pos
+        this.raw_valid := got
+    }
+
+    ; End of entity: give the descriptor back (the reference's StorageObject dies
+    ; with the input source). Idempotent — fill() reaches the end once, but a
+    ; rewound source can end again.
+    ; A source ABANDONED before its end (`-p` stops after the prolog; an error
+    ; limit ends the parse) keeps its descriptor until the process exits. That is
+    ; bounded by the number of entities open at once, not by their count, because
+    ; every entity a parse actually finishes closes here.
+    procedure close_raw(mutable this: ref[SourceFill])
+    {
+        if this.fp = null
+            return
+        let closed fclose(this.fp)
+        this.fp := null
+    }
+}
+
+; InputSource — in-memory Char buffer with an origin. current_location(index)
+; is the Location of the char at `index`; char_at reads it. (Stage 2 adds the
+; streaming fill()/get() cursor and record normalization.)
+;
+; Increment-B scanner cursor (InputSource.cs): the Recognizer scans a token by
+; repeatedly advancing `cur_index` (`token_char`), then commits the recognized
+; length with `end_token`. `start_token_no_multicode` marks the token start
+; (the reference syntax is single-code, so the multicode/scanSuppress path is
+; not needed). `token_char` yields the signed end-of-entity sentinel eE (-1)
+; past the buffer end — the recognizer maps eE to equiv code 0 (tokenEe).
+; ALL indexes on an InputSource are ABSOLUTE entity offsets (they ARE Location
+; indexes). `contents` is the window, `win_start` the absolute index of its
+; first slot, so a char lives at `contents + (index - win_start)`. An in-memory
+; source has win_start 0 and a window that spans the whole entity, which is why
+; every access below reads identically for it.
+define InputSource (origin: ref[Origin]?(null), var contents: pointer[u32](null), var length: size_t(0), var start_index: size_t(0), var cur_index: size_t(0), var end_index: size_t(0), var start_loc_index: u32(0), var win_start: size_t(0), var fill_st: ref[SourceFill]?(null))
+{
+    init(origin: ref[Origin]?, buf: Slice[u32])
+    {
+        this.origin := origin
+        this.contents := buf.data
+        this.length := buf.length
+        start_index := 0
+        cur_index := 0
+        end_index := buf.length
+        start_loc_index := 0
+        win_start := 0
+        fill_st := null
+    }
+
+    ; the EMPTY source -- an entity whose text is missing or vanished between
+    ; two passes: no buffer, every index 0. This is the `(null, 0)` pair the
+    ; buffer init used to be handed; a `Slice` has no null to hand.
+    init(origin: ref[Origin]?)
+    {
+        this.origin := origin
+        this.contents := null
+        this.length := 0
+        start_index := 0
+        cur_index := 0
+        end_index := 0
+        start_loc_index := 0
+        win_start := 0
+        fill_st := null
+    }
+
+    ; page-hosted factory — cross-package callers (the dazzle SchemeParser
+    ; reads through InputSources) must allocate HERE: a cross-package
+    ; `sizeof InputSource` at the call site miscompiles (the S50 lesson).
+    function make(host: ref[Page], origin: ref[Origin]?, buf: Slice[u32]) returns ref[InputSource]
+    {
+        let src &InputSource^host(origin, buf)
+        src
+    }
+
+    ; ExternalInputSource: a source that decodes its entity on demand. Nothing
+    ; is decoded here — the first get/token_char fills the window. `raw_start`
+    ; is the first byte to decode (past a BOM or the XML declaration the guessed
+    ; decoder already read), `rt` the record type, `block` the storage object's
+    ; read-block size. See SourceFill for why the pre-passes are the caller's.
+    procedure make_stream(host: ref[Page], mutable origin: ref[Origin]?, raw: Slice[u8], raw_start: size_t, cs_first: CodingSystem, switch_at: size_t, cs_rest: CodingSystem, rt: int, block: size_t) returns ref[InputSource]
+    {
+        let f &SourceFill^host(host, raw, raw.length, raw_start, raw_start, cs_first, switch_at, cs_rest, rt, true, block, block, 0, null as pointer[OpaqueFile], String(), 0, raw.length)
+        let src &InputSource^host(origin)
+        src.fill_st := f
+        src
+    }
+
+    ; ...and the FILE-backed form: the entity stays on disk and `raw` is a
+    ; reusable window (`raw.length` bytes) already holding `raw_valid` bytes from
+    ; offset 0 (the prefix the caller read for the decoder/record-type
+    ; pre-passes). `path` lets a rewind reopen after end of entity closes fp.
+    procedure make_stream_file(host: ref[Page], mutable origin: ref[Origin]?, raw: Slice[u8], raw_valid: size_t, raw_len: size_t, fp: pointer[OpaqueFile], path: String, raw_start: size_t, cs_first: CodingSystem, switch_at: size_t, cs_rest: CodingSystem, rt: int, block: size_t) returns ref[InputSource]
+    {
+        let f &SourceFill^host(host, raw, raw_len, raw_start, raw_start, cs_first, switch_at, cs_rest, rt, true, block, block, 0, fp, path, 0, raw_valid)
+        let src &InputSource^host(origin)
+        src.fill_st := f
+        src
+    }
+
+    ; rewind + re-get (maybeStartPass2's ExternalInputSource::rewind): a FRESH
+    ; source over the same entity, positioned at `index`. A streaming source
+    ; re-decodes from the start to get there (`pass2StartOffset` chars, exactly
+    ; the reference's route — which is also why no byte<->char offset table is
+    ; needed); an in-memory one just moves its cursor.
+    procedure make_rewound(host: ref[Page], mutable old: ref[InputSource], index: size_t) returns ref[InputSource]?
+    {
+        let f old.fill_st
+        if f = null
+        {
+            let view old.get_contents()
+            let src &InputSource^host(old.get_origin(), view)
+            src.advance_to(index)
+            return src
+        }
+        let org old.get_origin()
+        org.reset_text()
+        ; A file-backed source gets a FRESH descriptor and window: its own fp may
+        ; already be closed (end of entity), and two live sources sharing one file
+        ; position would have each one's fill move the other's. The pre-pass
+        ; results (decoder split, record type) are carried over, not recomputed.
+        var src: ref[InputSource]? null
+        if f.path.get_length() > 0
+        {
+            let rfp fopen(f.path.to_c_string(), "rb")
+            if rfp <> null
+            {
+                let rbuf allocate_slice[u8](host, f.raw.length)
+                let rgot fread(rbuf.data as pointer[void], 1 as size_t, rbuf.length, rfp)
+                src := InputSource.make_stream_file(host, org, rbuf, rgot, f.raw_len, rfp, f.path, f.raw_start, f.cs_first, f.switch_at, f.cs_rest, f.rt, f.block)
+            }
+            else
+            {
+                ; the entity vanished between the two passes. `f.raw` is only a
+                ; WINDOW here, so re-decoding from it would silently parse the
+                ; wrong bytes — answer an EMPTY source instead.
+                src := host.allocate(sizeof InputSource, alignof InputSource) as pointer[InputSource]
+                *src := InputSource(org)
+                return src
+            }
+        }
+        else
+            src := InputSource.make_stream(host, org, f.raw, f.raw_start, f.cs_first, f.switch_at, f.cs_rest, f.rt, f.block)
+        ; re-get the skipped prefix. start_index tracks the cursor so the window
+        ; keeps nothing: this is a discard, not a token.
+        var filling true
+        while filling
+        {
+            if src.get_length() >= index
+                filling := false
+            else
+            {
+                ; bind the chained call before handing it on (the documented
+                ; parenless-chained-argument hazard).
+                let at src.get_length()
+                src.advance_to(at)
+                if src.fill() = false
+                    filling := false
+            }
+        }
+        src.advance_to(index)
+        src
+    }
+
+    function get_length(this: InputSource) returns size_t
+        length
+
+    function get_origin(this: InputSource) returns ref[Origin]?
+        origin
+
+    ; the scan cursor's absolute buffer index — how far reading has advanced
+    ; (the multi-file document's pending-open flush compares boundaries
+    ; against the BOTTOM input's cursor).
+    function get_cur_index(this: InputSource) returns size_t
+        cur_index
+
+    ; the window as a view; its indexes are window-relative, so only an
+    ; in-memory source (win_start 0) may index it by absolute entity offset.
+    function get_contents(this: InputSource) returns Slice[u32]
+        Slice[u32](length, contents)
+
+    ; position the (fresh) source at an absolute buffer index — the pass-2
+    ; rewind point (the reference rewinds the source and re-gets
+    ; pass2StartOffset chars; our Location indices are absolute, so the
+    ; cursor and location jump directly).
+    procedure advance_to(mutable this: ref[InputSource], index: size_t)
+    {
+        this.start_index := index
+        this.cur_index := index
+        this.start_loc_index := index as u32
+    }
+
+    function char_at(this: InputSource, index: size_t) returns u32
+    {
+        if index >= length
+            return 0
+        if index < win_start
+            return 0
+
+        *(contents + (index - win_start))
+    }
+
+    ; the char at an absolute index IF it is still in the window — for the one
+    ; reader that looks BACKWARD past the current token (the attribute-value
+    ; adjacency check in Parser). Answers false once the chars have been decoded
+    ; over; the reference, which holds no more of the entity than we do, has the
+    ; same blind spot.
+    procedure window_char(this: InputSource, index: size_t, mutable out_ch: ref[u32]) returns bool
+    {
+        if index >= length
+            return false
+        if index < win_start
+            return false
+        out_ch := *(contents + (index - win_start))
+        true
+    }
+
+    function current_location(this: InputSource, index: size_t) returns Location
+        Location(origin, index as u32)
+
+    ; line/column of the char at `index` in this source's normalized buffer, for
+    ; diagnostic locations (MessageReporter::printLocation). make_char_source lays
+    ; each record out as an RS (0x0A, record/line start) then its data then an RE
+    ; (0x0D, record end, from a source LF); the entity opens with a leading RS and
+    ; the FINAL record's RS is dropped at end of entity. onsgmls numbers lines by
+    ; record START, so a trailing RE does NOT advance the line (its RS was
+    ; dropped) — matching real onsgmls, which reports e.g. a DOCTYPE-only document
+    ; ending in one newline at line 1, two newlines at line 2:
+    ;   line = number of RS (0x0A) at or before index   (leading RS => line 1)
+    ;   col  = index - (position after the last RS)      0-based
+    ; col is the value onsgmls prints (its 1-based columnNumber minus 1). A BOM was
+    ; stripped at decode, so `index` is a decoded-Char offset, matching onsgmls's
+    ; character-counted column.
+    ;
+    ; Only reachable for a source whose origin has no text of its own (the
+    ; documented-dead pre-resolution fallback in ParserState.resolve_location):
+    ; an origin WITH text answers through its RS-offset list, which is stack-
+    ; independent and does not need the chars. A windowed source therefore never
+    ; arrives here, and the scan below reads its own in-memory buffer.
+    procedure line_col(this: InputSource, index: size_t, rs_next_line: bool, mutable out_line: ref[u32], mutable out_col: ref[u32])
+    {
+        if origin <> null
+        {
+            if origin.get_has_text()
+            {
+                origin.line_col(index, rs_next_line, out_line, out_col)
+                return
+            }
+        }
+        var line: u32 0
+        var last_rs: size_t 0
+        var i: size_t win_start
+        var n index
+        if n > length
+            n := length
+        while i < n
+        {
+            if *(contents + (i - win_start)) = 0x0A
+            {
+                line := line + 1
+                last_rs := i + 1
+            }
+            i := i + 1
+        }
+        ; rs_next_line: an index ON an RS renders as the line that RS opens,
+        ; column omitted — the AUX-line rule; see Origin.line_col.
+        if rs_next_line and (index < length)
+        {
+            if index >= win_start
+            {
+                if *(contents + (index - win_start)) = 0x0A
+                {
+                    out_line := line + 1
+                    out_col := COL_OMITTED
+                    return
+                }
+            }
+        }
+        if line = 0
+            line := 1
+        out_line := line
+        out_col := (index - last_rs) as u32
+    }
+
+    ; --- token-scanning cursor (multicode=false path) ---
+
+    ; void startTokenNoMulticode(): commit any consumed chars to the start
+    ; location, then anchor the new token at the current position.
+    procedure start_token_no_multicode(mutable this: InputSource)
+    {
+        start_loc_index := start_loc_index + ((cur_index - start_index) as u32)
+        start_index := cur_index
+    }
+
+    ; Xchar tokenChar(Messenger&): next char, advancing the cursor; at the end of
+    ; what is decoded it fills, and eE (-1) once the entity is exhausted (fill()
+    ; of an internal source returns eE straight away).
+    ; The refill is a separate function on purpose: token_char is THE hot loop
+    ; of the parser (one call per document char), and keeping fill out of its
+    ; body keeps the fast path a load and an increment.
+    procedure token_char(mutable this: InputSource) returns i32
+    {
+        if cur_index < end_index
+        {
+            let c *(contents + (cur_index - win_start)) as i32
+            cur_index := cur_index + 1
+            return c
+        }
+        this.token_char_refill()
+    }
+
+    ; Xchar tokenCharInBuffer(Messenger &) (InputSource.h:135) — the same read
+    ; WITHOUT the refill: at the window end it answers the end-of-entity
+    ; sentinel instead of pulling the next block. `extendData`'s inner loop
+    ; runs on this so a data run never blocks on I/O mid-scan; the caller
+    ; resumes the run after the refill that the next token_char does.
+    ; -1 is the eE marker XcharMap.get maps to its index-0 slot, exactly as
+    ; the reference's `eE` indexes the extra slot of its XcharMap.
+    procedure token_char_in_buffer(mutable this: InputSource) returns i32
+    {
+        if cur_index < end_index
+        {
+            let c *(contents + (cur_index - win_start)) as i32
+            cur_index := cur_index + 1
+            return c
+        }
+        -1
+    }
+
+    procedure token_char_refill(mutable this: InputSource) returns i32
+    {
+        if fill_st = null
+            return -1
+        if this.fill() = false
+            return -1
+        if cur_index < end_index
+        {
+            let c *(contents + (cur_index - win_start)) as i32
+            cur_index := cur_index + 1
+            return c
+        }
+        -1
+    }
+
+    ; fill (ExternalInputSource::fill): decode the entity's next read block into
+    ; the window, record-normalize it and extend the scan limit. Returns false at
+    ; end of entity — a record start still pending there is DROPPED, exactly as
+    ; the reference's fill returns eE without flushing insertRS_, which is why a
+    ; file ending in a newline ends with RE and not RE RS.
+    ;
+    ; The normalization is the same code the eager
+    ; Parser.normalize_append_bounds_cs runs, one read block at a time; keep the
+    ; two in step. Every write goes through `out - win_start`, and the window is
+    ; sized so one block always fits after the kept prefix.
+    procedure fill(mutable this: InputSource) returns bool
+    {
+        let f fill_st
+        if f = null
+            return false
+        if f.raw_pos >= f.raw_len
+            return false
+
+        ; --- room for one more block ---------------------------------------
+        ; keep what the scanner may still look at: the current token, whatever
+        ; it has read past it, and ONE char of slack in front — the slot
+        ; push_char_ref overwrites.
+        var keep_from start_index
+        if keep_from > 0
+            keep_from := keep_from - 1
+        if keep_from < win_start
+            keep_from := win_start
+        let keep length - keep_from
+        ; a read block of raw bytes yields at most one Char per byte, each able
+        ; to insert a record start, plus the one already pending.
+        let need (f.block * 2) + 2
+        if (keep + need) > f.win_cap
+        {
+            ; reallocateBuffer: grow (and re-anchor at the kept prefix).
+            let cap (keep + need) * 2
+            let nb f.host.allocate(cap * 4, 4) as pointer[u32]
+            var c: size_t 0
+            while c < keep
+            {
+                *(nb + c) := *(contents + ((keep_from - win_start) + c))
+                c := c + 1
+            }
+            contents := nb
+            f.win_cap := cap
+            win_start := keep_from
+        }
+        else if ((length - win_start) + need) > f.win_cap
+        {
+            ; slide the kept prefix to the window front (memmove of the
+            ; reference's `newStart != start()` case; always to a LOWER address,
+            ; so a forward copy is safe).
+            let off keep_from - win_start
+            var c: size_t 0
+            while c < keep
+            {
+                *(contents + c) := *(contents + (off + c))
+                c := c + 1
+            }
+            win_start := keep_from
+        }
+
+        ; --- decode one read block ------------------------------------------
+        var out length
+        let out_before out
+        var pending f.pending
+        var i f.raw_pos
+        let n f.raw_len
+        var produced: size_t 0
+        while i < n
+        {
+            var ch: u32 IENC_NO_CHAR
+            var len: size_t 0
+            ; bytes that carry NO character at all (the SJIS decoder has three
+            ; such classes) are consumed and emit nothing.
+            var truncated false
+            while ch = IENC_NO_CHAR
+            {
+                if i >= n
+                {
+                    truncated := true
+                    break
+                }
+                ; keep the next char's bytes in the raw window. No coding system
+                ; consumes more than RAW_CHAR_MAX bytes for one Char, so this is
+                ; the whole invariant the decode below needs; with it, a `len` of
+                ; 0 still means exactly what it meant when the entity was held
+                ; whole — a truncated char AT THE ENTITY END, never a window edge.
+                ; For an in-memory source the window IS the entity and the guard
+                ; never fires (one pointer test per char).
+                if f.fp <> null
+                {
+                    if (i + RAW_CHAR_MAX) > (f.raw_base + f.raw_valid)
+                        f.ensure_raw(i, RAW_CHAR_MAX)
+                }
+                let j i - f.raw_base
+                if i >= f.switch_at
+                    len := f.cs_rest.decode_one(f.raw.slice_to(f.raw_valid), j, &ch)
+                else
+                    len := f.cs_first.decode_one(f.raw.slice_to(f.raw_valid), j, &ch)
+                if len = 0
+                {
+                    truncated := true
+                    break
+                }
+                if ch = IENC_NO_CHAR
+                    i := i + len
+            }
+            if truncated
+            {
+                i := n
+                break
+            }
+            if (i + len) > f.next_bound
+            {
+                ; this char's last raw byte crosses the read-block edge, so it
+                ; (and any pending record start) belongs to the NEXT block.
+                ; Record the boundary FIRST and stop after it: the grove reads
+                ; fill_bounds to find where a data token must break, and asking
+                ; for a boundary the fill had not reached yet would answer "none"
+                ; and merge a token across it.
+                while (i + len) > f.next_bound
+                {
+                    origin.note_bound(out)
+                    f.next_bound := f.next_bound + f.block
+                }
+                if produced > 0
+                    break
+            }
+            ; flush the RS armed by the entity start / the previous record end.
+            if pending
+            {
+                *(contents + (out - win_start)) := 0x0A
+                out := out + 1
+                pending := false
+            }
+            if f.rt = RT_LF
+            {
+                if ch = 0x0A
+                {
+                    ch := 0x0D
+                    pending := true
+                }
+            }
+            else if f.rt = RT_CR
+            {
+                if ch = 0x0D
+                    pending := true
+            }
+            *(contents + (out - win_start)) := ch
+            out := out + 1
+            i := i + len
+            produced := produced + 1
+        }
+        ; crlf: "Need to delete final RS if not followed by anything" — at the
+        ; END of the entity only (a read-block edge is not one; the record start
+        ; simply carries into the next block through `pending`). Guarded to this
+        ; fill's own bytes: a final fill that decoded NOTHING must not retract a
+        ; char the scanner has already read.
+        if i >= n
+        {
+            if f.rt = RT_CRLF
+            {
+                if out > out_before
+                {
+                    if *(contents + ((out - 1) - win_start)) = 0x0A
+                    {
+                        out := out - 1
+                        pending := true
+                    }
+                }
+            }
+        }
+        f.raw_pos := i
+        f.pending := pending
+        ; end of entity: give the descriptor back here rather than holding one per
+        ; entity for the whole parse (a document with hundreds of external
+        ; entities would run the process out of them).
+        if i >= n
+            f.close_raw()
+        ; noteRS for the record starts this fill wrote.
+        var k out_before
+        while k < out
+        {
+            if *(contents + (k - win_start)) = 0x0A
+                origin.append_rs(k)
+            k := k + 1
+        }
+        length := out
+        end_index := out
+        origin.note_decoded(out)
+        out > out_before
+    }
+
+    ; void endToken(size_t length): the recognizer knows the matched length.
+    procedure end_token(mutable this: InputSource, len: size_t)
+        cur_index := start_index + len
+
+    ; size_t currentTokenLength()
+    function current_token_length(this: InputSource) returns size_t
+        cur_index - start_index
+
+    function current_token_start_index(this: InputSource) returns size_t
+        start_index
+
+    function token_start_location(this: InputSource) returns Location
+        Location(origin, start_loc_index)
+
+    ; currentLocation() — the location at the scan cursor (the next char to be
+    ; read). ParserState.currentLocation() resolves through nested sources by
+    ; walking this location's origin chain (parent()).
+    function here_location(this: InputSource) returns Location
+        Location(origin, cur_index as u32)
+
+    ; currentToken() — a StringC copy of the [start_index, cur_index) slice the
+    ; recognizer just committed (on the returned value's own page).
+    function current_token_string(this: InputSource) returns StringC
+        StringC#(contents + (start_index - win_start), cur_index - start_index)
+
+    ; --- parser-stage cursor helpers (InputSource.cs) ---
+
+    ; void ungetToken(): push the just-recognized token back (curIndex_ =
+    ; startIndex_) so the next getToken re-scans from the token start.
+    procedure unget_token(mutable this: InputSource)
+        cur_index := start_index
+
+    ; void discardInitial(): advanceStart(cur_, curIndex_ - 1) — drop the
+    ; recognized delimiter prefix of a delim+nameStart token, leaving the
+    ; name-start char as the token start (so extendNameToken can grow the name).
+    procedure discard_initial(mutable this: InputSource)
+    {
+        let new_start cur_index - 1
+        start_loc_index := start_loc_index + ((new_start - start_index) as u32)
+        start_index := new_start
+    }
+
+    ; Char currentChar(): the first Char of the current token (currentTokenStart).
+    function current_char(this: InputSource) returns u32
+        *(contents + (start_index - win_start))
+
+    ; void startToken(): advanceStart(cur_, curIndex_) — anchor a fresh token at
+    ; the current cursor (used after an RNI delimiter to read the name after it).
+    procedure start_token(mutable this: InputSource)
+    {
+        start_loc_index := start_loc_index + ((cur_index - start_index) as u32)
+        start_index := cur_index
+    }
+
+    ; pushCharRef (InternalInputSource.cxx:34 / ExtendEntityManager.cxx:1045):
+    ; re-inject the char a named function reference (`&#RE;`) stands for, so
+    ; it is scanned as an ordinary source char — RE/RS re-tokenize through the
+    ; normal record machinery (verified vs real onsgmls: `<doc>&#RE;</doc>`
+    ; suppresses it as the first RE, `x&#RE;` drops it as the trailing RE,
+    ; `x&#RE;y` keeps it — plain re-tokenization, no special-casing). Called
+    ; with cur == start just past the consumed reference (the reference
+    ; ASSERTs it); the slot before holds the ref's last consumed char (REFC or
+    ; RE), dead to the scanner, so stepping back and overwriting it is the
+    ; index-model equivalent of the reference's moveLeft()+insert. The
+    ; reference leaves location indexes unshifted and corrects file offsets
+    ; through the origin's NamedCharRef table; our buffer index IS the
+    ; location index, so all three cursors step back together and later
+    ; locations stay correct by construction. The overwrite edits the shared
+    ; origin buffer, so a pushed RS (10) from `&#RS;` would read as a line
+    ; boundary to a line_col that SCANNED the buffer, and would shift line/col
+    ; of LATER positions (probed: a `&#RS;`-led SHORTREF pushed every -oline L
+    ; record one line high). line_col reads the origin's RS-offset list now,
+    ; which is written by the NORMALIZER — a pushed char is never in it, so the
+    ; exclusion list this used to maintain is gone (see Origin.note_rs for why
+    ; the reverse, a push over a listed RS, cannot happen).
+    procedure push_char_ref(mutable this: InputSource, c: u32)
+    {
+        if start_index = 0
+            return
+        start_index := start_index - 1
+        cur_index := start_index
+        start_loc_index := start_loc_index - 1
+        *(contents + (start_index - win_start)) := c
+    }
+
+    function test() returns int
+    {
+        ; Top source A = "hello" (origin has no reference location).
+        var origin_a Origin()
+        var ca u32[5]
+        let pca ca as pointer[u32]
+        ca[0] := 0x68
+        ca[1] := 0x65
+        ca[2] := 0x6C
+        ca[3] := 0x6C
+        ca[4] := 0x6F
+        var src_a InputSource(&origin_a, Slice[u32](5, pca))
+
+        if src_a.char_at(1) <> 0x65
+            return -1
+
+        ; While parsing A at index 2, push source B = "XY" referenced there.
+        let ref_in_a src_a.current_location(2)
+        var origin_b Origin(ref_in_a)
+        var cb u32[2]
+        let pcb cb as pointer[u32]
+        cb[0] := 0x58
+        cb[1] := 0x59
+        var src_b InputSource(&origin_b, Slice[u32](2, pcb))
+
+        ; A location deep in B.
+        let loc_b src_b.current_location(1)
+        if loc_b.get_index() <> 1
+            return -2
+
+        if loc_b.is_null()
+            return -3
+
+        ; Walk up: B's origin was referenced at A index 2.
+        let up loc_b.parent()
+        if up.get_index() <> 2
+            return -4
+
+        if up.get_origin() <> (&origin_a)
+            return -5
+
+        ; A is the top source: its origin has a null reference location.
+        let top up.parent()
+        if top.is_null() = false
+            return -6
+
+        0
+    }
+}

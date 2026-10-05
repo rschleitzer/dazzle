@@ -1,0 +1,3883 @@
+; Style — the inherited-characteristics foundation (Stage 6a Inc 8, slice 1).
+; Ported from ~/repos/dazzle/style/Style.{h,cxx} + InheritedC.cxx (C++ oracle;
+; the C# mirror is openjade-net/src/OpenJade/Style). The reference models an
+; InheritedC as a class hierarchy (six generic kinds + specials) whose set()
+; drives a FOTBuilder setter; here it is one kind-tagged record whose set_ic
+; renders through the SgmlFOTBuilder (the fot backend is the only IC consumer
+; in this slice — the transform backend's setters are no-ops and its path never
+; pushes styles).
+;
+; Lazy IC values (the reference design, replacing the slice-1 eager collapse):
+; a non-constant IC value expression compiles to standalone code (VarInheritedC
+; = a proto + code + loc record) evaluated at style-PUSH time against the
+; style's captured display vars and creation node (VarStyleRec). The push
+; machinery (InheritedCInfo cached_value/spec_level/dependencies, PopList
+; depending_list) supports the inherited-*/actual-* primitives; the VM-facing
+; evaluation glue lives in VM.scaly (Style cannot import VM — VM→Insn→Style).
+;
+; RBMM: prototype ICs + registry live on the interpreter's run page; per-make
+; constant ICs + VarInheritedC records + spec arrays on the compile host (with
+; the insn chain); push-time conversions and StyleStack push nodes
+; (InheritedCInfo/PopList) on the current node's eval scratch region — they are
+; popped inside the same bracket (inner→outer pointers only). The StyleStack
+; record + its info array live on the run page.
+
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use dazzle.ELObj.ELObj
+use dazzle.ELObj.Identifier
+use dazzle.ELObj.FlowObj
+use dazzle.ELObj.QuantityValue
+use dazzle.ELObj.EngLenSpec
+use dazzle.ELObj.GlyphSubstTableRec
+use dazzle.ELObj.AddressRec
+use dazzle.Interpreter.Interpreter
+use dazzle.ProcessingMode.Rule
+use dazzle.ProcessingMode.Action
+use dazzle.InterpreterMessages.InterpreterMessages
+use opensp.Location.Location
+use dazzle.Grove.GroveNode
+use dazzle.Insn.Insn
+
+; Interpreter::convertFromString hints (Interpreter.h:463) — which shapes a
+; STRING may be reinterpreted as under `-2`; each converter names its own.
+; ★They live in THIS module, not in Interpreter, because a module may only
+; read the globals of a module declared BEFORE it (dazzle.scaly's order) —
+; and read the wrong way round they do not merely fail to resolve: passed as
+; a call ARGUMENT the whole call is silently dropped and the result is
+; garbage (measured 2026-07-31, every gated characteristic then failing to
+; convert). Beside a binary operator the same read is a hard diagnostic.
+define CONVERT_ALLOW_BOOLEAN: int 1
+define CONVERT_ALLOW_SYMBOL: int 2
+define CONVERT_ALLOW_NUMBER: int 4
+
+; --- InheritedC kinds (the generic classes of InheritedC.cxx) ---------------
+define IC_BOOL: int 0
+define IC_LENGTH: int 1
+define IC_LENGTH_SPEC: int 2
+define IC_SYMBOL: int 3
+define IC_STRING: int 4
+define IC_INT: int 5
+define IC_PUBLIC_ID: int 6
+define IC_LETTER2: int 7
+; #f or strictly positive integer (GenericMaybeIntegerInheritedC); lval 0 = #f.
+define IC_MAYBE_INT: int 8
+; an ignored characteristic (IgnoredC): any value accepted, set() emits
+; nothing, value() returns the stored ELObj.
+define IC_IGNORED: int 9
+; BorderC (table-border / cell-*-border): like IgnoredC (set() silent, value()
+; = stored obj) but the value must be a table-border sosofo or a boolean
+; (canonicalized to #t/#f).
+define IC_BORDER: int 10
+; ColorC: obj = a ColorObj ELObj (never null; initial device-RGB black).
+define IC_COLOR: int 11
+; BackgroundColorC: obj = a ColorObj or null (#f -> the no-arg
+; setBackgroundColor).
+define IC_OPT_COLOR: int 12
+; GenericOptLengthSpecInheritedC: #f or a length-spec; bval true = #f
+; (hasLength 0), else ls holds the value.
+define IC_OPT_LENGTH_SPEC: int 13
+; GenericInlineSpaceInheritedC: obj = an InlineSpaceObj ELObj (never null).
+define IC_INLINE_SPACE: int 14
+; GenericOptInlineSpaceInheritedC: obj = an InlineSpaceObj or null (#f).
+; set() renders nothing in the fot backend (setInlineSpaceSpace is not
+; overridden in the reference SgmlFOTBuilder).
+define IC_OPT_INLINE_SPACE: int 15
+; GlyphSubstTableC: gst holds the table payloads, bval distinguishes the
+; list form from #f/single (inherited-glyph-subst-table rewraps).
+define IC_GST: int 16
+; RuleC (fraction-bar): like IgnoredC (set() silent, value() = stored obj)
+; but the value must be a rule-FO sosofo (the rule class binding included).
+define IC_RULE: int 17
+
+; --- make-keyword classification (MakeExpression::compile split) ------------
+define KEY_NIC: int 0
+; an IC key, fully handled at compile (constant or VarInheritedC entry in the
+; insn's prebuilt spec arrays) — no stack slot, nothing to do at exec.
+define KEY_IC_CONST: int 1
+; an unknown keyword (messaged at compile): the reference never compiles its
+; value expression — no stack slot.
+define KEY_DROP: int 2
+define KEY_USE: int 3
+; evaluated and dropped (label:/content-map:, line-field priorities).
+define KEY_IGNORE: int 4
+; HISTORICAL (Inc 8 slices 2-4): the simple-page-sequence header/footer sosofo
+; NICs had their own slotted class; they now ride the NIC machinery (constants
+; into the insn's hf prototype, non-constants into the lazy nic_code chain
+; with a part index on the SetNic insn). The constant stays reserved.
+define KEY_HF: int 5
+; a NIC-family key with a CONSTANT value, fully converted at compile into the
+; insn's prototype records (applyConstNonInheritedCs: display NIC, table NIC,
+; header/footer sosofo) — no stack slot, nothing to do at exec.
+define KEY_TABLE_CONST: int 6
+; a table-cell pseudo NIC (column-number / n-columns-spanned / starts-row? /
+; ends-row?) with a non-constant value: evaluated at CONSTRUCTION on the main
+; insn chain (SetPseudoNonInheritedCInsn) — the cell's pushStyle needs them
+; before the lazy NIC resolve.
+define KEY_PSEUDO_NIC: int 7
+; label: — the value expr compiles onto the post-make chain, a LabelSosofo
+; insn wraps the finished flow object (no key slot).
+define KEY_LABEL: int 8
+; content-map: — the value expr evaluates right after the content sosofos;
+; the make insn wraps the content with a SOSO_CONTENT_MAP (no key slot).
+define KEY_CONTENT_MAP: int 9
+
+; --- FOTBuilder::Symbol codes the NIC enum sets need ------------------------
+; (full table installed as symbol c-values by Interpreter.install_c_value_
+; symbols; codes = enum order in FOTBuilder.h)
+define SYM_FALSE: int 0
+define SYM_TRUE: int 1
+define SYM_HORIZONTAL: int 47
+define SYM_VERTICAL: int 48
+define SYM_ESCAPEMENT: int 49
+define SYM_LINE_PROGRESSION: int 50
+define SYM_PAGE: int 61
+define SYM_PAGE_REGION: int 62
+define SYM_COLUMN_SET: int 63
+define SYM_COLUMN: int 64
+define SYM_TOP: int 88
+define SYM_BOTTOM: int 89
+define SYM_FORCE: int 95
+define SYM_BEFORE: int 38
+define SYM_THROUGH: int 39
+define SYM_AFTER: int 40
+define SYM_TOP_TO_BOTTOM: int 41
+define SYM_LEFT_TO_RIGHT: int 42
+define SYM_BOTTOM_TO_TOP: int 43
+define SYM_RIGHT_TO_LEFT: int 44
+define SYM_MAX_SCALE: int 65
+define SYM_MAX_UNIFORM: int 66
+
+; FOTBuilder::LengthSpec — length in units (millipoints at 72000 upi) plus a
+; display-size factor (display-size-relative specs; slice 1 produces factors
+; only through length-spec VALUES, not arithmetic — see DESIGN.md).
+define LengthSpec (var length: int, factor: double)
+{
+    init()
+    {
+        this.length := 0
+        this.factor := 0.0
+    }
+
+    function is_set(this: LengthSpec) returns bool
+    {
+        if length <> 0 or factor <> 0.0
+            return true
+        false
+    }
+
+    function differs(this: LengthSpec, other: LengthSpec) returns bool
+    {
+        if length <> other.length or factor <> other.factor
+            return true
+        false
+    }
+}
+
+; FOTBuilder::DisplaySpace (defaults per its ctor: priority 0, conditional 1,
+; force 0).
+define DisplaySpace (var nominal: LengthSpec, var min: LengthSpec, var max: LengthSpec, var priority: int, var conditional: bool, var force: bool)
+{
+    init()
+    {
+        this.nominal := LengthSpec()
+        this.min := LengthSpec()
+        this.max := LengthSpec()
+        this.priority := 0
+        this.conditional := true
+        this.force := false
+    }
+
+    function make(host: ref[Page]) returns ref[DisplaySpace]
+    {
+        let p &DisplaySpace^host()
+        p
+    }
+}
+
+; FOTBuilder::InlineSpace.
+define InlineSpace (var nominal: LengthSpec, var min: LengthSpec, var max: LengthSpec)
+{
+    init()
+    {
+        this.nominal := LengthSpec()
+        this.min := LengthSpec()
+        this.max := LengthSpec()
+    }
+
+    function make(host: ref[Page]) returns ref[InlineSpace]
+    {
+        let p &InlineSpace^host()
+        p
+    }
+}
+
+; a validated FOT symbol value: the c-value code plus the interned print name
+; (code 0 = false, 1 = true; names render as "false"/"true").
+define FotSym (code: int, name: StringC)
+{
+    init()
+    {
+        this.code := SYM_FALSE
+        this.name := StringC()
+    }
+}
+
+; The class-specific non-inherited characteristics of a flow object.
+; Upstream gives every FlowObj subclass an `Owner<FOTBuilder::XNIC> nic_` of
+; its own type; the port's single FlowObj record (tagged by `foc`) holds ONE
+; of the twenty-two NIC records behind this pointer alias and reads it back
+; under the class's type (`fo.get_nic() as ref[TableNIC]`). One declaration
+; per opaque kind is the accepted form; a NICRef
+; handed where a grove declaration or a page belongs is a planner error.
+define NIC()
+define NICRef pointer[NIC]
+
+; FOTBuilder::DisplayNIC (+ DisplayGroupNIC's coalesce-id, carried flat).
+define DisplayNIC
+(
+    var space_before: DisplaySpace
+    var space_after: DisplaySpace
+    var position_preference: FotSym
+    var keep: FotSym
+    var break_before: FotSym
+    var break_after: FotSym
+    var keep_with_previous: bool
+    var keep_with_next: bool
+    var may_violate_keep_before: bool
+    var may_violate_keep_after: bool
+    var has_coalesce_id: bool
+    var coalesce_id: StringC
+)
+{
+    function make(host: ref[Page]) returns ref[DisplayNIC]
+    {
+        let n &DisplayNIC^host(DisplaySpace(), DisplaySpace(), FotSym(), FotSym(), FotSym(), FotSym(), false, false, false, false, false, StringC())
+        n
+    }
+
+    function copy(this: ref[DisplayNIC], host: ref[Page]) returns ref[DisplayNIC]
+    {
+        let n DisplayNIC.make(host)
+        n.space_before := this.space_before
+        n.space_after := this.space_after
+        n.position_preference := this.position_preference
+        n.keep := this.keep
+        n.break_before := this.break_before
+        n.break_after := this.break_after
+        n.keep_with_previous := this.keep_with_previous
+        n.keep_with_next := this.keep_with_next
+        n.may_violate_keep_before := this.may_violate_keep_before
+        n.may_violate_keep_after := this.may_violate_keep_after
+        n.has_coalesce_id := this.has_coalesce_id
+        n.coalesce_id := this.coalesce_id
+        n
+    }
+}
+
+; --- table-family NIC records (FOTBuilder.h TableNIC/TableColumnNIC/
+; TableCellNIC + the FlowObj.cxx NIC extensions, flattened) -----------------
+define TABLE_WIDTH_FULL: int 0
+define TABLE_WIDTH_MINIMUM: int 1
+define TABLE_WIDTH_EXPLICIT: int 2
+
+; TableFlowObj::NIC: width + the four border styles (a style ELObj, resolved
+; from a table-border sosofo or a boolean; null = unspecified -> the
+; table-border IC fallback at process).
+define TableNIC
+(
+    var width_type: int
+    var width: LengthSpec
+    var before_row_border: ref[ELObj]?
+    var after_row_border: ref[ELObj]?
+    var before_column_border: ref[ELObj]?
+    var after_column_border: ref[ELObj]?
+)
+{
+    function make(host: ref[Page]) returns ref[TableNIC]
+    {
+        let r &TableNIC^host(TABLE_WIDTH_FULL, LengthSpec(), null, null, null, null)
+        r
+    }
+
+    function copy(this: ref[TableNIC], host: ref[Page]) returns ref[TableNIC]
+    {
+        let r TableNIC.make(host)
+        r.width_type := this.width_type
+        r.width := this.width
+        r.before_row_border := this.before_row_border
+        r.after_row_border := this.after_row_border
+        r.before_column_border := this.before_column_border
+        r.after_column_border := this.after_column_border
+        r
+    }
+}
+
+; TableColumnFlowObj::NIC (columnIndex zero-based; the width is a
+; TableLengthSpec — the FOT LengthSpec plus the table-unit factor, flattened
+; into width + width_tfactor).
+define TableColumnNIC
+(
+    var column_index: int
+    var n_columns_spanned: int
+    var has_column_number: bool
+    var has_width: bool
+    var width: LengthSpec
+    var width_tfactor: double
+)
+{
+    function make(host: ref[Page]) returns ref[TableColumnNIC]
+    {
+        let r &TableColumnNIC^host(0, 1, false, false, LengthSpec(), 0.0)
+        r
+    }
+
+    function copy(this: ref[TableColumnNIC], host: ref[Page]) returns ref[TableColumnNIC]
+    {
+        let r TableColumnNIC.make(host)
+        r.column_index := this.column_index
+        r.n_columns_spanned := this.n_columns_spanned
+        r.has_column_number := this.has_column_number
+        r.has_width := this.has_width
+        r.width := this.width
+        r.width_tfactor := this.width_tfactor
+        r
+    }
+}
+
+; TableCellFlowObj::NIC (missing marks the synthesized filler cells).
+define TableCellNIC
+(
+    var missing: bool
+    var column_index: int
+    var n_columns_spanned: int
+    var n_rows_spanned: int
+    var has_column_number: bool
+    var starts_row: bool
+    var ends_row: bool
+)
+{
+    function make(host: ref[Page]) returns ref[TableCellNIC]
+    {
+        let r &TableCellNIC^host(false, 0, 1, 1, false, false, false)
+        r
+    }
+
+    function copy(this: ref[TableCellNIC], host: ref[Page]) returns ref[TableCellNIC]
+    {
+        let r TableCellNIC.make(host)
+        r.missing := this.missing
+        r.column_index := this.column_index
+        r.n_columns_spanned := this.n_columns_spanned
+        r.n_rows_spanned := this.n_rows_spanned
+        r.has_column_number := this.has_column_number
+        r.starts_row := this.starts_row
+        r.ends_row := this.ends_row
+        r
+    }
+}
+
+; FOTBuilder::RuleNIC minus the embedded DisplayNIC/InlineNIC bases (the
+; display half rides in FlowObj.dnic as usual; the InlineNIC break
+; priorities live here — the rule dump prints them for the non-display
+; orientations). orientation defaults to horizontal (RuleNIC()).
+define RuleNIC
+(
+    var orientation: FotSym
+    var has_length: bool
+    var length: LengthSpec
+    var break_before_priority: int
+    var break_after_priority: int
+)
+{
+    function make(host: ref[Page]) returns ref[RuleNIC]
+    {
+        ; the default name must be HOST-pinned (the copying StringC ctor as a
+        ; temporary lands on the temporary's page — S70 trap).
+        let tmp StringC("horizontal")
+        var o FotSym()
+        o.code := SYM_HORIZONTAL
+        o.name := StringC^host(tmp.as_slice())
+        let r &RuleNIC^host(o, false, LengthSpec(), 0, 0)
+        r
+    }
+
+    function copy(this: ref[RuleNIC], host: ref[Page]) returns ref[RuleNIC]
+    {
+        let r RuleNIC.make(host)
+        r.orientation := this.orientation
+        r.has_length := this.has_length
+        r.length := this.length
+        r.break_before_priority := this.break_before_priority
+        r.break_after_priority := this.break_after_priority
+        r
+    }
+}
+
+; FOTBuilder::Address::Type — all eight, in the reference's enum order
+; (FOTBuilder.h:433). `tei` and `html` are declared but no primitive of the
+; reference ever produces them; they exist because TeXFOTBuilder::startLink
+; switches over the full enum, and this port keeps both arms for the same
+; reason.
+define ADDR_NONE: int 0
+define ADDR_RESOLVED_NODE: int 1
+define ADDR_IDREF: int 2
+define ADDR_ENTITY: int 3
+define ADDR_SGML_DOCUMENT: int 4
+define ADDR_HYTIME_LINKEND: int 5
+define ADDR_TEI: int 6
+define ADDR_HTML: int 7
+
+; link NIC (destination:) — node is a ref[GroveNode]?, as Clark's Address is.
+; FOTBuilder::LineFieldNIC — the InlineNIC break priorities of a line-field.
+; The fot dump drops them (SgmlFOTBuilder::startLineField ignores its NIC) but
+; the TeX backend prints them, so they ride the ordinary tnic machinery.
+define LineFieldNIC (var break_before_priority: int, var break_after_priority: int)
+{
+    function make(host: ref[Page]) returns ref[LineFieldNIC]
+    {
+        let r &LineFieldNIC^host(0, 0)
+        r
+    }
+
+    function copy(this: ref[LineFieldNIC], host: ref[Page]) returns ref[LineFieldNIC]
+    {
+        let r LineFieldNIC.make(host)
+        r.break_before_priority := this.break_before_priority
+        r.break_after_priority := this.break_after_priority
+        r
+    }
+}
+
+; the `specifiedC` bit indices of FOTBuilder::CharacterNIC (enum order — the
+; fot dump renders in exactly this order, so the numbering is a contract).
+define CNIC_IS_DROP_AFTER_LINE_BREAK: int 0
+define CNIC_IS_DROP_UNLESS_BEFORE_LINE_BREAK: int 1
+define CNIC_IS_PUNCT: int 2
+define CNIC_IS_INPUT_WHITESPACE: int 3
+define CNIC_IS_INPUT_TAB: int 4
+define CNIC_IS_RECORD_END: int 5
+define CNIC_IS_SPACE: int 6
+define CNIC_CHAR: int 7
+define CNIC_GLYPH_ID: int 8
+define CNIC_SCRIPT: int 9
+define CNIC_MATH_CLASS: int 10
+define CNIC_MATH_FONT_POSTURE: int 11
+define CNIC_BREAK_BEFORE_PRIORITY: int 12
+define CNIC_BREAK_AFTER_PRIORITY: int 13
+
+; the math-class / math-font-posture enum sets (FOTBuilder::Symbol codes).
+define SYM_NOT_APPLICABLE: int 2
+define SYM_UPRIGHT: int 20
+define SYM_OBLIQUE: int 21
+define SYM_BACK_SLANTED_OBLIQUE: int 22
+define SYM_ITALIC: int 23
+define SYM_BACK_SLANTED_ITALIC: int 24
+define SYM_ORDINARY: int 52
+define SYM_OPERATOR: int 53
+define SYM_BINARY: int 54
+define SYM_RELATION: int 55
+define SYM_OPENING: int 56
+define SYM_CLOSING: int 57
+define SYM_PUNCTUATION: int 58
+define SYM_INNER: int 59
+define SYM_SPACE: int 60
+
+; FOTBuilder::CharacterNIC — the `character` flow object's non-inherited
+; characteristics. `specified` is the bit set above: the fot dump prints a
+; field only when its bit is set, and setImplicitChar fills every UNSET field
+; from the character properties of `ch`. `glyph_id` is a GlyphId-arm ELObj
+; (null = the reference's id-less FOTBuilder::GlyphId(), which prints "false");
+; `script` is a public identifier (empty = the reference's null PublicId).
+; ★The reference ctor initializes only valid/specifiedC/stretchFactor — every
+; other field is left indeterminate and is read only under `valid` or under
+; its own specified bit, so zeroing here is observationally identical.
+define CharacterNIC
+(
+    var valid: bool
+    var specified: int
+    var ch: u32
+    var glyph_id: ref[ELObj]?
+    var break_before_priority: int
+    var break_after_priority: int
+    var math_class: FotSym
+    var math_font_posture: FotSym
+    var script: StringC
+    var is_drop_after_line_break: bool
+    var is_drop_unless_before_line_break: bool
+    var is_punct: bool
+    var is_input_whitespace: bool
+    var is_input_tab: bool
+    var is_record_end: bool
+    var is_space: bool
+    var stretch_factor: double
+)
+{
+    function make(host: ref[Page]) returns ref[CharacterNIC]
+    {
+        let r &CharacterNIC^host(false, 0, 0, null, 0, 0, FotSym(), FotSym(), StringC(), false, false, false, false, false, false, false, 1.0)
+        r
+    }
+
+    function copy(this: ref[CharacterNIC], host: ref[Page]) returns ref[CharacterNIC]
+    {
+        let r CharacterNIC.make(host)
+        r.valid := this.valid
+        r.specified := this.specified
+        r.ch := this.ch
+        r.glyph_id := this.glyph_id
+        r.break_before_priority := this.break_before_priority
+        r.break_after_priority := this.break_after_priority
+        r.math_class := this.math_class
+        r.math_font_posture := this.math_font_posture
+        r.script := this.script
+        r.is_drop_after_line_break := this.is_drop_after_line_break
+        r.is_drop_unless_before_line_break := this.is_drop_unless_before_line_break
+        r.is_punct := this.is_punct
+        r.is_input_whitespace := this.is_input_whitespace
+        r.is_input_tab := this.is_input_tab
+        r.is_record_end := this.is_record_end
+        r.is_space := this.is_space
+        r.stretch_factor := this.stretch_factor
+        r
+    }
+
+    function is_specified(this: ref[CharacterNIC], bit: int) returns bool
+    {
+        let m 1 << bit
+        (this.specified & m) <> 0
+    }
+
+    procedure set_specified(mutable this: ref[CharacterNIC], bit: int)
+        this.specified := this.specified | (1 << bit)
+}
+
+; FOTBuilder::AnchorNIC (style/Anchor.cxx) — the inline break priorities plus
+; the display? flag.
+define AnchorNIC (var is_display: bool, var break_before_priority: int, var break_after_priority: int)
+{
+    function make(host: ref[Page]) returns ref[AnchorNIC]
+    {
+        let r &AnchorNIC^host(false, 0, 0)
+        r
+    }
+
+    function copy(this: ref[AnchorNIC], host: ref[Page]) returns ref[AnchorNIC]
+    {
+        let r AnchorNIC.make(host)
+        r.is_display := this.is_display
+        r.break_before_priority := this.break_before_priority
+        r.break_after_priority := this.break_after_priority
+        r
+    }
+}
+
+; FOTBuilder::GlyphAnnotationNIC (style/GlyphAnnotation.cxx) — two priorities.
+define GlyphAnnotationNIC (var break_before_priority: int, var break_after_priority: int)
+{
+    function make(host: ref[Page]) returns ref[GlyphAnnotationNIC]
+    {
+        let r &GlyphAnnotationNIC^host(0, 0)
+        r
+    }
+
+    function copy(this: ref[GlyphAnnotationNIC], host: ref[Page]) returns ref[GlyphAnnotationNIC]
+    {
+        let r GlyphAnnotationNIC.make(host)
+        r.break_before_priority := this.break_before_priority
+        r.break_after_priority := this.break_after_priority
+        r
+    }
+}
+
+; FOTBuilder::EmphasizingMarkNIC plus EmphasizingMarkFlowObj::emphmark_ — the
+; two priorities and the `mark:` sosofo (which the reference keeps in the flow
+; object, not in the NIC; here both travel in the tnic record so one copy
+; carries the whole state).
+define EmphasizingMarkNIC (var break_before_priority: int, var break_after_priority: int, var mark: ref[ELObj]?)
+{
+    function make(host: ref[Page]) returns ref[EmphasizingMarkNIC]
+    {
+        let r &EmphasizingMarkNIC^host(0, 0, null)
+        r
+    }
+
+    function copy(this: ref[EmphasizingMarkNIC], host: ref[Page]) returns ref[EmphasizingMarkNIC]
+    {
+        let r EmphasizingMarkNIC.make(host)
+        r.break_before_priority := this.break_before_priority
+        r.break_after_priority := this.break_after_priority
+        ; ★the reference's copy constructor FORGETS emphmark_
+        ; (style/EmphasizingMark.h:28 copies nic_ only), so every `make` of an
+        ; emphasizing-mark reads an indeterminate SosofoObj* and the reference
+        ; binary CRASHES on the class — measured on all six backends
+        ; (EXC_BAD_ACCESS in EmphasizingMarkFlowObj::processInner). The port
+        ; carries the mark, which is what the class plainly intends; the
+        ; fixture documents the deviation.
+        r.mark := this.mark
+        r
+    }
+}
+
+; RadicalFlowObj::radical_ (FlowObj.cxx:1879) — the ONE characteristic of the
+; class, a sosofo that must answer isCharacter (the `character` flow object's
+; CharacterNIC is what startRadical's radicalRadical hands the backend). There
+; is no FOTBuilder::RadicalNIC; the record exists so the shared tnic machinery
+; can carry the sosofo through the constant path and the lazy chain.
+define RadicalNIC (var radical: ref[ELObj]?)
+{
+    function make(host: ref[Page]) returns ref[RadicalNIC]
+    {
+        let r &RadicalNIC^host(null)
+        r
+    }
+
+    function copy(this: ref[RadicalNIC], host: ref[Page]) returns ref[RadicalNIC]
+    {
+        let r RadicalNIC.make(host)
+        r.radical := this.radical
+        r
+    }
+}
+
+; FOTBuilder::GridNIC (FOTBuilder.h:558) — two counts, both zero by default
+; (the fot dump prints an attribute only for a non-zero one).
+define GridNIC (var n_columns: int, var n_rows: int)
+{
+    function make(host: ref[Page]) returns ref[GridNIC]
+    {
+        let r &GridNIC^host(0, 0)
+        r
+    }
+
+    function copy(this: ref[GridNIC], host: ref[Page]) returns ref[GridNIC]
+    {
+        let r GridNIC.make(host)
+        r.n_columns := this.n_columns
+        r.n_rows := this.n_rows
+        r
+    }
+}
+
+; FOTBuilder::GridCellNIC (FOTBuilder.h:566) — the cell's position, same
+; defaults and same print rule.
+define GridCellNIC (var column_number: int, var row_number: int)
+{
+    function make(host: ref[Page]) returns ref[GridCellNIC]
+    {
+        let r &GridCellNIC^host(0, 0)
+        r
+    }
+
+    function copy(this: ref[GridCellNIC], host: ref[Page]) returns ref[GridCellNIC]
+    {
+        let r GridCellNIC.make(host)
+        r.column_number := this.column_number
+        r.row_number := this.row_number
+        r
+    }
+}
+
+; FOTBuilder::EmbeddedTextNIC (FOTBuilder.h:367) — one symbol, defaulting to
+; symbolFalse. ★Its allowed set has NO symbolFalse entry (the reference
+; comments the omission: "hay que definir uno de los dos obligatoriamente"),
+; so `direction: #f` is an invalid value even though #f is the initial state.
+define EmbeddedTextNIC (var direction: FotSym)
+{
+    function make(host: ref[Page]) returns ref[EmbeddedTextNIC]
+    {
+        let r &EmbeddedTextNIC^host(FotSym())
+        r
+    }
+
+    function copy(this: ref[EmbeddedTextNIC], host: ref[Page]) returns ref[EmbeddedTextNIC]
+    {
+        let r EmbeddedTextNIC.make(host)
+        r.direction := this.direction
+        r
+    }
+}
+
+define ICA_WIDTH_FULL: int 0
+define ICA_WIDTH_MINIMUM: int 1
+define ICA_WIDTH_EXPLICIT: int 2
+define ICA_HEIGHT_FULL: int 0
+define ICA_HEIGHT_MINIMUM: int 1
+define ICA_HEIGHT_EXPLICIT: int 2
+
+; FOTBuilder::IncludedContainerAreaNIC (FOTBuilder.h:377) — the one NIC record
+; of this family that derives from BOTH DisplayNIC and InlineNIC. The display
+; half travels in the shared DisplayNIC slot (the class is a display_foc), the
+; two inline break priorities and the nine own fields live here.
+; ★`scaleType` defaults to symbolMaxUniform, NOT symbolFalse — so an
+; untouched included-container-area still prints scale="max-uniform", while a
+; NUMERIC or PAIR scale sets the type to symbolFalse and prints scale-x/-y.
+define IncludedContainerAreaNIC
+(
+    var escapement_direction: FotSym
+    var is_display: bool
+    var width_type: int
+    var width: LengthSpec
+    var height_type: int
+    var height: LengthSpec
+    var position_point_x: LengthSpec
+    var position_point_y: LengthSpec
+    var contents_rotation: int
+    var scale_type: FotSym
+    var scale_x: double
+    var scale_y: double
+    var break_before_priority: int
+    var break_after_priority: int
+)
+{
+    function make(host: ref[Page]) returns ref[IncludedContainerAreaNIC]
+    {
+        var st FotSym()
+        st.code := SYM_MAX_UNIFORM
+        let r &IncludedContainerAreaNIC^host(FotSym(), false, ICA_WIDTH_FULL, LengthSpec(), ICA_HEIGHT_FULL, LengthSpec(), LengthSpec(), LengthSpec(), 0, st, 0.0, 0.0, 0, 0)
+        r
+    }
+
+    function copy(this: ref[IncludedContainerAreaNIC], host: ref[Page]) returns ref[IncludedContainerAreaNIC]
+    {
+        let r IncludedContainerAreaNIC.make(host)
+        r.escapement_direction := this.escapement_direction
+        r.is_display := this.is_display
+        r.width_type := this.width_type
+        r.width := this.width
+        r.height_type := this.height_type
+        r.height := this.height
+        r.position_point_x := this.position_point_x
+        r.position_point_y := this.position_point_y
+        r.contents_rotation := this.contents_rotation
+        r.scale_type := this.scale_type
+        r.scale_x := this.scale_x
+        r.scale_y := this.scale_y
+        r.break_before_priority := this.break_before_priority
+        r.break_after_priority := this.break_after_priority
+        r
+    }
+}
+
+; FOTBuilder::MultiMode (FOTBuilder.h:426) — one entry of the multi-mode
+; class's port list: a name (empty for the principal mode) and an optional
+; description.
+define MultiModeRec (var has_desc: bool, var name: StringC, var desc: StringC)
+{
+    function make(host: ref[Page]) returns ref[MultiModeRec]
+    {
+        let r &MultiModeRec^host(false, StringC(), StringC())
+        r
+    }
+}
+
+; MultiModeFlowObj::NIC (FlowObj.cxx:964) — the `multi-modes:` list, split
+; into the optional PRINCIPAL mode and the named ones in declaration order.
+; ★The named modes ARE the flow object's ports; no other class in the port
+; decides its port list at run time.
+define MultiModeNIC (var has_principal_mode: bool, var principal_has_desc: bool, var principal_desc: StringC, named: ref[Array[ref[MultiModeRec]?]])
+{
+    function make(host: ref[Page]) returns ref[MultiModeNIC]
+    {
+        let r &MultiModeNIC^host(false, false, StringC(), Array[ref[MultiModeRec]?]^host())
+        r
+    }
+
+    function copy(this: ref[MultiModeNIC], host: ref[Page]) returns ref[MultiModeNIC]
+    {
+        let r MultiModeNIC.make(host)
+        r.has_principal_mode := this.has_principal_mode
+        r.principal_has_desc := this.principal_has_desc
+        r.principal_desc := InheritedC.pin_string(host, this.principal_desc)
+        let n this.named.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let pp this.named.get(i)
+            if pp <> null
+            {
+                let src *pp
+                let m MultiModeRec.make(host)
+                m.has_desc := src.has_desc
+                m.name := InheritedC.pin_string(host, src.name)
+                m.desc := InheritedC.pin_string(host, src.desc)
+                r.named.add(m)
+            }
+            i := i + 1
+        }
+        r
+    }
+}
+
+; TeXFOTBuilder::PageFloatNIC — the page-float extension flow object's one
+; NIC (a string; hasNIC accepts only "placement").
+; MifFOTBuilder::IndexEntryNIC — the ISOGEN index-entry extension flow
+; object's non-inherited characteristics.
+define IndexEntryNIC (components: ref[Array[StringC]], var sort_string: StringC, var page_number: bool, var starts_page_range: bool, var ends_page_range: bool)
+{
+    function make(host: ref[Page]) returns ref[IndexEntryNIC]
+    {
+        let r &IndexEntryNIC^host(Array[StringC]^host(), StringC(), true, false, false)
+        r
+    }
+
+    function copy(this: ref[IndexEntryNIC], host: ref[Page]) returns ref[IndexEntryNIC]
+    {
+        let r IndexEntryNIC.make(host)
+        let n this.components.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let cp this.components.get(i)
+            r.components.add(*cp)
+            i := i + 1
+        }
+        r.sort_string := this.sort_string
+        r.page_number := this.page_number
+        r.starts_page_range := this.starts_page_range
+        r.ends_page_range := this.ends_page_range
+        r
+    }
+}
+
+define PageFloatNIC (var placement: StringC)
+{
+    function make(host: ref[Page]) returns ref[PageFloatNIC]
+    {
+        let r &PageFloatNIC^host(StringC())
+        r
+    }
+
+    function copy(this: ref[PageFloatNIC], host: ref[Page]) returns ref[PageFloatNIC]
+    {
+        let r PageFloatNIC.make(host)
+        r.placement := this.placement
+        r
+    }
+}
+
+define LinkNIC (var addr_type: int, var node: ref[GroveNode]?, var p0: StringC, var p1: StringC, var p2: StringC)
+{
+    function make(host: ref[Page]) returns ref[LinkNIC]
+    {
+        let r &LinkNIC^host(ADDR_NONE, null, StringC(), StringC(), StringC())
+        r
+    }
+
+    function copy(this: ref[LinkNIC], host: ref[Page]) returns ref[LinkNIC]
+    {
+        let r LinkNIC.make(host)
+        r.addr_type := this.addr_type
+        r.node := this.node
+        r.p0 := InheritedC.pin_string(host, this.p0)
+        r.p1 := InheritedC.pin_string(host, this.p1)
+        r.p2 := InheritedC.pin_string(host, this.p2)
+        r
+    }
+}
+
+; FOTBuilder::ExternalGraphicNIC minus the DisplayNIC/InlineNIC bases (the
+; display half rides in FlowObj.dnic; the break priorities live here).
+; Reference defaults: scale 1/1 with scaleType symbolFalse, isDisplay false.
+define ExternalGraphicNIC
+(
+    var entity_system_id: StringC
+    var notation_system_id: StringC
+    var scale_type: FotSym
+    var scale_x: double
+    var scale_y: double
+    var has_max_width: bool
+    var max_width: LengthSpec
+    var has_max_height: bool
+    var max_height: LengthSpec
+    var is_display: bool
+    var escapement_direction: FotSym
+    var position_point_x: LengthSpec
+    var position_point_y: LengthSpec
+    var break_before_priority: int
+    var break_after_priority: int
+)
+{
+    function make(host: ref[Page]) returns ref[ExternalGraphicNIC]
+    {
+        let r &ExternalGraphicNIC^host(StringC(), StringC(), FotSym(), 1.0, 1.0, false, LengthSpec(), false, LengthSpec(), false, FotSym(), LengthSpec(), LengthSpec(), 0, 0)
+        r
+    }
+
+    function copy(this: ref[ExternalGraphicNIC], host: ref[Page]) returns ref[ExternalGraphicNIC]
+    {
+        let r ExternalGraphicNIC.make(host)
+        r.entity_system_id := this.entity_system_id
+        r.notation_system_id := this.notation_system_id
+        r.scale_type := this.scale_type
+        r.scale_x := this.scale_x
+        r.scale_y := this.scale_y
+        r.has_max_width := this.has_max_width
+        r.max_width := this.max_width
+        r.has_max_height := this.has_max_height
+        r.max_height := this.max_height
+        r.is_display := this.is_display
+        r.escapement_direction := this.escapement_direction
+        r.position_point_x := this.position_point_x
+        r.position_point_y := this.position_point_y
+        r.break_before_priority := this.break_before_priority
+        r.break_after_priority := this.break_after_priority
+        r
+    }
+}
+
+; ScoreFlowObj::Type — type: is a char, a length(-spec), or one of the
+; symbols before/through/after; absent = the plain-sequence fallback.
+define SCORE_NONE: int 0
+define SCORE_CHAR: int 1
+define SCORE_LENGTH: int 2
+define SCORE_SYMBOL: int 3
+
+define ScoreNIC (var kind: int, var ch: u32, var length: LengthSpec, var sym: FotSym)
+{
+    function make(host: ref[Page]) returns ref[ScoreNIC]
+    {
+        let r &ScoreNIC^host(SCORE_NONE, 0, LengthSpec(), FotSym())
+        r
+    }
+
+    function copy(this: ref[ScoreNIC], host: ref[Page]) returns ref[ScoreNIC]
+    {
+        let r ScoreNIC.make(host)
+        r.kind := this.kind
+        r.ch := this.ch
+        r.length := this.length
+        r.sym := this.sym
+        r
+    }
+}
+
+; FOTBuilder::BoxNIC minus the DisplayNIC base.
+define BoxNIC (var is_display: bool, var break_before_priority: int, var break_after_priority: int)
+{
+    function make(host: ref[Page]) returns ref[BoxNIC]
+    {
+        let r &BoxNIC^host(false, 0, 0)
+        r
+    }
+
+    function copy(this: ref[BoxNIC], host: ref[Page]) returns ref[BoxNIC]
+    {
+        let r BoxNIC.make(host)
+        r.is_display := this.is_display
+        r.break_before_priority := this.break_before_priority
+        r.break_after_priority := this.break_after_priority
+        r
+    }
+}
+
+; FOTBuilder::LeaderNIC.
+define LeaderNIC (var has_length: bool, var length: LengthSpec, var break_before_priority: int, var break_after_priority: int)
+{
+    function make(host: ref[Page]) returns ref[LeaderNIC]
+    {
+        let r &LeaderNIC^host(false, LengthSpec(), 0, 0)
+        r
+    }
+
+    function copy(this: ref[LeaderNIC], host: ref[Page]) returns ref[LeaderNIC]
+    {
+        let r LeaderNIC.make(host)
+        r.has_length := this.has_length
+        r.length := this.length
+        r.break_before_priority := this.break_before_priority
+        r.break_after_priority := this.break_after_priority
+        r
+    }
+}
+
+; InheritedC — one record for the reference's class family. `kind` selects the
+; payload; `slot` <> -1 marks a pending entry (value converted from the VM
+; stack at make-exec); `proto` is the registry prototype a pending/converted
+; entry derives from. `print_name` is the exact attribute name SgmlFOTBuilder
+; emits (faithful quirks included: "inhibit-line-breaks?" keeps its '?',
+; justify-spread? prints "jystify-spread").
+define InheritedC
+(
+    kind: int
+    ident: ref[Identifier]?
+    index: int
+    print_name: StringC
+    var bval: bool
+    var lval: int
+    var sym: FotSym
+    var sval: StringC
+    var ls: LengthSpec
+    var obj: ref[ELObj]?
+    var gst: ref[Array[ref[GlyphSubstTableRec]?]]?
+    var code: ref[Insn]?
+    var proto: ref[InheritedC]?
+    var loc: Location
+    ; rtf-backend extension characteristic setter id (0 = none; the 12-entry
+    ; jade.cxx extension table, RtfFOTBuilder.set_extension_ic)
+    var ext_setter: int
+    ; Identifier::inheritedCPart_ / inheritedCLoc_ (the reference keeps them on
+    ; the Identifier; here they ride the prototype, the only cell a
+    ; declare-characteristic install writes). -1 = a BUILT-IN characteristic,
+    ; which is what makes `defPart <= currentPartIndex()` false for every
+    ; builtin and true only for one the stylesheet declared itself.
+    var def_part: u32
+    var def_loc: Location
+)
+{
+    function make(host: ref[Page], kind: int, ident: ref[Identifier]?, index: int, print_name: StringC) returns ref[InheritedC]
+    {
+        let ic &InheritedC^host(kind, ident, index, print_name, false, 0, FotSym(), StringC(), LengthSpec(), null, null, null, null, Location(), 0, 0xFFFFFFFF, Location())
+        ic
+    }
+
+    ; InheritedC::identifier()->name() — the characteristic's name, which only
+    ; the ambiguousStyle diagnostic needs.
+    function get_ident_name(this: InheritedC) returns StringC
+    {
+        if ident = null
+            return StringC()
+        ident.get_name()
+    }
+
+    function get_index(this: InheritedC) returns int
+        index
+
+    function get_kind(this: InheritedC) returns int
+        kind
+
+    function get_proto(this: InheritedC) returns ref[InheritedC]?
+        proto
+
+    ; VarInheritedC (Style.cxx): a non-constant spec — `code` (an Insn chain,
+    ; typed void: Style cannot import Insn) evaluated at style-push against the
+    ; owning style's display + node; `loc` anchors the invalid-value message.
+    procedure make_var(host: ref[Page], mutable proto: ref[InheritedC], code: ref[Insn]?, loc: Location) returns ref[InheritedC]
+    {
+        let ic InheritedC.make(host, proto.get_kind(), proto.ident, proto.get_index(), proto.print_name)
+        ic.code := code
+        ic.proto := proto
+        ic.loc := loc
+        ic.ext_setter := proto.ext_setter
+        ic
+    }
+
+    function is_var(this: InheritedC) returns bool
+        code <> null
+
+    ; pin a StringC's bytes onto `host` (empty stays empty) — the save-queue
+    ; records outlive the eval bracket the conversion ran under.
+    function pin_string(host: ref[Page], s: StringC) returns StringC
+    {
+        if s.get_size() = 0
+            return StringC()
+        StringC^host(s.as_slice())
+    }
+
+    function pin_fotsym(host: ref[Page], s: FotSym) returns FotSym
+    {
+        var r FotSym()
+        r.code := s.code
+        r.name := InheritedC.pin_string(host, s.name)
+        r
+    }
+
+    ; the SaveFOTBuilder deep copy: everything set_ic reads at replay time
+    ; must live on the queue's host (the reference Call records copy their
+    ; args by value). Payload ELObjs are rematerialized for the kinds the
+    ; sinks dereference (color / inline-space); other object payloads are
+    ; consumed at capture time and dropped here.
+    procedure copy_for_save(mutable this: ref[InheritedC], host: ref[Page]) returns ref[InheritedC]
+    {
+        let pn: StringC InheritedC.pin_string(host, this.print_name)
+        let c InheritedC.make(host, this.kind, this.ident, this.index, pn)
+        c.bval := this.bval
+        c.lval := this.lval
+        c.sym := InheritedC.pin_fotsym(host, this.sym)
+        c.sval := InheritedC.pin_string(host, this.sval)
+        c.ls := this.ls
+        c.proto := this.proto
+        c.loc := this.loc
+        c.ext_setter := this.ext_setter
+        if this.obj <> null
+        {
+            if (this.kind = IC_COLOR) or (this.kind = IC_OPT_COLOR)
+            {
+                let rgb this.obj.color_rgb()
+                if rgb >= 0
+                    c.obj := ELObj.make_color(host, (rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF)
+            }
+            if (this.kind = IC_INLINE_SPACE) or (this.kind = IC_OPT_INLINE_SPACE)
+            {
+                let sp this.obj.as_inline_space()
+                if sp <> null
+                {
+                    let np InlineSpace.make(host)
+                    np.nominal := sp.nominal
+                    np.min := sp.min
+                    np.max := sp.max
+                    c.obj := ELObj.make_inline_space(host, np)
+                }
+            }
+        }
+        if this.gst <> null
+        {
+            let tabs Array[ref[GlyphSubstTableRec]?]^host()
+            let n this.gst.get_length()
+            var i: size_t 0
+            while i < n
+            {
+                let tp this.gst.get(i)
+                if tp <> null
+                    tabs.add(*tp)
+                i := i + 1
+            }
+            c.gst := tabs
+        }
+        c
+    }
+
+}
+
+; --- value conversions (Interpreter::convert*C, InheritedC.cxx make()) ------
+define Convert
+{
+    ; ★The identifier is NULLABLE, in Primitive.arg_error#'s shape and for its
+    ; reason: the characteristic's name is materialised HERE and nowhere else,
+    ; the reference recovers it from a `const Identifier *`, and a value that
+    ; has no identifier still has an invalid value to report. An empty name is
+    ; what the reference's own message machinery prints for one.
+    procedure invalid_value(mutable interp: ref[Interpreter], ident: ref[Identifier]?, loc: Location)
+    {
+        interp.set_next_location(loc)
+        var iv_name StringC()
+        if ident <> null
+            iv_name := ident.get_name()
+        interp.message1(InterpreterMessages.invalidCharacteristicValue(), iv_name)
+    }
+
+    ; convertLengthC: an exact/inexact quantity of dimension 1.
+    procedure convert_length(mutable val_in: ref[ELObj], mutable out: ref[int], mutable interp: ref[Interpreter], loc: Location) returns bool
+    {
+        let val interp.convert_from_string(val_in, CONVERT_ALLOW_NUMBER, loc)
+        let qv: QuantityValue val.quantity_value()
+        if qv.get_qtype() = QT_LONG
+        {
+            ; ★the out parameter is written even when the DIMENSION is wrong:
+            ; the reference passes it straight into quantityValue
+            ; (`obj->quantityValue(n, d, dim)`), which stores the exact value
+            ; before anyone looks at the dimension. Measured: a dimensionless
+            ; `space-before: 12` messages `invalid value` AND prints
+            ; `.012pt,0pt,0pt` — 12 internal units in the nominal, nothing in
+            ; min/max. The double arm does NOT write (quantityValue fills `d`).
+            out := qv.get_lval()
+            if qv.get_dim() = 1
+                return true
+        }
+        if qv.get_qtype() = QT_DOUBLE
+        {
+            if qv.get_dim() = 1
+            {
+                out := qv.get_dval() as int
+                return true
+            }
+        }
+        false
+    }
+
+    ; convertLengthSpecC: the characteristic form — the `-2` string leniency
+    ; first, then the raw conversion below. ★The two are separate in the
+    ; reference too (Interpreter.h:388 declares the raw one on its own), and
+    ; the difference is observable: the display-space/inline-space PRIMITIVES
+    ; call the raw form, so a string argument stays invalid there even under
+    ; `-2`.
+    procedure convert_length_spec_c(mutable val_in: ref[ELObj]?, mutable out: ref[LengthSpec], mutable interp: ref[Interpreter], loc: Location) returns bool
+    {
+        let val interp.convert_from_string(val_in as ref[ELObj], CONVERT_ALLOW_NUMBER, loc)
+        Convert.convert_length_spec(val, out)
+    }
+
+    ; convertLengthSpec: a length quantity, or an engine length-spec
+    ; (display-size / arithmetic results) — LengthSpec::convert rounds the
+    ; length component and carries the display-size factor (the table-unit
+    ; component is dropped; the TableLengthSpec variant keeps it).
+    procedure convert_length_spec(val: ref[ELObj], mutable out: ref[LengthSpec]) returns bool
+    {
+        ; unlike convertLengthC (truncates), convertLengthSpec ROUNDS its
+        ; doubleQuantity arm (Interpreter.cxx: long(d < 0 ? d - .5 : d + .5))
+        let qv: QuantityValue val.quantity_value()
+        if qv.get_qtype() = QT_LONG
+        {
+            ; ★the LENGTH field is written even when the dimension is wrong
+            ; (see convert_length) — and only that field: the reference hands
+            ; `result.length` to quantityValue and never touches the factor.
+            out.length := qv.get_lval()
+            if qv.get_dim() = 1
+                return true
+        }
+        if qv.get_qtype() = QT_DOUBLE
+        {
+            if qv.get_dim() = 1
+            {
+                var ls LengthSpec()
+                ls.length := Convert.round_length(qv.get_dval())
+                out := ls
+                return true
+            }
+        }
+        let els val.length_spec()
+        if els <> null
+        {
+            var ls LengthSpec()
+            ls.length := Convert.round_length(els.v0)
+            ls.factor := els.v1
+            out := ls
+            return true
+        }
+        false
+    }
+
+    ; long(v < 0 ? v - .5 : v + .5) — LengthSpec::convert's rounding.
+    function round_length(v: double) returns int
+    {
+        if v < 0.0
+            return (v - 0.5) as int
+        (v + 0.5) as int
+    }
+
+    ; LengthSpec::convert(FOTBuilder::TableLengthSpec &) — like
+    ; convert_length_spec but the table-unit factor survives.
+    procedure convert_table_length_spec(mutable val: ref[ELObj], mutable out: ref[LengthSpec], mutable out_tfactor: ref[double], mutable interp: ref[Interpreter], loc: Location) returns bool
+    {
+        let els val.length_spec()
+        if els <> null
+        {
+            var ls LengthSpec()
+            ls.length := Convert.round_length(els.v0)
+            ls.factor := els.v1
+            out := ls
+            out_tfactor := els.v2
+            return true
+        }
+        out_tfactor := 0.0
+        ; the reference falls back to convertLengthSpecC here (FlowObj.cxx:2354)
+        Convert.convert_length_spec_c(val, out, interp, loc)
+    }
+
+    ; convertBooleanC is STRICT: only the #t/#f singletons convert (is_true
+    ; is truthiness — any non-#f object — and must NOT be used here). Under
+    ; `-2` the strings "yes"/"no"/"true"/"false" become those singletons
+    ; first; every other string stays invalid.
+    procedure convert_boolean(mutable val_in: ref[ELObj]?, mutable out: ref[bool], mutable interp: ref[Interpreter], loc: Location) returns bool
+    {
+        let val interp.convert_from_string(val_in as ref[ELObj], CONVERT_ALLOW_BOOLEAN, loc)
+        if val.is_false()
+        {
+            out := false
+            return true
+        }
+        if val.is_boolean_p()
+        {
+            out := true
+            return true
+        }
+        false
+    }
+
+    ; convertEnumC (identifier-less overload): #f / #t / any symbol installed
+    ; with a c-value. Under `-2` a string may name one of them.
+    procedure convert_enum(mutable val_in: ref[ELObj]?, mutable out: ref[FotSym], mutable interp: ref[Interpreter], loc: Location) returns bool
+    {
+        let val interp.convert_from_string(val_in as ref[ELObj], (CONVERT_ALLOW_SYMBOL | CONVERT_ALLOW_BOOLEAN), loc)
+        var r FotSym()
+        if val.is_false()
+        {
+            out := r
+            return true
+        }
+        if val.is_symbol_p()
+        {
+            let code val.symbol_c_value()
+            if code <> SYM_FALSE
+            {
+                r.code := code
+                r.name := val.symbol_name()
+                out := r
+                return true
+            }
+            return false
+        }
+        ; ★the reference tests IDENTITY with the #t singleton
+        ; (`obj == makeTrue()`), not truthiness — `is_true` answers true for
+        ; EVERY non-#f object, which used to let a length or a string through
+        ; as symbolTrue (measured 2026-07-31 with
+        ; `side-by-side-pre-align: 3pt`, which the reference rejects).
+        if val.is_boolean_p()
+        {
+            r.code := SYM_TRUE
+            out := r
+            return true
+        }
+        false
+    }
+
+    ; convertEnumC (allowed-set overload, the NIC form): the value must convert
+    ; AND its code must be in `allowed` (codes array, n entries).
+    procedure convert_enum_set(mutable val: ref[ELObj]?, allowed: Slice[int], mutable out: ref[FotSym], mutable interp: ref[Interpreter], loc: Location) returns bool
+    {
+        var r FotSym()
+        if Convert.convert_enum(val, &r, interp, loc) = false
+            return false
+        var i 0
+        while i < allowed.length
+        {
+            if allowed[i] = r.code
+            {
+                out := r
+                return true
+            }
+            i := i + 1
+        }
+        false
+    }
+
+    procedure convert_string(host: ref[Page], mutable val: ref[ELObj], mutable out: ref[StringC]) returns bool
+    {
+        if val.is_string_p() = false
+            return false
+        let s val.string_data(host)
+        out := StringC^host(s.as_slice())
+        true
+    }
+
+    ; ELObjExtensionFlowObjValue::convertStringList — a proper list of
+    ; strings; a malformed tail keeps the prefix already collected and fails.
+    procedure convert_string_list(host: ref[Page], mutable val: ref[ELObj], mutable out: ref[Array[StringC]]) returns bool
+    {
+        var obj: ref[ELObj]? val
+        while true
+        {
+            if obj = null
+                return false
+            if obj.is_nil()
+                return true
+            if obj.is_pair() = false
+                return false
+            let car obj.get_car()
+            if car = null
+                return false
+            if car.is_string_p() = false
+                return false
+            let sd car.string_data(host)
+            out.add(StringC^host(sd.as_slice()))
+            obj := obj.get_cdr()
+        }
+        false
+    }
+
+    procedure convert_integer(mutable val_in: ref[ELObj]?, mutable out: ref[int], mutable interp: ref[Interpreter], loc: Location) returns bool
+    {
+        let val interp.convert_from_string(val_in as ref[ELObj], CONVERT_ALLOW_NUMBER, loc)
+        let qv: QuantityValue val.quantity_value()
+        if qv.get_qtype() = QT_LONG
+        {
+            if qv.get_dim() = 0
+            {
+                out := qv.get_lval()
+                return true
+            }
+        }
+        false
+    }
+
+    ; convertPublicIdC: #f (empty) or a (possibly empty) string.
+    procedure convert_public_id(host: ref[Page], mutable val: ref[ELObj], mutable out: ref[StringC], mutable out_false: ref[bool]) returns bool
+    {
+        if val.is_false()
+        {
+            out_false := true
+            return true
+        }
+        if val.is_string_p()
+        {
+            out_false := false
+            let s val.string_data(host)
+            out := StringC^host(s.as_slice())
+            return true
+        }
+        false
+    }
+
+    ; convertLetter2C: #f clears; a STRING of exactly two UPPERCASE letters
+    ; (the reference accepts no symbols and does not case-fold — "de" is an
+    ; invalid value); the empty string also clears.
+    procedure convert_letter2(host: ref[Page], mutable val: ref[ELObj], mutable out: ref[StringC], mutable out_false: ref[bool]) returns bool
+    {
+        ; convertLetter2C goes through convertToString — a SYMBOL ('EN, the
+        ; docbook dsssl-language-code shape) converts like a string; #f is
+        ; checked only when the conversion fails.
+        let cs val.convert_to_string(host)
+        if cs = null
+        {
+            if val.is_false()
+            {
+                out_false := true
+                return true
+            }
+            return false
+        }
+        let s cs.string_data(host)
+        if s.get_size() = 0
+        {
+            out_false := true
+            return true
+        }
+        if s.get_size() <> 2
+            return false
+        var up u32[2]
+        var i: size_t 0
+        while i < 2
+        {
+            let c s.get(i)
+            if c < 0x41
+                return false
+            if c > 0x5A
+                return false
+            up[i] := c
+            i := i + 1
+        }
+        out_false := false
+        ; ^host, NOT the plain copying init: a plain StringC(ptr, n) temporary
+        ; copies onto the TEMPORARY's page (Page.get(this)) — the record then
+        ; stores a pointer into the dead frame region (bug found by the fot
+        ; toy diff: language="DE" printed NULs).
+        out := StringC^host(up as pointer[u32], 2)
+        true
+    }
+
+    ; InheritedC::make(value, loc, interp) — derive a constant IC from the
+    ; prototype `proto` with the converted value; null + message on invalid.
+    ; Quantities resolve first (a parse-time datum like 18pt is an
+    ; UnresolvedLengthObj until forced — ResolveQuantitiesInsn's job on the
+    ; eval path; the compile-time constant path forces here).
+    procedure ic_from_value(host: ref[Page], mutable proto: ref[InheritedC], mutable val_in: ref[ELObj], mutable loc: Location, mutable interp: ref[Interpreter]) returns ref[InheritedC]?
+    {
+        var val val_in
+        let resolved val.resolve_quantities(true, interp, loc)
+        if resolved <> null
+            val := resolved as ref[ELObj]
+        let ic InheritedC.make(host, proto.get_kind(), proto.ident, proto.get_index(), proto.print_name)
+        ic.proto := proto
+        ic.loc := loc
+        ic.ext_setter := proto.ext_setter
+        let kind proto.get_kind()
+        var ok false
+        if kind = IC_BOOL
+        {
+            var b false
+            ok := Convert.convert_boolean(val, &b, interp, loc)
+            ic.bval := b
+        }
+        else if kind = IC_LENGTH
+        {
+            var n 0
+            ok := Convert.convert_length(val, &n, interp, loc)
+            ic.lval := n
+        }
+        else if kind = IC_LENGTH_SPEC
+        {
+            var ls LengthSpec()
+            ok := Convert.convert_length_spec_c(val, &ls, interp, loc)
+            ic.ls := ls
+        }
+        else if kind = IC_SYMBOL
+        {
+            var sym FotSym()
+            ok := Convert.convert_enum(val, &sym, interp, loc)
+            ic.sym := sym
+        }
+        else if kind = IC_STRING
+        {
+            var s StringC()
+            ok := Convert.convert_string(host, val, &s)
+            ic.sval := s
+        }
+        else if kind = IC_INT
+        {
+            var n 0
+            ok := Convert.convert_integer(val, &n, interp, loc)
+            ic.lval := n
+        }
+        else if kind = IC_PUBLIC_ID
+        {
+            var s StringC()
+            var was_false false
+            ok := Convert.convert_public_id(host, val, &s, &was_false)
+            ic.sval := s
+            ic.bval := was_false
+        }
+        else if kind = IC_LETTER2
+        {
+            var s StringC()
+            var was_false false
+            ok := Convert.convert_letter2(host, val, &s, &was_false)
+            ic.sval := s
+            ic.bval := was_false
+        }
+        else if kind = IC_MAYBE_INT
+        {
+            ; convertOptPositiveIntegerC: #f -> 0, else a strictly positive
+            ; exact integer. ★Its `-2` leniency allows a number OR a boolean
+            ; and is applied ONCE, before the #f test — so "no" reaches the
+            ; #f arm, while convertIntegerC (number only) would reject it.
+            let mval interp.convert_from_string(val, (CONVERT_ALLOW_NUMBER | CONVERT_ALLOW_BOOLEAN), loc)
+            if mval.is_false()
+            {
+                ic.lval := 0
+                ok := true
+            }
+            else
+            {
+                var n 0
+                if Convert.convert_integer(mval, &n, interp, loc)
+                {
+                    if n > 0
+                    {
+                        ic.lval := n
+                        ok := true
+                    }
+                }
+            }
+        }
+        else if kind = IC_IGNORED
+        {
+            ; IgnoredC::make — any value is accepted and stored.
+            ic.obj := val
+            ok := true
+        }
+        else if kind = IC_BORDER
+        {
+            ; BorderC::make — a table-border sosofo is stored as-is; anything
+            ; else must convert to a boolean (canonical #t/#f stored).
+            if Convert.is_table_border_sosofo(val)
+            {
+                ic.obj := val
+                ok := true
+            }
+            else
+            {
+                var b false
+                if Convert.convert_boolean(val, &b, interp, loc)
+                {
+                    if b
+                        ic.obj := interp.make_true()
+                    else
+                        ic.obj := interp.make_false()
+                    ok := true
+                }
+            }
+        }
+        else if kind = IC_COLOR
+        {
+            ; ColorC::make / convertColorC — the value must be a color.
+            if val.is_color_p()
+            {
+                ic.obj := val
+                ok := true
+            }
+        }
+        else if kind = IC_OPT_COLOR
+        {
+            ; BackgroundColorC::make / convertOptColorC — a color or #f.
+            if val.is_color_p()
+            {
+                ic.obj := val
+                ok := true
+            }
+            else if val.is_false()
+            {
+                ic.obj := null
+                ok := true
+            }
+        }
+        else if kind = IC_OPT_LENGTH_SPEC
+        {
+            ; convertOptLengthSpecC: #f -> no length; else a length-spec.
+            ; ★its own `-2` leniency (number OR boolean) runs BEFORE the #f
+            ; test, so "no" selects the length-less form.
+            let oval interp.convert_from_string(val, (CONVERT_ALLOW_NUMBER | CONVERT_ALLOW_BOOLEAN), loc)
+            if oval.is_false()
+            {
+                ic.bval := true
+                ok := true
+            }
+            else
+            {
+                var ls LengthSpec()
+                if Convert.convert_length_spec_c(oval, &ls, interp, loc)
+                {
+                    ic.ls := ls
+                    ic.bval := false
+                    ok := true
+                }
+            }
+        }
+        else if kind = IC_INLINE_SPACE
+        {
+            ; GenericInlineSpaceInheritedC::make — an inline-space object, or
+            ; a length-spec (min = max = nominal).
+            if val.as_inline_space() <> null
+            {
+                ic.obj := val
+                ok := true
+            }
+            else
+            {
+                var ls LengthSpec()
+                if Convert.convert_length_spec_c(val, &ls, interp, loc)
+                {
+                    let sp InlineSpace.make(host)
+                    sp.nominal := ls
+                    sp.min := ls
+                    sp.max := ls
+                    ic.obj := ELObj.make_inline_space(host, sp)
+                    ok := true
+                }
+            }
+        }
+        else if kind = IC_OPT_INLINE_SPACE
+        {
+            ; GenericOptInlineSpaceInheritedC::make — an inline-space, #f, or
+            ; a length-spec (via convertOptLengthSpecC, whose leniency covers
+            ; the #f test as well).
+            if val.as_inline_space() <> null
+            {
+                ic.obj := val
+                ok := true
+            }
+            else
+            {
+                let oval interp.convert_from_string(val, (CONVERT_ALLOW_NUMBER | CONVERT_ALLOW_BOOLEAN), loc)
+                if oval.is_false()
+                {
+                    ic.obj := null
+                    ok := true
+                }
+                else
+                {
+                    var ls LengthSpec()
+                    if Convert.convert_length_spec_c(oval, &ls, interp, loc)
+                    {
+                        let sp InlineSpace.make(host)
+                        sp.nominal := ls
+                        sp.min := ls
+                        sp.max := ls
+                        ic.obj := ELObj.make_inline_space(host, sp)
+                        ok := true
+                    }
+                }
+            }
+        }
+        else if kind = IC_GST
+        {
+            ; GlyphSubstTableC::make — #f (isList 0, empty), a single table
+            ; (isList 0), or a proper list of tables (isList 1); bval = isList.
+            let tabs Array[ref[GlyphSubstTableRec]?]^host()
+            ic.gst := tabs
+            if val.is_false()
+                ok := true
+            else
+            {
+                let single val.as_glyph_subst_table()
+                if single <> null
+                {
+                    tabs.add(single)
+                    ok := true
+                }
+                else
+                {
+                    ic.bval := true
+                    var p val
+                    var good true
+                    var done false
+                    while done = false
+                    {
+                        if p.is_nil()
+                            done := true
+                        else if p.is_pair() = false
+                        {
+                            good := false
+                            done := true
+                        }
+                        else
+                        {
+                            let car p.get_car()
+                            var t: ref[GlyphSubstTableRec]? null
+                            if car <> null
+                                t := car.as_glyph_subst_table()
+                            if t = null
+                            {
+                                good := false
+                                done := true
+                            }
+                            else
+                            {
+                                tabs.add(t)
+                                p := p.get_cdr() as ref[ELObj]
+                            }
+                        }
+                    }
+                    ok := good
+                }
+            }
+        }
+        else if kind = IC_RULE
+        {
+            ; RuleC::make — the value must be a rule-FO sosofo (the rule
+            ; class binding's FlowObj prototype counts: FlowObj isRule()).
+            if Convert.is_rule_value(val)
+            {
+                ic.obj := val
+                ok := true
+            }
+        }
+        if ok = false
+        {
+            Convert.invalid_value(interp, proto.ident, loc)
+            return null
+        }
+        ic
+    }
+
+    ; FlowObj::setDisplayNIC — returns true when `sk` is a display NIC key
+    ; (value converted into `nic`; an invalid value messages and leaves the
+    ; default, per the reference convert*C behaviour).
+    procedure set_display_nic(mutable nic: ref[DisplayNIC], sk: int, mutable val: ref[ELObj], ident: ref[Identifier]?, loc: Location, mutable interp: ref[Interpreter], host: ref[Page]) returns bool
+    {
+        if sk = SK_POSITION_PREFERENCE
+        {
+            ; 3 x 8-byte int (an undersized buffer here overlaps the next
+            ; allocation — the decode-key-args bug class).
+            let allowed allocate_slice[int](host, 3)
+            allowed.put(0, SYM_FALSE)
+            allowed.put(1, SYM_TOP)
+            allowed.put(2, SYM_BOTTOM)
+            var s FotSym()
+            if Convert.convert_enum_set(val, allowed, &s, interp, loc)
+                nic.position_preference := s
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if sk = SK_KEEP_WITH_PREVIOUS
+        {
+            var b false
+            if Convert.convert_boolean(val, &b, interp, loc)
+                nic.keep_with_previous := b
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if sk = SK_KEEP_WITH_NEXT
+        {
+            var b false
+            if Convert.convert_boolean(val, &b, interp, loc)
+                nic.keep_with_next := b
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if sk = SK_KEEP
+        {
+            let allowed allocate_slice[int](host, 5)
+            allowed.put(0, SYM_FALSE)
+            allowed.put(1, SYM_TRUE)
+            allowed.put(2, SYM_PAGE)
+            allowed.put(3, SYM_COLUMN_SET)
+            allowed.put(4, SYM_COLUMN)
+            var s FotSym()
+            if Convert.convert_enum_set(val, allowed, &s, interp, loc)
+                nic.keep := s
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if (sk = SK_BREAK_BEFORE) or (sk = SK_BREAK_AFTER)
+        {
+            let allowed allocate_slice[int](host, 5)
+            allowed.put(0, SYM_FALSE)
+            allowed.put(1, SYM_PAGE)
+            allowed.put(2, SYM_PAGE_REGION)
+            allowed.put(3, SYM_COLUMN_SET)
+            allowed.put(4, SYM_COLUMN)
+            var s FotSym()
+            if Convert.convert_enum_set(val, allowed, &s, interp, loc)
+            {
+                if sk = SK_BREAK_BEFORE
+                    nic.break_before := s
+                else
+                    nic.break_after := s
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if sk = SK_MAY_VIOLATE_KEEP_BEFORE
+        {
+            var b false
+            if Convert.convert_boolean(val, &b, interp, loc)
+                nic.may_violate_keep_before := b
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if sk = SK_MAY_VIOLATE_KEEP_AFTER
+        {
+            var b false
+            if Convert.convert_boolean(val, &b, interp, loc)
+                nic.may_violate_keep_after := b
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return true
+        }
+        if (sk = SK_SPACE_BEFORE) or (sk = SK_SPACE_AFTER)
+        {
+            ; FlowObj.cxx keySpaceBefore/After: a display-space object copies
+            ; whole; else a length spec (min = max = nominal).
+            let dsp val.as_display_space()
+            if dsp <> null
+            {
+                let ds: DisplaySpace dsp as ref[DisplaySpace]
+                if sk = SK_SPACE_BEFORE
+                    nic.space_before := ds
+                else
+                    nic.space_after := ds
+                return true
+            }
+            ; the reference converts STRAIGHT into the NIC's own
+            ; `ds.nominal` (`convertLengthSpecC(obj, ident, loc, ds.nominal)`),
+            ; so a conversion that fails on the DIMENSION still leaves its
+            ; partial value in the NIC — `space-before: 12` messages AND
+            ; prints `.012pt,0pt,0pt` (see convert_length_spec).
+            var ds DisplaySpace()
+            if sk = SK_SPACE_BEFORE
+                ds := nic.space_before
+            else
+                ds := nic.space_after
+            var ls ds.nominal
+            let ok Convert.convert_length_spec_c(val, &ls, interp, loc)
+            ds.nominal := ls
+            if ok
+            {
+                ds.min := ls
+                ds.max := ls
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+            if sk = SK_SPACE_BEFORE
+                nic.space_before := ds
+            else
+                nic.space_after := ds
+            return true
+        }
+        false
+    }
+
+    ; a (make table-border …) sosofo — the only sosofo with a border style
+    ; (SosofoObj::tableBorderStyle).
+    function is_table_border_sosofo(val: ref[ELObj]) returns bool
+    {
+        if val.is_sosofo_p() = false
+            return false
+        if val.sosofo_kind() <> SOSO_FLOWOBJ
+            return false
+        let fo val.sosofo_flowobj()
+        if fo = null
+            return false
+        fo.get_foc() = FOC_TABLE_BORDER
+    }
+
+    ; RuleC::make's test — a rule-FO sosofo, or the rule class binding's
+    ; FlowObj prototype itself (a FlowObj IS a sosofo in the reference;
+    ; fraction-bar's initial value is lookup("rule")->flowObj()).
+    function is_rule_value(val: ref[ELObj]) returns bool
+    {
+        let box val.flowobj_box_ref()
+        if box <> null
+            return box.get_foc() = FOC_RULE
+        if val.is_sosofo_p() = false
+            return false
+        if val.sosofo_kind() <> SOSO_FLOWOBJ
+            return false
+        let fo val.sosofo_flowobj()
+        if fo = null
+            return false
+        fo.get_foc() = FOC_RULE
+    }
+
+    ; a border characteristic VALUE resolved to the style to push: a
+    ; table-border sosofo's style, or a boolean -> the canned border-present
+    ; styles; null = invalid (caller messages).
+    procedure border_style_from(mutable val: ref[ELObj], mutable interp: ref[Interpreter], loc: Location) returns ref[ELObj]?
+    {
+        if Convert.is_table_border_sosofo(val)
+            return val.sosofo_flowobj().get_style()
+        var b false
+        if Convert.convert_boolean(val, &b, interp, loc)
+        {
+            if b
+                return interp.border_true_style()
+            return interp.border_false_style()
+        }
+        null
+    }
+
+    ; TableFlowObj::setNonInheritedC, the table-specific keys (the display
+    ; NICs go through set_display_nic).
+    procedure set_table_nic(mutable rec: ref[TableNIC], sk: int, mutable val: ref[ELObj], ident: ref[Identifier]?, loc: Location, mutable interp: ref[Interpreter])
+    {
+        if sk = SK_TABLE_WIDTH
+        {
+            if val.is_false()
+            {
+                rec.width_type := TABLE_WIDTH_MINIMUM
+                return
+            }
+            var ls LengthSpec()
+            if Convert.convert_length_spec_c(val, &ls, interp, loc)
+            {
+                rec.width := ls
+                rec.width_type := TABLE_WIDTH_EXPLICIT
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return
+        }
+        let style Convert.border_style_from(val, interp, loc)
+        if style = null
+        {
+            Convert.invalid_value(interp, ident, loc)
+            return
+        }
+        if sk = SK_BEFORE_ROW_BORDER
+            rec.before_row_border := style
+        if sk = SK_AFTER_ROW_BORDER
+            rec.after_row_border := style
+        if sk = SK_BEFORE_COLUMN_BORDER
+            rec.before_column_border := style
+        if sk = SK_AFTER_COLUMN_BORDER
+            rec.after_column_border := style
+    }
+
+    ; TableColumnFlowObj::setNonInheritedC.
+    procedure set_table_column_nic(mutable rec: ref[TableColumnNIC], sk: int, mutable val: ref[ELObj]?, ident: ref[Identifier]?, loc: Location, mutable interp: ref[Interpreter])
+    {
+        if sk = SK_WIDTH
+        {
+            ; width is a TableLengthSpec, not just a LengthSpec — the
+            ; table-unit factor survives.
+            var ls LengthSpec()
+            var tf 0.0
+            if Convert.convert_table_length_spec(val as ref[ELObj], &ls, &tf, interp, loc)
+            {
+                rec.width := ls
+                rec.width_tfactor := tf
+                rec.has_width := true
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return
+        }
+        var n 0
+        var ok Convert.convert_integer(val, &n, interp, loc)
+        if ok
+        {
+            if n <= 0
+                ok := false
+        }
+        if ok = false
+        {
+            Convert.invalid_value(interp, ident, loc)
+            return
+        }
+        if sk = SK_COLUMN_NUMBER
+        {
+            rec.column_index := n - 1
+            rec.has_column_number := true
+        }
+        if sk = SK_N_COLUMNS_SPANNED
+            rec.n_columns_spanned := n
+    }
+
+    ; TableCellFlowObj::setNonInheritedC.
+    procedure set_table_cell_nic(mutable rec: ref[TableCellNIC], sk: int, mutable val: ref[ELObj]?, ident: ref[Identifier]?, loc: Location, mutable interp: ref[Interpreter])
+    {
+        if (sk = SK_IS_STARTS_ROW) or (sk = SK_IS_ENDS_ROW)
+        {
+            var b false
+            if Convert.convert_boolean(val, &b, interp, loc)
+            {
+                if sk = SK_IS_STARTS_ROW
+                    rec.starts_row := b
+                else
+                    rec.ends_row := b
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return
+        }
+        var n 0
+        var ok Convert.convert_integer(val, &n, interp, loc)
+        if ok
+        {
+            if n <= 0
+                ok := false
+        }
+        if ok = false
+        {
+            Convert.invalid_value(interp, ident, loc)
+            return
+        }
+        if sk = SK_COLUMN_NUMBER
+        {
+            rec.column_index := n - 1
+            rec.has_column_number := true
+        }
+        if sk = SK_N_COLUMNS_SPANNED
+            rec.n_columns_spanned := n
+        if sk = SK_N_ROWS_SPANNED
+            rec.n_rows_spanned := n
+    }
+
+    ; the table-family NIC key sets (Table*FlowObj::hasNonInheritedC +
+    ; hasPseudoNonInheritedC — both classes route the same way here).
+    function is_table_nic_key(foc: int, sk: int) returns bool
+    {
+        if foc = FOC_TABLE
+        {
+            match sk
+                case SK_TABLE_WIDTH case SK_BEFORE_ROW_BORDER case SK_AFTER_ROW_BORDER: return true
+                case SK_BEFORE_COLUMN_BORDER case SK_AFTER_COLUMN_BORDER: return true
+            return false
+        }
+        if foc = FOC_TABLE_COLUMN
+        {
+            match sk
+                case SK_COLUMN_NUMBER case SK_N_COLUMNS_SPANNED case SK_WIDTH: return true
+            return false
+        }
+        if foc = FOC_TABLE_CELL
+        {
+            match sk
+                case SK_N_ROWS_SPANNED case SK_COLUMN_NUMBER: return true
+                case SK_N_COLUMNS_SPANNED case SK_IS_STARTS_ROW case SK_IS_ENDS_ROW: return true
+            return false
+        }
+        false
+    }
+
+    ; dispatch a table-family NIC key into the FO's record (created on demand
+    ; on `host`); `tnic` is the in/out record slot.
+    procedure apply_table_nic(foc: int, mutable nic_in: NICRef, sk: int, mutable val: ref[ELObj]?, ident: ref[Identifier]?, loc: Location, mutable interp: ref[Interpreter], host: ref[Page]) returns NICRef
+    {
+        var nic nic_in
+        if foc = FOC_TABLE
+        {
+            if nic = null
+                nic := TableNIC.make(host) as NICRef
+            Convert.set_table_nic(nic as ref[TableNIC], sk, val as ref[ELObj], ident, loc, interp)
+            return nic
+        }
+        if foc = FOC_TABLE_COLUMN
+        {
+            if nic = null
+                nic := TableColumnNIC.make(host) as NICRef
+            Convert.set_table_column_nic(nic as ref[TableColumnNIC], sk, val, ident, loc, interp)
+            return nic
+        }
+        if foc = FOC_TABLE_CELL
+        {
+            if nic = null
+                nic := TableCellNIC.make(host) as NICRef
+            Convert.set_table_cell_nic(nic as ref[TableCellNIC], sk, val, ident, loc, interp)
+        }
+        nic
+    }
+
+    ; RuleFlowObj::hasNonInheritedC — the rule extras beyond the display NICs.
+    function is_rule_nic_key(foc: int, sk: int) returns bool
+    {
+        if foc <> FOC_RULE
+            return false
+        match sk
+            case SK_ORIENTATION case SK_LENGTH case SK_BREAK_BEFORE_PRIORITY case SK_BREAK_AFTER_PRIORITY: return true
+        false
+    }
+
+    ; RuleFlowObj::setNonInheritedC (the non-display keys).
+    procedure apply_rule_nic(mutable nic_in: NICRef, sk: int, mutable val: ref[ELObj]?, ident: ref[Identifier]?, loc: Location, mutable interp: ref[Interpreter], host: ref[Page]) returns NICRef
+    {
+        var nic nic_in
+        if nic = null
+            nic := RuleNIC.make(host) as NICRef
+        let r nic as ref[RuleNIC]
+        if sk = SK_ORIENTATION
+        {
+            let allowed allocate_slice[int](host, 4)
+            allowed.put(0, SYM_HORIZONTAL)
+            allowed.put(1, SYM_VERTICAL)
+            allowed.put(2, SYM_ESCAPEMENT)
+            allowed.put(3, SYM_LINE_PROGRESSION)
+            var s FotSym()
+            if Convert.convert_enum_set(val, allowed, &s, interp, loc)
+                r.orientation := s
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return nic
+        }
+        if sk = SK_LENGTH
+        {
+            var ls LengthSpec()
+            if Convert.convert_length_spec_c(val, &ls, interp, loc)
+            {
+                r.length := ls
+                r.has_length := true
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return nic
+        }
+        if (sk = SK_BREAK_BEFORE_PRIORITY) or (sk = SK_BREAK_AFTER_PRIORITY)
+        {
+            var n 0
+            if Convert.convert_integer(val, &n, interp, loc)
+            {
+                if sk = SK_BREAK_BEFORE_PRIORITY
+                    r.break_before_priority := n
+                else
+                    r.break_after_priority := n
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+        }
+        nic
+    }
+
+    ; the link/external-graphic/leader/box/score NIC keys (each class's
+    ; hasNonInheritedC minus the display-NIC base, which rides the shared
+    ; display_foc admission).
+    function is_fo_nic_key(foc: int, sk: int) returns bool
+    {
+        if foc = FOC_LINK
+            return sk = SK_DESTINATION
+        if foc = FOC_EXTERNAL_GRAPHIC
+        {
+            match sk
+                case SK_IS_DISPLAY case SK_SCALE case SK_MAX_WIDTH case SK_MAX_HEIGHT: return true
+                case SK_ENTITY_SYSTEM_ID case SK_NOTATION_SYSTEM_ID case SK_POSITION_POINT_X: return true
+                case SK_POSITION_POINT_Y case SK_ESCAPEMENT_DIRECTION: return true
+                case SK_BREAK_BEFORE_PRIORITY case SK_BREAK_AFTER_PRIORITY: return true
+            return false
+        }
+        if foc = FOC_BOX
+        {
+            match sk
+                case SK_IS_DISPLAY case SK_BREAK_BEFORE_PRIORITY case SK_BREAK_AFTER_PRIORITY: return true
+            return false
+        }
+        if foc = FOC_LEADER
+        {
+            match sk
+                case SK_LENGTH case SK_BREAK_BEFORE_PRIORITY case SK_BREAK_AFTER_PRIORITY: return true
+            return false
+        }
+        if foc = FOC_SCORE
+            return sk = SK_TYPE
+        if foc = FOC_PAGE_FLOAT
+            return sk = SK_PLACEMENT
+        if foc = FOC_INDEX_ENTRY
+        {
+            match sk
+                case SK_COMPONENTS case SK_PAGE_NUMBER_P case SK_SORT_STRING: return true
+                case SK_STARTS_PAGE_RANGE case SK_ENDS_PAGE_RANGE: return true
+            return false
+        }
+        if foc = FOC_LINE_FIELD
+        {
+            if sk = SK_BREAK_BEFORE_PRIORITY or sk = SK_BREAK_AFTER_PRIORITY
+                return true
+            return false
+        }
+        ; CharacterFlowObj::hasNonInheritedC — the fifteen keyed names (the
+        ; DECLARED char NICs come in through is_char_nic_ident below, which is
+        ; the ident-aware wrapper every classification site uses).
+        if foc = FOC_CHARACTER
+        {
+            match sk
+                case SK_CHAR case SK_GLYPH_ID case SK_IS_SPACE case SK_IS_RECORD_END: return true
+                case SK_IS_INPUT_TAB case SK_IS_INPUT_WHITESPACE case SK_IS_PUNCT: return true
+                case SK_IS_DROP_AFTER_LINE_BREAK case SK_IS_DROP_UNLESS_BEFORE_LINE_BREAK: return true
+                case SK_SCRIPT case SK_MATH_CLASS case SK_MATH_FONT_POSTURE: return true
+                case SK_STRETCH_FACTOR case SK_BREAK_BEFORE_PRIORITY case SK_BREAK_AFTER_PRIORITY: return true
+            return false
+        }
+        if foc = FOC_ANCHOR
+        {
+            match sk
+                case SK_IS_DISPLAY case SK_BREAK_BEFORE_PRIORITY case SK_BREAK_AFTER_PRIORITY: return true
+            return false
+        }
+        if foc = FOC_GLYPH_ANNOTATION
+        {
+            if sk = SK_BREAK_BEFORE_PRIORITY or sk = SK_BREAK_AFTER_PRIORITY
+                return true
+            return false
+        }
+        if foc = FOC_EMPHASIZING_MARK
+        {
+            match sk
+                case SK_BREAK_BEFORE_PRIORITY case SK_BREAK_AFTER_PRIORITY case SK_MARK: return true
+            return false
+        }
+        ; the three MATH classes that carry characteristics at all
+        ; (RadicalFlowObj / GridFlowObj / GridCellFlowObj::hasNonInheritedC).
+        ; ★None of them admits the two break priorities — they are not
+        ; InlineNIC-bearing classes.
+        if foc = FOC_RADICAL
+            return sk = SK_RADICAL
+        if foc = FOC_GRID
+        {
+            if sk = SK_GRID_N_COLUMNS or sk = SK_GRID_N_ROWS
+                return true
+            return false
+        }
+        if foc = FOC_GRID_CELL
+        {
+            if sk = SK_COLUMN_NUMBER or sk = SK_ROW_NUMBER
+                return true
+            return false
+        }
+        ; the LAYOUT-COMPOSITE classes that carry characteristics beyond the
+        ; display NIC (EmbeddedTextFlowObj / IncludedContainerAreaFlowObj;
+        ; `side-by-side` and `aligned-column` are isDisplayNIC-only and
+        ; `side-by-side-item` has no hasNonInheritedC at all — every keyword
+        ; there is unknown).
+        if foc = FOC_EMBEDDED_TEXT
+            return sk = SK_DIRECTION
+        if foc = FOC_INCLUDED_CONTAINER_AREA
+        {
+            match sk
+                case SK_IS_DISPLAY case SK_BREAK_BEFORE_PRIORITY case SK_BREAK_AFTER_PRIORITY: return true
+                case SK_SCALE case SK_POSITION_POINT_X case SK_POSITION_POINT_Y case SK_HEIGHT: return true
+                case SK_WIDTH case SK_ESCAPEMENT_DIRECTION case SK_CONTENTS_ROTATION: return true
+            return false
+        }
+        ; the ONLINE family: MultiModeFlowObj::hasNonInheritedC is exactly one
+        ; key; MarginaliaFlowObj has no hasNonInheritedC at all.
+        if foc = FOC_MULTI_MODE
+            return sk = SK_MULTI_MODES
+        false
+    }
+
+    ; the ident-aware admission: is_fo_nic_key plus the ONE case that is not a
+    ; syntactic key at all — a name registered as a char NIC by
+    ; `declare-char-characteristic+property` is a non-inherited characteristic
+    ; of the `character` flow object (CharacterFlowObj::hasNonInheritedC's
+    ; charNICDefined tail).
+    function is_fo_nic_ident(foc: int, sk: int, ident: ref[Identifier]?) returns bool
+    {
+        if Convert.is_fo_nic_key(foc, sk)
+            return true
+        if foc <> FOC_CHARACTER
+            return false
+        if ident = null
+            return false
+        ident.char_nic
+    }
+
+    ; the SGML-transformation classes' hasNIC, by NAME (TransformFOTBuilder.cxx
+    ; — an ExtensionFlowObj cannot extend the syntactic-key enum, so the
+    ; reference compares strings: `name == "gi"`, `name == "attributes"`, …).
+    ; Everything a class does NOT claim here is an ordinary inherited
+    ; characteristic, exactly as for any other flow object; that is why these
+    ; classes take the styled make path.
+    function is_transform_nic_name(foc: int, name: StringC) returns bool
+    {
+        if (foc = FOC_ELEMENT) or (foc = FOC_EMPTY_ELEMENT)
+        {
+            if name.equals(StringC("gi"))
+                return true
+            return name.equals(StringC("attributes"))
+        }
+        if foc = FOC_ENTITY
+            return name.equals(StringC("system-id"))
+        if foc = FOC_ENTITY_REF
+            return name.equals(StringC("name"))
+        if foc = FOC_PROCESSING_INSTRUCTION
+            return name.equals(StringC("data"))
+        if foc = FOC_FORMATTING_INSTRUCTION
+            return name.equals(StringC("data"))
+        if foc = FOC_DOCUMENT_TYPE
+        {
+            if name.equals(StringC("name")) or name.equals(StringC("public-id"))
+                return true
+            return name.equals(StringC("system-id"))
+        }
+        ; the dazzle `directory` extension
+        if foc = FOC_DIRECTORY
+            return name.equals(StringC("path"))
+        false
+    }
+
+    function is_transform_foc(foc: int) returns bool
+    {
+        if foc < FOC_ELEMENT
+            return false
+        foc <= FOC_DIRECTORY
+    }
+
+    function make_fo_nic(foc: int, host: ref[Page]) returns NICRef
+    {
+        if foc = FOC_LINK
+            return LinkNIC.make(host) as NICRef
+        if foc = FOC_EXTERNAL_GRAPHIC
+            return ExternalGraphicNIC.make(host) as NICRef
+        if foc = FOC_BOX
+            return BoxNIC.make(host) as NICRef
+        if foc = FOC_LEADER
+            return LeaderNIC.make(host) as NICRef
+        if foc = FOC_SCORE
+            return ScoreNIC.make(host) as NICRef
+        if foc = FOC_PAGE_FLOAT
+            return PageFloatNIC.make(host) as NICRef
+        if foc = FOC_INDEX_ENTRY
+            return IndexEntryNIC.make(host) as NICRef
+        if foc = FOC_LINE_FIELD
+            return LineFieldNIC.make(host) as NICRef
+        if foc = FOC_CHARACTER
+            return CharacterNIC.make(host) as NICRef
+        if foc = FOC_ANCHOR
+            return AnchorNIC.make(host) as NICRef
+        if foc = FOC_GLYPH_ANNOTATION
+            return GlyphAnnotationNIC.make(host) as NICRef
+        if foc = FOC_EMPHASIZING_MARK
+            return EmphasizingMarkNIC.make(host) as NICRef
+        if foc = FOC_RADICAL
+            return RadicalNIC.make(host) as NICRef
+        if foc = FOC_GRID
+            return GridNIC.make(host) as NICRef
+        if foc = FOC_GRID_CELL
+            return GridCellNIC.make(host) as NICRef
+        if foc = FOC_EMBEDDED_TEXT
+            return EmbeddedTextNIC.make(host) as NICRef
+        if foc = FOC_INCLUDED_CONTAINER_AREA
+            return IncludedContainerAreaNIC.make(host) as NICRef
+        if foc = FOC_MULTI_MODE
+            return MultiModeNIC.make(host) as NICRef
+        null
+    }
+
+    function copy_fo_nic(foc: int, p: NICRef, host: ref[Page]) returns NICRef
+    {
+        if p = null
+            return Convert.make_fo_nic(foc, host)
+        if foc = FOC_LINK
+        {
+            let l p as ref[LinkNIC]
+            return l.copy(host) as NICRef
+        }
+        if foc = FOC_EXTERNAL_GRAPHIC
+        {
+            let g p as ref[ExternalGraphicNIC]
+            return g.copy(host) as NICRef
+        }
+        if foc = FOC_BOX
+        {
+            let b p as ref[BoxNIC]
+            return b.copy(host) as NICRef
+        }
+        if foc = FOC_LEADER
+        {
+            let d p as ref[LeaderNIC]
+            return d.copy(host) as NICRef
+        }
+        if foc = FOC_SCORE
+        {
+            let s p as ref[ScoreNIC]
+            return s.copy(host) as NICRef
+        }
+        if foc = FOC_PAGE_FLOAT
+        {
+            let f p as ref[PageFloatNIC]
+            return f.copy(host) as NICRef
+        }
+        if foc = FOC_INDEX_ENTRY
+        {
+            let ie p as ref[IndexEntryNIC]
+            return ie.copy(host) as NICRef
+        }
+        if foc = FOC_LINE_FIELD
+        {
+            let lf p as ref[LineFieldNIC]
+            return lf.copy(host) as NICRef
+        }
+        if foc = FOC_CHARACTER
+        {
+            let cn p as ref[CharacterNIC]
+            return cn.copy(host) as NICRef
+        }
+        if foc = FOC_ANCHOR
+        {
+            let an p as ref[AnchorNIC]
+            return an.copy(host) as NICRef
+        }
+        if foc = FOC_GLYPH_ANNOTATION
+        {
+            let ga p as ref[GlyphAnnotationNIC]
+            return ga.copy(host) as NICRef
+        }
+        if foc = FOC_EMPHASIZING_MARK
+        {
+            let em p as ref[EmphasizingMarkNIC]
+            return em.copy(host) as NICRef
+        }
+        if foc = FOC_RADICAL
+        {
+            let ra p as ref[RadicalNIC]
+            return ra.copy(host) as NICRef
+        }
+        if foc = FOC_GRID
+        {
+            let gr p as ref[GridNIC]
+            return gr.copy(host) as NICRef
+        }
+        if foc = FOC_GRID_CELL
+        {
+            let gc p as ref[GridCellNIC]
+            return gc.copy(host) as NICRef
+        }
+        if foc = FOC_EMBEDDED_TEXT
+        {
+            let et p as ref[EmbeddedTextNIC]
+            return et.copy(host) as NICRef
+        }
+        if foc = FOC_INCLUDED_CONTAINER_AREA
+        {
+            let ic p as ref[IncludedContainerAreaNIC]
+            return ic.copy(host) as NICRef
+        }
+        if foc = FOC_MULTI_MODE
+        {
+            let mm p as ref[MultiModeNIC]
+            return mm.copy(host) as NICRef
+        }
+        null
+    }
+
+    ; Link/ExternalGraphic/Box/Leader/Score FlowObj::setNonInheritedC.
+    procedure apply_fo_nic(foc: int, mutable nic_in: NICRef, sk: int, mutable val: ref[ELObj], ident: ref[Identifier]?, mutable loc: Location, mutable interp: ref[Interpreter], host: ref[Page]) returns NICRef
+    {
+        var nic nic_in
+        if nic = null
+            nic := Convert.make_fo_nic(foc, host)
+        if foc = FOC_LINK
+        {
+            ; LinkFlowObj: an address or #f (#f = Address::none; anything
+            ; else is invalid).
+            let r nic as ref[LinkNIC]
+            if val.is_address_p()
+            {
+                let a val.address_rec()
+                r.addr_type := a.addr_type
+                r.node := a.node
+                ; the params outlive the value object (the NIC is replayed
+                ; from a SaveFOTBuilder long after the eval region died), so
+                ; pin them on the NIC's own page.
+                r.p0 := InheritedC.pin_string(host, a.p0)
+                r.p1 := InheritedC.pin_string(host, a.p1)
+                r.p2 := InheritedC.pin_string(host, a.p2)
+            }
+            else
+            {
+                ; ★LinkFlowObj::setNonInheritedC assigns addressObj_ OUTSIDE
+                ; its if/else (FlowObj.cxx:909): both #f and an invalid value
+                ; end at Address::none — an invalid `destination:` therefore
+                ; also DISCARDS a valid one set earlier in the same make.
+                if val.is_false() = false
+                    Convert.invalid_value(interp, ident, loc)
+                r.addr_type := ADDR_NONE
+                r.node := null
+                r.p0 := StringC()
+                r.p1 := StringC()
+                r.p2 := StringC()
+            }
+            return nic
+        }
+        if foc = FOC_EXTERNAL_GRAPHIC
+        {
+            let r nic as ref[ExternalGraphicNIC]
+            if sk = SK_IS_DISPLAY
+            {
+                var b false
+                if Convert.convert_boolean(val, &b, interp, loc)
+                    r.is_display := b
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_SCALE
+            {
+                ; a number (uniform x/y), the symbols max/max-uniform, or a
+                ; two-number list.
+                if val.is_number()
+                {
+                    var s FotSym()
+                    r.scale_type := s
+                    r.scale_x := val.real_value()
+                    r.scale_y := val.real_value()
+                    return nic
+                }
+                if val.is_symbol_p()
+                {
+                    let allowed allocate_slice[int](host, 2)
+                    allowed.put(0, SYM_MAX_SCALE)
+                    allowed.put(1, SYM_MAX_UNIFORM)
+                    var s FotSym()
+                    if Convert.convert_enum_set(val, allowed, &s, interp, loc)
+                        r.scale_type := s
+                    else
+                        Convert.invalid_value(interp, ident, loc)
+                    return nic
+                }
+                var ok false
+                if val.is_pair()
+                {
+                    let x val.get_car()
+                    let rest val.get_cdr()
+                    if x.is_number() and rest.is_pair()
+                    {
+                        let y rest.get_car()
+                        let tail rest.get_cdr()
+                        if y.is_number() and tail.is_nil()
+                        {
+                            var s FotSym()
+                            r.scale_type := s
+                            r.scale_x := x.real_value()
+                            r.scale_y := y.real_value()
+                            ok := true
+                        }
+                    }
+                }
+                if ok = false
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_MAX_WIDTH
+            {
+                var ls LengthSpec()
+                if Convert.convert_length_spec_c(val, &ls, interp, loc)
+                {
+                    r.max_width := ls
+                    r.has_max_width := true
+                }
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_MAX_HEIGHT
+            {
+                var ls LengthSpec()
+                if Convert.convert_length_spec_c(val, &ls, interp, loc)
+                {
+                    r.max_height := ls
+                    r.has_max_height := true
+                }
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_ENTITY_SYSTEM_ID
+            {
+                var s StringC()
+                if Convert.convert_string(host, val, &s)
+                    r.entity_system_id := s
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_NOTATION_SYSTEM_ID
+            {
+                var s StringC()
+                if Convert.convert_string(host, val, &s)
+                    r.notation_system_id := s
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_POSITION_POINT_X
+            {
+                var ls LengthSpec()
+                if Convert.convert_length_spec_c(val, &ls, interp, loc)
+                    r.position_point_x := ls
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_POSITION_POINT_Y
+            {
+                var ls LengthSpec()
+                if Convert.convert_length_spec_c(val, &ls, interp, loc)
+                    r.position_point_y := ls
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_ESCAPEMENT_DIRECTION
+            {
+                let allowed allocate_slice[int](host, 4)
+                allowed.put(0, SYM_TOP_TO_BOTTOM)
+                allowed.put(1, SYM_LEFT_TO_RIGHT)
+                allowed.put(2, SYM_BOTTOM_TO_TOP)
+                allowed.put(3, SYM_RIGHT_TO_LEFT)
+                var s FotSym()
+                if Convert.convert_enum_set(val, allowed, &s, interp, loc)
+                    r.escapement_direction := s
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if (sk = SK_BREAK_BEFORE_PRIORITY) or (sk = SK_BREAK_AFTER_PRIORITY)
+            {
+                var n 0
+                if Convert.convert_integer(val, &n, interp, loc)
+                {
+                    if sk = SK_BREAK_BEFORE_PRIORITY
+                        r.break_before_priority := n
+                    else
+                        r.break_after_priority := n
+                }
+                else
+                    Convert.invalid_value(interp, ident, loc)
+            }
+            return nic
+        }
+        if foc = FOC_BOX
+        {
+            let r nic as ref[BoxNIC]
+            if sk = SK_IS_DISPLAY
+            {
+                var b false
+                if Convert.convert_boolean(val, &b, interp, loc)
+                    r.is_display := b
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if (sk = SK_BREAK_BEFORE_PRIORITY) or (sk = SK_BREAK_AFTER_PRIORITY)
+            {
+                var n 0
+                if Convert.convert_integer(val, &n, interp, loc)
+                {
+                    if sk = SK_BREAK_BEFORE_PRIORITY
+                        r.break_before_priority := n
+                    else
+                        r.break_after_priority := n
+                }
+                else
+                    Convert.invalid_value(interp, ident, loc)
+            }
+            return nic
+        }
+        if foc = FOC_LEADER
+        {
+            let r nic as ref[LeaderNIC]
+            if sk = SK_LENGTH
+            {
+                var ls LengthSpec()
+                if Convert.convert_length_spec_c(val, &ls, interp, loc)
+                {
+                    r.length := ls
+                    r.has_length := true
+                }
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if (sk = SK_BREAK_BEFORE_PRIORITY) or (sk = SK_BREAK_AFTER_PRIORITY)
+            {
+                var n 0
+                if Convert.convert_integer(val, &n, interp, loc)
+                {
+                    if sk = SK_BREAK_BEFORE_PRIORITY
+                        r.break_before_priority := n
+                    else
+                        r.break_after_priority := n
+                }
+                else
+                    Convert.invalid_value(interp, ident, loc)
+            }
+            return nic
+        }
+        if foc = FOC_SCORE
+        {
+            ; ScoreFlowObj::setNonInheritedC — char, then dim-1 quantity,
+            ; then the before/through/after symbols.
+            let r nic as ref[ScoreNIC]
+            let c val.char_value()
+            if c >= 0
+            {
+                r.kind := SCORE_CHAR
+                r.ch := c as u32
+                return nic
+            }
+            let qv val.quantity_value()
+            if qv.get_dim() = 1
+            {
+                if qv.get_qtype() = QT_LONG
+                {
+                    var ls LengthSpec()
+                    ls.length := qv.get_lval()
+                    r.kind := SCORE_LENGTH
+                    r.length := ls
+                    return nic
+                }
+                if qv.get_qtype() = QT_DOUBLE
+                {
+                    var ls LengthSpec()
+                    ls.length := qv.get_dval() as int
+                    r.kind := SCORE_LENGTH
+                    r.length := ls
+                    return nic
+                }
+            }
+            let allowed allocate_slice[int](host, 3)
+            allowed.put(0, SYM_BEFORE)
+            allowed.put(1, SYM_THROUGH)
+            allowed.put(2, SYM_AFTER)
+            var s FotSym()
+            if Convert.convert_enum_set(val, allowed, &s, interp, loc)
+            {
+                r.kind := SCORE_SYMBOL
+                r.sym := s
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return nic
+        }
+        if foc = FOC_LINE_FIELD
+        {
+            ; LineFieldFlowObj::setNonInheritedC — convertIntegerC.
+            let r nic as ref[LineFieldNIC]
+            var n 0
+            if Convert.convert_integer(val, &n, interp, loc)
+            {
+                if sk = SK_BREAK_BEFORE_PRIORITY
+                    r.break_before_priority := n
+                else
+                    r.break_after_priority := n
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return nic
+        }
+        if foc = FOC_PAGE_FLOAT
+        {
+            ; PageFloatFlowObj::setNIC — value.convertString(placement); the
+            ; ELObjExtensionFlowObjValue conversion is silent on failure
+            ; (leaves the NIC untouched, no diagnostic).
+            let r nic as ref[PageFloatNIC]
+            var str StringC()
+            if Convert.convert_string(host, val, &str)
+                r.placement := str
+            return nic
+        }
+        if foc = FOC_INDEX_ENTRY
+        {
+            ; MifFOTBuilder::IndexEntryFlowObj::setNIC over
+            ; ELObjExtensionFlowObjValue: convertStringList / convertBoolean /
+            ; (convertBoolean then convertString) — each reports
+            ; invalidCharacteristicValue itself on failure.
+            let r nic as ref[IndexEntryNIC]
+            if sk = SK_COMPONENTS
+            {
+                if Convert.convert_string_list(host, val, r.components) = false
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_SORT_STRING
+            {
+                var has false
+                if Convert.convert_boolean(val, &has, interp, loc) = false
+                {
+                    Convert.invalid_value(interp, ident, loc)
+                    return nic
+                }
+                if has
+                {
+                    var ss StringC()
+                    if Convert.convert_string(host, val, &ss)
+                        r.sort_string := ss
+                    else
+                        Convert.invalid_value(interp, ident, loc)
+                }
+                return nic
+            }
+            var bv false
+            if Convert.convert_boolean(val, &bv, interp, loc) = false
+            {
+                Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_PAGE_NUMBER_P
+                r.page_number := bv
+            else if sk = SK_STARTS_PAGE_RANGE
+                r.starts_page_range := bv
+            else if sk = SK_ENDS_PAGE_RANGE
+                r.ends_page_range := bv
+            return nic
+        }
+        if foc = FOC_CHARACTER
+        {
+            Convert.set_character_nic(nic as ref[CharacterNIC], sk, val, ident, loc, interp, host)
+            return nic
+        }
+        if foc = FOC_ANCHOR
+        {
+            let r nic as ref[AnchorNIC]
+            if sk = SK_IS_DISPLAY
+            {
+                var b false
+                if Convert.convert_boolean(val, &b, interp, loc)
+                    r.is_display := b
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            var n 0
+            if Convert.convert_integer(val, &n, interp, loc) = false
+            {
+                Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_BREAK_BEFORE_PRIORITY
+                r.break_before_priority := n
+            else if sk = SK_BREAK_AFTER_PRIORITY
+                r.break_after_priority := n
+            return nic
+        }
+        if foc = FOC_GLYPH_ANNOTATION
+        {
+            let r nic as ref[GlyphAnnotationNIC]
+            var n 0
+            if Convert.convert_integer(val, &n, interp, loc) = false
+            {
+                Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_BREAK_BEFORE_PRIORITY
+                r.break_before_priority := n
+            else if sk = SK_BREAK_AFTER_PRIORITY
+                r.break_after_priority := n
+            return nic
+        }
+        if foc = FOC_EMPHASIZING_MARK
+        {
+            let r nic as ref[EmphasizingMarkNIC]
+            if sk = SK_MARK
+            {
+                ; EmphasizingMarkFlowObj::setNonInheritedC — any sosofo (no
+                ; isCharacter demand, unlike radical:).
+                if val.is_sosofo_p()
+                    r.mark := val
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            var n 0
+            if Convert.convert_integer(val, &n, interp, loc) = false
+            {
+                Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_BREAK_BEFORE_PRIORITY
+                r.break_before_priority := n
+            else if sk = SK_BREAK_AFTER_PRIORITY
+                r.break_after_priority := n
+            return nic
+        }
+        if foc = FOC_RADICAL
+        {
+            ; RadicalFlowObj::setNonInheritedC — the value must be a sosofo
+            ; that answers isCharacter, i.e. a `character` flow object.
+            ; ★The reference STORES whatever asSosofo() gave (possibly null)
+            ; and only then messages, so an invalid radical: leaves the slot
+            ; overwritten — reproduced.
+            let r nic as ref[RadicalNIC]
+            if val.is_sosofo_p()
+                r.radical := val
+            else
+                r.radical := null
+            if Convert.is_character_sosofo(r.radical) = false
+                Convert.invalid_value(interp, ident, loc)
+            return nic
+        }
+        if foc = FOC_GRID
+        {
+            ; GridFlowObj::setNonInheritedC — convertIntegerC, then a
+            ; POSITIVITY gate that messages with the same diagnostic.
+            let r nic as ref[GridNIC]
+            var n 0
+            if Convert.convert_integer(val, &n, interp, loc) = false
+            {
+                Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if n <= 0
+            {
+                Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_GRID_N_COLUMNS
+                r.n_columns := n
+            else if sk = SK_GRID_N_ROWS
+                r.n_rows := n
+            return nic
+        }
+        if foc = FOC_GRID_CELL
+        {
+            let r nic as ref[GridCellNIC]
+            var n 0
+            if Convert.convert_integer(val, &n, interp, loc) = false
+            {
+                Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if n <= 0
+            {
+                Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_COLUMN_NUMBER
+                r.column_number := n
+            else if sk = SK_ROW_NUMBER
+                r.row_number := n
+            return nic
+        }
+        if foc = FOC_EMBEDDED_TEXT
+        {
+            ; EmbeddedTextFlowObj::setNonInheritedC — one enum, and its allowed
+            ; set deliberately omits symbolFalse (the reference's own comment:
+            ; one of the two directions MUST be given), so `direction: #f` is
+            ; an invalid value.
+            let r nic as ref[EmbeddedTextNIC]
+            let allowed allocate_slice[int](host, 2)
+            allowed.put(0, SYM_RIGHT_TO_LEFT)
+            allowed.put(1, SYM_LEFT_TO_RIGHT)
+            var s FotSym()
+            if Convert.convert_enum_set(val, allowed, &s, interp, loc)
+                r.direction := s
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return nic
+        }
+        if foc = FOC_INCLUDED_CONTAINER_AREA
+        {
+            ; IncludedContainerAreaFlowObj::setNonInheritedC — the ten keys the
+            ; class adds on top of the display NIC.
+            let r nic as ref[IncludedContainerAreaNIC]
+            if sk = SK_IS_DISPLAY
+            {
+                var b false
+                if Convert.convert_boolean(val, &b, interp, loc)
+                    r.is_display := b
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if (sk = SK_BREAK_BEFORE_PRIORITY) or (sk = SK_BREAK_AFTER_PRIORITY)
+            {
+                var n 0
+                if Convert.convert_integer(val, &n, interp, loc)
+                {
+                    if sk = SK_BREAK_BEFORE_PRIORITY
+                        r.break_before_priority := n
+                    else
+                        r.break_after_priority := n
+                }
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_CONTENTS_ROTATION
+            {
+                var n 0
+                if Convert.convert_integer(val, &n, interp, loc)
+                    r.contents_rotation := n
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_SCALE
+            {
+                ; a number (uniform), the symbols max/max-uniform, or a
+                ; two-number list — the same three shapes external-graphic
+                ; takes, but probed in the reference's own order (realValue
+                ; first, then asSymbol, then the pair).
+                if val.is_number()
+                {
+                    var s FotSym()
+                    r.scale_type := s
+                    r.scale_x := val.real_value()
+                    r.scale_y := val.real_value()
+                    return nic
+                }
+                if val.is_symbol_p()
+                {
+                    let allowed allocate_slice[int](host, 2)
+                    allowed.put(0, SYM_MAX_SCALE)
+                    allowed.put(1, SYM_MAX_UNIFORM)
+                    var s FotSym()
+                    if Convert.convert_enum_set(val, allowed, &s, interp, loc)
+                        r.scale_type := s
+                    else
+                        Convert.invalid_value(interp, ident, loc)
+                    return nic
+                }
+                var ok false
+                if val.is_pair()
+                {
+                    let x val.get_car()
+                    let rest val.get_cdr()
+                    if x.is_number() and rest.is_pair()
+                    {
+                        let y rest.get_car()
+                        let tail rest.get_cdr()
+                        if y.is_number() and tail.is_nil()
+                        {
+                            var s FotSym()
+                            r.scale_type := s
+                            r.scale_x := x.real_value()
+                            r.scale_y := y.real_value()
+                            ok := true
+                        }
+                    }
+                }
+                if ok = false
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_POSITION_POINT_X
+            {
+                var ls LengthSpec()
+                if Convert.convert_length_spec_c(val, &ls, interp, loc)
+                    r.position_point_x := ls
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_POSITION_POINT_Y
+            {
+                var ls LengthSpec()
+                if Convert.convert_length_spec_c(val, &ls, interp, loc)
+                    r.position_point_y := ls
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if (sk = SK_WIDTH) or (sk = SK_HEIGHT)
+            {
+                ; ★#f is the MINIMUM form (not an invalid value); anything else
+                ; must convert, and a failed conversion leaves the type alone
+                ; after the conversion's own diagnostic.
+                if val.is_false()
+                {
+                    if sk = SK_WIDTH
+                        r.width_type := ICA_WIDTH_MINIMUM
+                    else
+                        r.height_type := ICA_HEIGHT_MINIMUM
+                    return nic
+                }
+                var ls LengthSpec()
+                if Convert.convert_length_spec_c(val, &ls, interp, loc)
+                {
+                    if sk = SK_WIDTH
+                    {
+                        r.width := ls
+                        r.width_type := ICA_WIDTH_EXPLICIT
+                    }
+                    else
+                    {
+                        r.height := ls
+                        r.height_type := ICA_HEIGHT_EXPLICIT
+                    }
+                }
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            if sk = SK_ESCAPEMENT_DIRECTION
+            {
+                let allowed allocate_slice[int](host, 4)
+                allowed.put(0, SYM_TOP_TO_BOTTOM)
+                allowed.put(1, SYM_BOTTOM_TO_TOP)
+                allowed.put(2, SYM_RIGHT_TO_LEFT)
+                allowed.put(3, SYM_LEFT_TO_RIGHT)
+                var s FotSym()
+                if Convert.convert_enum_set(val, allowed, &s, interp, loc)
+                    r.escapement_direction := s
+                else
+                    Convert.invalid_value(interp, ident, loc)
+                return nic
+            }
+            return nic
+        }
+        if foc = FOC_MULTI_MODE
+        {
+            ; MultiModeFlowObj::setNonInheritedC — a proper list whose members
+            ; are handled one by one; the FIRST member that is not one of the
+            ; four accepted shapes messages and STOPS (the prefix already
+            ; collected stays).
+            let r nic as ref[MultiModeNIC]
+            var cur val
+            while cur.is_nil() = false
+            {
+                if cur.is_pair() = false
+                {
+                    Convert.invalid_value(interp, ident, loc)
+                    return nic
+                }
+                if Convert.multi_modes_member(r, (cur.get_car()) as ref[ELObj], host) = false
+                {
+                    Convert.invalid_value(interp, ident, loc)
+                    return nic
+                }
+                cur := cur.get_cdr() as ref[ELObj]
+            }
+            return nic
+        }
+        nic
+    }
+
+    ; MultiModeFlowObj::handleMultiModesMember — the four accepted shapes of a
+    ; `multi-modes:` member: `#f` (the principal mode), a symbol (a named
+    ; mode), `(#f "desc")` and `(sym "desc")`.
+    procedure multi_modes_member(mutable r: ref[MultiModeNIC], mutable obj: ref[ELObj], host: ref[Page]) returns bool
+    {
+        if obj.is_false()
+        {
+            r.has_principal_mode := true
+            return true
+        }
+        if obj.is_symbol_p()
+        {
+            let m MultiModeRec.make(host)
+            let nm obj.symbol_name()
+            m.name := StringC^host(nm.as_slice())
+            r.named.add(m)
+            return true
+        }
+        if obj.is_pair() = false
+            return false
+        let spec obj.get_car()
+        let rest obj.get_cdr()
+        if rest.is_pair() = false
+            return false
+        let tail rest.get_cdr()
+        if tail.is_nil() = false
+            return false
+        var d StringC()
+        if Convert.convert_string(host, (rest.get_car()) as ref[ELObj], &d) = false
+            return false
+        if spec.is_false()
+        {
+            r.has_principal_mode := true
+            r.principal_has_desc := true
+            r.principal_desc := d
+            return true
+        }
+        if spec.is_symbol_p() = false
+            return false
+        let m MultiModeRec.make(host)
+        let nm spec.symbol_name()
+        m.name := StringC^host(nm.as_slice())
+        m.desc := d
+        m.has_desc := true
+        r.named.add(m)
+        true
+    }
+
+    ; SosofoObj::isCharacter (ProcessContext.cxx:535) — only a `character`
+    ; flow-object sosofo answers true; it is what `radical:` demands.
+    function is_character_sosofo(val: ref[ELObj]?) returns bool
+    {
+        if val = null
+            return false
+        if val.is_sosofo_p() = false
+            return false
+        if val.sosofo_kind() <> SOSO_FLOWOBJ
+            return false
+        let fo val.sosofo_flowobj()
+        if fo = null
+            return false
+        fo.get_foc() = FOC_CHARACTER
+    }
+
+    ; convertRealC.
+    procedure convert_real(mutable val_in: ref[ELObj], mutable out: ref[double], mutable interp: ref[Interpreter], loc: Location) returns bool
+    {
+        let val interp.convert_from_string(val_in, CONVERT_ALLOW_NUMBER, loc)
+        if val.is_number() = false
+            return false
+        out := val.real_value()
+        true
+    }
+
+    ; convertCharC: a char object, or a string of exactly one character.
+    procedure convert_char(host: ref[Page], mutable val: ref[ELObj], mutable out: ref[u32]) returns bool
+    {
+        if val.is_char_p()
+        {
+            out := val.char_value() as u32
+            return true
+        }
+        if val.has_string_data()
+        {
+            let s val.string_data(host)
+            if s.get_size() = 1
+            {
+                out := s.get(0)
+                return true
+            }
+        }
+        false
+    }
+
+    ; the math-class enum set (CharacterFlowObj::setNonInheritedC).
+    procedure convert_math_class(mutable val: ref[ELObj], mutable out: ref[FotSym], host: ref[Page], mutable interp: ref[Interpreter], loc: Location) returns bool
+    {
+        let allowed allocate_slice[int](host, 9)
+        allowed.put(0, SYM_ORDINARY)
+        allowed.put(1, SYM_OPERATOR)
+        allowed.put(2, SYM_BINARY)
+        allowed.put(3, SYM_RELATION)
+        allowed.put(4, SYM_OPENING)
+        allowed.put(5, SYM_CLOSING)
+        allowed.put(6, SYM_PUNCTUATION)
+        allowed.put(7, SYM_INNER)
+        allowed.put(8, SYM_SPACE)
+        Convert.convert_enum_set(val, allowed, out, interp, loc)
+    }
+
+    ; the math-font-posture enum set — #f is IN the set here (symbolFalse is
+    ; the first allowed value), so `math-font-posture: #f` is valid.
+    procedure convert_math_font_posture(mutable val: ref[ELObj], mutable out: ref[FotSym], host: ref[Page], mutable interp: ref[Interpreter], loc: Location) returns bool
+    {
+        let allowed allocate_slice[int](host, 7)
+        allowed.put(0, SYM_FALSE)
+        allowed.put(1, SYM_NOT_APPLICABLE)
+        allowed.put(2, SYM_UPRIGHT)
+        allowed.put(3, SYM_OBLIQUE)
+        allowed.put(4, SYM_BACK_SLANTED_OBLIQUE)
+        allowed.put(5, SYM_ITALIC)
+        allowed.put(6, SYM_BACK_SLANTED_ITALIC)
+        Convert.convert_enum_set(val, allowed, out, interp, loc)
+    }
+
+    ; CharacterFlowObj::setNonInheritedC. Every branch marks its `specified`
+    ; bit ONLY on a successful conversion (the reference's `if (convert…)`
+    ; shape) — an invalid value leaves the field unspecified and the fot dump
+    ; silent. `stretch-factor` is the one field with no bit: it renders
+    ; whenever it differs from 1.0.
+    ; ★A name that is a DECLARED char NIC (not a syntactic key) is accepted by
+    ; hasNonInheritedC and then does NOTHING here — the reference's
+    ; charNICDefined arm returns before the CANNOT_HAPPEN, so the value is
+    ; swallowed without a diagnostic. Measured against the reference binary.
+    procedure set_character_nic(mutable r: ref[CharacterNIC], sk: int, mutable val: ref[ELObj], ident: ref[Identifier]?, mutable loc: Location, mutable interp: ref[Interpreter], host: ref[Page])
+    {
+        if sk = SK_CHAR
+        {
+            if Convert.set_implicit_char(r, val, ident, loc, interp, host)
+            {
+                r.set_specified(CNIC_CHAR)
+                ; the reference clears the two input-* flags after an
+                ; explicit char: unless they were specified themselves.
+                if r.is_specified(CNIC_IS_INPUT_TAB) = false
+                    r.is_input_tab := false
+                if r.is_specified(CNIC_IS_INPUT_WHITESPACE) = false
+                    r.is_input_whitespace := false
+            }
+            return
+        }
+        if sk = SK_GLYPH_ID
+        {
+            if val.is_false()
+            {
+                r.glyph_id := null
+                r.set_specified(CNIC_GLYPH_ID)
+                return
+            }
+            if val.is_glyph_id_p() = false
+            {
+                Convert.invalid_value(interp, ident, loc)
+                return
+            }
+            r.glyph_id := val
+            r.set_specified(CNIC_GLYPH_ID)
+            return
+        }
+        if sk = SK_SCRIPT
+        {
+            if val.is_false()
+            {
+                r.script := StringC()
+                r.set_specified(CNIC_SCRIPT)
+                return
+            }
+            var s StringC()
+            if Convert.convert_string(host, val, &s) = false
+            {
+                Convert.invalid_value(interp, ident, loc)
+                return
+            }
+            r.script := s
+            r.set_specified(CNIC_SCRIPT)
+            return
+        }
+        if sk = SK_MATH_CLASS
+        {
+            var m FotSym()
+            if Convert.convert_math_class(val, &m, host, interp, loc)
+            {
+                r.math_class := m
+                r.set_specified(CNIC_MATH_CLASS)
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return
+        }
+        if sk = SK_MATH_FONT_POSTURE
+        {
+            var p FotSym()
+            if Convert.convert_math_font_posture(val, &p, host, interp, loc)
+            {
+                r.math_font_posture := p
+                r.set_specified(CNIC_MATH_FONT_POSTURE)
+            }
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return
+        }
+        if sk = SK_STRETCH_FACTOR
+        {
+            var d 0.0
+            if Convert.convert_real(val, &d, interp, loc)
+                r.stretch_factor := d
+            else
+                Convert.invalid_value(interp, ident, loc)
+            return
+        }
+        if (sk = SK_BREAK_BEFORE_PRIORITY) or (sk = SK_BREAK_AFTER_PRIORITY)
+        {
+            var n 0
+            if Convert.convert_integer(val, &n, interp, loc) = false
+            {
+                Convert.invalid_value(interp, ident, loc)
+                return
+            }
+            if sk = SK_BREAK_BEFORE_PRIORITY
+            {
+                r.break_before_priority := n
+                r.set_specified(CNIC_BREAK_BEFORE_PRIORITY)
+            }
+            else
+            {
+                r.break_after_priority := n
+                r.set_specified(CNIC_BREAK_AFTER_PRIORITY)
+            }
+            return
+        }
+        ; the seven boolean flags
+        var bit 0 - 1
+        if sk = SK_IS_SPACE
+            bit := CNIC_IS_SPACE
+        if sk = SK_IS_RECORD_END
+            bit := CNIC_IS_RECORD_END
+        if sk = SK_IS_INPUT_TAB
+            bit := CNIC_IS_INPUT_TAB
+        if sk = SK_IS_INPUT_WHITESPACE
+            bit := CNIC_IS_INPUT_WHITESPACE
+        if sk = SK_IS_PUNCT
+            bit := CNIC_IS_PUNCT
+        if sk = SK_IS_DROP_AFTER_LINE_BREAK
+            bit := CNIC_IS_DROP_AFTER_LINE_BREAK
+        if sk = SK_IS_DROP_UNLESS_BEFORE_LINE_BREAK
+            bit := CNIC_IS_DROP_UNLESS_BEFORE_LINE_BREAK
+        if bit < 0
+            ; a declared char NIC (see the note above) — accepted, dropped.
+            return
+        var b false
+        if Convert.convert_boolean(val, &b, interp, loc) = false
+        {
+            Convert.invalid_value(interp, ident, loc)
+            return
+        }
+        if bit = CNIC_IS_SPACE
+            r.is_space := b
+        if bit = CNIC_IS_RECORD_END
+            r.is_record_end := b
+        if bit = CNIC_IS_INPUT_TAB
+            r.is_input_tab := b
+        if bit = CNIC_IS_INPUT_WHITESPACE
+            r.is_input_whitespace := b
+        if bit = CNIC_IS_PUNCT
+            r.is_punct := b
+        if bit = CNIC_IS_DROP_AFTER_LINE_BREAK
+            r.is_drop_after_line_break := b
+        if bit = CNIC_IS_DROP_UNLESS_BEFORE_LINE_BREAK
+            r.is_drop_unless_before_line_break := b
+        r.set_specified(bit)
+    }
+
+    ; CharacterFlowObj::setImplicitChar — the heart of the class: once `char`
+    ; is known, every characteristic still UNSPECIFIED is filled from that
+    ; character's PROPERTIES (the thirteen built-ins of installCharProperties
+    ; plus whatever a stylesheet declared). Answers false when the char does
+    ; not convert or was already specified — the reference then leaves the NIC
+    ; alone (and, on the `char:` branch, skips the specified bit as well).
+    procedure set_implicit_char(mutable r: ref[CharacterNIC], mutable val: ref[ELObj], ident: ref[Identifier]?, mutable loc: Location, mutable interp: ref[Interpreter], host: ref[Page]) returns bool
+    {
+        if r.is_specified(CNIC_CHAR)
+            return false
+        var ch: u32 0
+        if Convert.convert_char(host, val, &ch) = false
+        {
+            Convert.invalid_value(interp, ident, loc)
+            return false
+        }
+        r.ch := ch
+        r.valid := true
+        if r.is_specified(CNIC_IS_SPACE) = false
+            Convert.char_prop_bool("space?", ch, loc, interp, ident, &r.is_space)
+        if r.is_specified(CNIC_IS_RECORD_END) = false
+            Convert.char_prop_bool("record-end?", ch, loc, interp, ident, &r.is_record_end)
+        if r.is_specified(CNIC_IS_INPUT_TAB) = false
+            Convert.char_prop_bool("input-tab?", ch, loc, interp, ident, &r.is_input_tab)
+        if r.is_specified(CNIC_IS_INPUT_WHITESPACE) = false
+            Convert.char_prop_bool("input-whitespace?", ch, loc, interp, ident, &r.is_input_whitespace)
+        if r.is_specified(CNIC_IS_PUNCT) = false
+            Convert.char_prop_bool("punct?", ch, loc, interp, ident, &r.is_punct)
+        if r.is_specified(CNIC_IS_DROP_AFTER_LINE_BREAK) = false
+            Convert.char_prop_bool("drop-after-line-break?", ch, loc, interp, ident, &r.is_drop_after_line_break)
+        if r.is_specified(CNIC_IS_DROP_UNLESS_BEFORE_LINE_BREAK) = false
+            Convert.char_prop_bool("drop-unless-before-line-break?", ch, loc, interp, ident, &r.is_drop_unless_before_line_break)
+        if r.is_specified(CNIC_BREAK_BEFORE_PRIORITY) = false
+            Convert.char_prop_int("break-before-priority", ch, loc, interp, ident, &r.break_before_priority)
+        if r.is_specified(CNIC_BREAK_AFTER_PRIORITY) = false
+            Convert.char_prop_int("break-after-priority", ch, loc, interp, ident, &r.break_after_priority)
+        if r.is_specified(CNIC_SCRIPT) = false
+        {
+            let prop interp.char_property(StringC("script"), ch, loc, null)
+            if prop <> null
+            {
+                if prop.is_false()
+                    r.script := StringC()
+                else
+                {
+                    var s StringC()
+                    if Convert.convert_string(host, prop, &s)
+                        r.script := s
+                    else
+                        Convert.invalid_value(interp, ident, loc)
+                }
+            }
+        }
+        if r.is_specified(CNIC_GLYPH_ID) = false
+        {
+            let prop interp.char_property(StringC("glyph-id"), ch, loc, null)
+            if prop <> null
+            {
+                if prop.is_false()
+                    r.glyph_id := null
+                else if prop.is_glyph_id_p()
+                    r.glyph_id := prop
+            }
+        }
+        if r.is_specified(CNIC_MATH_FONT_POSTURE) = false
+        {
+            let prop interp.char_property(StringC("math-font-posture"), ch, loc, null)
+            if prop <> null
+            {
+                var p FotSym()
+                if Convert.convert_math_font_posture(prop, &p, host, interp, loc)
+                    r.math_font_posture := p
+                else
+                    Convert.invalid_value(interp, ident, loc)
+            }
+        }
+        if r.is_specified(CNIC_MATH_CLASS) = false
+        {
+            let prop interp.char_property(StringC("math-class"), ch, loc, null)
+            if prop <> null
+            {
+                var m FotSym()
+                if Convert.convert_math_class(prop, &m, host, interp, loc)
+                    r.math_class := m
+                else
+                    Convert.invalid_value(interp, ident, loc)
+            }
+        }
+        true
+    }
+
+    procedure char_prop_bool(mutable name: Slice[char], ch: u32, mutable loc: Location, mutable interp: ref[Interpreter], ident: ref[Identifier]?, mutable out: ref[bool])
+    {
+        let prop interp.char_property(StringC(name), ch, loc, null)
+        if prop = null
+            return
+        var b false
+        if Convert.convert_boolean(prop, &b, interp, loc)
+            out := b
+        else
+            Convert.invalid_value(interp, ident, loc)
+    }
+
+    procedure char_prop_int(mutable name: Slice[char], ch: u32, mutable loc: Location, mutable interp: ref[Interpreter], ident: ref[Identifier]?, mutable out: ref[int])
+    {
+        let prop interp.char_property(StringC(name), ch, loc, null)
+        if prop = null
+            return
+        var n 0
+        if Convert.convert_integer(prop, &n, interp, loc)
+            out := n
+        else
+            Convert.invalid_value(interp, ident, loc)
+    }
+
+    function is_display_nic_key(sk: int) returns bool
+    {
+        match sk
+            case SK_POSITION_PREFERENCE case SK_KEEP_WITH_PREVIOUS case SK_KEEP_WITH_NEXT: return true
+            case SK_KEEP case SK_BREAK_BEFORE case SK_BREAK_AFTER case SK_MAY_VIOLATE_KEEP_BEFORE: return true
+            case SK_MAY_VIOLATE_KEEP_AFTER case SK_SPACE_BEFORE case SK_SPACE_AFTER: return true
+        false
+    }
+}
+
+; --- StyleStack (Style.cxx) --------------------------------------------------
+; VarStyleObj's payload (the ELObj Style arm keeps its two-pointer shape: spec
+; points here, use_chain stays in the arm). `display` is the captured closure
+; vars of the style's VarInheritedC codes (null-terminated, like a closure
+; display); `node` the current node at style creation (typed void: Style does
+; not import Grove — only the VM glue dereferences it).
+define VarStyleRec
+(
+    force_specs: ref[Array[ref[InheritedC]?]]?
+    specs: ref[Array[ref[InheritedC]?]]?
+    display: pointer[pointer[ELObj]]
+    node: ref[GroveNode]?
+)
+{
+    function make(host: ref[Page], force_specs: ref[Array[ref[InheritedC]?]]?, specs: ref[Array[ref[InheritedC]?]]?, display: pointer[pointer[ELObj]], node: ref[GroveNode]?) returns ref[VarStyleRec]
+    {
+        let r &VarStyleRec^host(force_specs, specs, display, node)
+        r
+    }
+}
+
+; InheritedCInfo — one pushed spec for one characteristic index; `prev` chains
+; to the spec shadowed at an outer level (restored by pop). `style` is the
+; VarStyleRec the spec came from (display + node for VarInheritedC evaluation);
+; `cached_value` the push-time evaluated value (valid only while none of
+; `dependencies` — indices this value read via actual-*/inherited-* — changed).
+define InheritedCInfo
+(
+    spec: ref[InheritedC]
+    prev: ref[InheritedCInfo]?
+    val_level: int
+    spec_level: int
+    style: ref[VarStyleRec]
+    var cached_value: ref[ELObj]?
+    dependencies: ref[Array[int]]
+    ; the STYLE RULE that specified this characteristic at this level, null for
+    ; a style pushed by `make` (which has no rule). Only ambiguousStyle reads
+    ; it: two rules of EQUAL specificity setting the same characteristic at
+    ; the same level is the one case the reference reports.
+    rule: ref[Rule]?
+)
+{
+    function make(host: ref[Page], spec: ref[InheritedC], style: ref[VarStyleRec], prev: ref[InheritedCInfo], val_level: int, spec_level: int) returns ref[InheritedCInfo]
+        InheritedCInfo.make_ruled(host, spec, style, prev, val_level, spec_level, null)
+
+    function make_ruled(host: ref[Page], spec: ref[InheritedC], style: ref[VarStyleRec], prev: ref[InheritedCInfo]?, val_level: int, spec_level: int, rule: ref[Rule]?) returns ref[InheritedCInfo]
+    {
+        let info &InheritedCInfo^host(spec, prev, val_level, spec_level, style, null, Array[int]^host(), rule)
+        info
+    }
+}
+
+define PopList (list: ref[Array[int]]?, depending_list: ref[Array[int]], prev: ref[PopList]?)
+{
+    function make(host: ref[Page], prev: ref[PopList]?) returns ref[PopList]
+    {
+        let pl &PopList^host(Array[int]^host(), Array[int]^host(), prev)
+        pl
+    }
+}
+
+define StyleStack (var info: ref[Array[ref[InheritedCInfo]?]], var level: int, var pop_list: ref[PopList]?, var host: ref[Page])
+{
+    function make(host: ref[Page]) returns ref[StyleStack]
+    {
+        let ss &StyleStack^host(Array[ref[InheritedCInfo]?]^host(), 0, null, host)
+        ss
+    }
+
+    procedure push_start(mutable this: ref[StyleStack], scratch: ref[Page])
+    {
+        this.level := this.level + 1
+        this.pop_list := PopList.make(scratch, this.pop_list)
+    }
+
+    ; the C++ StyleStack copy (Connectable/Connection snapshots): a shallow
+    ; copy of the info vector (the InheritedCInfo chains are immutable and
+    ; shared), same level, SHARED pop-list pointer — balanced push/pop on the
+    ; copy builds and unwinds its own PopLists on top and never mutates the
+    ; shared tail (push_end_prologue only READS prev's depending list).
+    function copy(this: ref[StyleStack], host: ref[Page]) returns ref[StyleStack]
+    {
+        let ss host.allocate(sizeof StyleStack, alignof StyleStack) as pointer[StyleStack]
+        let info Array[ref[InheritedCInfo]?]^host()
+        let n this.info.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let p this.info.get(i)
+            if p <> null
+                info.add(*p)
+            else
+                info.add(null)
+            i := i + 1
+        }
+        ss.info := info
+        ss.level := this.level
+        ss.pop_list := this.pop_list
+        ss.host := host
+        ss
+    }
+
+    ; grow the info vector to cover index `ind`.
+    function info_at(this: ref[StyleStack], ind: int) returns ref[InheritedCInfo]?
+    {
+        if (ind as size_t) >= this.info.get_length()
+            return null
+        let p this.info.get(ind as size_t)
+        if p = null
+            return null
+        *p
+    }
+
+    procedure info_set(mutable this: ref[StyleStack], ind: int, v: ref[InheritedCInfo]?)
+    {
+        while this.info.get_length() <= (ind as size_t)
+            this.info.add(null)
+        this.info.put(ind as size_t, v)
+    }
+
+    ; StyleStack::pushContinue — walk the style chain per VarStyleObj::
+    ; appendIter: own force! specs, own specs, then the use chain (its force
+    ; and normal specs at that point); first spec per characteristic wins
+    ; within this level.
+    procedure push_continue(mutable this: ref[StyleStack], style: ref[ELObj]?, scratch: ref[Page], rule: ref[Rule]?, mutable interp: ref[Interpreter])
+    {
+        if style = null
+            return
+        ; MergeStyleObj::appendIter — a merged style has no specifications of
+        ; its own; it expands to its parts IN ORDER, and since the first
+        ; specification per characteristic wins at a level, the FIRST part
+        ; takes precedence.
+        let parts style.style_merged()
+        if parts <> null
+        {
+            let np parts.get_length()
+            var pi: size_t 0
+            while pi < np
+            {
+                let pp parts.get(pi)
+                if pp <> null
+                    this.push_continue(*pp, scratch, rule, interp)
+                pi := pi + 1
+            }
+            return
+        }
+        let rec style.style_spec()
+        if rec <> null
+        {
+            this.push_spec_array(rec.force_specs, rec, scratch, rule, interp)
+            this.push_spec_array(rec.specs, rec, scratch, rule, interp)
+        }
+        let u style.style_use()
+        if u <> null
+            this.push_continue(u, scratch, rule, interp)
+    }
+
+    procedure push_spec_array(mutable this: ref[StyleStack], arr: ref[Array[ref[InheritedC]?]]?, rec: ref[VarStyleRec], scratch: ref[Page], rule: ref[Rule]?, mutable interp: ref[Interpreter])
+    {
+        if arr = null
+            return
+        let n arr.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let icp arr.get(i)
+            if icp <> null
+            {
+                let ic *icp
+                if ic <> null
+                    this.push_spec(ic, rec, scratch, rule, interp)
+            }
+            i := i + 1
+        }
+    }
+
+    procedure push_spec(mutable this: ref[StyleStack], spec: ref[InheritedC], rec: ref[VarStyleRec], scratch: ref[Page], rule: ref[Rule]?, mutable interp: ref[Interpreter])
+    {
+        let ind spec.get_index()
+        let cur this.info_at(ind)
+        if cur <> null
+        {
+            if cur.val_level = this.level
+            {
+                ; ambiguousStyle (Style.cxx:42): the characteristic is already
+                ; specified AT THIS LEVEL. Only a RULE-borne specification can
+                ; clash — and only with another rule of equal specificity,
+                ; because a more specific one legitimately wins. ★The message
+                ; anchors at the EXISTING rule and carries the new one as the
+                ; auxiliary line, which is the reverse of every other duplicate
+                ; diagnostic in this engine.
+                if (rule <> null) and (cur.rule <> null)
+                {
+                    if rule.compare_specificity(cur.rule as ref[Rule]) = 0
+                    {
+                        interp.set_next_location(cur.rule.get_action().location())
+                        interp.message1(InterpreterMessages.ambiguousStyle(), spec.get_ident_name())
+                        interp.emit_aux(InterpreterMessages.ambiguousStyle_aux(), rule.get_action().location())
+                    }
+                }
+                return
+            }
+        }
+        this.pop_list.list.add(ind)
+        this.info_set(ind, InheritedCInfo.make_ruled(scratch, spec, rec, cur, this.level, this.level, rule))
+    }
+
+    ; StyleStack::pushEnd's prologue: a characteristic that DEPENDS (via
+    ; actual-*) on another characteristic re-evaluates at this level when any
+    ; of its dependencies was re-specified here — re-push it (keeping its
+    ; original spec_level); otherwise it keeps depending at this level too.
+    procedure push_end_prologue(mutable this: ref[StyleStack], scratch: ref[Page])
+    {
+        let pl this.pop_list
+        if pl = null
+            return
+        let old pl.prev
+        if old = null
+            return
+        let n old.depending_list.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let dp old.depending_list.get(i)
+            if dp <> null
+            {
+                let d *dp
+                let info this.info_at(d)
+                if info <> null
+                {
+                    if info.val_level <> this.level
+                    {
+                        var changed false
+                        let deps info.dependencies
+                        let nd deps.get_length()
+                        var j: size_t 0
+                        while j < nd
+                        {
+                            if changed = false
+                            {
+                                let ip deps.get(j)
+                                if ip <> null
+                                {
+                                    let p this.info_at(*ip)
+                                    if p <> null
+                                    {
+                                        if p.val_level = this.level
+                                        {
+                                            this.info_set(d, InheritedCInfo.make(scratch, info.spec, info.style, info, this.level, info.spec_level))
+                                            pl.list.add(d)
+                                            changed := true
+                                        }
+                                    }
+                                }
+                            }
+                            j := j + 1
+                        }
+                        if changed = false
+                            pl.depending_list.add(d)
+                    }
+                }
+            }
+            i := i + 1
+        }
+    }
+
+    ; pushEnd's per-spec epilogue: a spec whose evaluation recorded
+    ; dependencies keeps re-evaluating at deeper levels (see prologue).
+    procedure note_depending(mutable this: ref[StyleStack], ind: int)
+    {
+        if this.pop_list <> null
+            this.pop_list.depending_list.add(ind)
+    }
+
+    procedure pop(mutable this: ref[StyleStack])
+    {
+        let pl this.pop_list
+        if pl <> null
+        {
+            let n pl.list.get_length()
+            var i: size_t 0
+            while i < n
+            {
+                let indp pl.list.get(i)
+                if indp <> null
+                {
+                    let ind *indp
+                    let cur this.info_at(ind)
+                    if cur <> null
+                        this.info_set(ind, cur.prev)
+                }
+                i := i + 1
+            }
+            this.pop_list := pl.prev
+        }
+        this.level := this.level - 1
+    }
+
+    procedure push_empty(mutable this: ref[StyleStack])
+        this.level := this.level + 1
+
+    procedure pop_empty(mutable this: ref[StyleStack])
+        this.level := this.level - 1
+
+    function get_level(this: ref[StyleStack]) returns int
+        level
+
+    ; the specs pushed at the CURRENT level, in push order — the set* feed for
+    ; pushEnd (the caller renders them through its sink).
+    function current_specs(this: ref[StyleStack]) returns ref[Array[int]]?
+    {
+        if this.pop_list = null
+            return null
+        this.pop_list.list
+    }
+
+}

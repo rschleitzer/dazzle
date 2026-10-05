@@ -1,0 +1,1301 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use scaly.containers.String
+use scaly.os.Path
+use scaly.fiber.Io
+use opensp.StringC.StringC
+use opensp.ParserState.ParserState
+use opensp.Event.Event
+use opensp.Location.Location
+use opensp.Location.Origin
+use opensp.Attribute.AttributeValue
+use opensp.Attribute.Attribute
+use opensp.Attribute.AttributeSemantics
+use opensp.Attribute.Text
+use opensp.AttributeList.AttributeList
+use opensp.ElementType.ElementType
+use opensp.ElementType.ElementDefinition
+use opensp.Entity.Entity
+use opensp.Entity.InternalEntity
+use opensp.Entity.ExternalTextEntity
+use opensp.Entity.ExternalDataEntity
+use opensp.Entity.SubdocEntity
+use opensp.Notation.Notation
+use opensp.ExternalId.ExternalId
+use opensp.CodingSystemKit.CodingSystemKit
+use opensp.CodingSystemKit.OutputEncoder
+use opensp.CodingSystemKit.OESC_NONE
+use opensp.CodingSystemKit.OESC_BACKSLASH
+
+; Esis — the ESIS event-dump writer (Stage 4 Increment 3 + the -o option axis).
+;
+; Ports SgmlsEventHandler (nsgmls/SgmlsEventHandler.cxx — the C++ oracle, NOT
+; the C# mirror, since escaping differs): walks the ParserState event queue and
+; produces the byte-identical ESIS text that `onsgmls` writes to stdout. This is
+; the harness the tests/sgml corpus counter measures.
+;
+; ESIS grammar produced here:
+;   A<NAME> <TYPE> <VALUE>   one per attribute with a value (before its (start)
+;                            TYPE = IMPLIED | TOKEN/NOTATION/ENTITY/ID <v> |
+;                            CDATA <v> | DATA <notation> <v> (-odata-attribute)
+;   (<GI> / )<GI>            start / end element
+;   -<data>                  character data (consecutive data coalesces; the
+;                            trailing '\n' is written when the run is flushed)
+;   C                        conforming document (only when errorCount == 0)
+;   N/E/I/S/T + p/s/f        entity + notation definitions
+;   &<NAME>                  external data entity reference in content
+;   D<ENAME> <NAME> <TYPE…>  data attributes of an external data entity
+;   ?<data> / #<appinfo>     processing instruction / APPINFO
+;   {<NAME> }<NAME>          subdocument brackets
+;   L<line> [<file>]         -oline location records
+;   i / e / o                -oincluded / -oempty / -o(tag|attr)omit records
+;   _<comment>               -ocomment records (instance comment declarations)
+;   V…                       -oversion parser-information records
+;
+; The -o flags arrive as ParserState.output_flags (OF_*, Event.scaly). The
+; mutable writer state (data-run flag, -oline line tracking, the per-document
+; definedEntities/definedNotations sets, the inDocument_ comment gate) lives in
+; one page-hosted EsisW record threaded through the helpers.
+;
+; Escaping (outputString, SgmlsEventHandler.cxx): '\' -> '\\'; RE (0x0D) -> '\n';
+; any char < 0x20 -> '\0' + two octal digits; everything else through the
+; output coding system.
+;
+; Output coding system (CmdLineApp::makeStdOut -> EncodeOutputCharStream): the
+; whole ESIS stream (names, data, attribute values) leaves through ONE encoder
+; (outputCodingSystem_): CmdLineApp::initCodingSystem's environment default,
+; overridable per run with -b (processOption 'b' -> lookupCodingSystem). The
+; writer accumulates the char stream as INTERNAL UTF-8 and encode_out re-runs
+; it through the selected system (CodingSystemKit.transcode) in one pass —
+; including the stream's escaper (SgmlsEventHandler::escaper, set once via
+; setEscaper): a char the encoder cannot represent writes escapePrefix
+; numEscape <decimal> escapeEnd = `\#<N>;` back through the same encoder.
+; The UTF-8 system is the internal representation itself, so that path is a
+; verbatim pass-through (its 5/6-byte forms stay unreachable — chars are
+; capped at charMax <= 0x10FFFF; surrogates encode blindly as 3-byte
+; sequences, exactly like the reference encoder).
+
+; The writer's mutable state (the SgmlsEventHandler data members).
+define EsisW
+(
+    acc: ref[Array[u8]]
+    flags: u32
+    ; haveData_ — a `-` data run is open.
+    var have_data: bool
+    ; inDocument_ — set at endProlog when -ocomment; comment records print
+    ; only afterwards (prolog comments are dropped). Never reset — a subdoc's
+    ; DTD comments print, bug-for-bug with the reference.
+    var in_document: bool
+    ; -oline: lastSos_/lastLineno_ — the resolved origin identity stands in
+    ; for the reference's StorageObjectSpec pointer. A multi-file document
+    ; origin is ONE origin covering several storage objects, so the segment
+    ; index joins the identity (a boundary crossing prints `L<line> <file>`).
+    var last_sos: ref[Origin]?
+    var last_seg: size_t
+    var last_lineno: u32
+    ps: ref[ParserState]?
+    ; definedEntities_/definedNotations_ — swapped fresh per subdocument
+    ; (SgmlsSubdocState::init/swap).
+    var seen_e: ref[Array[StringC]]
+    var seen_n: ref[Array[StringC]]
+    ; the writer's own page — fresh per-subdocument seen-sets allocate here
+    ; (streaming delivery consumes events in chunks, so the writer can no
+    ; longer borrow write()'s locals across calls).
+    whost: ref[Page]
+    ; SgmlsSubdocState::swap — the saved outer seen-sets, one level per
+    ; open subdocument (depth-indexed; Array has no remove, slots are
+    ; overwritten on re-push).
+    stack_e: ref[Array[ref[Array[StringC]]?]]
+    stack_n: ref[Array[ref[Array[StringC]]?]]
+    var sub_depth: size_t
+    ; Streaming output: the fd the accumulated ESIS goes out on at every drain,
+    ; or -1 to DISCARD it there (-s: the caller writes nothing, so the bytes are
+    ; dead as soon as they are rendered). Not streaming at all (the RAST and
+    ; unit-test paths, which construct the writer inside Esis.write) leaves this
+    ; -1 and never drains, so the full text still comes back as the return value.
+    ;
+    ; Why: the writer used to accumulate the WHOLE ESIS text and Esis.write then
+    ; copied it into a String — measured on a 13.1 MiB parse whose output is
+    ; 22.5 MiB, that is 31.6 MiB of accumulator capacity plus a 22.5 MiB String
+    ; alive at the same moment, 29 % of the peak, for bytes that were already
+    ; final. The reference writes to its stdout as it goes (EncodeOutputCharStream
+    ; over a FileOutputByteStream); flushing per drain is that behaviour.
+    out_fd: int
+    ; the BOM (UNICODE output) belongs to the STREAM, so only the first flush
+    ; may emit it — see Esis.encode_out's `bom` argument.
+    var bom_done: bool
+)
+
+define Esis
+{
+    procedure put(mutable acc: ref[Array[u8]], b: u8)
+        acc.add(b)
+
+    ; append an ASCII literal (a byte String) verbatim.
+    procedure put_lit(mutable acc: ref[Array[u8]], s: String)
+    {
+        let n s.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            acc.add(s.get(i))
+            i := i + 1
+        }
+    }
+
+    ; decimal digits of n (the escaper prints `(unsigned long)c` — plain
+    ; decimal, no padding).
+    procedure put_dec(mutable acc: ref[Array[u8]], n: u32)
+    {
+        var digits u8[16]
+        var v n
+        var count: size_t 0
+        var go true
+        while go
+        {
+            digits[count] := ((0x30 + (v % 10)) as u8)
+            count := count + 1
+            v := v / 10
+            if v = 0
+                go := false
+        }
+        var i count
+        while i > 0
+        {
+            i := i - 1
+            acc.add(digits[i])
+        }
+    }
+
+    ; Encode one Char as UTF-8. The C++ handler never narrows a Char itself: it
+    ; hands every Char to an OutputCharStream (`os().put(*p)`, `os() << name`)
+    ; whose UTF-8 encoder this mirrors (UTF8CodingSystem.cxx; the 5/6-byte
+    ; forms are unreachable, chars are capped at 0x10FFFF).
+    procedure put_utf8(mutable acc: ref[Array[u8]], c: u32)
+    {
+        if c < 0x80
+            acc.add(c as u8)
+        else if c < 0x800
+        {
+            acc.add((0xC0 | (c >> (6 as u32))) as u8)
+            acc.add((0x80 | (c & 0x3F)) as u8)
+        }
+        else if c < 0x10000
+        {
+            acc.add((0xE0 | (c >> (12 as u32))) as u8)
+            acc.add((0x80 | ((c >> (6 as u32)) & 0x3F)) as u8)
+            acc.add((0x80 | (c & 0x3F)) as u8)
+        }
+        else
+        {
+            acc.add((0xF0 | (c >> (18 as u32))) as u8)
+            acc.add((0x80 | ((c >> (12 as u32)) & 0x3F)) as u8)
+            acc.add((0x80 | ((c >> (6 as u32)) & 0x3F)) as u8)
+            acc.add((0x80 | (c & 0x3F)) as u8)
+        }
+    }
+
+    ; one Char into the writer's INTERNAL stream — always UTF-8; the selected
+    ; output coding system (including the unencodable-char escaper) applies in
+    ; one pass at the end (Esis.encode_out -> CodingSystemKit.transcode).
+    procedure put_char(mutable acc: ref[Array[u8]], c: u32)
+        Esis.put_utf8(acc, c)
+
+    ; append a StringC as a name (no escaping; GIs/attr names are already
+    ; reference-syntax name characters) through the output encoder — the
+    ; escaper is set on the whole stream, so names take the same path as data.
+    procedure put_name(mutable acc: ref[Array[u8]], sc: StringC)
+    {
+        let n sc.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            Esis.put_char(acc, sc.get(i))
+            i := i + 1
+        }
+    }
+
+    ; append a StringC as ESIS data with the C++ outputString escaping. The
+    ; control-char / '\' / RE escapes run BEFORE the coding system (they are
+    ; outputString's, upstream of the encoder); only the default arm is
+    ; encoding-dependent.
+    procedure put_data(mutable acc: ref[Array[u8]], sc: StringC)
+    {
+        let n sc.get_size()
+        var i: size_t 0
+        while i < n
+        {
+            let c sc.get(i)
+            if c = 0x5C
+            {
+                acc.add(0x5C)
+                acc.add(0x5C)
+            }
+            else if c = 0x0D
+            {
+                acc.add(0x5C)
+                acc.add(0x6E)
+            }
+            else if c < 0x20
+            {
+                acc.add(0x5C)
+                acc.add(0x30)
+                let d1 (c / 8) % 8
+                let d2 c % 8
+                acc.add((0x30 + d1) as u8)
+                acc.add((0x30 + d2) as u8)
+            }
+            else
+                Esis.put_char(acc, c)
+            i := i + 1
+        }
+    }
+
+    ; outputString over an 8-bit String (system/public identifiers) — the same
+    ; escaping as put_data, byte-wise.
+    procedure put_data_bytes(mutable acc: ref[Array[u8]], s: String)
+    {
+        let n s.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let c s.get(i) as u32
+            if c = 0x5C
+            {
+                acc.add(0x5C)
+                acc.add(0x5C)
+            }
+            else if c = 0x0D
+            {
+                acc.add(0x5C)
+                acc.add(0x6E)
+            }
+            else if c < 0x20
+            {
+                acc.add(0x5C)
+                acc.add(0x30)
+                let d1 (c / 8) % 8
+                let d2 c % 8
+                acc.add((0x30 + d1) as u8)
+                acc.add((0x30 + d2) as u8)
+            }
+            else
+                Esis.put_char(acc, c)
+            i := i + 1
+        }
+    }
+
+    ; SgmlsEventHandler::markEntity/markNotation — StringSet::add: true when
+    ; the name was already output this document, else remember it. Names alias
+    ; run-page StringCs (stable for the writer's lifetime).
+    procedure mark(mutable seen: ref[Array[StringC]], name: StringC) returns bool
+    {
+        let n seen.get_length()
+        var i: size_t 0
+        while i < n
+        {
+            let s seen[i]
+            if s.equals(name)
+                return true
+            i := i + 1
+        }
+        seen.add(name)
+        false
+    }
+
+    ; ---- stateful writers (the SgmlsEventHandler members) -----------------
+
+    procedure start_data(mutable w: ref[EsisW])
+    {
+        if w.have_data = false
+        {
+            Esis.put(w.acc, 0x2D)
+            w.have_data := true
+        }
+    }
+
+    procedure flush_data(mutable w: ref[EsisW])
+    {
+        if w.have_data
+        {
+            Esis.put(w.acc, 0x0A)
+            w.have_data := false
+        }
+    }
+
+    ; outputString INSIDE the writer state: RE chars written while a data run
+    ; is open advance the -oline line tracker (outputString's lastLineno_++ —
+    ; multi-line data runs then need no L record per line).
+    procedure w_data(mutable w: ref[EsisW], sc: StringC)
+    {
+        Esis.put_data(w.acc, sc)
+        if w.have_data and ((w.flags & OF_LINE) <> 0)
+        {
+            let n sc.get_size()
+            var i: size_t 0
+            while i < n
+            {
+                if sc.get(i) = 0x0D
+                    w.last_lineno := w.last_lineno + 1
+                i := i + 1
+            }
+        }
+    }
+
+    procedure w_data_bytes(mutable w: ref[EsisW], s: String)
+    {
+        Esis.put_data_bytes(w.acc, s)
+        if w.have_data and ((w.flags & OF_LINE) <> 0)
+        {
+            let n s.get_length()
+            var i: size_t 0
+            while i < n
+            {
+                if (s.get(i) as u32) = 0x0D
+                    w.last_lineno := w.last_lineno + 1
+                i := i + 1
+            }
+        }
+    }
+
+    ; SgmlsEventHandler::outputLocation/outputLocation1 (-oline): resolve the
+    ; event's location to its real source (the same origin walk the message
+    ; header uses); a change of source prints `L<line> <storage id>`, a change
+    ; of line within the same source prints `L<line>`, anything else nothing.
+    procedure out_loc(mutable w: ref[EsisW], loc: Location)
+    {
+        if (w.flags & OF_LINE) = 0
+            return
+        var line: u32 0
+        var col: u32 0
+        var ridx: size_t 0
+        let ps w.ps
+        ; the outputLocation1 walk — NOT the message walk: parent index
+        ; without the reference length, previous-line rule on inserted RS.
+        let org ps.resolve_location_sos(loc, &line, &col, &ridx)
+        if org = null
+            return
+        ; storage-object identity: origin + segment (a multi-file document is
+        ; one origin over several storage objects).
+        let seg org.segment_index_at(ridx)
+        if (org = w.last_sos) and (seg = w.last_seg)
+        {
+            if line = w.last_lineno
+                return
+            Esis.flush_data(w)
+            Esis.put(w.acc, 0x4C)
+            Esis.put_dec(w.acc, line)
+            Esis.put(w.acc, 0x0A)
+            w.last_lineno := line
+            return
+        }
+        Esis.flush_data(w)
+        Esis.put(w.acc, 0x4C)
+        Esis.put_dec(w.acc, line)
+        Esis.put(w.acc, 0x20)
+        ; soLoc.actualStorageId — the storage object's id WITHOUT the manager
+        ; prefix: the stdin document displays `<OSFD>0` in message headers but
+        ; `0` here (probed). File names carry no prefix.
+        var fname org.file_name_at(ridx)
+        let pfx StringC("<OSFD>")
+        let pn pfx.get_size()
+        if fname.get_size() > pn
+        {
+            var is_fd true
+            var pi: size_t 0
+            while pi < pn
+            {
+                if fname.get(pi) <> pfx.get(pi)
+                {
+                    is_fd := false
+                    pi := pn
+                }
+                else
+                    pi := pi + 1
+            }
+            if is_fd
+                fname := StringC(fname.as_slice().slice_from(pn))
+        }
+        Esis.w_data(w, fname)
+        Esis.put(w.acc, 0x0A)
+        w.last_lineno := line
+        w.last_sos := org
+        w.last_seg := seg
+    }
+
+    ; SgmlsEventHandler::externalId (:585): p<pubid> / s<sysid> and, when
+    ; `output_file`, f<effective system id> — the storage id generateSystemId
+    ; stamped (declared system id resolved against the declaring directory, or
+    ; the catalog's SYSTEM/PUBLIC/name mapping), printed only when non-empty.
+    ; `base_dir` backs the pre-stamping fallback (a declared system id whose
+    ; entity never ran generateSystemId).
+    procedure put_external_id(mutable w: ref[EsisW], id: ExternalId, base_dir: String, output_file: bool)
+    {
+        if id.has_public_id()
+        {
+            Esis.put(w.acc, 0x70)
+            Esis.w_data_bytes(w, id.get_public_id())
+            Esis.put(w.acc, 0x0A)
+        }
+        if id.has_system_id()
+        {
+            Esis.put(w.acc, 0x73)
+            Esis.w_data_bytes(w, id.get_system_id())
+            Esis.put(w.acc, 0x0A)
+        }
+        if output_file
+        {
+            if id.has_effective_system()
+            {
+                ; the effective system id is stored as the FULL FSI text
+                ; (`<OSFILE>path`, `<CATALOG PUBLIC="...">...` for delegate
+                ; hits) — printed verbatim.
+                let eff id.get_effective_system()
+                if eff.get_length() > 0
+                {
+                    Esis.put(w.acc, 0x66)
+                    Esis.w_data_bytes(w, eff)
+                    Esis.put(w.acc, 0x0A)
+                }
+            }
+            else if id.has_system_id()
+            {
+                Esis.put(w.acc, 0x66)
+                Esis.put_lit(w.acc, String("<OSFILE>"))
+                let joined Path.join(base_dir, id.get_system_id())
+                Esis.w_data_bytes(w, joined)
+                Esis.put(w.acc, 0x0A)
+            }
+        }
+    }
+
+    ; SgmlsEventHandler::defineNotation (:575) — marks itself; a repeat is
+    ; silent. The f-line prints only under -onotation-sysid.
+    procedure define_notation(mutable w: ref[EsisW], nt: ref[Notation])
+    {
+        let nm nt.get_name()
+        if Esis.mark(w.seen_n, nm)
+            return
+        let id nt.get_external_id()
+        Esis.put_external_id(w, id, String(), (w.flags & OF_NOTATION_SYSID) <> 0)
+        Esis.put(w.acc, 0x4E)
+        Esis.put_name(w.acc, nm)
+        Esis.put(w.acc, 0x0A)
+    }
+
+    ; SgmlsEventHandler::defineEntity (:488) — the CALLER checks markEntity
+    ; first (both the attribute and the `&` reference sites), exactly like the
+    ; reference; the -oentity endProlog sweep and the entity-defaulted replay
+    ; call it directly (no mark — reference behavior).
+    ;   internal        I<name> <CDATA|SDATA|TEXT|PI> <text>
+    ;   external data   the notation's definition, p/s/f, E<name> <TYPE> <not>,
+    ;                   then the entity's data attributes as D records
+    ;   subdoc          p/s/f, S<name>
+    ;   external text   p/s/f, T<name>
+    procedure define_entity(mutable w: ref[EsisW], ent: ref[Entity]?)
+    {
+        ; ★a `choose` SUBJECT may not be an Option -- the wrapper hides the
+        ; union's arms. No entity is nothing to define.
+        if ent = null
+            return
+        choose (ent as ref[Entity])
+            when i: Internal
+            {
+                Esis.put(w.acc, 0x49)
+                Esis.put_name(w.acc, i.get_name())
+                Esis.put(w.acc, 0x20)
+                let dt i.get_data_type()
+                if dt = DT_CDATA
+                    Esis.put_lit(w.acc, String("CDATA "))
+                else if dt = DT_SDATA
+                    Esis.put_lit(w.acc, String("SDATA "))
+                else if dt = DT_PI
+                    Esis.put_lit(w.acc, String("PI "))
+                else
+                    Esis.put_lit(w.acc, String("TEXT "))
+                Esis.w_data(w, i.get_text())
+                Esis.put(w.acc, 0x0A)
+            }
+            when e: ExternalText
+            {
+                Esis.put_external_id(w, e.get_external_id(), e.get_base_dir(), true)
+                Esis.put(w.acc, 0x54)
+                Esis.put_name(w.acc, e.get_name())
+                Esis.put(w.acc, 0x0A)
+            }
+            when d: ExternalData
+            {
+                let nt d.get_notation() as ref[Notation]
+                Esis.define_notation(w, nt)
+                Esis.put_external_id(w, d.get_external_id(), d.get_base_dir(), true)
+                Esis.put(w.acc, 0x45)
+                let dname d.get_name()
+                Esis.put_name(w.acc, dname)
+                Esis.put(w.acc, 0x20)
+                let ddt d.get_data_type()
+                if ddt = DT_CDATA
+                    Esis.put_lit(w.acc, String("CDATA "))
+                else if ddt = DT_SDATA
+                    Esis.put_lit(w.acc, String("SDATA "))
+                else
+                    Esis.put_lit(w.acc, String("NDATA "))
+                let ntname nt.get_name()
+                Esis.put_name(w.acc, ntname)
+                Esis.put(w.acc, 0x0A)
+                let datts d.get_attributes() as ref[AttributeList]?
+                Esis.put_attributes(w, datts, 0x44, &dname)
+            }
+            when sub: Subdoc
+            {
+                Esis.put_external_id(w, sub.get_external_id(), sub.get_base_dir(), true)
+                Esis.put(w.acc, 0x53)
+                Esis.put_name(w.acc, sub.get_name())
+                Esis.put(w.acc, 0x0A)
+            }
+    }
+
+    ; the CDATA value body (SgmlsEventHandler::attributes' TextIter loop):
+    ; data segments print plain, sdata runs between `\|` markers, non-SGML
+    ; items as `\%N;` under -ononsgml (dropped otherwise). Both item lists are
+    ; flat position-sorted pairs into the value string.
+    procedure put_value_cdata(mutable w: ref[EsisW], v: ref[AttributeValue])
+    {
+        let vs v.get_string()
+        let vt v.get_text()
+        var runs: ref[Array[size_t]]? null
+        var nsi: ref[Array[size_t]]? null
+        if vt <> null
+        {
+            runs := (*vt).get_sdata_runs()
+            nsi := (*vt).get_nonsgml_items()
+        }
+        if (runs = null) and (nsi = null)
+        {
+            Esis.w_data(w, vs)
+            return
+        }
+        let vn vs.get_size()
+        var nr: size_t 0
+        if runs <> null
+            nr := runs.get_length()
+        var nn: size_t 0
+        if nsi <> null
+            nn := nsi.get_length()
+        var pos: size_t 0
+        var ri: size_t 0
+        var ni: size_t 0
+        var going true
+        while going
+        {
+            if (ri >= nr) and (ni >= nn)
+            {
+                if vn > pos
+                {
+                    let tail StringC(vs.as_slice().subslice(pos, vn))
+                    Esis.w_data(w, tail)
+                }
+                going := false
+            }
+            else
+            {
+                ; the next item by position (sdata wins a tie — insertion order).
+                var next_s vn
+                if ri < nr
+                {
+                    next_s := runs[ri]
+                    if next_s > vn
+                        next_s := vn
+                }
+                var next_n vn
+                if ni < nn
+                {
+                    next_n := nsi[ni]
+                    if next_n > vn
+                        next_n := vn
+                }
+                var take_sdata ri < nr
+                if take_sdata and (ni < nn) and next_n < next_s
+                    take_sdata := false
+                if take_sdata
+                {
+                    var rs next_s
+                    var re runs[ri + 1]
+                    if re > vn
+                        re := vn
+                    if rs > pos
+                    {
+                        let seg_before StringC(vs.as_slice().subslice(pos, rs))
+                        Esis.w_data(w, seg_before)
+                    }
+                    Esis.put(w.acc, 0x5C)
+                    Esis.put(w.acc, 0x7C)
+                    if re > rs
+                    {
+                        let seg_sdata StringC(vs.as_slice().subslice(rs, re))
+                        Esis.w_data(w, seg_sdata)
+                    }
+                    Esis.put(w.acc, 0x5C)
+                    Esis.put(w.acc, 0x7C)
+                    pos := re
+                    ri := ri + 2
+                }
+                else
+                {
+                    if next_n > pos
+                    {
+                        let seg_before StringC(vs.as_slice().subslice(pos, next_n))
+                        Esis.w_data(w, seg_before)
+                    }
+                    let nc nsi[ni + 1]
+                    if (w.flags & OF_NONSGML) <> 0
+                    {
+                        Esis.put(w.acc, 0x5C)
+                        Esis.put(w.acc, 0x25)
+                        Esis.put_dec(w.acc, nc as u32)
+                        Esis.put(w.acc, 0x3B)
+                    }
+                    pos := next_n
+                    ni := ni + 2
+                }
+            }
+        }
+    }
+
+    ; A<NAME> <TYPE> <VALUE> for each attribute in the list that has a value
+    ; (SgmlsEventHandler::attributes, :330). `code` is 'A' for start-tag
+    ; attributes, 'D' for an entity's data attributes, 'a' for link-rule
+    ; attributes (`owner` then prefixes the attribute name). A tokenized value
+    ; WITH semantics first prints the definitions its value references — the
+    ; notation, or (without -oentity) each not-yet-output entity — and types
+    ; the line NOTATION / ENTITY instead of TOKEN; -oid types ID declared
+    ; values as ID. -oattromit prints an `o` record before each attribute the
+    ; instance did not specify.
+    procedure put_attributes(mutable w: ref[EsisW], atts: ref[AttributeList]?, code: u8, owner: ref[StringC]?)
+    {
+        if atts = null
+            return
+        let n atts.size()
+        var i: size_t 0
+        while i < n
+        {
+            let v atts.value(i)
+            if v <> null
+            {
+                if (w.flags & OF_ATTR_OMISSION) <> 0
+                {
+                    if atts.specified(i) = false
+                    {
+                        Esis.put(w.acc, 0x6F)
+                        Esis.put(w.acc, 0x0A)
+                    }
+                }
+                let ty v.value_type()
+                ; 0 TOKEN, 1 NOTATION, 2 ENTITY, 3 ID
+                var tkind: int 0
+                if ty = AVT_TOKENIZED
+                {
+                    let a atts.attribute(i)
+                    let sem a.get_semantics()
+                    if sem <> null
+                    {
+                        let ntv sem.get_notation()
+                        if ntv <> null
+                        {
+                            Esis.define_notation(w, ntv as ref[Notation])
+                            tkind := 1
+                        }
+                        else
+                        {
+                            let ne sem.n_entities()
+                            if ne > 0
+                            {
+                                tkind := 2
+                                if (w.flags & OF_ENTITY) = 0
+                                {
+                                    var j: size_t 0
+                                    while j < ne
+                                    {
+                                        let ent sem.entity(j) as ref[Entity]
+                                        let en ent.get_name()
+                                        if Esis.mark(w.seen_e, en) = false
+                                            Esis.define_entity(w, ent)
+                                        j := j + 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ; outputId: an ID declared value types as ID.
+                    if (w.flags & OF_ID) <> 0
+                    {
+                        if atts.id(i)
+                            tkind := 3
+                    }
+                }
+                ; -odata-attribute: a DATA declared value's CDATA carries its
+                ; notation; the A line types `DATA <notation>` and the value's
+                ; data attributes follow as D records.
+                var data_nt: ref[Notation]? null
+                if ty = AVT_CDATA
+                {
+                    if (w.flags & OF_DATA_ATT) <> 0
+                    {
+                        let dntv v.get_cdata_notation()
+                        if dntv <> null
+                            data_nt := dntv as ref[Notation]
+                    }
+                }
+                Esis.put(w.acc, code)
+                if owner <> null
+                {
+                    Esis.put_name(w.acc, *owner)
+                    Esis.put(w.acc, 0x20)
+                }
+                Esis.put_name(w.acc, atts.name(i))
+                Esis.put(w.acc, 0x20)
+                if ty = AVT_IMPLIED
+                    Esis.put_lit(w.acc, String("IMPLIED"))
+                else if ty = AVT_CDATA
+                {
+                    if data_nt <> null
+                    {
+                        Esis.put_lit(w.acc, String("DATA "))
+                        Esis.put_name(w.acc, data_nt.get_name())
+                        Esis.put(w.acc, 0x20)
+                    }
+                    else
+                        Esis.put_lit(w.acc, String("CDATA "))
+                    Esis.put_value_cdata(w, v)
+                }
+                else
+                {
+                    if tkind = 1
+                        Esis.put_lit(w.acc, String("NOTATION "))
+                    else if tkind = 2
+                        Esis.put_lit(w.acc, String("ENTITY "))
+                    else if tkind = 3
+                        Esis.put_lit(w.acc, String("ID "))
+                    else
+                        Esis.put_lit(w.acc, String("TOKEN "))
+                    Esis.w_data(w, v.get_string())
+                }
+                Esis.put(w.acc, 0x0A)
+                if data_nt <> null
+                {
+                    Esis.define_notation(w, data_nt)
+                    let datts2 v.get_data_attributes() as ref[AttributeList]
+                    let aname atts.name(i)
+                    ; always the D code (dataAttributeCode), whatever `code`
+                    ; the parent list used (SgmlsEventHandler.cxx:416).
+                    Esis.put_attributes(w, datts2, 0x44, &aname)
+                }
+            }
+            i := i + 1
+        }
+    }
+
+    ; StartElementEvent::mustOmitEnd — EMPTY declared content or a specified
+    ; CONREF attribute (-oempty's `e` record).
+    function must_omit_end(ev: ref[Event]) returns bool
+    {
+        let e ev.get_element_type()
+        if e <> null
+        {
+            let def e.get_definition()
+            if def <> null and def.get_declared_content() = DC_EMPTY
+                return true
+        }
+        let atts ev.get_attributes()
+        if atts <> null
+            return atts.conref_of()
+        false
+    }
+
+    ; SgmlsEventHandler::features (-oversion): the V parser-information block,
+    ; written once before everything (handler construction time).
+    procedure features(mutable w: ref[EsisW])
+    {
+        Esis.put_lit(w.acc, String("Vp OpenSP\n"))
+        Esis.put_lit(w.acc, String("Vv 1.5.2\n"))
+        Esis.put_lit(w.acc, String("Vc -?C#()&ADaNEISTps{}fLie_oV\n"))
+        Esis.put_lit(w.acc, String("Vo esis"))
+        ; the outputOptions table from index 1 (the leading "all" is skipped):
+        ; every entry whose flag intersects prints — "omitted" fires on EITHER
+        ; omission bit, and tagomit/attromit re-print their own names.
+        if (w.flags & OF_LINE) <> 0
+            Esis.put_lit(w.acc, String(" line"))
+        if (w.flags & OF_ENTITY) <> 0
+            Esis.put_lit(w.acc, String(" entity"))
+        if (w.flags & OF_ID) <> 0
+            Esis.put_lit(w.acc, String(" id"))
+        if (w.flags & OF_INCLUDED) <> 0
+            Esis.put_lit(w.acc, String(" included"))
+        if (w.flags & OF_NOTATION_SYSID) <> 0
+            Esis.put_lit(w.acc, String(" notation-sysid"))
+        if (w.flags & OF_NONSGML) <> 0
+            Esis.put_lit(w.acc, String(" nonsgml"))
+        if (w.flags & OF_EMPTY) <> 0
+            Esis.put_lit(w.acc, String(" empty"))
+        if (w.flags & OF_DATA_ATT) <> 0
+            Esis.put_lit(w.acc, String(" data-attribute"))
+        if (w.flags & OF_COMMENT) <> 0
+            Esis.put_lit(w.acc, String(" comment"))
+        if (w.flags & (OF_TAG_OMISSION | OF_ATTR_OMISSION)) <> 0
+            Esis.put_lit(w.acc, String(" omitted"))
+        if (w.flags & OF_TAG_OMISSION) <> 0
+            Esis.put_lit(w.acc, String(" tagomit"))
+        if (w.flags & OF_ATTR_OMISSION) <> 0
+            Esis.put_lit(w.acc, String(" attromit"))
+        if (w.flags & OF_PARSER_INFO) <> 0
+            Esis.put_lit(w.acc, String(" version"))
+        Esis.put(w.acc, 0x0A)
+    }
+
+    ; walk the event queue -> the ESIS byte String.
+    ; writer construction — everything write() did before the event loop.
+    ; Streaming delivery calls this BEFORE the parse; the classic whole-queue
+    ; path calls it from write().
+    procedure begin(host: ref[Page], mutable ps: ref[ParserState], out_fd: int) returns ref[EsisW]
+    {
+        let acc Array[u8]^host()
+        let se0 Array[StringC]^host()
+        let sn0 Array[StringC]^host()
+        let ste0 Array[ref[Array[StringC]]?]^host()
+        let stn0 Array[ref[Array[StringC]]?]^host()
+        let w &EsisW^host(
+            acc: acc,
+            flags: ps.get_output_flags(),
+            have_data: false,
+            in_document: false,
+            last_sos: null,
+            last_seg: 0,
+            last_lineno: 0,
+            ps: ps,
+            seen_e: se0,
+            seen_n: sn0,
+            whost: host,
+            stack_e: ste0,
+            stack_n: stn0,
+            sub_depth: 0,
+            out_fd: out_fd,
+            bom_done: false)
+        if (w.flags & OF_PARSER_INFO) <> 0
+            Esis.features(w)
+        w
+    }
+
+    ; Hand the rendered ESIS bytes to the output and empty the accumulator —
+    ; called at every streaming drain, where everything in `acc` is already
+    ; final. `acc.clear()` keeps the buffer, so it stays chunk-sized instead of
+    ; growing with the document.
+    ;
+    ; ★The transcode temporaries go on the EVENT SCRATCH (ps.event_host()),
+    ; which the drain resets immediately after this returns — otherwise the
+    ; per-chunk copies would accumulate on the run region and this would move
+    ; the cost rather than remove it.
+    ;
+    ; ★The encoder is the RUN's (ps.get_output_encoder(), reached through
+    ; encode_out), so whatever state it carries continues across chunks; only
+    ; the BOM is per-stream, hence bom_done.
+    procedure flush_out(mutable w: ref[EsisW], mutable ps: ref[ParserState])
+    {
+        let acc w.acc
+        let n acc.get_length()
+        if n = 0
+            return
+        if w.out_fd >= 0
+        {
+            let host ps.event_host()
+            let internal String(acc.get_buffer() as pointer[const_char], n)
+            let out Esis.encode_out(host, ps, internal, true, w.bom_done = false)
+            if out.get_length() > 0
+                Io.write_all(w.out_fd as i32, out.get_buffer() as pointer[void], out.get_length())
+        }
+        w.bom_done := true
+        acc.clear()
+    }
+
+    ; render the queued events [from, n) — the writer state carries across
+    ; calls, so streaming delivery can consume the queue in chunks.
+    procedure write_events(mutable w: ref[EsisW], ps: ref[ParserState], from: size_t, n: size_t)
+    {
+        let host w.whost
+        let stack_e w.stack_e
+        let stack_n w.stack_n
+        var sub_depth w.sub_depth
+        var k: size_t from
+        while k < n
+        {
+            let ev ps.get_event(k)
+            let ty ev.get_type()
+            if ty = EV_DATA
+            {
+                Esis.out_loc(w, ev.get_loc())
+                Esis.start_data(w)
+                Esis.w_data(w, ev.get_data())
+            }
+            else if ty = EV_SDATA
+            {
+                ; SgmlsEventHandler::sdataEntity (:255) — startData() (the run
+                ; CONTINUES), then `\|` + escaped text + `\|` inline.
+                Esis.out_loc(w, ev.get_loc())
+                Esis.start_data(w)
+                Esis.put(w.acc, 0x5C)
+                Esis.put(w.acc, 0x7C)
+                Esis.w_data(w, ev.get_data())
+                Esis.put(w.acc, 0x5C)
+                Esis.put(w.acc, 0x7C)
+            }
+            else if ty = EV_NONSGML
+            {
+                ; SgmlsEventHandler::nonSgmlChar (:292) — only under -ononsgml:
+                ; the run continues with the `\%N;` escape.
+                if (w.flags & OF_NONSGML) <> 0
+                {
+                    Esis.out_loc(w, ev.get_loc())
+                    Esis.start_data(w)
+                    let nsc ev.get_data()
+                    Esis.put(w.acc, 0x5C)
+                    Esis.put(w.acc, 0x25)
+                    Esis.put_dec(w.acc, nsc.get(0))
+                    Esis.put(w.acc, 0x3B)
+                }
+            }
+            else if ty = EV_START_ELEMENT
+            {
+                Esis.flush_data(w)
+                ; link-rule attributes first (SgmlsEventHandler::startElement:
+                ; the `a<lpdname> ...` records precede the `A` records).
+                let latts ev.get_link_attributes()
+                if latts <> null
+                    Esis.put_attributes(w, latts, 0x61, ev.get_link_owner())
+                Esis.put_attributes(w, ev.get_attributes(), 0x41, null)
+                ; -otagomit / -oincluded / -oempty records, then the -oline
+                ; L record, then the `(` line (reference order :320-327).
+                if (w.flags & OF_TAG_OMISSION) <> 0
+                {
+                    if ev.get_has_markup() = false
+                    {
+                        Esis.put(w.acc, 0x6F)
+                        Esis.put(w.acc, 0x0A)
+                    }
+                }
+                if (w.flags & OF_INCLUDED) <> 0
+                {
+                    if ev.is_included()
+                    {
+                        Esis.put(w.acc, 0x69)
+                        Esis.put(w.acc, 0x0A)
+                    }
+                }
+                if (w.flags & OF_EMPTY) <> 0
+                {
+                    if Esis.must_omit_end(ev as ref[Event])
+                    {
+                        Esis.put(w.acc, 0x65)
+                        Esis.put(w.acc, 0x0A)
+                    }
+                }
+                Esis.out_loc(w, ev.get_markup_loc())
+                Esis.put(w.acc, 0x28)
+                Esis.put_name(w.acc, ev.get_element_type().get_name())
+                Esis.put(w.acc, 0x0A)
+            }
+            else if ty = EV_END_ELEMENT
+            {
+                ; reference order (:437): flush, L record, `o`, `)` line.
+                Esis.flush_data(w)
+                Esis.out_loc(w, ev.get_markup_loc())
+                if (w.flags & OF_TAG_OMISSION) <> 0
+                {
+                    if ev.get_has_markup() = false
+                    {
+                        Esis.put(w.acc, 0x6F)
+                        Esis.put(w.acc, 0x0A)
+                    }
+                }
+                Esis.put(w.acc, 0x29)
+                Esis.put_name(w.acc, ev.get_element_type().get_name())
+                Esis.put(w.acc, 0x0A)
+            }
+            else if ty = EV_PI
+            {
+                ; SgmlsEventHandler::pi — location, flushData(), `?` + data + RE.
+                Esis.out_loc(w, ev.get_loc())
+                Esis.flush_data(w)
+                Esis.put(w.acc, 0x3F)
+                Esis.w_data(w, ev.get_data())
+                Esis.put(w.acc, 0x0A)
+            }
+            else if ty = EV_APPINFO
+            {
+                ; SgmlsEventHandler::appinfo — location, flushData(), `#` + RE.
+                Esis.out_loc(w, ev.get_loc())
+                Esis.flush_data(w)
+                Esis.put(w.acc, 0x23)
+                Esis.w_data(w, ev.get_data())
+                Esis.put(w.acc, 0x0A)
+            }
+            else if ty = EV_COMMENT
+            {
+                ; SgmlsEventHandler::commentDecl — only once the document has
+                ; started (inDocument_), one `_` record per comment segment.
+                if w.in_document
+                {
+                    Esis.out_loc(w, ev.get_loc())
+                    Esis.flush_data(w)
+                    let segs ev.get_comments()
+                    if segs <> null
+                    {
+                        let nsg segs.get_length()
+                        var sgi: size_t 0
+                        while sgi < nsg
+                        {
+                            let seg segs[sgi]
+                            Esis.put(w.acc, 0x5F)
+                            Esis.w_data(w, seg)
+                            Esis.put(w.acc, 0x0A)
+                            sgi := sgi + 1
+                        }
+                    }
+                }
+            }
+            else if ty = EV_ENTITY_REF
+            {
+                ; SgmlsEventHandler::externalDataEntity (:448): location, flush
+                ; the data run, print the entity's definition on first use
+                ; (suppressed under -oentity — the endProlog sweep already
+                ; defined everything), then the `&name` reference line.
+                Esis.out_loc(w, ev.get_loc())
+                Esis.flush_data(w)
+                let rent ev.get_entity()
+                let rname rent.get_name()
+                if (w.flags & OF_ENTITY) = 0
+                {
+                    if Esis.mark(w.seen_e, rname) = false
+                        Esis.define_entity(w, rent)
+                }
+                Esis.put(w.acc, 0x26)
+                Esis.put_name(w.acc, rname)
+                Esis.put(w.acc, 0x0A)
+            }
+            else if ty = EV_ENTITY_DEFAULTED
+            {
+                ; SgmlsEventHandler::entityDefaulted + the lookup re-dispatch:
+                ; -oentity re-prints the definition at every reference.
+                if (w.flags & OF_ENTITY) <> 0
+                {
+                    Esis.flush_data(w)
+                    Esis.define_entity(w, ev.get_entity())
+                }
+            }
+            else if ty = EV_START_SUBDOC
+            {
+                ; SgmlsEventHandler::subdocEntity (:461): location, flush,
+                ; define the subdoc entity on first use, `{name`, then fresh
+                ; per-subdocument seen-sets (SgmlsSubdocState::init).
+                Esis.out_loc(w, ev.get_loc())
+                Esis.flush_data(w)
+                let sent ev.get_entity()
+                let sname sent.get_name()
+                if (w.flags & OF_ENTITY) = 0
+                {
+                    if Esis.mark(w.seen_e, sname) = false
+                        Esis.define_entity(w, sent)
+                }
+                Esis.put(w.acc, 0x7B)
+                Esis.put_name(w.acc, sname)
+                Esis.put(w.acc, 0x0A)
+                if sub_depth < stack_e.get_length()
+                {
+                    stack_e.put(sub_depth, w.seen_e)
+                    stack_n.put(sub_depth, w.seen_n)
+                }
+                else
+                {
+                    stack_e.add(w.seen_e)
+                    stack_n.add(w.seen_n)
+                }
+                sub_depth := sub_depth + 1
+                let fe Array[StringC]^host()
+                let fn Array[StringC]^host()
+                w.seen_e := fe
+                w.seen_n := fn
+            }
+            else if ty = EV_END_PROLOG
+            {
+                ; SgmlsEventHandler::endProlog — under -oentity first define
+                ; EVERY general entity of the DTD (bucket order), then the
+                ; comment gate opens, then the active SIMPLE link types'
+                ; attribute lists print as `a<linkname> <att> ...` records.
+                let ges ev.get_general_entities()
+                if ges <> null
+                {
+                    if (w.flags & OF_ENTITY) <> 0
+                    {
+                        Esis.flush_data(w)
+                        let ngs ges.get_length()
+                        var gei: size_t 0
+                        while gei < ngs
+                        {
+                            let ge ges[gei]
+                            Esis.define_entity(w, ge)
+                            gei := gei + 1
+                        }
+                    }
+                }
+                if (w.flags & OF_COMMENT) <> 0
+                    w.in_document := true
+                let sl_names ev.get_simple_link_names()
+                if sl_names <> null
+                {
+                    let sl_atts ev.get_simple_link_atts()
+                    let nsl sl_names.get_length()
+                    var sli: size_t 0
+                    while sli < nsl
+                    {
+                        Esis.flush_data(w)
+                        let sname sl_names.at(sli)
+                        let satts sl_atts[sli]
+                        Esis.put_attributes(w, satts, 0x61, sname)
+                        sli := sli + 1
+                    }
+                }
+            }
+            else if ty = EV_END_SUBDOC
+            {
+                ; `}name` — restore the outer seen-sets first (the reference
+                ; swaps back before writing the bracket).
+                Esis.flush_data(w)
+                if sub_depth > 0
+                {
+                    sub_depth := sub_depth - 1
+                    w.seen_e := stack_e[sub_depth] as ref[Array[StringC]]
+                    w.seen_n := stack_n[sub_depth] as ref[Array[StringC]]
+                }
+                Esis.put(w.acc, 0x7D)
+                Esis.put_name(w.acc, ev.get_entity().get_name())
+                Esis.put(w.acc, 0x0A)
+            }
+            k := k + 1
+        }
+        w.sub_depth := sub_depth
+    }
+
+    procedure write(host: ref[Page], mutable ps: ref[ParserState], conforming: bool) returns String
+    {
+        ; streaming delivery: the parser already created the writer and
+        ; drained chunks into it — pick it up and render only the tail.
+        var w: ref[EsisW]? null
+        var from: size_t 0
+        if ps.is_streaming()
+        {
+            w := ps.get_stream_w() as ref[EsisW]
+            from := ps.get_drained()
+        }
+        else
+            w := Esis.begin(host, ps, -1)
+        Esis.write_events(w as ref[EsisW], ps, from, ps.n_events())
+        Esis.flush_data(w as ref[EsisW])
+        ; The conformance marker `C` is written iff the document conformed
+        ; (SgmlsEventHandler dtor) — onsgmls's invariant is C present <=> exit 0.
+        ; A failed parse that recorded no message (e.g. an unresolved external
+        ; DTD subset) is still non-conforming, so `n_errors==0` alone is not
+        ; enough — the caller passes the same decision that sets the exit code.
+        let acc w.acc
+        if conforming
+        {
+            Esis.put(acc, 0x43)
+            Esis.put(acc, 0x0A)
+        }
+        let internal String(acc.get_buffer() as pointer[const_char], acc.get_length())
+        ; the ESIS stream has the escaper set; a BOM-writing system (UNICODE)
+        ; stamps it at stream creation, i.e. per document.
+        Esis.encode_out(host, ps, internal, true, w.bom_done = false)
+    }
+
+    ; run a writer's internal UTF-8 stream through the run's output coding
+    ; system. A null encoder (unit-test / in-process JIT paths that never go
+    ; through the driver) falls back to the environment pair the driver would
+    ; have installed: UTF-8 under SP_CHARSET_FIXED+SP_ENCODING, else identity.
+    function encode_out(host: ref[Page], ps: ref[ParserState], internal: String, escaper: bool, bom: bool) returns String
+    {
+        ; the ESIS stream's escaper is SgmlsEventHandler's `\#<decimal>;`
+        ; (RAST sets none), so the bool selects between those two.
+        var esc OESC_NONE
+        if escaper
+            esc := OESC_BACKSLASH
+        let enc ps.get_output_encoder()
+        if enc <> null
+            return CodingSystemKit.transcode(host, enc, internal, esc, bom)
+        var fb OutputEncoder()
+        CodingSystemKit.make_default(host, ps.get_output_utf8(), &fb)
+        CodingSystemKit.transcode(host, &fb, internal, esc, bom)
+    }
+
+    ; ---- self-test: escaping over a controlled StringC --------------------
+    function test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+
+        ; data escaping: "a<TAB>b\<RE>c" -> "a\011b\\\nc"
+        let acc Array[u8]^host()
+        var raw u32[5]
+        let rp raw as pointer[u32]
+        raw[0] := 0x61
+        raw[1] := 0x09
+        raw[2] := 0x62
+        raw[3] := 0x5C
+        raw[4] := 0x0D
+        let sc StringC(rp, 5)
+        Esis.put_data(acc, sc)
+        let got String(acc.get_buffer() as pointer[const_char], acc.get_length())
+        if got.equals(String("a\\011b\\\\\\n")) = false
+            return -1
+
+        ; UTF-8 output: U+00FC -> C3 BC, U+FFFD -> EF BF BD (the two shapes the
+        ; XML-encoding decoder actually produces), ASCII still identity.
+        let acc2 Array[u8]^host()
+        var raw2 u32[3]
+        let rp2 raw2 as pointer[u32]
+        raw2[0] := 0x7A     ; 'z'
+        raw2[1] := 0xFC     ; 'ü'
+        raw2[2] := 0xFFFD   ; U+FFFD
+        let sc2 StringC(rp2, 3)
+        Esis.put_data(acc2, sc2)
+        if acc2.get_length() <> 6
+            return -2
+        if acc2[0] <> 0x7A
+            return -3
+        if acc2[1] <> 0xC3
+            return -4
+        if acc2[2] <> 0xBC
+            return -5
+        if acc2[3] <> 0xEF
+            return -6
+        if acc2[4] <> 0xBF
+            return -7
+        if acc2[5] <> 0xBD
+            return -8
+
+        ; identity output (the default coding system) applies at transcode
+        ; time: c <= 0xFF -> the raw byte; c >= 0x100 -> the `\#N;` escape.
+        ; Same input Chars: z ü U+FFFD -> 7A FC "\#65533;".
+        let internal3 String(acc2.get_buffer() as pointer[const_char], acc2.get_length())
+        var e3 OutputEncoder()
+        CodingSystemKit.make_default(host, false, &e3)
+        let got3 CodingSystemKit.transcode(host, &e3, internal3, OESC_BACKSLASH, true)
+        if got3.get_length() <> 10
+            return -9
+        if got3.get(0) <> 0x7A
+            return -10
+        if got3.get(1) <> 0xFC
+            return -11
+        let b3 got3.get_buffer()
+        let esc3 String((b3 + 2) as pointer[const_char], 8)
+        if esc3.equals(String("\\#65533;")) = false
+            return -12
+        0
+    }
+}

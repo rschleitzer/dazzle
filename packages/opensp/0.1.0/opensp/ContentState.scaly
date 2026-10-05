@@ -1,0 +1,408 @@
+use scaly.memory.Page
+use scaly.containers.Array
+use opensp.StringC.StringC
+use opensp.Location.Location
+use opensp.ElementType.ElementType
+use opensp.ElementType.ElementDefinition
+use opensp.ShortReferenceMap.ShortReferenceMap
+use opensp.Dtd.Dtd
+use opensp.OpenElement.OpenElement
+use opensp.ContentToken.ContentToken
+use opensp.ContentToken.CmNode
+use opensp.ContentToken.CompiledModelGroup
+use opensp.ContentToken.Ambiguity
+
+; ContentState — ContentState.cs (216 LOC). The parser's open-element stack and
+; the machinery that tracks, for every dense element-type index, how many
+; instances are currently open / included / excluded — so the content checker
+; can answer elementIsOpen/Included/Excluded in O(1) and drive tag-omission and
+; content-model transitions.
+;
+; MI resolution: C++ `ParserState : ContentState + AttributeContext`, and the C#
+; port linearized it as `ContentState : AttributeContext` so ParserState could
+; single-inherit. Scaly has neither — ContentState is ported as a STANDALONE
+; concept holding the stack + counts; the eventual ParserState will COMPOSE a
+; ContentState and an AttributeContext (their state is disjoint). ContentState is
+; concrete here (C# made it abstract only because ParserState supplied the
+; Messenger — irrelevant to the data structure).
+;
+; PORT SHAPE: page-hosted flat struct. The C++ intrusive `IList<OpenElement>`
+; stack becomes an `Array[pointer[OpenElement]]` + a live `depth` (Array cannot
+; shrink; pop just decrements and reuses slots). The Vector<uint> count arrays
+; are `Array[u32]`, rebuilt by startContent and grown one slot at a time by
+; lookupCreateUndefinedElement (C++ push_back).
+;
+; DEFERRED to the Parser increment (emit diagnostics / need the live parser):
+; getOpenElementInfo (open-element context for messages — needs an OpenElementInfo
+; record + the rniPcdata name, both message-formatting surface).
+
+; Build an Array[u32] of `n` zeros on `host` (Vector<uint>::assign(n, 0)).
+function fill_zeros_u32(host: ref[Page], n: size_t) returns ref[Array[u32]]
+{
+    let a Array[u32]^host()
+    var i: size_t 0
+    while i < n
+    {
+        a.add(0)
+        i := i + 1
+    }
+    a
+}
+
+define ContentState
+(
+    open_elements: ref[Array[ref[OpenElement]?]]
+    var depth: size_t
+    var open_element_count: ref[Array[u32]]
+    var include_count: ref[Array[u32]]
+    var exclude_count: ref[Array[u32]]
+    var total_exclude_count: u32
+    var tag_level: u32
+    var net_enabling_count: u32
+    var next_index: u64
+    var last_ended_type: ref[ElementType]?
+    document_element_container: ref[ElementType]
+    the_empty_map: ref[ShortReferenceMap]
+    ; Popped elements, kept for re-arming — see acquire_element. The reference
+    ; DELETES an element it discards (`delete popSaveElement()`,
+    ; ContentState.cxx:109) and `new`s one per start tag; a region has no
+    ; per-object free, so the discard path hands the object back here instead.
+    ; Without this every start tag left an OpenElement + its MatchState +
+    ; AndState on the run region for the whole parse: measured 112 bytes of
+    ; struct per element, and 114 MB between two 8.4-MB documents of the same
+    ; size but opposite shape (1.05 M tiny elements vs 1048 big text runs).
+    free_elements: ref[Array[ref[OpenElement]?]]
+    ; live entries in free_elements — the same Array-plus-depth shape the open
+    ; element stack uses above, so the list never needs to shrink.
+    var free_count: size_t
+)
+{
+    function make(host: ref[Page]) returns ref[ContentState]
+    {
+        let cs &ContentState^host(Array[ref[OpenElement]?]^host(), 0, Array[u32]^host(), Array[u32]^host(), Array[u32]^host(), 0, 0, 0, 0, null, ElementType^host(StringC(), ELEMENT_UNDEFINED_INDEX), ShortReferenceMap.make(host, StringC()), Array[ref[OpenElement]?]^host(), 0)
+        cs
+    }
+
+    ; One OpenElement for a start tag: a recycled one if the discard path has
+    ; handed any back, a fresh one otherwise. This is `new OpenElement(...)` in
+    ; the reference; the recycling is what stands in for its `delete`.
+    ;
+    ; ★Only elements that pop_element DISCARDED are in the list. An element that
+    ; left through pop_save_element belongs to its caller — the OMITTAG undo
+    ; machinery keeps it in `UndoEntry.element` and re-pushes it on rollback —
+    ; and is never recycled, exactly the ownership split the reference draws
+    ; between popSaveElement and popElement.
+    procedure acquire_element(mutable this: ref[ContentState], host: ref[Page], type: ref[ElementType], net: bool, included: bool, map: ref[ShortReferenceMap]?, start_location: Location) returns ref[OpenElement]
+    {
+        if this.free_count = 0
+            return OpenElement.make(host, type, net, included, map, start_location)
+        this.free_count := this.free_count - 1
+        let e this.free_elements[this.free_count]
+        e.reinit(host, type, net, included, map, start_location)
+        e as ref[OpenElement]
+    }
+
+    ; the discard half of the reference's `delete popSaveElement()`.
+    procedure release_element(mutable this: ref[ContentState], e: ref[OpenElement])
+    {
+        if this.free_count < this.free_elements.get_length()
+            this.free_elements.put(this.free_count, e)
+        else
+            this.free_elements.add(e)
+        this.free_count := this.free_count + 1
+    }
+
+    ; ---- stack primitives (Array + live depth) ---------------------------
+    procedure stack_push(mutable this: ref[ContentState], e: ref[OpenElement])
+    {
+        if this.depth < this.open_elements.get_length()
+            this.open_elements.put(this.depth, e)
+        else
+            this.open_elements.add(e)
+        this.depth := this.depth + 1
+    }
+
+    ; the element at stack offset `k` from the top (0 = current/head).
+    function at_top(this: ContentState, k: size_t) returns ref[OpenElement]?
+        open_elements[(depth - 1 - k)]
+
+    ; ContentState::theEmptyMap — the shared sentinel `#EMPTY` map.
+    function get_the_empty_map(this: ContentState) returns ref[ShortReferenceMap]
+        the_empty_map
+
+    function current_element(this: ContentState) returns ref[OpenElement]?
+        open_elements[(depth - 1)]
+
+    ; ---- startContent ----------------------------------------------------
+    ; Build the synthetic document-element container: a SEQ model group of the
+    ; single document element type, compiled to a DFA, and install it as the
+    ; base of the (freshly cleared) open-element stack.
+    procedure start_content(mutable this: ref[ContentState], host: ref[Page], dtd: ref[Dtd], scratch_on: bool)
+    {
+        let members ContentToken.new_node_vec(host)
+        members.add(ContentToken.make_leaf(host, dtd.get_document_element_type(), OI_NONE, false, false))
+        let group ContentToken.make_group(host, CONN_SEQ, members, OI_NONE)
+        let amb ContentToken.new_amb_vec(host)
+        var unreach false
+        let compiled ContentToken.compile(host, group, dtd.n_element_type_index(), amb, &unreach, scratch_on)
+        let def ElementDefinition.make_with_model(host, Location(), 0, 0, DC_MODEL_GROUP, compiled)
+        this.document_element_container.set_element_definition(def, 0)
+
+        this.tag_level := 0
+        this.depth := 0
+        this.stack_push(OpenElement.make(host, this.document_element_container, false, false, this.the_empty_map, Location()))
+
+        let n dtd.n_element_type_index()
+        this.include_count := fill_zeros_u32(host, n)
+        this.exclude_count := fill_zeros_u32(host, n)
+        this.open_element_count := fill_zeros_u32(host, n)
+        this.net_enabling_count := 0
+        this.total_exclude_count := 0
+        this.last_ended_type := null
+        this.next_index := 0
+    }
+
+    ; ---- push / pop ------------------------------------------------------
+    procedure push_element(mutable this: ref[ContentState], mutable e: ref[OpenElement])
+    {
+        this.tag_level := this.tag_level + 1
+        let oec this.open_element_count.as_slice()
+        let ti e.get_type().get_index()
+        oec.put(ti, oec[ti] + 1)
+        let def e.get_type().get_definition()
+        if def <> null
+        {
+            let inc this.include_count.as_slice()
+            var i: size_t 0
+            let ni def.n_inclusions()
+            while i < ni
+            {
+                let idx def.inclusion(i).get_index()
+                inc.put(idx, inc[idx] + 1)
+                i := i + 1
+            }
+            let exc this.exclude_count.as_slice()
+            var j: size_t 0
+            let ne def.n_exclusions()
+            while j < ne
+            {
+                let idx def.exclusion(j).get_index()
+                exc.put(idx, exc[idx] + 1)
+                this.total_exclude_count := this.total_exclude_count + 1
+                j := j + 1
+            }
+        }
+        if e.get_net_enabling()
+            this.net_enabling_count := this.net_enabling_count + 1
+        e.set_index(this.next_index)
+        this.next_index := this.next_index + 1
+        this.stack_push(e)
+    }
+
+    procedure pop_save_element(mutable this: ref[ContentState]) returns ref[OpenElement]
+    {
+        let e this.open_elements[(this.depth - 1)]
+        this.depth := this.depth - 1
+        this.tag_level := this.tag_level - 1
+        let oec this.open_element_count.as_slice()
+        let ti e.get_type().get_index()
+        oec.put(ti, oec[ti] - 1)
+        let def e.get_type().get_definition()
+        if def <> null
+        {
+            let inc this.include_count.as_slice()
+            var i: size_t 0
+            let ni def.n_inclusions()
+            while i < ni
+            {
+                let idx def.inclusion(i).get_index()
+                inc.put(idx, inc[idx] - 1)
+                i := i + 1
+            }
+            let exc this.exclude_count.as_slice()
+            var j: size_t 0
+            let ne def.n_exclusions()
+            while j < ne
+            {
+                let idx def.exclusion(j).get_index()
+                exc.put(idx, exc[idx] - 1)
+                this.total_exclude_count := this.total_exclude_count - 1
+                j := j + 1
+            }
+        }
+        if e.get_net_enabling()
+            this.net_enabling_count := this.net_enabling_count - 1
+        this.last_ended_type := e.get_type()
+        e as ref[OpenElement]
+    }
+
+    ; `delete popSaveElement()` (ContentState.cxx:109) — pop and give the object
+    ; up. Here that means handing it to the free list for the next start tag.
+    procedure pop_element(mutable this: ref[ContentState])
+    {
+        let e this.pop_save_element()
+        this.release_element(e)
+    }
+
+    ; ---- queries ---------------------------------------------------------
+    function tag_level_of(this: ContentState) returns u32
+        tag_level
+
+    function element_is_open(this: ContentState, e: ref[ElementType]) returns bool
+        open_element_count[e.get_index()] <> 0
+
+    function element_is_included(this: ContentState, e: ref[ElementType]) returns bool
+    {
+        let idx e.get_index()
+        (include_count[idx] <> 0) && (exclude_count[idx] = 0)
+    }
+
+    function element_is_excluded(this: ContentState, e: ref[ElementType]) returns bool
+        exclude_count[e.get_index()] <> 0
+
+    function last_ended_element_type(this: ContentState) returns ref[ElementType]
+        this.last_ended_type as ref[ElementType]
+
+    function after_document_element(this: ContentState) returns bool
+    {
+        let ce this.current_element()
+        (tag_level = 0) && ce.is_finished()
+    }
+
+    function content_mode(this: ContentState) returns int
+        this.current_element().mode(net_enabling_count > 0)
+
+    ; checkImplyLoop — a loop is detected if any of the top `count` open elements
+    ; has the same type AND match state as the current head.
+    function check_imply_loop(this: ContentState, count: u32) returns bool
+    {
+        let head this.current_element()
+        var k: size_t 0
+        var c count
+        while c > 0
+        {
+            let cur this.at_top(k)
+            if cur.get_type() = head.get_type()
+            {
+                if ContentToken.ms_equals((cur.get_match_state()) as ref[MatchState], (head.get_match_state()) as ref[MatchState])
+                    return false
+            }
+            k := k + 1
+            c := c - 1
+        }
+        true
+    }
+
+    ; lookupCreateUndefinedElement — a referenced-but-undeclared element: create
+    ; it with an undefined ANY definition, register it in the DTD, hand it the
+    ; implicit attribute def, and grow the count arrays by one slot.
+    procedure lookup_create_undefined_element(mutable this: ref[ContentState], host: ref[Page], mutable name: StringC, mutable loc: Location, mutable dtd: ref[Dtd], allow_immediate_recursion: bool) returns ref[ElementType]
+    {
+        ; ElementType.make, NOT the init: `name` is the parser's transient folded-
+        ; token buffer, and the element type outlives the start tag. The init stores
+        ; the StringC as given (aliasing it) — make deep-copies onto `host`.
+        let idx dtd.alloc_element_type_index()
+        let p ElementType.make(host, name, idx)
+        dtd.insert_element_type(p)
+        let def ElementDefinition.make(host, loc, ELEMENT_UNDEFINED_INDEX, OMIT_END, DC_ANY, allow_immediate_recursion)
+        p.set_element_definition(def, 0)
+        let iad dtd.get_implicit_element_attribute_def()
+        p.set_attribute_def(iad)
+        this.include_count.add(0)
+        this.exclude_count.add(0)
+        this.open_element_count.add(0)
+        p
+    }
+
+    procedure test() returns int
+    {
+        let anchor StringC("x")
+        let host Page.get(anchor.data_ptr())
+
+        ; a DTD whose document element "doc" has model (a), with "a" EMPTY.
+        let dtd Dtd.make(host, StringC("doc"), true)
+        let doc_type dtd.get_document_element_type()
+        let a &ElementType^host(StringC("a"), dtd.alloc_element_type_index())
+        dtd.insert_element_type(a)
+        let m ContentToken.new_node_vec(host)
+        m.add(ContentToken.make_leaf(host, a, OI_NONE, false, false))
+        let grp ContentToken.make_group(host, CONN_SEQ, m, OI_NONE)
+        let amb ContentToken.new_amb_vec(host)
+        var unreach false
+        let cmg ContentToken.compile(host, grp, dtd.n_element_type_index(), amb, &unreach, true)
+        let doc_def ElementDefinition.make_with_model(host, Location(), 0, 0, DC_MODEL_GROUP, cmg)
+        doc_type.set_element_definition(doc_def, 0)
+        let a_def ElementDefinition.make(host, Location(), 1, 0, DC_EMPTY, true)
+        a.set_element_definition(a_def, 0)
+
+        let cs ContentState.make(host)
+        cs.start_content(host, dtd, true)
+        if cs.tag_level_of() <> 0
+            return -1
+        ; the container (model SEQ(doc)) is not finished until doc is seen.
+        if cs.after_document_element()
+            return -2
+        ; the container admits a transition to the document element type.
+        if cs.current_element().try_transition(doc_type) = false
+            return -3
+
+        ; push doc.
+        let oe_doc OpenElement.make(host, doc_type, false, false, null, Location())
+        cs.push_element(oe_doc)
+        if cs.tag_level_of() <> 1
+            return -4
+        if cs.element_is_open(doc_type as ref[ElementType]) = false
+            return -5
+        if cs.element_is_open(a)
+            return -6
+        if cs.current_element() <> oe_doc
+            return -7
+
+        ; within doc, transition to a and push it.
+        if cs.current_element().try_transition(a) = false
+            return -8
+        let oe_a OpenElement.make(host, a, false, false, null, Location())
+        cs.push_element(oe_a)
+        if cs.tag_level_of() <> 2
+            return -9
+        if cs.element_is_open(a) = false
+            return -10
+        ; each open element got a distinct serial index.
+        if oe_doc.get_index() <> 0
+            return -11
+        if oe_a.get_index() <> 1
+            return -12
+
+        ; pop a: count clears, last-ended records a.
+        cs.pop_element()
+        if cs.tag_level_of() <> 1
+            return -13
+        if cs.element_is_open(a)
+            return -14
+        if cs.last_ended_element_type() <> a
+            return -15
+
+        ; a checkImplyLoop over the head compares it to itself -> loop (false);
+        ; a zero-length window sees no loop (true).
+        if cs.check_imply_loop(0) = false
+            return -16
+        if cs.check_imply_loop(1)
+            return -17
+
+        ; pop doc.
+        cs.pop_element()
+        if cs.tag_level_of() <> 0
+            return -18
+
+        ; lookupCreateUndefinedElement registers + grows the count arrays.
+        let u cs.lookup_create_undefined_element(host, StringC("unk"), Location(), dtd, true)
+        if dtd.lookup_element_type(StringC("unk")) <> u
+            return -19
+        if u.undefined() = false
+            return -20
+        if cs.element_is_open(u)
+            return -21
+
+        0
+    }
+}
