@@ -17,6 +17,13 @@
 # set with line fields, a table with a header row repeated on its second
 # page, cell backgrounds and borders, verbatim text, a rule and a PNG.
 #
+# fonts: text in a font family found among the files of DAZZLE_FONTS and
+# embedded -- two synthetic fonts whose glyphs are rectangles, a regular and
+# a bold one -- with characters far beyond code page 1252 and a composed
+# glyph; and a family no file has, which is set in a standard font. `book` runs with DAZZLE_FONTS empty, that is with
+# no font files at all, so that it does not depend on the fonts of the
+# machine.
+#
 # To freeze a new golden after a deliberate change: run with BLESS=1.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -35,10 +42,11 @@ if ! tests/dazzle/build-cli.sh "$OUT" > "$OUT.build.log" 2>&1; then
 fi
 
 cp "$HERE"/*.sgml "$HERE"/*.dsl "$HERE"/*.png "$WORK/"
+cp -R "$HERE/fonts" "$WORK/fonts"
 
-run_case() { # name
+run_case() { # name [font directories]
   local name="$1"
-  ( cd "$WORK" && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
+  ( cd "$WORK" && DAZZLE_FONTS="${2:-}" SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
       "$OUT" -t pdf -o "$name.out.pdf" -d "$name.dsl" "$name.sgml" 2> "$name.err" )
   local rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -58,9 +66,10 @@ run_case() { # name
 }
 
 run_case book
+run_case fonts fonts
 
 # default output name: <docbase>.pdf in the current directory.
-( cd "$WORK" && rm -f book.pdf && SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
+( cd "$WORK" && rm -f book.pdf && DAZZLE_FONTS= SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
     "$OUT" -t pdf -d book.dsl book.sgml 2> /dev/null )
 if ! cmp -s "$HERE/book.expected.pdf" "$WORK/book.pdf"; then
   echo "dazzle-pdf: FAIL default-output-name"; exit 1

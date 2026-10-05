@@ -30,10 +30,17 @@ One backend the original does not have, in the Scaly engine only: PDF
 (`-t pdf`). It sets the pages itself and writes them with the
 [pdf](https://github.com/rschleitzer/pdf) package. It is rudimentary: simple
 page sequences with headers and footers, paragraphs, display groups, line
-fields, leaders, rules, external graphics (JPEG, PNG) and tables, in the
-standard fonts Helvetica, Times and Courier — enough to set a book with the
-DocBook print stylesheets, and not more. A character outside Windows code
-page 1252 prints as `?`.
+fields, leaders, rules, external graphics (JPEG, PNG) and tables — enough to
+set a book with the DocBook print stylesheets, and not more.
+
+A font family is looked for among the TrueType files of the system's font
+directories, by the family name and style each file states, and embedded
+with the glyphs the document uses; the text may be any Unicode the font has.
+For a family the system lacks, its usual sans serif, serif or typewriter face
+is taken instead. `DAZZLE_FONTS` names the directories to look in, separated
+by colons, in place of the system's. Where no file is found, the text is set
+in a standard font (Helvetica, Times, Courier), which has the characters of
+Windows code page 1252 only.
 
 ```sh
 SCALY_HOME=$PWD ./dazzle -t pdf -o book.pdf -d stylesheet.dsl document.xml

@@ -6,8 +6,18 @@
 ; It is rudimentary, and means to be: simple page sequences with headers and
 ; footers, paragraphs, display groups, line fields, leaders, rules, external
 ; graphics and tables — enough to set a book with the DocBook print
-; stylesheets, and not more. Text is in the standard fonts (Helvetica, Times,
-; Courier), so a character outside Windows code page 1252 prints as `?`.
+; stylesheets, and not more.
+;
+; Fonts: a font-family-name is looked for among the TrueType files of the
+; system's font directories (those of DAZZLE_FONTS, if that is set), by the
+; family name and style each file states; the font found is embedded with
+; the glyphs the document uses, so the text may be any Unicode the font has.
+; For a family the system does not have, the sans serif, serif or typewriter
+; face it usually has instead is taken, by what the name says. A character
+; the font lacks is taken from another font that has it (other_font). Where none of
+; those is found either, the text is set in a standard font -- Helvetica,
+; Times or Courier, which every reader has and none embeds -- and there a
+; character outside Windows code page 1252 prints as `?`.
 ;
 ; Shape: the builder does NOT stream. The flow object calls build a TREE of
 ; nodes, each with a snapshot of the inherited characteristics it was made
@@ -40,9 +50,10 @@ use scaly.containers.StringBuilder.StringBuilder
 use scaly.os.File.File
 use opensp.StringC.StringC
 use pdf.Font.PdfFont
-use pdf.Font.PDF_HELVETICA
-use pdf.Font.PDF_BOLD
-use pdf.Font.PDF_ITALIC
+use pdf.Font.PDF_TIMES
+use pdf.Font.PDF_COURIER
+use pdf.Font.PDF_FONT_COUNT
+use pdf.FontFiles.PdfFontFiles
 use pdf.Document.PdfDocument
 use dazzle.Grove.GroveNode
 use dazzle.ELObj.ELObj
@@ -143,8 +154,9 @@ define POP_IMAGE: int 3
 ; element
 define POP_MARK: int 4
 
-; --- the atoms of a line: kind, characteristics, two operands, width ---------
-define PAT_SIZE: int 5
+; --- the atoms of a line: kind, characteristics, two operands, width, and
+; for text the font it is set in ------------------------------------------
+define PAT_SIZE: int 6
 ; text at, text length
 define PAT_TEXT: int 0
 define PAT_SPACE: int 1
@@ -198,7 +210,7 @@ define PdfChars
     ; its place in the builder's list of snapshots
     var id: int
     var font_size: int
-    ; PDF_HELVETICA, PDF_TIMES or PDF_COURIER
+    ; the family's place in the builder's list of families
     var family: int
     var bold: bool
     var italic: bool
@@ -241,7 +253,7 @@ define PdfChars
     {
         this.id := 0
         this.font_size := 10 * 1000
-        this.family := PDF_HELVETICA
+        this.family := 0
         this.bold := false
         this.italic := false
         this.color := 0
@@ -348,17 +360,6 @@ define PdfChars
             return false
         true
     }
-
-    ; The font of the pdf package these characteristics ask for.
-    function font(this: ref[PdfChars]) returns int
-    {
-        var f this.family
-        if this.bold
-            f := f + PDF_BOLD
-        if this.italic
-            f := f + PDF_ITALIC
-        f
-    }
 }
 
 ; --- one node of the buffered tree -------------------------------------------
@@ -420,10 +421,24 @@ define PdfFOTBuilder
     var depth: int
     var snap: ref[PdfChars]?
     var snaps: ref[Array[ref[PdfChars]?]]
+    ; the font families named: where the name is in `family_names`, its
+    ; length, and the font of the document for each of the four styles
+    ; (-1: not asked for yet)
+    var families: ref[PdfInts]
+    var family_names: ref[Array[u8]]
+    ; the font files of the system, read when the first family is asked for
+    var font_files: ref[PdfFontFiles]
+    var fonts_scanned: bool
+    ; the families a character is looked for in that its own font lacks
+    var others: ref[PdfInts]
+    ; the font files read: where the path is in `family_names`, its length,
+    ; and the font of the document it became (-1: no font)
+    var loaded: ref[PdfInts]
+    var others_known: bool
     ; 0 body, 1 header, 2 footer: where the rows of the open table part go
     var section: int
     ; --- the layout ------------------------------------------------------------
-    var doc: ref[PdfDocument]?
+    var doc: ref[PdfDocument]
     var ops: ref[PdfInts]
     var atoms: ref[PdfInts]
     var scratch: ref[PdfInts]
@@ -488,7 +503,14 @@ define PdfFOTBuilder
         f.snap := null
         f.snaps := Array[ref[PdfChars]?]^host()
         f.section := 0
-        f.doc := null
+        f.doc := &PdfDocument^host()
+        f.families := PdfInts.make(host)
+        f.family_names := Array[u8]^host()
+        f.font_files := &PdfFontFiles^host()
+        f.fonts_scanned := false
+        f.others := PdfInts.make(host)
+        f.loaded := PdfInts.make(host)
+        f.others_known := false
         f.ops := PdfInts.make(host)
         f.atoms := PdfInts.make(host)
         f.scratch := PdfInts.make(host)
@@ -522,6 +544,8 @@ define PdfFOTBuilder
         f.page_fixed := 0
         f.row_height := 0
         let b f as ref[PdfFOTBuilder]
+        ; family 0, the one a flow object has before any is named
+        let helvetica b.family("Helvetica")
         let top b.snapshot()
         b.seq_chars := top
         b.root := PdfNode.make(host, PN_GROUP, top)
@@ -616,7 +640,7 @@ define PdfFOTBuilder
         if index = 0
             this.next.font_size := ic.lval
         else if index = 1
-            this.next.family := PdfFOTBuilder.family_of(ic.sval)
+            this.next.family := this.family_of(ic.sval)
         else if index = 2
         {
             let c ic.sym.code
@@ -706,8 +730,10 @@ define PdfFOTBuilder
         }
     }
 
-    ; The font family a font-family-name asks for.
-    function family_of(name: StringC) returns int
+    ; --- fonts -----------------------------------------------------------------
+
+    ; The place of a font-family-name in the list of families.
+    procedure family_of(mutable this: ref[PdfFOTBuilder], name: StringC) returns int
     {
         var buf u8[64]
         var n: size_t 0
@@ -720,7 +746,176 @@ define PdfFOTBuilder
                 buf[n] := 0x3F
             n := n + 1
         }
-        PdfFont.select(Slice[u8](n, buf as pointer[u8]), false, false)
+        this.family(Slice[u8](n, buf as pointer[u8]))
+    }
+
+    procedure family(mutable this: ref[PdfFOTBuilder], name: Slice[u8]) returns int
+    {
+        var i 0
+        while i < this.families.count
+        {
+            let at this.families.at(i) as size_t
+            if (this.families.at(i + 1) as size_t) = name.length
+            {
+                var k: size_t 0
+                while k < name.length and this.family_names[at + k] = name[k]
+                    k := k + 1
+                if k = name.length
+                    return i / 6
+            }
+            i := i + 6
+        }
+        this.families.push(this.family_names.get_length() as int)
+        this.families.push(name.length as int)
+        this.families.push(0 - 1)
+        this.families.push(0 - 1)
+        this.families.push(0 - 1)
+        this.families.push(0 - 1)
+        this.family_names.add(name)
+        i / 6
+    }
+
+    ; The font of the document that characteristics ask for: the family's
+    ; file in the style, embedded, if the system has one; else the standard
+    ; font nearest to the family's name.
+    procedure font_of(mutable this: ref[PdfFOTBuilder], c: ref[PdfChars]) returns int
+    {
+        var style 0
+        if c.bold
+            style := 1
+        if c.italic
+            style := style + 2
+        let entry c.family * 6
+        let known this.families.at(entry + 2 + style)
+        if known >= 0
+            return known
+        let at this.families.at(entry) as size_t
+        let name this.family_names.as_slice().subslice(at, at + (this.families.at(entry + 1) as size_t))
+        if this.fonts_scanned = false
+        {
+            this.fonts_scanned := true
+            this.scan_fonts()
+        }
+        var font 0 - 1
+        let path this.font_file(name, c.bold, c.italic)
+        if path.get_length() > 0
+            font := this.load_font(path)
+        if font < 0
+            font := PdfFont.select(name, c.bold, c.italic)
+        this.families.put(entry + 2 + style, font)
+        font
+    }
+
+    ; The font of the document a file is: read and given to the document
+    ; the first time, the same font every time after.
+    procedure load_font(mutable this: ref[PdfFOTBuilder], path: String) returns int
+    {
+        let wanted path.as_slice()
+        var i 0
+        while i < this.loaded.count
+        {
+            let at this.loaded.at(i) as size_t
+            if (this.loaded.at(i + 1) as size_t) = wanted.length
+            {
+                var k: size_t 0
+                while k < wanted.length and this.family_names[at + k] = wanted[k]
+                    k := k + 1
+                if k = wanted.length
+                    return this.loaded.at(i + 2)
+            }
+            i := i + 3
+        }
+        let data File.read_to_string(path)
+        let font this.doc.add_font(data.as_slice())
+        this.loaded.push(this.family_names.get_length() as int)
+        this.loaded.push(wanted.length as int)
+        this.loaded.push(font)
+        this.family_names.add(wanted)
+        font
+    }
+
+    ; The file of a family in a style: the family's own, else that of a
+    ; family commonly installed in its place -- for a name that means a sans
+    ; serif, a serif or a typewriter face the usual one of each system.
+    function font_file(this: ref[PdfFOTBuilder], name: Slice[u8], bold: bool, italic: bool) returns String
+    {
+        let own this.font_files.find(name, bold, italic)
+        if own.get_length() > 0
+            return own
+        let kind PdfFont.select(name, false, false)
+        if kind = PDF_TIMES
+        {
+            let a this.font_files.find("Times New Roman", bold, italic)
+            if a.get_length() > 0
+                return a
+            let b this.font_files.find("Liberation Serif", bold, italic)
+            if b.get_length() > 0
+                return b
+            return this.font_files.find("DejaVu Serif", bold, italic)
+        }
+        if kind = PDF_COURIER
+        {
+            let a this.font_files.find("Courier New", bold, italic)
+            if a.get_length() > 0
+                return a
+            let b this.font_files.find("Liberation Mono", bold, italic)
+            if b.get_length() > 0
+                return b
+            return this.font_files.find("DejaVu Sans Mono", bold, italic)
+        }
+        let a this.font_files.find("Arial", bold, italic)
+        if a.get_length() > 0
+            return a
+        let b this.font_files.find("Liberation Sans", bold, italic)
+        if b.get_length() > 0
+            return b
+        this.font_files.find("DejaVu Sans", bold, italic)
+    }
+
+    ; Read which font files there are: in the directories DAZZLE_FONTS names
+    ; (separated by colons; set but empty, none at all), else in the places
+    ; the systems keep their fonts.
+    procedure scan_fonts(mutable this: ref[PdfFOTBuilder])
+    {
+        let set getenv("DAZZLE_FONTS")
+        if set <> null
+        {
+            let list String(set)
+            var sb StringBuilder()
+            var i: size_t 0
+            while i <= list.get_length()
+            {
+                if i = list.get_length() or list.get(i) = 0x3A
+                {
+                    if sb.get_length() > 0
+                        this.font_files.scan(sb.to_string(), 3)
+                    sb := StringBuilder()
+                }
+                else
+                    sb.append(list.get(i) as char)
+                i := i + 1
+            }
+            return
+        }
+        this.font_files.scan(String("/System/Library/Fonts/Supplemental"), 0)
+        this.font_files.scan(String("/System/Library/Fonts"), 0)
+        this.font_files.scan(String("/Library/Fonts"), 1)
+        this.font_files.scan(String("/usr/share/fonts"), 3)
+        this.font_files.scan(String("/usr/local/share/fonts"), 3)
+        let home getenv("HOME")
+        if home <> null
+        {
+            let h String(home)
+            this.font_files.scan("`h`/Library/Fonts", 1)
+            this.font_files.scan("`h`/.fonts", 3)
+            this.font_files.scan("`h`/.local/share/fonts", 3)
+        }
+        let windows getenv("WINDIR")
+        if windows <> null
+        {
+            let w String(windows)
+            this.font_files.scan("`w`/Fonts", 0)
+        }
     }
 
     ; --- the tree --------------------------------------------------------------
@@ -815,13 +1010,7 @@ define PdfFOTBuilder
             else if ch = 0xAD or ch = 0x200B or ch = 0x200C or ch = 0x200D or ch = 0xFEFF
                 continue
             else if ch >= 0x20
-            {
-                let code PdfFont.encode(ch)
-                if code = 0
-                    this.pool.add(0x3F)
-                else
-                    this.pool.add(code)
-            }
+                PdfFont.append(this.pool, ch)
         }
         let length this.pool.get_length() - at
         if length = 0
@@ -963,16 +1152,16 @@ define PdfFOTBuilder
         {
             let n this.add(PN_GRAPHIC)
             this.display(n, dnic)
-            ; the system identifier, one byte per character
+            ; the system identifier
             let name nic.entity_system_id
             n.text_at := this.pool.get_length() as int
             var i: size_t 0
             while i < name.get_size()
             {
-                this.pool.add(name.get(i) as u8)
+                PdfFont.append(this.pool, name.get(i))
                 i := i + 1
             }
-            n.text_length := name.get_size() as int
+            n.text_length := (this.pool.get_length() as int) - n.text_at
             if nic.is_display
                 n.i0 := 1
             n.i1 := 0 - 1
@@ -1242,19 +1431,17 @@ define PdfFOTBuilder
     ; be written.
     procedure finish(mutable this: ref[PdfFOTBuilder]) returns bool
     {
-        let host this.host
-        let first &PdfDocument^host()
         this.measuring := true
-        this.layout(first)
-        let second &PdfDocument^host()
+        this.layout()
+        ; the fonts found stay with the document, the pages are set again
+        this.doc.clear()
         this.measuring := false
-        this.layout(second)
-        second.write(this.out_name)
+        this.layout()
+        this.doc.write(this.out_name)
     }
 
-    procedure layout(mutable this: ref[PdfFOTBuilder], doc: ref[PdfDocument])
+    procedure layout(mutable this: ref[PdfFOTBuilder])
     {
-        this.doc := doc
         this.ops.cut(0)
         this.atoms.cut(0)
         this.scratch.cut(0)
@@ -1315,7 +1502,7 @@ define PdfFOTBuilder
     ; Write the page being set.
     procedure emit_page(mutable this: ref[PdfFOTBuilder])
     {
-        let doc this.doc as ref[PdfDocument]
+        let doc this.doc
         let c this.seq_chars
         doc.begin_page(c.page_width, c.page_height)
         if this.page_labelled
@@ -1549,13 +1736,14 @@ define PdfFOTBuilder
         }
     }
 
-    procedure atom(mutable this: ref[PdfFOTBuilder], kind: int, chars: ref[PdfChars], a: int, b: int, width: int)
+    procedure atom(mutable this: ref[PdfFOTBuilder], kind: int, chars: ref[PdfChars], a: int, b: int, width: int, font: int)
     {
         this.atoms.push(kind)
         this.atoms.push(chars.id)
         this.atoms.push(a)
         this.atoms.push(b)
         this.atoms.push(width)
+        this.atoms.push(font)
     }
 
     procedure flow_node(mutable this: ref[PdfFOTBuilder], n: ref[PdfNode])
@@ -1566,12 +1754,12 @@ define PdfFOTBuilder
         else if kind = PN_SEQUENCE
             this.flow_inside(n)
         else if kind = PN_MARK
-            this.atom(PAT_MARK, n.chars, n.i0, 0, 0)
+            this.atom(PAT_MARK, n.chars, n.i0, 0, 0, 0)
         else if kind = PN_FIELD
         {
-            this.atom(PAT_FIELD_START, n.chars, 0, 0, n.i0)
+            this.atom(PAT_FIELD_START, n.chars, 0, 0, n.i0, 0)
             this.flow_inside(n)
-            this.atom(PAT_FIELD_END, n.chars, 0, 0, 0)
+            this.atom(PAT_FIELD_END, n.chars, 0, 0, 0, 0)
         }
         else if kind = PN_PAGE_NUMBER
         {
@@ -1730,7 +1918,7 @@ define PdfFOTBuilder
             }
             i := i + 4
         }
-        let doc this.doc as ref[PdfDocument]
+        let doc this.doc
         var sb StringBuilder()
         var from n.text_at
         let end n.text_at + n.text_length
@@ -1797,7 +1985,7 @@ define PdfFOTBuilder
         var width 0
         var height 0
         this.image_size(n, image, this.frame_width, &width, &height)
-        this.atom(PAT_IMAGE, n.chars, this.images.at(image + 1), height, width)
+        this.atom(PAT_IMAGE, n.chars, this.images.at(image + 1), height, width, 0)
     }
 
     ; --- atoms -----------------------------------------------------------------
@@ -1806,7 +1994,7 @@ define PdfFOTBuilder
     ; verbatim text lines and the breaks between them.
     procedure text_atoms(mutable this: ref[PdfFOTBuilder], c: ref[PdfChars], at: int, length: int)
     {
-        let font c.font()
+        let font this.font_of(c)
         let verbatim c.asis or c.preserve
         var stop: u8 0x20
         if verbatim
@@ -1819,21 +2007,86 @@ define PdfFOTBuilder
             if i = end or this.pool[i as size_t] = stop
             {
                 if i > word
-                {
-                    let width PdfFont.text_width(font, c.font_size, this.pool.as_slice().subslice(word as size_t, i as size_t))
-                    this.atom(PAT_TEXT, c, word, i - word, width)
-                }
+                    this.word_atoms(c, font, word, i)
                 if i < end
                 {
                     if verbatim
-                        this.atom(PAT_NEWLINE, c, 0, 0, 0)
+                        this.atom(PAT_NEWLINE, c, 0, 0, 0, 0)
                     else
-                        this.atom(PAT_SPACE, c, 0, 0, PdfFont.width(font, 0x20) * c.font_size / 1000)
+                        this.atom(PAT_SPACE, c, 0, 0, this.doc.text_width(font, c.font_size, " "), 0)
                 }
                 word := i + 1
             }
             i := i + 1
         }
+    }
+
+    ; The atoms of one word: one, in the font of its characteristics --
+    ; unless that font lacks a character of it; then the word is as many
+    ; atoms as it has runs of characters from one font, with no break
+    ; between them.
+    procedure word_atoms(mutable this: ref[PdfFOTBuilder], c: ref[PdfChars], font: int, from: int, to: int)
+    {
+        let text this.pool.as_slice()
+        var run from
+        var run_font font
+        var i from
+        while i < to
+        {
+            let ch PdfFont.decode(text, i as size_t)
+            var f font
+            if ch > 0x7E and this.doc.has_character(font, ch) = false
+                f := this.other_font(font, ch)
+            if f <> run_font
+            {
+                if i > run
+                    this.atom(PAT_TEXT, c, run, i - run, this.doc.text_width(run_font, c.font_size, text.subslice(run as size_t, i as size_t)), run_font)
+                run := i
+                run_font := f
+            }
+            i := i + (PdfFont.decoded(text, i as size_t) as int)
+        }
+        if to > run
+            this.atom(PAT_TEXT, c, run, to - run, this.doc.text_width(run_font, c.font_size, this.pool.as_slice().subslice(run as size_t, to as size_t)), run_font)
+    }
+
+    ; A font that has a character the font asked for lacks: the first of
+    ; the fonts kept for this -- the usual faces of the systems, then the
+    ; ones made to have everything -- that has it; the font asked for where
+    ; none does.
+    procedure other_font(mutable this: ref[PdfFOTBuilder], font: int, ch: u32) returns int
+    {
+        if this.others_known = false
+        {
+            this.others_known := true
+            this.add_other("Times New Roman")
+            this.add_other("Arial")
+            this.add_other("Courier New")
+            this.add_other("Liberation Serif")
+            this.add_other("DejaVu Sans")
+            this.add_other("DejaVu Sans Mono")
+            this.add_other("Noto Sans")
+            this.add_other("Noto Sans Symbols")
+            this.add_other("Apple Symbols")
+            this.add_other("Arial Unicode MS")
+        }
+        ; a family's file is read only when a character comes that far
+        var probe PdfChars()
+        var i 0
+        while i < this.others.count
+        {
+            probe.family := this.others.at(i)
+            let other this.font_of(&probe)
+            if other >= PDF_FONT_COUNT and other <> font and this.doc.has_character(other, ch)
+                return other
+            i := i + 1
+        }
+        font
+    }
+
+    procedure add_other(mutable this: ref[PdfFOTBuilder], name: Slice[u8])
+    {
+        this.others.push(this.family(name))
     }
 
     ; A leader: its pattern is the text in it, a dot where there is none.
@@ -1860,8 +2113,9 @@ define PdfFOTBuilder
             this.pool.add(0x2E)
             length := 1
         }
-        let width PdfFont.text_width(c.font(), c.font_size, this.pool.as_slice().subslice(at as size_t, (at + length) as size_t))
-        this.atom(PAT_LEADER, c, at, length, width)
+        let font this.font_of(c)
+        let width this.doc.text_width(font, c.font_size, this.pool.as_slice().subslice(at as size_t, (at + length) as size_t))
+        this.atom(PAT_LEADER, c, at, length, width, font)
     }
 
     ; A page number in a format (the character of page-number-format),
@@ -2149,7 +2403,7 @@ define PdfFOTBuilder
             if kind = PAT_TEXT
             {
                 let c this.atom_chars(i)
-                this.op(POP_TEXT, x, baseline - c.shift, c.font(), c.font_size, c.color, a, b)
+                this.op(POP_TEXT, x, baseline - c.shift, this.atoms.at(i + 5), c.font_size, c.color, a, b)
                 x := x + width
             }
             else if kind = PAT_SPACE
@@ -2174,7 +2428,7 @@ define PdfFOTBuilder
                     }
                     k := k + 1
                 }
-                this.op(POP_TEXT, x + room - count * width, baseline, c.font(), c.font_size, c.color, at, count * b)
+                this.op(POP_TEXT, x + room - count * width, baseline, this.atoms.at(i + 5), c.font_size, c.color, at, count * b)
                 x := x + room
             }
             else if kind = PAT_IMAGE
