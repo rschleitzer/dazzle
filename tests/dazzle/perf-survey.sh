@@ -13,7 +13,7 @@
 #   CLAML        ClaML workload      (no default — the corpus lives in a
 #                                     local-only repo, see the note below)
 #
-# Paths that name other repos do not belong in this file. Put them in the
+# Paths of your own machine do not belong in this file. Put them in the
 # gitignored `tests/dazzle/perf-survey.local` instead, which is sourced when
 # CLAML is not already in the environment:
 #

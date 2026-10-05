@@ -19,7 +19,7 @@
 #
 # Two-tier corpus (see README.md):
 #   corpus/          public, committed — Scaly's own SGML + synthetic fixtures
-#   corpus-private/  gitignored further documents (fetch-private.sh)
+#   corpus-private/  optional and never committed: further documents of your own
 #
 # ★The count is GATED (see the discovery gate at the bottom): the number of
 # models found must equal `expected-models` — the public tier's is committed, the
@@ -34,12 +34,10 @@
 #   DOC=<file>            document passed to the binary (required)
 #   BASE=repo|entry       resolve DOC/cwd against repo root or the entry dir
 #                         (default: entry — self-contained fixture)
-#   WORKDIR=<path>        cwd override (wins over BASE). ABSOLUTE: the model
-#                         stays in its home repo and no local source is
-#                         copied into this tree. RELATIVE: resolved against the
-#                         entry — a FROZEN private entry (freeze-private.sh)
-#                         carrying its own copy, so the corpus stops drifting
-#                         when those repos move on
+#   WORKDIR=<path>        cwd override (wins over BASE). ABSOLUTE: the document
+#                         stays where it lives and nothing is copied into
+#                         this tree. RELATIVE: resolved against the entry,
+#                         which then carries its own copy
 #   SP_ENV="K=V K=V"      environment prefix (e.g. SP_CHARSET_FIXED=YES SP_ENCODING=XML)
 #   EXTRA_ARGS="..."      extra args before DOC (e.g. a leading xml.dcl, -c catalog)
 #   RAST=1                run with -t <tmpfile> and compare it against the

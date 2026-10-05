@@ -10,7 +10,7 @@
 # openjade on the same inputs as the GC baseline. Answers risk-register item 1:
 # does the arena-per-run model retain enough style-eval garbage to need the
 # scratch-region or Collector rung? Output is RSS figures only — no corpus
-# content — so it is safe to run over local corpora too.
+# content — so nothing of a document reaches the report.
 #
 # (In the Scaly compiler's tree, where this lived until 2026-10-05, it ran the
 # five generator runs of that project's build; the four literate-test style

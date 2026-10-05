@@ -21,19 +21,14 @@ The corpus is split by **origin**, not by size:
   `expressions` since the corpus moved out of that project's tree
   (2026-10-05) — and hand-written synthetic SGML fixtures (`synth-*`) exercising
   SGML-only features — omitted tags, unquoted attributes, marked sections,
-  entities — that a plain XML parser would miss. No external, no local
-  content. A fresh checkout runs exactly these.
+  entities — that a plain XML parser would miss. A fresh checkout runs exactly
+  these.
 
-- **`corpus-private/` — gitignored, local-only.** The full real-world survival
-  corpus: further documents plus bulky external standards, each
-  parsed in its HOME repo (the manifest carries an absolute `WORKDIR`; nothing
-  is copied here). The map that names those repos is itself local and
-  lives at `corpus-private/corpus.map` — also gitignored. **Nothing under
-  `corpus-private/` is ever committed — not a model, not a golden, not a
-  name.**
-
-Rule of thumb: *committed = born in this repo or synthetic; gitignored =
-anything pulled from another repo.*
+- **`corpus-private/` — optional, never committed.** Further documents of
+  your own, in the same entry layout: a directory with a `manifest` and the
+  goldens blessed from the reference `onsgmls`. A manifest's `WORKDIR` may be
+  absolute, so a document can be parsed where it lives and nothing is copied
+  here. The tier carries its own `expected-models`.
 
 ## Running
 
@@ -43,13 +38,12 @@ anything pulled from another repo.*
     tests/sgml/run.sh --bless [binary]    # (re)generate goldens for corpus/ from a binary
 
 A fresh checkout only has `corpus/`; `run.sh` simply reports the
-public count. To light up the full gate locally, populate the private tier.
+public count.
 
 ### The discovery gate
 
 `run.sh` also checks HOW MANY models it found, against `expected-models`
-(committed for the public tier, written by `fetch-private.sh`/`freeze-private.sh`
-for the private one), and fails on **any** difference — fewer *or* more. Growing
+(committed for the public tier, the private one's inside it), and fails on **any** difference — fewer *or* more. Growing
 the corpus therefore means editing that file, deliberately, in the same commit.
 
 The reason is a failure this suite could not previously report: `N of M
@@ -63,26 +57,12 @@ number the run PRINTED.
 
 `--filter` skips the gate — a filtered run is a selection, not a corpus.
 
-## Bootstrapping the private tier
-
-    cp tests/sgml/corpus.map.example tests/sgml/corpus-private/corpus.map
-    $EDITOR tests/sgml/corpus-private/corpus.map   # fill in your real repo paths
-    tests/sgml/fetch-private.sh [repos-root]       # default root: ~/repos
-
-`fetch-private.sh` is a generic driver: it reads the (gitignored) map, and for
-each entry writes a manifest + a golden ESIS blessed from the reference
-`onsgmls`. Missing home repos are skipped, so any subset of the real-world
-repos being checked out works. Re-run it whenever the sibling repos or the
-reference `onsgmls` change.
-
 ## Notes
 
-- **Exit codes are part of the oracle.** Several documents exit
-  non-zero under `onsgmls` (validation diagnostics, or fragments parsed outside
-  their including document). The gate reproduces `onsgmls` *exactly* — its
-  errors and exit codes included — so a matching exit 1 is a pass, not a
-  failure. The glob tier deliberately over-includes non-root fragments as bonus
-  error-path coverage; trim the map if you want only the top-level job docs.
+- **Exit codes are part of the oracle.** A document may exit non-zero under
+  `onsgmls` (validation diagnostics, or a fragment parsed outside its including
+  document). The gate reproduces `onsgmls` *exactly* — its errors and exit
+  codes included — so a matching exit 1 is a pass, not a failure.
 - **Manifest format** (each entry dir has one; sourced by `run.sh`):
   `DOC` (required), `BASE=repo|entry`, `WORKDIR=<abs>` (overrides BASE),
   `SP_ENV="K=V …"`, `EXTRA_ARGS="…"`. See `run.sh` header for details.

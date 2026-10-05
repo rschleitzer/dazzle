@@ -181,7 +181,7 @@ def run_entry(entry, name, tmp, bless, launch):
     else:
         return (0, 0, "  %s: bad BASE=%s" % (name, base), None)
     if not os.path.isdir(workdir):
-        return (0, 0, "  %s: workdir missing (%s) — skipped (fetch-private.sh?)" % (name, workdir), None)
+        return (0, 0, "  %s: workdir missing (%s) — skipped" % (name, workdir), None)
 
     got_rast = os.path.join(tmp, name + ".rast")
     args = []

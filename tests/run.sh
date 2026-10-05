@@ -29,9 +29,8 @@
 # directory named at the end; everything else is removed.
 #
 # Not run here, each for its reason: tests/dazzle/nsweep, perf-survey.sh,
-# perf-codegen.sh and memhw.sh are instruments (they measure, minutes of it);
-# tests/sgml/coding and the two deviation scripts compare with the C++
-# reference programs; codegen-private-run.sh needs the local-only tier.
+# and memhw.sh are instruments (they measure, minutes of it); tests/sgml/coding
+# and the two deviation scripts compare with the C++ reference programs.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"

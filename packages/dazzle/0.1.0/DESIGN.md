@@ -19,8 +19,7 @@ the `.dsl` (a style-sheet-DTD SGML document) through the same opensp parser.
 Gate corpus decided 2026-07-17 (Ralf): one tiny smoke module, three large
 representative modules, one module on the second database schema — all from
 the model-DTD codegen family (`-G -t sgml -d map.dsl <module>.xml`,
-`SP_CHARSET_FIXED=YES SP_ENCODING=XML`, cwd = the script's directory; the
-concrete module list lives in the gitignored corpus map, never here). Later
+`SP_CHARSET_FIXED=YES SP_ENCODING=XML`, cwd = the script's directory). Later
 add one service-codegen run (the roadmap exit names both stylesheet families).
 
 - smoke module: 0.06 s, 17 files, 92 K
@@ -85,7 +84,7 @@ ground-truth oracle for the sink, dazzle-net the structural mirror.
 
   **Verdict for risk-register item 1: arena-per-run is sufficient at this scale;
   neither the scratch-region (rung ii) nor the Collector (rung iii) is needed.**
-  Caveat: this is the project's own literate/grammar corpus. The real-world
+  Caveat: this is the project's own literate/grammar corpus. The larger
   service-codegen family (the 3.6 M-output module behind the 95 MB openjade
   reference above) uses named-let-over-node-list idioms more heavily and is not
   in this checkout — re-run `memhw.sh` against it when those stylesheets are
