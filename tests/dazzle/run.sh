@@ -2,7 +2,10 @@
 # dazzle unit suite — the style-engine layer self-tests for the dazzle port
 # (Stage 6a).
 #
-#   tests/dazzle/run.sh [scalyc-binary]   (default: scalyc/build/scalyc)
+#   tests/dazzle/run.sh [scalyc-binary]   (default: tests/toolchain.sh)
+#
+# (The engine's end-to-end suites are the directories beside this file, each
+# with a run.sh of its own; tests/run.sh runs everything.)
 #
 # dazzle.test() chains every module's self-test (ELObj, …) and returns 0 on
 # success. `scaly test` runs it on the package ROOT, so dazzle's own bodies are
@@ -12,10 +15,10 @@
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-BIN="${1:-$ROOT/scalyc/build/scalyc}"
-# the tool beside the compiler: scaly for REPL/run/build/test, scalyc for the flags
-SCALY=$("$ROOT/tools/scaly-of.sh" "$BIN")
 cd "$ROOT"
+# the compiler and the tool beside it (scaly for build/run/test)
+# shellcheck disable=SC1091
+. tests/toolchain.sh "${1:-}" || exit 2
 
 # shellcheck disable=SC1091
 . tests/platform.sh || exit 1

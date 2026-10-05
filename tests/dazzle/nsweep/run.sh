@@ -15,7 +15,7 @@
 #
 # This is an INSTRUMENT, not a gate — like ../framevol and ../frameprobe. It
 # reports numbers and exits 1 when it sees a port defect, so it can be wired
-# into a gate later, but nothing in the bar runs it today: the sizes it needs
+# into a gate later, but tests/run.sh does not run it today: the sizes it needs
 # make it a minute-scale run, and its answer is a ranking rather than a
 # pass/fail.
 #
@@ -33,9 +33,10 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
-BIN="${1:-$ROOT/scalyc/build/scalyc}"
 FILTER="${2:-}"
 cd "$ROOT"
+# shellcheck disable=SC1091
+. tests/toolchain.sh "${1:-}" || exit 2
 
 command -v python3 >/dev/null 2>&1 || { echo "nsweep: python3 is required"; exit 2; }
 
@@ -45,7 +46,7 @@ trap 'rm -rf "$TMP"' EXIT
 DZ="${DAZZLE_BIN:-}"
 if [ -z "$DZ" ]; then
   DZ="$TMP/dazzle"
-  if ! tests/dazzle/build-cli.sh "$DZ" "$BIN" > "$TMP/build.log" 2>&1; then
+  if ! tests/dazzle/build-cli.sh "$DZ" > "$TMP/build.log" 2>&1; then
     echo "nsweep: FAIL (build)"; tail -8 "$TMP/build.log"; exit 1
   fi
 fi

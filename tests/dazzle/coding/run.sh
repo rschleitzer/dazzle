@@ -49,9 +49,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 BLESS=0
 if [ "${1:-}" = "--bless" ]; then BLESS=1; shift; fi
-BIN="${1:-$ROOT/scalyc/build/scalyc}"
 REF="${REF:-/usr/local/bin/dazzle}"
 cd "$ROOT"
+# shellcheck disable=SC1091
+. tests/toolchain.sh "${1:-}" || exit 2
 set -u
 
 OUT="$(mktemp -d)/dazzle"
@@ -62,7 +63,7 @@ if [ "$BLESS" -eq 1 ]; then
   DZ="$REF"
   if [ ! -x "$DZ" ]; then echo "dazzle-coding: no reference at $DZ"; exit 1; fi
 else
-  if ! tests/dazzle/build-cli.sh "$OUT" "$BIN" > "$OUT.build.log" 2>&1; then
+  if ! tests/dazzle/build-cli.sh "$OUT" > "$OUT.build.log" 2>&1; then
     echo "dazzle-coding: FAIL (build)"; tail -8 "$OUT.build.log"; exit 1
   fi
   DZ="$OUT"

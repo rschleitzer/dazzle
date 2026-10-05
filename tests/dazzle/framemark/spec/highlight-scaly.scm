@@ -1,0 +1,273 @@
+<![CDATA[
+;; Generate the scalyls highlighter inputs from scaly.sgm
+;;
+;; Two artifacts share this file as their single source of truth, so a new
+;; keyword flows into highlighting automatically on ./mkp:
+;;   * scalyls/grammar.scaly       - classifier for the LSP semanticTokens scan
+;;   * editors/vscode/syntaxes/...  - TextMate grammar (instant client-side base)
+;; Add a <keyword> to scaly.sgm and both pick it up.
+;;
+;; NOTE this file is parsed by the SGML/DSSSL engine, which constrains how it
+;; may be written: ASCII only (a typographic dash is a "non SGML character"),
+;; and a newline inside a string literal is written LITERALLY -- the DSSSL
+;; string syntax has no \n escape, it reads \<name> as a character reference and
+;; reports `unknown character name "n"`.
+
+;; ---------------------------------------------------------------- operators
+;; Scaly has NO operator token class. The lexer's Token union carries only
+;; Identifier and scan_operator returns Token.Identifier (lexer.scaly:326,
+;; :338) -- an operator IS an identifier, distinguished from a normal one ONLY
+;; by consisting exclusively of operator characters. So highlighting needs no
+;; operator list at all: the character class is the definition.
+;;
+;; '^' (94) is NOT one of them, and that is load-bearing rather than an
+;; oversight: lexer.scaly:330 excludes the caret because it is the lifetime
+;; sigil, so `&^this v` has to tokenize as `& ^this v`. Both highlighter layers
+;; included it anyway until 2026-08-11, which painted the run `&^` as one
+;; operator and a bare `^host` as an operator instead of a sigil. That is why
+;; the set is GENERATED here now instead of being spelled out a third time --
+;; the two places it has to agree with are lexer.scaly:131 and :335.
+;;
+;; The byte code feeds the Scaly predicate, the spelling feeds the TextMate
+;; character class; ONE table so the two cannot drift. '-' leads because it is
+;; only literal inside [...] in first position; none of the rest needs escaping
+;; there. Two-element lists rather than dotted pairs, and `car`/`(car (cdr ...))`
+;; rather than `cadr`, because our own engine implements those and ./mkp runs
+;; through it (tests/dazzle/codegen asserts the output against openjade's).
+(define op-chars
+    '((45 "-") (43 "+") (42 "*") (47 "/") (61 "=") (37 "%")
+      (38 "&") (124 "|") (126 "~") (60 "<") (62 ">")))
+
+;; The word operators are the ONLY exceptions to the character-class rule, which
+;; is why they are the only operators that have to be listed at all. To the lexer
+;; they are ordinary identifiers; they become operators by NAME in
+;; Planner.mangled_operator_name (Planner.scaly:30233ff), the authoritative list.
+;; `xor` is not a wart that could be lexed away: '^' is the lifetime sigil and
+;; therefore not an operator character (above), so bitwise XOR has no symbolic
+;; spelling available at all. And `and`/`or`/`not` are full synonyms of
+;; `&&`/`||`/`!`, so this list would keep three entries even if XOR were
+;; respelled -- the exception cannot be generated away.
+(define word-operators '("and" "not" "or" "xor"))
+
+;; Value words: lone identifiers the compiler resolves to a VALUE rather than to
+;; a binding, so `variable` is the one class they must not get. None of them is a
+;; grammar keyword -- the parser does not treat any of them as one:
+;;   true/false  Modeler.scaly:669     null  Planner.scaly:15815
+;;   this        the receiver parameter (Emitter.scaly:1846)
+;; Split only for the TextMate scopes, which distinguish a language constant
+;; from the receiver; the semantic layer has one class for both. `value-words`
+;; is derived, so the predicate and the two patterns cannot disagree.
+(define constant-words '("false" "null" "true"))
+(define self-words     '("this"))
+(define value-words    (append constant-words self-words))
+
+;; ------------------------------------------------------------------ helpers
+;; "a|b|c" -- words as a regex alternation. The first word is bare and the rest
+;; carry a leading "|", so there is NO trailing pipe (a group that can match the
+;; empty string would match everywhere).
+(define (alternation words)
+    (apply $ (cons (car words) (map (lambda (w) ($ "|" w)) (cdr words)))))
+
+(define (keyword-list)
+    (map id (node-list->list (select-elements (children (current-node)) "keyword"))))
+
+;; The body of a Scaly `(word: String) returns bool` predicate: one test per word.
+(define (word-tests words)
+    (apply $ (map (lambda (w) ($
+"        if word = \"" w "\"
+            return true
+"   )) words)))
+
+;; The body of the byte predicate, from the op-chars table.
+(define (byte-tests table)
+    (apply $ (map (lambda (e) ($
+"        if c = " (number->string (car e)) "
+            return true
+"   )) table)))
+
+;; The op-chars spellings as a TextMate character class body.
+(define (op-char-class table)
+    (apply $ (map (lambda (e) (car (cdr e))) table)))
+
+(define (generate-highlight-scaly) ($
+"; grammar.scaly - Generated from scaly.sgm
+; DO NOT EDIT - generated by codegen (./mkp)
+;
+; Grammar-derived classification for the scalyls semantic-token highlighter.
+; The keyword set comes straight from the grammar's <keyword> elements, so new
+; keywords flow into syntax highlighting automatically as the language grows.
+; The other three predicates cover what the grammar does NOT carry: see the
+; header of codegen/highlight-scaly.scm for why each word is where it is.
+
+define grammar
+{
+    ; True when `word` is a reserved keyword (scaly.sgm <keyword> list).
+    function is_keyword(word: String) returns bool
+    {
+"   (word-tests (keyword-list))
+"        false
+    }
+
+    ; True for an operator CHARACTER. An operator is an identifier consisting
+    ; exclusively of these, so this predicate is the whole definition and no
+    ; operator list exists. Must agree with lexer.scaly:131 and :335 -- note
+    ; that '^' (94) is deliberately absent (it is the lifetime sigil).
+    function is_op_char(c: u8) returns bool
+    {
+"   (byte-tests op-chars)
+"        false
+    }
+
+    ; True for a WORD operator -- the only identifiers that are operators
+    ; without being spelled in operator characters. Authoritative list:
+    ; Planner.mangled_operator_name.
+    function is_word_operator(word: String) returns bool
+    {
+"   (word-tests word-operators)
+"        false
+    }
+
+    ; True for a lone identifier that resolves to a VALUE, not to a binding:
+    ; true/false (Modeler), null (Planner), this (the receiver parameter).
+    function is_value_word(word: String) returns bool
+    {
+"   (word-tests value-words)
+"        false
+    }
+}
+"
+))
+
+;; TextMate grammar (.tmLanguage.json) - the always-on, server-independent base
+;; layer VS Code paints before/around the LSP semantic tokens. Token classes
+;; mirror the lexer + the semanticTokens scan: comments (; line and ;* *; block),
+;; strings (" ' `), numbers, keywords (grammar-derived), the four word
+;; operators, the value words, uppercase-initial types, and operator runs.
+;; The keyword alternation, the word lists and the operator character class are
+;; generated; the rest is a stable template. Heavy escaping: a regex backslash
+;; is \\ in the JSON file, i.e. \\\\ here; a JSON quote is \" in the file, i.e.
+;; \\\" here.
+;;
+;; Pattern ORDER is match order. The word lists come before #types (harmless --
+;; they are lowercase) and before #operators, which cannot match a letter; they
+;; must come after #comments and #strings so a word inside either keeps its own
+;; colour.
+(define (generate-textmate) ($
+"{
+  \"name\": \"Scaly\",
+  \"scopeName\": \"source.scaly\",
+  \"patterns\": [
+    { \"include\": \"#comments\" },
+    { \"include\": \"#strings\" },
+    { \"include\": \"#numbers\" },
+    { \"include\": \"#keywords\" },
+    { \"include\": \"#wordoperators\" },
+    { \"include\": \"#constants\" },
+    { \"include\": \"#self\" },
+    { \"include\": \"#types\" },
+    { \"include\": \"#operators\" }
+  ],
+  \"repository\": {
+    \"comments\": {
+      \"patterns\": [
+        { \"name\": \"comment.block.scaly\", \"begin\": \";\\\\*\", \"end\": \"\\\\*;\" },
+        { \"name\": \"comment.line.semicolon.scaly\", \"match\": \";.*$\" }
+      ]
+    },
+    \"strings\": {
+      \"patterns\": [
+        { \"name\": \"string.quoted.double.scaly\", \"begin\": \"\\\"\", \"end\": \"\\\"\", \"patterns\": [ { \"name\": \"constant.character.escape.scaly\", \"match\": \"\\\\\\\\.\" } ] },
+        { \"name\": \"string.quoted.single.scaly\", \"begin\": \"'\", \"end\": \"'\", \"patterns\": [ { \"name\": \"constant.character.escape.scaly\", \"match\": \"\\\\\\\\.\" } ] },
+        { \"name\": \"string.quoted.other.scaly\", \"begin\": \"`\", \"end\": \"`\" }
+      ]
+    },
+    \"numbers\": {
+      \"patterns\": [ { \"name\": \"constant.numeric.scaly\", \"match\": \"\\\\b[0-9][0-9a-fA-FxX._]*\\\\b\" } ]
+    },
+    \"keywords\": {
+      \"patterns\": [ { \"name\": \"keyword.control.scaly\", \"match\": \"\\\\b(" (alternation (keyword-list)) ")\\\\b\" } ]
+    },
+    \"wordoperators\": {
+      \"patterns\": [ { \"name\": \"keyword.operator.word.scaly\", \"match\": \"\\\\b(" (alternation word-operators) ")\\\\b\" } ]
+    },
+    \"constants\": {
+      \"patterns\": [ { \"name\": \"constant.language.scaly\", \"match\": \"\\\\b(" (alternation constant-words) ")\\\\b\" } ]
+    },
+    \"self\": {
+      \"patterns\": [ { \"name\": \"variable.language.scaly\", \"match\": \"\\\\b(" (alternation self-words) ")\\\\b\" } ]
+    },
+    \"types\": {
+      \"patterns\": [ { \"name\": \"entity.name.type.scaly\", \"match\": \"\\\\b[A-Z][A-Za-z0-9_]*\\\\b\" } ]
+    },
+    \"operators\": {
+      \"patterns\": [ { \"name\": \"keyword.operator.scaly\", \"match\": \"[" (op-char-class op-chars) "]+\" } ]
+    }
+  }
+}
+"
+))
+
+;; ------------------------------------------------------- editor configuration
+;; language-configuration.json - the CLIENT-side half of editing Scaly: what a
+;; comment is, which pairs auto-close, where a word begins, how a block indents.
+;; No language server can supply any of it; the editor needs it before it has
+;; ever spoken to scalyls.
+;;
+;; Generated for ONE reason: `wordPattern` has to know the operator characters,
+;; and spelling that class a third time is exactly how the caret got into it
+;; twice before (see the op-chars header above). The rest is a stable template.
+;;
+;; wordPattern decides double-click selection, Ctrl+D and what the rename box
+;; pre-fills. Three consequences worth stating, because each is a decision:
+;; an operator RUN is one word (`<=` selects whole, matching the lexer, for which
+;; an operator is one identifier); '^' belongs to no word, so double-clicking
+;; `^host` selects `host` -- the sigil is not part of the name; and '_' is a word
+;; character even though it may not START an identifier, so `count_1` selects
+;; whole (the lexer's rule is about the first byte only).
+;;
+;; indentationRules: with Allman braces the opener sits alone on its line, so the
+;; increase pattern asks for a line whose last non-blank character opens a block
+;; and which carries no `;` comment and no quote before it -- a brace inside
+;; either opens nothing. Single-expression bodies (`if cond` on one line, the
+;; statement on the next) are deliberately NOT matched: nothing in the text says
+;; where such a body ENDS, so an increase there would over-indent every line that
+;; follows. Missing indentation costs one Tab; wrong indentation costs a Delete
+;; on every line after it.
+(define (generate-language-configuration) ($
+"// language-configuration.json - Generated from scaly.sgm
+// DO NOT EDIT - generated by codegen (./mkp)
+{
+  \"comments\": {
+    \"lineComment\": \";\",
+    \"blockComment\": [\";*\", \"*;\"]
+  },
+  \"brackets\": [
+    [\"{\", \"}\"],
+    [\"[\", \"]\"],
+    [\"(\", \")\"]
+  ],
+  \"autoClosingPairs\": [
+    { \"open\": \"{\", \"close\": \"}\" },
+    { \"open\": \"[\", \"close\": \"]\" },
+    { \"open\": \"(\", \"close\": \")\" },
+    { \"open\": \"\\\"\", \"close\": \"\\\"\", \"notIn\": [\"string\", \"comment\"] },
+    { \"open\": \"'\", \"close\": \"'\", \"notIn\": [\"string\", \"comment\"] },
+    { \"open\": \"`\", \"close\": \"`\", \"notIn\": [\"comment\"] }
+  ],
+  \"surroundingPairs\": [
+    [\"{\", \"}\"],
+    [\"[\", \"]\"],
+    [\"(\", \")\"],
+    [\"\\\"\", \"\\\"\"],
+    [\"'\", \"'\"],
+    [\"`\", \"`\"]
+  ],
+  \"wordPattern\": \"(0[xX][0-9A-Fa-f]+)|([0-9]+)|([A-Za-z][A-Za-z0-9_]*)|([" (op-char-class op-chars) "]+)\",
+  \"indentationRules\": {
+    \"increaseIndentPattern\": \"^[^;\\\"'`]*[{([]\\\\s*$\",
+    \"decreaseIndentPattern\": \"^\\\\s*[)}\\\\]]\"
+  }
+}
+"
+))
+]]>

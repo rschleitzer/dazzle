@@ -15,12 +15,14 @@ drop-in it reports the coverage achieved so far.
 
 The corpus is split by **origin**, not by size:
 
-- **`corpus/` — committed, public, CI.** Fixtures born in this repo (Scaly's
-  own `scaly.sgm` + `tests/*.sgm`, the real minimization stress cases used by
-  `mkp`) and hand-written synthetic SGML fixtures (`synth-*`) exercising
+- **`corpus/` — committed, public.** The Scaly compiler's own SGML — its
+  grammar `scaly.sgm` and its four literate test suites, real minimization
+  stress cases, kept here as FROZEN copies inside the entries `scaly` and
+  `expressions` since the corpus moved out of that project's tree
+  (2026-10-05) — and hand-written synthetic SGML fixtures (`synth-*`) exercising
   SGML-only features — omitted tags, unquoted attributes, marked sections,
   entities — that a plain XML parser would miss. No external, no local
-  content. These run in CI.
+  content. A fresh checkout runs exactly these.
 
 - **`corpus-private/` — gitignored, local-only.** The full real-world survival
   corpus: further documents plus bulky external standards, each
@@ -40,7 +42,7 @@ anything pulled from another repo.*
     tests/sgml/run.sh /path/to/scaly-onsgmls   # against the port
     tests/sgml/run.sh --bless [binary]    # (re)generate goldens for corpus/ from a binary
 
-CI and a fresh checkout only have `corpus/`; `run.sh` simply reports the
+A fresh checkout only has `corpus/`; `run.sh` simply reports the
 public count. To light up the full gate locally, populate the private tier.
 
 ### The discovery gate

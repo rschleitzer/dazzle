@@ -65,8 +65,9 @@ ground-truth oracle for the sink, dazzle-net the structural mirror.
   whether the ladder's scratch-region or Collector rung is needed.
 
   **6a-exit measurement (2026-07-19, `tests/dazzle/memhw.sh`).** Peak RSS over
-  the in-repo mkp DSSSL codegen corpus (the five `-G -t sgml -d` runs that
-  `tests/dazzle/codegen/run.sh` proves byte-identical):
+  the Scaly compiler's DSSSL codegen corpus (the five `-G -t sgml -d` runs of
+  that project's build, which its own codegen suite proves byte-identical; the
+  heaviest of them is frozen here as the fixture of `tests/dazzle/framemark`):
 
   | run | dazzle | openjade | ratio |
   |---|---|---|---|

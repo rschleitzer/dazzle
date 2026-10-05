@@ -22,8 +22,7 @@
 # The two external corpora are optional; missing ones are skipped with a note.
 # Each row first runs both sides ONCE and diffs the output — a row whose output
 # differs is reported as MISMATCH and its timings are meaningless. The codegen
-# row rewrites generated files in the tree; only those are restored afterwards,
-# so unrelated local modifications survive the run.
+# row writes its generated files into a scratch directory, never the tree.
 #
 # Numbers are medians over `runs` runs. `cpu` is user+sys; on this engine it
 # tracks wall almost exactly (single-threaded, no `for` self-scaling fires).
@@ -62,21 +61,18 @@ CLAML="${CLAML:-}"
 cd "$ROOT"
 set -u
 
-# The codegen row writes generated files into the tree. Restoring them with a
-# blanket `git checkout -- .` would also discard unrelated local work, so
-# instead the run remembers which files were already modified and reverts only
-# what the codegen row adds on top.
-DIRTY_BEFORE="$(git status --porcelain --untracked-files=no | awk '{print $NF}' | sort)"
-restore_generated() {
-  local now
-  now="$(git status --porcelain --untracked-files=no | awk '{print $NF}' | sort)"
-  comm -13 <(printf '%s\n' "$DIRTY_BEFORE") <(printf '%s\n' "$now") | while read -r f; do
-    [ -n "$f" ] && git checkout -- "$f" 2>/dev/null
-  done
-}
+# The codegen row's style sheet writes files relative to the WORKING
+# DIRECTORY: it runs in $GEN, a scratch directory with the output tree's shape
+# (the frozen fixture of tests/dazzle/framemark, whose run.sh has the account).
+# Each run overwrites the last one's files, so there is nothing to restore —
+# restore_generated stays as the hook a row's `restore` argument calls.
+restore_generated() { :; }
 
 TMP="$(mktemp -d)"
-trap 'restore_generated; rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"' EXIT
+GEN="$TMP/gen"
+mkdir -p "$GEN/packages/scalyc/0.1.0/scalyc/compiler" "$GEN/packages/scalyls/0.1.0/scalyls" \
+  "$GEN/editors/vscode/syntaxes"
 
 # --- binaries -------------------------------------------------------------
 ONS="${ONSGMLS_BIN:-}"
@@ -215,7 +211,7 @@ hdr
 
 # ---- 1. parsing (event dump) --------------------------------------------
 REPEAT=20
-row "parse scaly.sgm 25K" "$ROOT" "" \
+row "parse scaly.sgm 25K" "$ROOT/tests/sgml/corpus/scaly" "" \
   "$ONS scaly.sgm" "$REF_ONSGMLS scaly.sgm"
 
 if [ -f "$DAZZLEDOC/dsssl.xml" ]; then
@@ -237,13 +233,15 @@ else
   echo "  (CLAML unset — large rows skipped; see the header note)"
 fi
 
-# ---- 2. DSSSL codegen (the mkp corpus) -----------------------------------
-# Output goes into the tree, not to stdout; tests/dazzle/codegen/run.sh is the
+# ---- 2. DSSSL codegen (the Scaly grammar's code generator, frozen) -------
+# Output goes into $GEN, not to stdout; tests/dazzle/framemark/run.sh is the
 # byte-identity proof, so this row measures only.
 REPEAT=10
-row "codegen scaly.dsl -t sgml" "$ROOT" "" \
-  "$DZ -t sgml -d codegen/scaly.dsl scaly.sgm" \
-  "$REF_JADE -G -t sgml -d codegen/scaly.dsl scaly.sgm" 0 1
+CG_SPEC="$ROOT/tests/dazzle/framemark/spec/scaly.dsl"
+CG_DOC="$ROOT/tests/sgml/corpus/scaly/scaly.sgm"
+row "codegen scaly.dsl -t sgml" "$GEN" "" \
+  "$DZ -t sgml -d $CG_SPEC $CG_DOC" \
+  "$REF_JADE -G -t sgml -d $CG_SPEC $CG_DOC" 0 1
 
 # ---- 3. DSSSL styling (DocBook print stylesheets over dsssl.xml) ---------
 if [ -f "$DAZZLEDOC/dsssl.xml" ]; then
@@ -276,4 +274,3 @@ if [ -f "$CLAMLDOC" ]; then
 fi
 
 echo
-restore_generated

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transcribe ~/repos/dazzle/style/charProps.h into Scaly const arrays.
+"""Transcribe upstream/style/charProps.h into Scaly const arrays.
 
 The reference keeps the built-in character-property tables as C initializer
 rows behind #ifdef guards and #includes the file once per property. Each
@@ -27,7 +27,7 @@ Usage:  tools/charpropgen.py > /tmp/cp.scaly
 """
 import re, sys, os
 
-SRC = os.path.expanduser("~/repos/dazzle/style/charProps.h")
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "upstream", "style", "charProps.h")
 
 def rows(guard):
     out, on = [], False

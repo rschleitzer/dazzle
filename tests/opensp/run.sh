@@ -3,7 +3,7 @@
 # dazzle/OpenSP port: every `test` function of the package, run by
 # `scaly test` on the package root.
 #
-#   tests/opensp/run.sh [scalyc-binary]   (default: scalyc/build/scalyc)
+#   tests/opensp/run.sh [scalyc-binary]   (default: tests/toolchain.sh)
 #
 # HISTORY: the first harness ran `scalyc
 # --jit unit.scaly`, a PROGRAM that uses opensp -- the package bodies were
@@ -13,10 +13,10 @@
 # (checked 2026-09-30). The JIT does not run on the Windows box: SKIP there.
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-BIN="${1:-$ROOT/scalyc/build/scalyc}"
-# the tool beside the compiler: scaly for REPL/run/build/test, scalyc for the flags
-SCALY=$("$ROOT/tools/scaly-of.sh" "$BIN")
 cd "$ROOT"
+# the compiler and the tool beside it (scaly for build/run/test)
+# shellcheck disable=SC1091
+. tests/toolchain.sh "${1:-}" || exit 2
 
 . tests/platform.sh || exit 1
 if ! scaly_jit_available; then

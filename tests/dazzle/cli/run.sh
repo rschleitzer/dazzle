@@ -10,14 +10,15 @@
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
-BIN="${1:-$ROOT/scalyc/build/scalyc}"
 cd "$ROOT"
+# shellcheck disable=SC1091
+. tests/toolchain.sh "${1:-}" || exit 2
 set -u
 
 OUT="$(mktemp -d)/dazzle"
 trap 'rm -rf "$(dirname "$OUT")"' EXIT
 
-if ! tests/dazzle/build-cli.sh "$OUT" "$BIN" > "$OUT.build.log" 2>&1; then
+if ! tests/dazzle/build-cli.sh "$OUT" > "$OUT.build.log" 2>&1; then
   echo "dazzle-cli: FAIL (build)"; tail -8 "$OUT.build.log"; exit 1
 fi
 

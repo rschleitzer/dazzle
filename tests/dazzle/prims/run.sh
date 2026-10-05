@@ -127,7 +127,7 @@
 # macros.
 # time1 + time2 (langdoc.sgml): the TIME family — time, time->string and the
 # four comparisons over timeConv, the last primitives of primitive.h that
-# needed a C shim (packages/scaly/0.1.0/scaly/time/ctime.c: struct tm plus
+# needed a C shim (the Scaly standard library's scaly/time/ctime.c: struct tm plus
 # variadic sscanf/sprintf, containment rule (a)+(b)). Both run under a FIXED
 # TZ so localtime is deterministic without tzdata, and both are MARKED
 # SECTIONS rather than SYSTEM .scm entities for lang1's reason — `time<?`
@@ -152,15 +152,16 @@
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
-BIN="${1:-$ROOT/scalyc/build/scalyc}"
 cd "$ROOT"
+# shellcheck disable=SC1091
+. tests/toolchain.sh "${1:-}" || exit 2
 set -u
 
 OUT="$(mktemp -d)/dazzle"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$(dirname "$OUT")" "$WORK"' EXIT
 
-if ! tests/dazzle/build-cli.sh "$OUT" "$BIN" > "$OUT.build.log" 2>&1; then
+if ! tests/dazzle/build-cli.sh "$OUT" > "$OUT.build.log" 2>&1; then
   echo "dazzle-prims: FAIL (build)"; tail -8 "$OUT.build.log"; exit 1
 fi
 
