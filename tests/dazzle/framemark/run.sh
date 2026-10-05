@@ -106,6 +106,27 @@ for way in env cli; do
   fi
 done
 
+# A VM's stacks GROW while marked frames run (stackgrow.dsl: a recursion that
+# is no tail call and answers a constant, forty deep, in a characteristic's
+# expression). The buffer the VM keeps lay in the span the frame's pop
+# rewinds; unhooked, the flow object tree lost every paragraph's `quadding`
+# at rc 0, and a larger stylesheet read its control stack out of freed memory.
+# The golden is the C++ reference's; under poison a dangling read faults.
+echo "framemark: stacks that grow under a mark"
+for way in on poison off; do
+  case "$way" in
+    on)     SG_ENV="" ;;
+    poison) SG_ENV="SCALY_POISON=1" ;;
+    off)    SG_ENV="DAZZLE_FRAME_MARK=0" ;;
+  esac
+  if ! env SCALY_HOME="$ROOT" $SG_ENV "$DZ" -t fot -o "$TMP/stackgrow.$way.fot" \
+         -d "$HERE/stackgrow.dsl" "$HERE/stackgrow.sgml" > "$TMP/stackgrow.$way.err" 2>&1 \
+     || ! cmp -s "$TMP/stackgrow.$way.fot" "$HERE/stackgrow.expected.fot"; then
+    echo "framemark: FAIL (stackgrow, mark $way: the flow object tree differs from the reference's)"
+    head -3 "$TMP/stackgrow.$way.err"; rc=1
+  fi
+done
+
 rm -rf "$TMP"
 [ $rc = 0 ] && echo "framemark: PASS" || echo "framemark: FAIL"
 exit $rc
