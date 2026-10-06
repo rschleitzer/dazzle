@@ -63,6 +63,20 @@ it, so a stylesheet can lay out a whole tree of generated files.
     (make formatting-instruction data: "content")))
 ```
 
+## Install
+
+With Scaly installed (`curl -fsSL https://scaly.io/install.sh | sh`, on
+Windows `irm https://scaly.io/install.ps1 | iex`; see
+[scaly.io/download](https://scaly.io/download/)) and `git` at hand:
+
+```sh
+scaly install github.com/rschleitzer/dazzle dazzle 0.1.0     # the program dazzle
+scaly install github.com/rschleitzer/dazzle opensp 0.1.0     # the program onsgmls
+```
+
+fetches the package and what it uses, builds its program and puts it beside
+`scaly` on the `PATH`.
+
 ## Build
 
 Install Scaly (`curl -fsSL https://scaly.io/install.sh | sh`, or see
