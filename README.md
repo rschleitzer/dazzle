@@ -1,7 +1,9 @@
 # dazzle
 
 A DSSSL processor: James Clark's OpenSP and OpenJade, ported from C++ to
-[Scaly](https://scaly.io).
+[Scaly](https://scaly.io) — and, beyond the original, with a backend that
+writes PDF: a DocBook book goes from its XML to a typeset PDF with one
+program and no TeX in between.
 
 DSSSL (ISO/IEC 10179) is the style and transformation language of SGML. An
 engine reads an SGML or XML document, applies a stylesheet written in a Scheme
@@ -9,9 +11,10 @@ dialect, and writes the result through a backend. This repository holds the
 whole chain twice:
 
 - `packages/opensp` — the SGML parser, with the program `onsgmls`;
-  `packages/dazzle` — the style engine, with the program `dazzle`. Both are
-  written in Scaly, a language with region-based memory management the
-  compiler infers.
+  `packages/dazzle` — the style engine, with the program `dazzle`, the
+  original's backends and one of its own, PDF (below). Both are written in
+  Scaly, a language with region-based memory management the compiler
+  infers.
 - `upstream/` — the C++ original they were ported from (OpenSP 1.5.2 and
   OpenJade 1.3 with a few modifications), which still builds and remains
   the reference: where the two disagree, the port is wrong.
