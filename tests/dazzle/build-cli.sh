@@ -6,7 +6,7 @@
 #     scalyc-binary compiler to use  (default: tests/toolchain.sh — the
 #                   installed scalyc, or SCALYC)
 #
-# Builds packages/dazzle/0.1.0/dazzle_cli.scaly with the tool (`scaly build
+# Builds packages/dazzle/0.1.0/programs/dazzle.scaly with the tool (`scaly build
 # --release`), from the repository root — the same recipe as
 # tests/sgml/build-onsgmls.sh. Compiling the dazzle package needs a 64 MB
 # stack (`ulimit -s 65520`). Then, e.g.:
@@ -88,7 +88,7 @@ trap 'rm -rf "$TMP"' EXIT
 # the binary, not a speed one -- the packages as cached objects.
 RELEASE=--release
 [ -n "${DAZZLE_NO_OPT:-}" ] && RELEASE=
-if ! "$SCALY" build packages/dazzle/0.1.0/dazzle_cli.scaly $RELEASE -o "$EXE" > "$TMP/build.log" 2>&1; then
+if ! "$SCALY" build packages/dazzle/0.1.0/programs/dazzle.scaly $RELEASE -o "$EXE" > "$TMP/build.log" 2>&1; then
   echo "dazzle-cli: FAIL (build)"; tail -8 "$TMP/build.log"; exit 1
 fi
 if [ "$EXE" = "$OUT" ]; then

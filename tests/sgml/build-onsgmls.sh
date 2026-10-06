@@ -6,7 +6,7 @@
 #     scalyc-binary compiler to use  (default: tests/toolchain.sh — the
 #                   installed scalyc, or SCALYC)
 #
-# Builds packages/opensp/0.1.0/onsgmls.scaly with the tool (`scaly build
+# Builds packages/opensp/0.1.0/programs/onsgmls.scaly with the tool (`scaly build
 # --release`), from the repository root. Point tests/sgml/run.sh at the result:
 #
 #   tests/sgml/build-onsgmls.sh && tests/sgml/run.sh /tmp/scaly-onsgmls
@@ -55,7 +55,7 @@ trap 'rm -rf "$TMP"' EXIT
 # the build time. The compiler project's arity audit over each package's IR,
 # which ran here too, is a gate of the compiler and stayed with it.)
 RELEASE=--release
-if ! "$SCALY" build packages/opensp/0.1.0/onsgmls.scaly $RELEASE -o "$EXE" > "$TMP/build.log" 2>&1; then
+if ! "$SCALY" build packages/opensp/0.1.0/programs/onsgmls.scaly $RELEASE -o "$EXE" > "$TMP/build.log" 2>&1; then
   echo "onsgmls: FAIL (build)"; tail -8 "$TMP/build.log"; exit 1
 fi
 if [ "$EXE" = "$OUT" ]; then

@@ -73,8 +73,8 @@ git clone https://github.com/rschleitzer/pdf ../pdf
 Then from this directory:
 
 ```sh
-scaly build packages/dazzle/0.1.0/dazzle_cli.scaly --release -o dazzle
-scaly build packages/opensp/0.1.0/onsgmls.scaly --release -o onsgmls
+scaly build packages/dazzle/0.1.0/programs/dazzle.scaly --release -o dazzle
+scaly build packages/opensp/0.1.0/programs/onsgmls.scaly --release -o onsgmls
 ```
 
 The compiler finds the packages in `packages/` here and the standard
