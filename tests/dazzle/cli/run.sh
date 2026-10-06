@@ -391,6 +391,20 @@ if [ "$gotM" != "from!rules!" ] || [ "$gotP" = "from!rules!" ] || ! grep -q 'can
   echo "  posix: $(printf '%s' "$gotP" | cat -v)"
   exit 1
 fi
+# ... and the line terminator is the system's (the reference's SP_LINE_TERM,
+# asked at run time: SP_LINE_TERM, else with the file names): a file the
+# transformation backend writes ends its lines CR LF there and LF elsewhere,
+# the same text otherwise.
+printf '(declare-flow-object-class formatting-instruction "UNREGISTERED::James Clark//Flow Object Class::formatting-instruction")\n(declare-flow-object-class entity "UNREGISTERED::James Clark//Flow Object Class::entity")\n(element doc (make entity system-id: "lines.txt" (make formatting-instruction data: "one\r") (make formatting-instruction data: "two\r")))\n' > "$WM/lines.dsl"
+lines_run() { ( cd "$WM" && rm -f lines.txt && env -u SCALY_HOME HOME="$WM/home" USERPROFILE="$WM/home" "$@" "$OUT" -t sgml -d lines.dsl sub/doc.sgml > /dev/null 2>"$WM/lines.err" && od -An -c lines.txt | tr -s ' \n' ' ' ); }
+gotCRLF="$(lines_run SP_LINE_TERM=crlf)"
+gotLF="$(lines_run SP_LINE_TERM=lf)"
+gotFollow="$(lines_run SP_FILENAMES=msdos)"
+if [ "$gotCRLF" != " o n e \r \n t w o \r \n " ] || [ "$gotLF" != " o n e \n t w o \n " ] || [ "$gotFollow" != "$gotCRLF" ]; then
+  echo "dazzle-cli: FAIL line terminator"
+  echo "  crlf: '$gotCRLF'  lf: '$gotLF'  with MS-DOS file names: '$gotFollow'"; head -2 "$WM/lines.err"
+  exit 1
+fi
 rm -rf "$WM"
 
 echo "dazzle-cli: PASS"
