@@ -369,4 +369,28 @@ if ! python3 "$ROOT/tools/dssslgen.py" --check > /dev/null; then
   exit 1
 fi
 
+# MS-DOS file names (the reference's SP_MSDOS_FILENAMES, asked at run time:
+# SP_FILENAMES, else the system): a stylesheet named with backslashes pulls
+# in the entity beside it, the catalog list is separated by `;` and its
+# entries by backslashes, the document lies under a backslash path -- the way
+# a Windows batch file calls the program. Read as POSIX names the same call
+# does not find the stylesheet's entity and answers with the document's text
+# alone, at rc 0; that is the negative control.
+WM="$(mktemp -d)"
+mkdir -p "$WM/XMLModel/generator" "$WM/XMLModel/dsssl" "$WM/sub" "$WM/home"
+cp "$HERE/msdos/gen/map.dsl" "$HERE/msdos/gen/rules.scm" "$WM/XMLModel/generator/"
+cp "$ROOT"/packages/dazzle/0.1.0/dsssl/* "$WM/XMLModel/dsssl/"
+cp "$HERE/msdos/doc.sgml" "$WM/sub/"
+msdos_run() { ( cd "$WM" && env -u SCALY_HOME HOME="$WM/home" USERPROFILE="$WM/home" SP_FILENAMES="$1" \
+  'SGML_CATALOG_FILES=nosuch\catalog;XMLModel\dsssl\catalog' "$OUT" -t sgml -d 'XMLModel\generator\map.dsl' 'sub\doc.sgml' 2>"$WM/$1.err" ); }
+gotM="$(msdos_run msdos)"
+gotP="$(msdos_run posix)"
+if [ "$gotM" != "from!rules!" ] || [ "$gotP" = "from!rules!" ] || ! grep -q 'cannot open "nosuch/catalog"' "$WM/msdos.err"; then
+  echo "dazzle-cli: FAIL MS-DOS file names"
+  echo "  msdos: $(printf '%s' "$gotM" | cat -v) / $(head -2 "$WM/msdos.err" | cut -c1-160)"
+  echo "  posix: $(printf '%s' "$gotP" | cat -v)"
+  exit 1
+fi
+rm -rf "$WM"
+
 echo "dazzle-cli: PASS"

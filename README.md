@@ -94,6 +94,12 @@ a stylesheet, so it runs from any directory:
 (The catalog and the DTDs are laid into `~/.cache/dazzle/` the first time —
 the parser reads them as files.)
 
+On Windows the two programs take file names as that system writes them —
+backslashes, a drive letter, and `;` between the entries of
+`SGML_CATALOG_FILES` and `SGML_SEARCH_PATH` — on the command line and in the
+environment, as the original built for Windows does; a batch file written
+for `openjade` runs `dazzle` with the same lines.
+
 The C++ reference is built in its own directory: `cd upstream && ./build.sh`.
 
 ## Test
