@@ -46,7 +46,7 @@ in a standard font (Helvetica, Times, Courier), which has the characters of
 Windows code page 1252 only.
 
 ```sh
-SCALY_HOME=$PWD ./dazzle -t pdf -o book.pdf -d stylesheet.dsl document.xml
+./dazzle -t pdf -o book.pdf -d stylesheet.dsl document.xml
 ```
 
 One addition to DSSSL, in both the C++ and the Scaly engine: the `directory`
@@ -84,13 +84,15 @@ The compiler finds the packages in `packages/` here and the standard
 library in the installation. Compiling the engine needs a 64 MB stack
 (`ulimit -s 65520`).
 
-The engine reads its DSSSL prolog and catalog from
-`packages/dazzle/0.1.0/dsssl/` under `SCALY_HOME`, so run it with that
-variable naming this checkout:
+The program carries its DSSSL prolog and the catalog with the DTDs that read
+a stylesheet, so it runs from any directory:
 
 ```sh
-SCALY_HOME=$PWD ./dazzle -t sgml -d stylesheet.dsl document.xml
+./dazzle -t sgml -d stylesheet.dsl document.xml
 ```
+
+(The catalog and the DTDs are laid into `~/.cache/dazzle/` the first time —
+the parser reads them as files.)
 
 The C++ reference is built in its own directory: `cd upstream && ./build.sh`.
 
