@@ -1885,7 +1885,10 @@ define ELObj union
     ; a rope node over already-string-valued parts; `size` = total chars.
     function make_strcat(host: ref[Page], interp: ref[Interpreter], parts: ref[Array[ref[ELObj]?]], size: size_t) returns ref[ELObj]
     {
-        let p ELObj.StrCat^host(StrCatObj(parts, size, FrameMark.perm(interp.frame_mark)))
+        var memo FrameMark.perm(interp.frame_mark)
+        if memo <> null
+            memo := interp.memo_host(host) as pointer[Page]
+        let p ELObj.StrCat^host(StrCatObj(parts, size, memo))
         &p
     }
 
@@ -4051,6 +4054,248 @@ define ELObj union
         next
     }
 
+    ; A frame held by its RESULT alone (FrameMark condition 4) is rewound all
+    ; the same where the result can be taken out of it: a string is carried
+    ; over the rewind on the stack; a list, a number, a node list that owns
+    ; nothing in the frame are copied to the interpreter's evacuation region,
+    ; the frame goes back to its mark, and the copy is made again there. What
+    ; the result reaches OUTSIDE the frame is older than the frame and is kept
+    ; by reference. Identity is preserved: an object reached twice is copied
+    ; once (the old object carries a forwarding word; the frame is dead).
+    procedure evacuate(mutable vm: ref[VM], mutable result: ref[ELObj]) returns ref[ELObj]
+    {
+        choose result
+            when s: Str
+            {
+                let n s.str.size
+                let old s.str.data
+                let inside FrameMark.in_frame(vm.frame_mark, vm.get_csp(), old as pointer[void])
+                if inside and n > 1000
+                    return result
+                ; it pays only where the frame holds more than its result
+                if FrameMark.span_at(vm.frame_mark, vm.get_csp()) < (((n * 8) + 256) as i64)
+                    return result
+                if FrameMark.can_rewind(vm.frame_mark, vm.get_csp()) = false
+                    return result
+                var buf u32[1000]
+                if inside and n > 0
+                    memcpy(&buf[0] as pointer[void], old as pointer[void], n * 4)
+                if FrameMark.rewind_at(vm.frame_mark, vm.get_csp()) = false
+                    return result
+                let host vm.get_interp().get_host()
+                if inside
+                {
+                    let chars allocate_slice[u32](host, n)
+                    if n > 0
+                        memcpy(chars.data as pointer[void], &buf[0] as pointer[void], n * 4)
+                    return ELObj.make_string_adopt(host, chars)
+                }
+                return ELObj.make_string_adopt(host, Slice[u32](n, old))
+            }
+            else
+            {
+                FrameMark.count_reset(vm.frame_mark)
+                if ELObj.evac_ok(vm, result) = false
+                    return result
+                ; it pays only where the frame holds more than its result (a
+                ; list built by non-tail recursion would be copied at every
+                ; level otherwise)
+                if FrameMark.span_at(vm.frame_mark, vm.get_csp()) < ((FrameMark.count(vm.frame_mark) * 128) + 512)
+                    return result
+                if FrameMark.can_rewind(vm.frame_mark, vm.get_csp()) = false
+                    return result
+                let aside vm.get_interp().get_evac_region()
+                let tmp ELObj.evac_clone(vm, result, aside, false)
+                if FrameMark.rewind_at(vm.frame_mark, vm.get_csp()) = false
+                {
+                    scaly_eputs("dazzle: a frame that could be rewound was not")
+                    scaly_eputnl()
+                    exit(3)
+                }
+                let fin ELObj.evac_clone(vm, tmp, vm.get_interp().get_host(), true)
+                vm.get_interp().reset_evac_region()
+                return fin
+            }
+        result
+    }
+
+    ; is `p` in what is being evacuated -- the frame, or (on the way back) the
+    ; evacuation region?
+    function evac_src(vm: ref[VM], p: pointer[void], scratch: bool) returns bool
+    {
+        if scratch
+            return FrameMark.head_of(Page.get(p) as i64) = (vm.get_interp().get_evac_region() as i64)
+        FrameMark.in_frame(vm.frame_mark, vm.get_csp(), p)
+    }
+
+    ; can everything `obj` reaches inside the frame be copied? `obj` lies in
+    ; the frame. Bounded: the mark's block counts the objects (64 bytes each,
+    ; characters included), and 2000 of them is where it gives up.
+    procedure evac_ok(mutable vm: ref[VM], obj: ref[ELObj]) returns bool
+    {
+        FrameMark.count_add(vm.frame_mark, 1)
+        if FrameMark.count(vm.frame_mark) > 2000
+            return false
+        choose obj
+            when s: Str
+            {
+                if s.str.size = 0
+                    return true
+                if ELObj.evac_src(vm, s.str.data as pointer[void], false) = false
+                    return true
+                FrameMark.count_add(vm.frame_mark, (s.str.size / 16) as i64)
+                return s.str.size <= 1000
+            }
+            when sc: StrCat
+            {
+                let ps sc.parts
+                if ps = null
+                    return true
+                let n ps.get_length()
+                if n > 100
+                    return false
+                var i: size_t 0
+                while i < n
+                {
+                    let part ps[i]
+                    if part <> null and ELObj.evac_src(vm, part as pointer[void], false)
+                    {
+                        if ELObj.evac_ok(vm, part as ref[ELObj]) = false
+                            return false
+                    }
+                    i := i + 1
+                }
+                return true
+            }
+            when pr: Pair
+            {
+                if pr.car <> null and ELObj.evac_src(vm, pr.car as pointer[void], false)
+                {
+                    if ELObj.evac_ok(vm, pr.car as ref[ELObj]) = false
+                        return false
+                }
+                if pr.cdr <> null and ELObj.evac_src(vm, pr.cdr as pointer[void], false)
+                {
+                    if ELObj.evac_ok(vm, pr.cdr as ref[ELObj]) = false
+                        return false
+                }
+                return true
+            }
+            when nl: NodeList
+            {
+                if nl.gen <> null
+                    return false
+                ; a node of a DECLARATION is made on demand, on the region the
+                ; asking primitive runs on -- it may lie in this frame, and the
+                ; list would be carried out pointing at it
+                if nl.single <> null and ELObj.evac_src(vm, nl.single as pointer[void], false)
+                    return false
+                if nl.nodes <> null
+                {
+                    let members nl.nodes as ref[Array[ref[GroveNode]?]]
+                    let m members.get_length()
+                    if m > 64
+                        return false
+                    var k: size_t 0
+                    while k < m
+                    {
+                        let member members[k]
+                        if member <> null and ELObj.evac_src(vm, member as pointer[void], false)
+                            return false
+                        k := k + 1
+                    }
+                }
+                if nl.nodes <> null and ELObj.evac_src(vm, nl.nodes as pointer[void], false)
+                    return false
+                if nl.prefix <> null and ELObj.evac_src(vm, nl.prefix as pointer[void], false)
+                    return false
+                return true
+            }
+            when i: Int
+                return true
+            when c: Chr
+                return true
+            when r: Real
+                return true
+            when l: Length
+                return true
+            when q: Quantity
+                return true
+            else
+                return false
+        false
+    }
+
+    ; the copy of `obj` (which lies in the source) on `to`
+    procedure evac_clone(mutable vm: ref[VM], mutable obj: ref[ELObj], to: ref[Page], scratch: bool) returns ref[ELObj]
+    {
+        let raw obj as i64
+        if (*(raw as pointer[u8]) as int) = 255
+            return *((raw + 8) as pointer[i64]) as ref[ELObj]
+        var copy: ref[ELObj]? null
+        choose obj
+            when s: Str
+            {
+                let n s.str.size
+                let old s.str.data
+                if n > 0 and ELObj.evac_src(vm, old as pointer[void], scratch)
+                {
+                    let chars allocate_slice[u32](to, n)
+                    memcpy(chars.data as pointer[void], old as pointer[void], n * 4)
+                    copy := ELObj.make_string_adopt(to, chars)
+                }
+                else
+                    copy := ELObj.make_string_adopt(to, Slice[u32](n, old))
+            }
+            when sc: StrCat
+            {
+                let ps sc.parts
+                if ps = null
+                {
+                    let p to.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+                    memcpy(p as pointer[void], obj as pointer[void], sizeof ELObj)
+                    copy := p
+                }
+                else
+                {
+                    let n ps.get_length()
+                    let na Array[ref[ELObj]?]^to()
+                    var i: size_t 0
+                    while i < n
+                    {
+                        var part ps[i]
+                        if part <> null and ELObj.evac_src(vm, part as pointer[void], scratch)
+                            part := ELObj.evac_clone(vm, part as ref[ELObj], to, scratch)
+                        na.add(part)
+                        i := i + 1
+                    }
+                    let p ELObj.StrCat^to(StrCatObj(na, sc.size, sc.memo))
+                    copy := &p
+                }
+            }
+            when pr: Pair
+            {
+                var car2 pr.car
+                if car2 <> null and ELObj.evac_src(vm, car2 as pointer[void], scratch)
+                    car2 := ELObj.evac_clone(vm, car2 as ref[ELObj], to, scratch)
+                var cdr2 pr.cdr
+                if cdr2 <> null and ELObj.evac_src(vm, cdr2 as pointer[void], scratch)
+                    cdr2 := ELObj.evac_clone(vm, cdr2 as ref[ELObj], to, scratch)
+                let p to.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+                *p := ELObj.Pair(PairObj(car2, cdr2))
+                copy := p
+            }
+            else
+            {
+                let p to.allocate(sizeof ELObj, alignof ELObj) as pointer[ELObj]
+                memcpy(p as pointer[void], obj as pointer[void], sizeof ELObj)
+                copy := p
+            }
+        *(raw as pointer[u8]) := 255
+        *((raw + 8) as pointer[i64]) := copy as i64
+        copy as ref[ELObj]
+    }
+
     ; PrimitiveObj::tailCall — dispatch, pop frame, push result.
     procedure prim_tail_call(mutable this: ref[ELObj], mutable vm: ref[VM], mutable loc: Location, n_caller_args: int) returns ref[Insn]?
     {
@@ -4062,10 +4307,12 @@ define ELObj union
             return vm.fail()
         }
         vm.set_sp(argp - n_caller_args)
-        FrameMark.pop(vm.frame_mark, vm.get_csp(), result as pointer[void])
+        var res result
+        if FrameMark.pop(vm.frame_mark, vm.get_csp(), result as pointer[void])
+            res := ELObj.evacuate(vm, result as ref[ELObj])
         let nxt vm.pop_frame()
         vm.need_stack(1)
-        vm.stack_set(vm.get_sp(), result)
+        vm.stack_set(vm.get_sp(), res)
         vm.set_sp(vm.get_sp() + 1)
         nxt
     }
