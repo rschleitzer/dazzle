@@ -275,11 +275,11 @@ if [ "$rc14" -ne 0 ] || [ "$got14" != "$want14" ]; then
   exit 1
 fi
 
-# -v: the openjade + OpenSP banners on stderr, the run continues.
+# -v: the dazzle version on stderr, the run continues.
 got14="$(cd "$HERE" && SCALY_HOME="$ROOT" "$OUT" -v -t sgml -d map.dsl doc.sgml 2>"$OUT.verr")"
 rc14=$?
 err14="$(sed "s|^$OUT|PROG|" "$OUT.verr")"
-wanterr14="$(printf '%s\n' 'PROG:I: "openjade" version "1.3.3-pre1"' 'PROG:I: "OpenSP" version "1.5.2"')"
+wanterr14="$(printf '%s\n' 'PROG:I: "dazzle" version "0.1.0"')"
 if [ "$rc14" -ne 0 ] || [ "$got14" != "$base14" ] || [ "$err14" != "$wanterr14" ]; then
   echo "dazzle-cli: FAIL getopt -v (rc=$rc14)"
   echo "  err:  $(printf '%s' "$err14" | cat -v)"
