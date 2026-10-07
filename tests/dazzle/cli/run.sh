@@ -278,7 +278,8 @@ fi
 # -v: the dazzle version on stderr, the run continues.
 got14="$(cd "$HERE" && SCALY_HOME="$ROOT" "$OUT" -v -t sgml -d map.dsl doc.sgml 2>"$OUT.verr")"
 rc14=$?
-err14="$(sed "s|^$OUT|PROG|" "$OUT.verr")"
+# (a released program says its day and commit behind the number)
+err14="$(sed -e "s|^$OUT|PROG|" -e 's|"0\.1\.0 [0-9-]* [0-9a-f]*"|"0.1.0"|' "$OUT.verr")"
 wanterr14="$(printf '%s\n' 'PROG:I: "dazzle" version "0.1.0"')"
 if [ "$rc14" -ne 0 ] || [ "$got14" != "$base14" ] || [ "$err14" != "$wanterr14" ]; then
   echo "dazzle-cli: FAIL getopt -v (rc=$rc14)"
