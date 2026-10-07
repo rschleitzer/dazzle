@@ -180,9 +180,6 @@ use scaly.memory.Page
 function getenv(name: pointer[const_char]) returns pointer[const_char] extern
 function calloc(count: size_t, size: size_t) returns pointer[void] extern
 function atoll(s: pointer[const_char]) returns int extern
-function malloc(size: size_t) returns pointer[void] extern
-function free(p: pointer[void]) extern
-function memcpy(dst: pointer[void], src: pointer[void], n: size_t) returns pointer[void] extern
 
 ; deeper frames are counted, not marked
 define FM_MAX_DEPTH: i64 65536
@@ -200,13 +197,8 @@ define FM_SPAN_N: i64 7     ; `span_collect`: the further pages of the span unde
 define FM_SPAN_OK: i64 8    ;   whether a rewind would go through,
 define FM_SPAN_BYTES: i64 9 ;   and the bytes it holds
 define FM_SPAN_LIMIT: i64 10 ; how many further pages `span_collect` goes (0: never take a result out)
-define FM_SPAN_AT: i64 11   ;   and where its pages begin in the page list
-define FM_PL: i64 12        ; the PAGE LIST: the region's pages in chain order, from the
-define FM_PL_N: i64 13      ;   first frame of this generation on (`push_on`), a malloc'd
-define FM_PL_CAP: i64 14    ;   array of FM_PL_CAP words, FM_PL_N of them in use,
-define FM_PL_GEN: i64 15    ;   valid for the generation FM_PL_GEN;
-define FM_PL_LAST: i64 16   ;   its last page (0: no list) -- what a push compares
-define FM_SPAN_MAX: i64 4096
+define FM_SPAN: i64 32      ; the pages themselves: FM_SPAN_MAX words up to FM_HDR
+define FM_SPAN_MAX: i64 64
 ; ... and how far it goes unless DAZZLE_EVACUATE says otherwise. Measured
 ; 2026-10-07 on two generators: one keeps its whole gain at 1 page, the other
 ; loses 43 % of it below 16 (a cliff between 8 and 16); on a machine where a
@@ -223,7 +215,6 @@ define FC_HEXCL: i64 3      ; the region HEAD's, a DIFFERENT list
 define FC_HEADAT: i64 4     ; the head's bump at the push — condition 6
 define FC_GEN: i64 5        ; -1 means "this frame carries no mark"
 define FC_EPOCH: i64 6
-define FC_PIDX: i64 7       ; where the mark's page stands in the page list
 
 ; The state block is the ENGINE's, not the process's: `Interpreter.make` asks
 ; `create` for one and keeps it in `frame_mark`, every VM copies it (the frame
@@ -254,9 +245,6 @@ define FrameMark
         ; for its result to be taken out (ELObj.evacuate) -- 0 switches that
         ; off and leaves the rest of the mark, anything past FM_SPAN_MAX is
         ; FM_SPAN_MAX; unset, FM_SPAN_DEFAULT.
-        *(f + FM_PL_CAP) := 1024
-        *(f + FM_PL) := malloc(1024 * 8) as i64
-        *(f + FM_PL_GEN) := 0 - 1
         *(f + FM_SPAN_LIMIT) := FM_SPAN_DEFAULT
         let pages getenv("DAZZLE_EVACUATE")
         if pages <> null
@@ -392,94 +380,6 @@ define FrameMark
         *(c + FC_HEADAT) := FrameMark.bump(head)
         *(c + FC_GEN) := *(f + FM_GEN)
         *(c + FC_EPOCH) := *(f + FM_EPOCH)
-        ; the page list knows the mark's page: its last entry, as a rule, and
-        ; `list_reach` (cold) where the region has run on since the last push
-        ; ★ONE test on the hot path and one call off it: with the list's upkeep
-        ; written out here the inliner stopped putting this procedure into its
-        ; callers, and every frame paid a call and a prologue (measured: 50
-        ; instructions a frame). FM_PL_LAST is the list's last page, or 0
-        ; where there is no list for this generation.
-        if *(f + FM_PL_LAST) = t
-            *(c + FC_PIDX) := *(f + FM_PL_N) - 1
-        else
-            *(c + FC_PIDX) := FrameMark.list_sync(f, t) - 1
-    }
-
-    ; --- the PAGE LIST ---------------------------------------------------------
-    ; The pages of the marked region in chain order, kept beside it: which
-    ; pages a frame's span holds is then a stretch of this array, and neither
-    ; counting them nor asking "does this lie in the span?" reads a page header.
-    ; Walking the headers was the price of the evacuation on a machine where
-    ; that is dear (2026-10-07: a limit of 16 pages against 1 cost a quarter of
-    ; a production run there). It begins anew with every generation, grows
-    ; where a push or `span_collect` finds the region run on, and is cut back
-    ; where a rewind takes pages away -- every rewind of a marked region goes
-    ; through this file.
-    procedure list_sync(mutable f: pointer[i64], tail: i64) returns i64
-    {
-        if *(f + FM_PL_GEN) <> *(f + FM_GEN) or *(f + FM_PL_N) = 0
-        {
-            *((*(f + FM_PL) as pointer[i64])) := tail
-            *(f + FM_PL_N) := 1
-            *(f + FM_PL_GEN) := *(f + FM_GEN)
-            *(f + FM_PL_LAST) := tail
-            return 1
-        }
-        FrameMark.list_reach(f, tail)
-    }
-
-    ; the list up to the region's tail; 0 where the chain does not lead there
-    ; from the list's last page (then there is no list for this generation)
-    procedure list_reach(mutable f: pointer[i64], tail: i64) returns i64
-    {
-        var n *(f + FM_PL_N)
-        var pl *(f + FM_PL) as pointer[i64]
-        var p FrameMark.next_page(*(pl + (n - 1)))
-        while p <> 0
-        {
-            if n >= *(f + FM_PL_CAP)
-            {
-                let cap *(f + FM_PL_CAP) * 2
-                let wider malloc((cap * 8) as size_t) as pointer[i64]
-                memcpy(wider as pointer[void], pl as pointer[void], (n * 8) as size_t)
-                free(pl as pointer[void])
-                pl := wider
-                *(f + FM_PL) := wider as i64
-                *(f + FM_PL_CAP) := cap
-            }
-            *(pl + n) := p
-            n := n + 1
-            p := FrameMark.next_page(p)
-        }
-        if *(pl + (n - 1)) <> tail
-        {
-            *(f + FM_PL_N) := 0
-            *(f + FM_PL_GEN) := 0 - 1
-            *(f + FM_PL_LAST) := 0
-            return 1
-        }
-        *(f + FM_PL_N) := n
-        *(f + FM_PL_LAST) := tail
-        n
-    }
-
-    ; a rewind took the pages after the mark's away
-    procedure list_cut(mutable f: pointer[i64], c: pointer[i64])
-    {
-        if *(f + FM_PL_GEN) <> *(f + FM_GEN)
-            return
-        let idx *(c + FC_PIDX)
-        if idx < *(f + FM_PL_N) and *((*(f + FM_PL) as pointer[i64]) + idx) = *(c + FC_PAGE)
-        {
-            *(f + FM_PL_N) := idx + 1
-            *(f + FM_PL_LAST) := *(c + FC_PAGE)
-        }
-        else
-        {
-            *(f + FM_PL_N) := 0
-            *(f + FM_PL_GEN) := 0 - 1
-            *(f + FM_PL_LAST) := 0
-        }
     }
 
     ; The ReturnInsn arm and PrimitiveObj::tailCall, before VM.pop_frame — `csp`
@@ -524,13 +424,7 @@ define FrameMark
         ; that shows the mark engaged: a silently disabled mark passes every
         ; differential there is.
         if FrameMark.rewind(c, head)
-        {
             *(f + FM_REWOUND) := *(f + FM_REWOUND) + 1
-            ; (only where the rewind took pages away: 99.7 % of frames stay
-            ; on their mark's page)
-            if *(f + FM_PL_LAST) <> *(c + FC_PAGE)
-                FrameMark.list_cut(f, c)
-        }
         false
     }
 
@@ -538,74 +432,56 @@ define FrameMark
     ; Each speaks of the frame at `csp` right after `pop` answered true, before
     ; VM.pop_frame: its columns are still the leaving frame's.
     ;
-    ; ★★★No walk over the span's pages. Every question about a span that has
-    ; run on to further pages used to walk their headers -- and a page header
-    ; is a page of its own to the processor's address tables. The first
-    ; version asked "does this lie in the frame?" once per OBJECT of the
+    ; ★★★ONE walk over the span's pages, and a short one. Every question about
+    ; a span that has run on to further pages walks their headers -- and a
+    ; page header is a page of its own to the processor's address tables. The
+    ; first version asked "does this lie in the frame?" once per OBJECT of the
     ; result, each a walk: 30 % more time on a production codegen here, and
-    ; TEN TIMES the run on the machine it was meant for (2026-10-07). Now the
-    ; span is a stretch of the PAGE LIST (above): `span_collect` finds it
-    ; without reading a header, `in_frame` looks through it, and only
-    ; `can_rewind` -- asked last, where the result is about to be taken out and
-    ; the rewind will read those headers anyway -- looks at the pages.
+    ; TEN TIMES the run on an emulated x64 machine, where a table miss is
+    ; expensive (2026-10-07). So `span_collect` walks once, gives up past
+    ; FM_SPAN_MAX pages (measured: 8 loses the memory again, 64 keeps all of
+    ; it), and leaves the pages in the block; `in_frame`, `can_rewind` and
+    ; `span_at` read what it left.
     procedure span_collect(mutable f: pointer[i64], csp: int) returns bool
     {
         let c f + (FM_HDR + (((csp - 1) as i64) * FM_COLS))
         let head *(f + FM_HEAD)
         let mp *(c + FC_PAGE)
-        if *(f + FM_PL_GEN) <> *(f + FM_GEN)
-            return false
-        var n *(f + FM_PL_N)
-        if n = 0
-            return false
-        let t FrameMark.tail(head)
-        if *(f + FM_PL_LAST) <> t
-            n := FrameMark.list_reach(f, t)
-        let idx *(c + FC_PIDX)
-        if *(f + FM_PL_GEN) <> *(f + FM_GEN) or idx >= n
-            return false
-        if *((*(f + FM_PL) as pointer[i64]) + idx) <> mp
-            return false
-        let further (n - 1) - idx
-        if further > *(f + FM_SPAN_LIMIT)
-            return false
-        *(f + FM_SPAN_N) := further
-        *(f + FM_SPAN_AT) := idx + 1
         var ok FrameMark.bump(mp) <> 0
         if FrameMark.exclusive(mp) <> *(c + FC_EXCL)
             ok := false
         if FrameMark.exclusive(head) <> *(c + FC_HEXCL)
             ok := false
+        var n: i64 0
+        var last mp
+        var p FrameMark.next_page(mp)
+        while p <> 0
+        {
+            if n >= *(f + FM_SPAN_LIMIT)
+                return false
+            *(f + (FM_SPAN + n)) := p
+            n := n + 1
+            if FrameMark.exclusive(p) <> 0
+                ok := false
+            last := p
+            p := FrameMark.next_page(p)
+        }
+        *(f + FM_SPAN_N) := n
         *(f + FM_SPAN_OK) := 0
         if ok
             *(f + FM_SPAN_OK) := 1
-        if further = 0
+        if n = 0
             *(f + FM_SPAN_BYTES) := FrameMark.bump(mp) - *(c + FC_OFF)
         else
-            *(f + FM_SPAN_BYTES) := further * 4096
+            *(f + FM_SPAN_BYTES) := n * 4096
         true
     }
 
     ; would a rewind go through? Every test Page.rewind makes (conditions 2
     ; and 3), made without acting -- the caller copies the result first and
-    ; must know the rewind will follow. The one question that reads the
-    ; span's page headers: ask it LAST.
+    ; must know the rewind will follow.
     function can_rewind(f: pointer[i64], csp: int) returns bool
-    {
-        if *(f + FM_SPAN_OK) = 0
-            return false
-        let pl *(f + FM_PL) as pointer[i64]
-        let at *(f + FM_SPAN_AT)
-        let n *(f + FM_SPAN_N)
-        var k: i64 0
-        while k < n
-        {
-            if FrameMark.exclusive(*(pl + (at + k))) <> 0
-                return false
-            k := k + 1
-        }
-        true
-    }
+        *(f + FM_SPAN_OK) <> 0
 
     ; does `v` lie in the frame's span?
     function in_frame(f: pointer[i64], csp: int, v: pointer[void]) returns bool
@@ -616,13 +492,11 @@ define FrameMark
         let vp Page.get(v) as i64
         if vp = *(c + FC_PAGE)
             return (v as i64) >= *(c + FC_OFF)
-        let pl *(f + FM_PL) as pointer[i64]
-        let at *(f + FM_SPAN_AT)
         let n *(f + FM_SPAN_N)
         var k: i64 0
         while k < n
         {
-            if *(pl + (at + k)) = vp
+            if *(f + (FM_SPAN + k)) = vp
                 return true
             k := k + 1
         }
@@ -640,10 +514,6 @@ define FrameMark
         if FrameMark.rewind(c, *(f + FM_HEAD))
         {
             *(f + FM_REWOUND) := *(f + FM_REWOUND) + 1
-            ; (only where the rewind took pages away: 99.7 % of frames stay
-            ; on their mark's page)
-            if *(f + FM_PL_LAST) <> *(c + FC_PAGE)
-                FrameMark.list_cut(f, c)
             return true
         }
         false
@@ -819,7 +689,5 @@ define FrameMark
             return
         *(f + FM_HEAD) := p as i64
         *(f + FM_GEN) := *(f + FM_GEN) + 1
-        ; the page list is another region's now
-        *(f + FM_PL_LAST) := 0
     }
 }
