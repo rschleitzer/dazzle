@@ -192,7 +192,12 @@ define FM_TOP: i64 3        ; the innermost live frame's index
 define FM_REWOUND: i64 4    ; rewinds done — `--frame-mark-stats`, the gate's proof
 define FM_PERM: i64 5       ; the run arena — the memo seam's host (Interpreter.memo_host)
 define FM_COUNT: i64 6      ; the objects of the result an evacuation is looking at
-define FM_HDR: i64 32       ; where the per-frame columns start
+define FM_SPAN_N: i64 7     ; `span_collect`: the further pages of the span under evacuation,
+define FM_SPAN_OK: i64 8    ;   whether a rewind would go through,
+define FM_SPAN_BYTES: i64 9 ;   and the bytes it holds
+define FM_SPAN: i64 32      ; the pages themselves: FM_SPAN_MAX words up to FM_HDR
+define FM_SPAN_MAX: i64 64
+define FM_HDR: i64 128       ; where the per-frame columns start
 
 ; one 64-byte line per frame
 define FM_COLS: i64 8
@@ -404,56 +409,82 @@ define FrameMark
     ; --- for the caller that lifts condition 4 (ELObj.evacuate) --------------
     ; Each speaks of the frame at `csp` right after `pop` answered true, before
     ; VM.pop_frame: its columns are still the leaving frame's.
+    ;
+    ; ★★★ONE walk over the span's pages, and a short one. Every question about
+    ; a span that has run on to further pages walks their headers -- and a
+    ; page header is a page of its own to the processor's address tables. The
+    ; first version asked "does this lie in the frame?" once per OBJECT of the
+    ; result, each a walk: 30 % more time on a production codegen here, and
+    ; TEN TIMES the run on an emulated x64 machine, where a table miss is
+    ; expensive (2026-10-07). So `span_collect` walks once, gives up past
+    ; FM_SPAN_MAX pages (measured: 8 loses the memory again, 64 keeps all of
+    ; it), and leaves the pages in the block; `in_frame`, `can_rewind` and
+    ; `span_at` read what it left.
+    procedure span_collect(mutable f: pointer[i64], csp: int) returns bool
+    {
+        let c f + (FM_HDR + (((csp - 1) as i64) * FM_COLS))
+        let head *(f + FM_HEAD)
+        let mp *(c + FC_PAGE)
+        var ok FrameMark.bump(mp) <> 0
+        if FrameMark.exclusive(mp) <> *(c + FC_EXCL)
+            ok := false
+        if FrameMark.exclusive(head) <> *(c + FC_HEXCL)
+            ok := false
+        var n: i64 0
+        var last mp
+        var p FrameMark.next_page(mp)
+        while p <> 0
+        {
+            if n >= FM_SPAN_MAX
+                return false
+            *(f + (FM_SPAN + n)) := p
+            n := n + 1
+            if FrameMark.exclusive(p) <> 0
+                ok := false
+            last := p
+            p := FrameMark.next_page(p)
+        }
+        *(f + FM_SPAN_N) := n
+        *(f + FM_SPAN_OK) := 0
+        if ok
+            *(f + FM_SPAN_OK) := 1
+        if n = 0
+            *(f + FM_SPAN_BYTES) := FrameMark.bump(mp) - *(c + FC_OFF)
+        else
+            *(f + FM_SPAN_BYTES) := n * 4096
+        true
+    }
 
     ; would a rewind go through? Every test Page.rewind makes (conditions 2
     ; and 3), made without acting -- the caller copies the result first and
     ; must know the rewind will follow.
     function can_rewind(f: pointer[i64], csp: int) returns bool
-    {
-        let c f + (FM_HDR + (((csp - 1) as i64) * FM_COLS))
-        let head *(f + FM_HEAD)
-        let mp *(c + FC_PAGE)
-        if FrameMark.bump(mp) = 0
-            return false
-        if FrameMark.exclusive(mp) <> *(c + FC_EXCL)
-            return false
-        if FrameMark.exclusive(head) <> *(c + FC_HEXCL)
-            return false
-        var p FrameMark.next_page(mp)
-        while p <> 0
-        {
-            if FrameMark.exclusive(p) <> 0
-                return false
-            p := FrameMark.next_page(p)
-        }
-        true
-    }
+        *(f + FM_SPAN_OK) <> 0
 
     ; does `v` lie in the frame's span?
     function in_frame(f: pointer[i64], csp: int, v: pointer[void]) returns bool
     {
+        if v = null
+            return false
         let c f + (FM_HDR + (((csp - 1) as i64) * FM_COLS))
-        FrameMark.in_span(c, *(f + FM_HEAD), v)
+        let vp Page.get(v) as i64
+        if vp = *(c + FC_PAGE)
+            return (v as i64) >= *(c + FC_OFF)
+        let n *(f + FM_SPAN_N)
+        var k: i64 0
+        while k < n
+        {
+            if *(f + (FM_SPAN + k)) = vp
+                return true
+            k := k + 1
+        }
+        false
     }
 
     ; the bytes the frame's span holds (a page counted whole once the span
     ; has run on to further pages)
     function span_at(f: pointer[i64], csp: int) returns i64
-    {
-        let c f + (FM_HDR + (((csp - 1) as i64) * FM_COLS))
-        let head *(f + FM_HEAD)
-        let t FrameMark.tail(head)
-        if t = *(c + FC_PAGE)
-            return FrameMark.bump(t) - *(c + FC_OFF)
-        var n: i64 4096
-        var p FrameMark.next_page(*(c + FC_PAGE))
-        while p <> 0 and p <> t
-        {
-            n := n + 4096
-            p := FrameMark.next_page(p)
-        }
-        n
-    }
+        *(f + FM_SPAN_BYTES)
 
     procedure rewind_at(mutable f: pointer[i64], csp: int) returns bool
     {
