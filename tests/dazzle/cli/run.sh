@@ -215,6 +215,20 @@ if [ "$rc13" -ne 1 ] || [ "$got13" != "$want13" ] || [ "$err13" != "$wanterr13" 
   exit 1
 fi
 
+# The ORDER of the messages when the document and the stylesheet both have
+# something to say: the document's first, then what reading the stylesheet
+# said, then what evaluating it says. The program reads the stylesheet BEFORE
+# the document (for the memory's sake) and holds what that reading says until
+# the document's messages are out; without the hold the stylesheet's syntax
+# error comes first. Golden argv0-normalized, minted from the reference dazzle.
+( cd "$HERE" && SCALY_HOME="$ROOT" "$OUT" -t sgml -d order.dsl order.sgml > /dev/null 2>"$OUT.orerr" )
+errOrder="$(sed 's|^[^:]*:|PROG:|' "$OUT.orerr")"
+if [ "$errOrder" != "$(cat "$HERE/order.expected.err")" ]; then
+  echo "dazzle-cli: FAIL message order, document against stylesheet"
+  echo "  got:  $(printf '%s' "$errOrder" | cat -v)"
+  exit 1
+fi
+
 # --- 14: the getopt clone surface (S85) -------------------------------------
 # Options.scaly wired into the CLI: clustered shorts, attached option args,
 # unique-prefix long names, `--`, the ?/-/= error renderings, -h/-v, -t
