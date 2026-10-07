@@ -104,9 +104,15 @@ TRAIN="${SCALY_TRAIN:-}"
 if [ -z "$TRAIN" ]; then
   TRAIN="$W/Scaly"
   echo "release: fetching the training material"
-  git clone -q --depth 1 https://github.com/rschleitzer/Scaly "$TRAIN"
+  # as it is in the repository: a Git for Windows that turns line ends on
+  # checkout would hand the check below files nobody generated
+  git -c core.autocrlf=false clone -q --depth 1 https://github.com/rschleitzer/Scaly "$TRAIN"
 fi
 [ -x "$TRAIN/mkp" ] || { echo "release: FAIL — no mkp in $TRAIN"; exit 1; }
+# The runs write line feeds on every system (SP_LINE_TERM, the reference's
+# own switch): the files they regenerate are checked in that way, and step 5
+# compares them byte for byte. On Windows the engine would write CR LF.
+export SP_LINE_TERM=lf
 train() { # the three runs with the engine $1
   ( cd "$TRAIN" && DAZZLE="$1" DAZZLE_REPO="$W/none" SCALY_HOME="$TRAIN" ./mkp ) > "$W/mkp.log" 2>&1 \
     || { tail -20 "$W/mkp.log"; return 1; }
@@ -137,6 +143,7 @@ git -C "$TRAIN" checkout -q -- . 2>/dev/null || true
 train "$W/dazzle$EXE" || { echo "release: FAIL — the profiled program on the training runs"; exit 1; }
 changed="$(git -C "$TRAIN" status --porcelain --untracked-files=no | grep -v ' docs/' || true)"
 [ -z "$changed" ] || { echo "$changed" | head -10; echo "release: FAIL — the profiled program generates other files than are checked in"; exit 1; }
+unset SP_LINE_TERM
 echo "release: checking — the suites"
 failed=""
 for d in cli coding engine flowobj fot framemark grove html mif pdf prims rtf specarena tex; do
