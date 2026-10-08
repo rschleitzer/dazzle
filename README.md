@@ -102,7 +102,8 @@ On macOS and Linux compiling the engine needs a 64 MB stack
 A program built this way says the number of its package for its version (`dazzle -v`). The day
 and the commit are stamped in by `tools/release.sh`, which builds what the
 [releases](https://github.com/rschleitzer/dazzle/releases) hand out; the
-`VERSION` file of a release names the commit of the pdf package too.
+`VERSION` file of a release names the pdf package too, by the git tree of
+its version directory.
 
 To work on the pdf package alongside, link a checkout of it in as
 `packages/pdf` (git ignores the link here); the packages of this directory

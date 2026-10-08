@@ -195,19 +195,22 @@ done
 # 6. the archive
 mkdir -p "$OUT" "$W/$NAME"
 cp "$W/dazzle$EXE" "$W/onsgmls$EXE" LICENSE "$W/$NAME/"
-# the pdf package the programs were built with: a checkout linked in as
-# packages/pdf (it must be committed), else what scaly fetched
+# the pdf package the programs were built with, by the git tree of its
+# version directory -- what packages/pdf/published in its repository names
+# for the version. The tree and not a commit: the same files give the same
+# number wherever this runs, whether out of a checkout linked in as
+# packages/pdf (it must be committed) or out of what scaly fetched.
 PDFV="$(sed -n 's/^package pdf \([0-9.]*\) .*/\1/p' "packages/dazzle/$V/dazzle.scaly" | head -1)"
 [ -n "$PDFV" ] || { echo "release: FAIL — the dazzle package does not declare the pdf package"; exit 1; }
 if [ -d "packages/pdf/$PDFV" ]; then
   git -C "packages/pdf/$PDFV" diff --quiet HEAD -- . 2>/dev/null \
     || { echo "release: FAIL — the pdf checkout behind packages/pdf has uncommitted changes"; exit 1; }
-  PDF="$(git -C "packages/pdf/$PDFV" rev-parse HEAD 2>/dev/null | cut -c1-7)"
+  PDF="$(git -C "packages/pdf/$PDFV" rev-parse HEAD:./ 2>/dev/null)"
 else
-  PDF="$(sed -n 's/^commit //p' "${SCALY_PACKAGES:-${HOME:-$USERPROFILE}/.scaly/packages}/github.com/rschleitzer/pdf/packages/pdf/$PDFV.fetched" 2>/dev/null | cut -c1-7)"
+  PDF="$(sed -n 's/^tree //p' "${SCALY_PACKAGES:-${HOME:-$USERPROFILE}/.scaly/packages}/github.com/rschleitzer/pdf/packages/pdf/$PDFV.fetched" 2>/dev/null)"
 fi
-[ -n "$PDF" ] || { echo "release: FAIL — cannot tell which commit of the pdf package was built in"; exit 1; }
-printf "dazzle $V %s %s for %s\npdf $PDFV %s\nhttps://github.com/rschleitzer/dazzle\n" "$DAY" "$COMMIT" "$SYSTEM" "$PDF" > "$W/$NAME/VERSION"
+[ -n "$PDF" ] || { echo "release: FAIL — cannot tell which pdf package was built in"; exit 1; }
+printf "dazzle $V %s %s for %s\npdf $PDFV tree %s\nhttps://github.com/rschleitzer/dazzle\n" "$DAY" "$COMMIT" "$SYSTEM" "$PDF" > "$W/$NAME/VERSION"
 if [ "$os" = windows ]; then
   ARCHIVE="$NAME.zip"
   ( cd "$W" && "$(cygpath -u "${SYSTEMROOT:-C:\\Windows}")/System32/tar.exe" -a -c -f "$(cygpath -w "$OUT/$ARCHIVE")" "$NAME" )
