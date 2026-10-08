@@ -20,6 +20,7 @@
 #   sgml           the SGML corpus against it (tests/sgml/run.sh)
 #   opensp         the parser's self-tests (tests/opensp/run.sh, `scaly test`)
 #   cmscratch      the content-model scratch arena (tests/sgml/cmscratch/run.sh)
+#   quiet          onsgmls -s: no ESIS, the same messages (tests/sgml/quiet/run.sh)
 #
 # The dazzle suites and the corpus run under SCALY_POISON=1: every released
 # page is overwritten, so a read after release faults at its first use instead
@@ -90,6 +91,7 @@ if step onsgmls-build tests/sgml/build-onsgmls.sh "$LOG/onsgmls"; then
   step sgml env SCALY_POISON=1 tests/sgml/run.sh "$sgml_bin"
   step opensp tests/opensp/run.sh
   step cmscratch tests/sgml/cmscratch/run.sh "$LOG/onsgmls"
+  step quiet tests/sgml/quiet/run.sh "$LOG/onsgmls"
 else
   step opensp tests/opensp/run.sh
 fi

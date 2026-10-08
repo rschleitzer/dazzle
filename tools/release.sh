@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tools/release.sh — the programs of this repository as one archive for the
-# system it runs on: dazzle built with a profile, onsgmls beside it.
+# system it runs on: dazzle and onsgmls, each built with a profile.
 #
 #   tools/release.sh [outdir]          # default dist/
 #
@@ -22,7 +22,7 @@
 #   1. stamps the version: `dazzle -v` of a released program says
 #      "0.1.0 <day> <commit>" (one line of programs/dazzle.scaly, put back at
 #      the end)
-#   2. builds dazzle instrumented (`scaly build --pgo-train`)
+#   2. builds dazzle and onsgmls instrumented (`scaly build --pgo-train`)
 #   3. trains it on what the Scaly repository itself runs: ./mkp (the parser
 #      and syntax generators, the literate tests) and the specification as HTML
 #      and as PDF. Measured 2026-10-07: that profile takes 13 % off a
@@ -31,10 +31,14 @@
 #      $SCALY_TRAIN names a checkout of github.com/rschleitzer/Scaly to train
 #      on (it is written into: use a clone made for this); unset, one is
 #      fetched.
-#   4. builds dazzle with the profile, onsgmls `--release`
+#      onsgmls is trained on the documents those runs read: the grammar, the
+#      literate tests and the specification, each parsed to its ESIS and once
+#      more with -s, the parse alone.
+#   4. builds both with their profiles
 #   5. checks the result: the profiled dazzle must regenerate the training
 #      checkout's generated files byte for byte (they are checked in there),
-#      and pass every dazzle suite of this repository
+#      and pass every dazzle suite of this repository; the profiled onsgmls
+#      must write the ESIS the instrumented one wrote, byte for byte
 #   6. packs dazzle, onsgmls and the licence, with a checksum beside the archive
 #
 # The archive is named dazzle-<day>-<commit>-<system>: this repository's
@@ -99,6 +103,11 @@ echo "release: dazzle, instrumented"
 "$SCALY" build "$PROGRAM" --pgo-train -o "$W/dazzle-train$EXE" > "$W/train-build.log" 2>&1 \
   || { tail -20 "$W/train-build.log"; echo "release: FAIL — the instrumented build"; exit 1; }
 
+echo "release: onsgmls, instrumented"
+ONSGMLS=packages/opensp/0.1.0/programs/onsgmls.scaly
+"$SCALY" build "$ONSGMLS" --pgo-train -o "$W/onsgmls-train$EXE" > "$W/onsgmls-train-build.log" 2>&1 \
+  || { tail -20 "$W/onsgmls-train-build.log"; echo "release: FAIL — the instrumented build of onsgmls"; exit 1; }
+
 # 3. training
 TRAIN="${SCALY_TRAIN:-}"
 if [ -z "$TRAIN" ]; then
@@ -126,14 +135,34 @@ LLVM_PROFILE_FILE="$W/prof/train-%p.profraw" train "$W/dazzle-train$EXE" \
 ls "$W/prof"/*.profraw > /dev/null 2>&1 || { echo "release: FAIL — the training runs wrote no profile"; exit 1; }
 "$PROFDATA" merge -o "$W/dazzle.profdata" "$W/prof"/*.profraw
 
+# onsgmls: the documents the runs above read, each to its ESIS (kept, for the
+# check in step 5). The specification is the large one -- a DocBook book with
+# its DTD and every chapter an entity.
+parse_all() { # the parses with the program $1, their output into the directory $2
+  mkdir -p "$2"
+  ( cd "$TRAIN" && for d in scaly.sgm tests/expressions.sgm tests/definitions.sgm tests/choose.sgm tests/controlflow.sgm; do
+      "$1" "$d" > "$2/$(basename "$d").esis" 2> "$2/$(basename "$d").err" || exit 1
+      "$1" -s "$d" > /dev/null 2>&1 || exit 1
+    done ) || return 1
+  ( cd "$TRAIN/docs" && SP_ENCODING=utf-8 "$1" scaly-spec.xml > "$2/scaly-spec.esis" 2> "$2/scaly-spec.err" \
+      && SP_ENCODING=utf-8 "$1" -s scaly-spec.xml > /dev/null 2>&1 ) || return 1
+}
+mkdir -p "$W/prof-onsgmls"
+LLVM_PROFILE_FILE="$W/prof-onsgmls/train-%p.profraw" parse_all "$W/onsgmls-train$EXE" "$W/esis-train" \
+  || { echo "release: FAIL — a training parse of onsgmls"; exit 1; }
+ls "$W/prof-onsgmls"/*.profraw > /dev/null 2>&1 || { echo "release: FAIL — the training parses wrote no profile"; exit 1; }
+"$PROFDATA" merge -o "$W/onsgmls.profdata" "$W/prof-onsgmls"/*.profraw
+
 # 4. the programs
-echo "release: dazzle with the profile, onsgmls"
+echo "release: dazzle and onsgmls with their profiles"
 "$SCALY" build "$PROGRAM" --pgo "$W/dazzle.profdata" -o "$W/dazzle$EXE" > "$W/pgo-build.log" 2>&1 \
   || { tail -20 "$W/pgo-build.log"; echo "release: FAIL — the build with the profile"; exit 1; }
 stale=$(grep -c 'profile data may be out of date\|function control flow change detected' "$W/pgo-build.log" || true)
 [ "$stale" = 0 ] || { echo "release: FAIL — $stale warnings of a profile that does not fit the program"; exit 1; }
-"$SCALY" build packages/opensp/0.1.0/programs/onsgmls.scaly --release -o "$W/onsgmls$EXE" > "$W/onsgmls-build.log" 2>&1 \
-  || { tail -20 "$W/onsgmls-build.log"; echo "release: FAIL — onsgmls"; exit 1; }
+"$SCALY" build "$ONSGMLS" --pgo "$W/onsgmls.profdata" -o "$W/onsgmls$EXE" > "$W/onsgmls-build.log" 2>&1 \
+  || { tail -20 "$W/onsgmls-build.log"; echo "release: FAIL — onsgmls with the profile"; exit 1; }
+stale=$(grep -c 'profile data may be out of date\|function control flow change detected' "$W/onsgmls-build.log" || true)
+[ "$stale" = 0 ] || { echo "release: FAIL — $stale warnings of a profile that does not fit onsgmls"; exit 1; }
 
 # 5. the checks
 said="$("$W/dazzle$EXE" -v < /dev/null 2>&1 | head -1 | sed 's/.*:I: //')"
@@ -143,6 +172,11 @@ git -C "$TRAIN" checkout -q -- . 2>/dev/null || true
 train "$W/dazzle$EXE" || { echo "release: FAIL — the profiled program on the training runs"; exit 1; }
 changed="$(git -C "$TRAIN" status --porcelain --untracked-files=no | grep -v ' docs/' || true)"
 [ -z "$changed" ] || { echo "$changed" | head -10; echo "release: FAIL — the profiled program generates other files than are checked in"; exit 1; }
+echo "release: checking — onsgmls parses as it did in training"
+parse_all "$W/onsgmls$EXE" "$W/esis-check" || { echo "release: FAIL — a parse of the profiled onsgmls"; exit 1; }
+for e in "$W/esis-train"/*.esis; do
+  cmp -s "$e" "$W/esis-check/$(basename "$e")" || { echo "release: FAIL — the profiled onsgmls writes another ESIS for $(basename "$e" .esis)"; exit 1; }
+done
 unset SP_LINE_TERM
 echo "release: checking — the suites"
 failed=""
