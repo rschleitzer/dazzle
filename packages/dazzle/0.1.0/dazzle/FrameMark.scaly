@@ -199,6 +199,8 @@ define FM_SPAN_BYTES: i64 9 ;   and the bytes it holds
 define FM_SPAN_LIMIT: i64 10 ; how many further pages `span_collect` goes (0: never take a result out)
 define FM_BASE: i64 11      ; `nest`: the column of stack depth 1 -- an evaluation run by a
                             ;   primitive has a VM of its own, counting from 1 again
+define FM_VIEWS: i64 12     ; the VIEW region of the bracket (Interpreter.view_host), 0: none
+define FM_VEPOCH: i64 13    ;   and its counter: a view older than the innermost frame grew
 define FM_SPAN: i64 32      ; the pages themselves: FM_SPAN_MAX words up to FM_HDR
 define FM_SPAN_MAX: i64 64
 ; ... and how far it goes unless DAZZLE_EVACUATE says otherwise. Measured
@@ -209,7 +211,7 @@ define FM_SPAN_DEFAULT: i64 16
 define FM_HDR: i64 128       ; where the per-frame columns start
 
 ; one 64-byte line per frame
-define FM_COLS: i64 8
+define FM_COLS: i64 16
 define FC_PAGE: i64 0       ; the mark's page
 define FC_OFF: i64 1        ; the mark itself
 define FC_EXCL: i64 2       ; the mark page's exclusive list — condition 3
@@ -217,6 +219,14 @@ define FC_HEXCL: i64 3      ; the region HEAD's, a DIFFERENT list
 define FC_HEADAT: i64 4     ; the head's bump at the push — condition 6
 define FC_GEN: i64 5        ; -1 means "this frame carries no mark"
 define FC_EPOCH: i64 6
+; the same mark on the VIEW region (FM_VIEWS), taken with the frame's own
+define FC_VHEAD: i64 8      ; the view region it was taken on, 0: none
+define FC_VPAGE: i64 9
+define FC_VOFF: i64 10
+define FC_VEXCL: i64 11
+define FC_VHEXCL: i64 12
+define FC_VHEADAT: i64 13
+define FC_VEPOCH: i64 14
 
 ; The state block is the ENGINE's, not the process's: `Interpreter.make` asks
 ; `create` for one and keeps it in `frame_mark`, every VM copies it (the frame
@@ -382,6 +392,22 @@ define FrameMark
         *(c + FC_HEADAT) := FrameMark.bump(head)
         *(c + FC_GEN) := *(f + FM_GEN)
         *(c + FC_EPOCH) := *(f + FM_EPOCH)
+        ; ... and where the view region stands
+        *(c + FC_VHEAD) := 0
+        let vh *(f + FM_VIEWS)
+        if vh = 0
+            return
+        let vt FrameMark.tail(vh)
+        let vb FrameMark.bump(vt)
+        if vb = 0
+            return
+        *(c + FC_VHEAD) := vh
+        *(c + FC_VPAGE) := vt
+        *(c + FC_VOFF) := vb
+        *(c + FC_VEXCL) := FrameMark.exclusive(vt)
+        *(c + FC_VHEXCL) := FrameMark.exclusive(vh)
+        *(c + FC_VHEADAT) := FrameMark.bump(vh)
+        *(c + FC_VEPOCH) := *(f + FM_VEPOCH)
     }
 
     ; The ReturnInsn arm and PrimitiveObj::tailCall, before VM.pop_frame — `csp`
@@ -426,8 +452,155 @@ define FrameMark
         ; that shows the mark engaged: a silently disabled mark passes every
         ; differential there is.
         if FrameMark.rewind(c, head)
+        {
             *(f + FM_REWOUND) := *(f + FM_REWOUND) + 1
+            FrameMark.rewind_views(f, c)
+        }
         false
+    }
+
+    ; ---- the VIEW region -------------------------------------------------
+    ; A lazy node list keeps what it has walked in buffers of their own
+    ; (`out`, the prefix, the path). They cannot lie on the evaluation region:
+    ; whichever frame asks the list for a member grows them, at the region's
+    ; end, inside ITS span. So they lie on a region beside it -- and stayed
+    ; there until the bracket ended, for every list a frame made and dropped:
+    ; measured 2026-10-08 on the heaviest real-world codegen, 14.8 million
+    ; lists and 211 MB of such buffers in one bracket.
+    ; A frame's mark is taken on that region too (push_on), and when the frame
+    ; is given back, so is what the view region gained since -- under the same
+    ; conditions as on the evaluation region, and one of its own:
+    ;   * every list made in the frame died with it: the frame was REWOUND
+    ;     (this runs only then), by the plain path -- its result lay outside
+    ;     its span, so it is no list of the frame's;
+    ;   * no list OLDER than the frame grew meanwhile (`view_grows` takes the
+    ;     view mark from every frame younger than the list): such a buffer
+    ;     lies above the frame's view mark and belongs to a list that lives on.
+    procedure rewind_views(mutable f: pointer[i64], c: pointer[i64])
+    {
+        let vh *(c + FC_VHEAD)
+        if vh = 0
+            return
+        if vh <> *(f + FM_VIEWS)
+            return
+        if *(c + FC_VEPOCH) <> *(f + FM_VEPOCH)
+            return
+        if *(c + FC_VPAGE) <> vh
+        {
+            if FrameMark.bump(vh) <> *(c + FC_VHEADAT)
+                return
+        }
+        ; A list that grew past a kilobyte has a buffer with a page of its own,
+        ; entered in the exclusive list of the page its Array lies on -- above
+        ; the mark, so it is this frame's, like the list. Page.rewind refuses
+        ; a span that gained such a page (on the evaluation region it cannot
+        ; know whose it is); here every one is given back first. Each list is
+        ; walked to the entry the mark saw BEFORE anything is released: an
+        ; entry of then that is gone now would mean an older buffer was moved,
+        ; and then nothing is touched.
+        let mp *(c + FC_VPAGE)
+        if FrameMark.list_holds(mp, *(c + FC_VEXCL)) = false
+            return
+        if mp <> vh
+        {
+            if FrameMark.list_holds(vh, *(c + FC_VHEXCL)) = false
+                return
+        }
+        FrameMark.release_exclusive(mp, *(c + FC_VEXCL))
+        if mp <> vh
+            FrameMark.release_exclusive(vh, *(c + FC_VHEXCL))
+        var later FrameMark.next_page(mp)
+        while later <> 0
+        {
+            FrameMark.release_exclusive(later, 0)
+            later := FrameMark.next_page(later)
+        }
+        let hp vh as pointer[Page]
+        let gone hp.rewind(mp as pointer[Page], *(c + FC_VOFF) as pointer[void], *(c + FC_VEXCL) as pointer[PageNode], *(c + FC_VHEXCL) as pointer[PageNode])
+    }
+
+    ; Is `keep` -- an entry of the page's exclusive list, or 0 for its end --
+    ; still reached from the list's head?
+    function list_holds(page: i64, keep: i64) returns bool
+    {
+        let pg page as pointer[Page]
+        var node pg.exclusive_pages.head
+        while (node as i64) <> keep
+        {
+            if node = null
+                return false
+            node := node.next
+        }
+        true
+    }
+
+    ; Give back every exclusive page entered in front of `keep`.
+    procedure release_exclusive(page: i64, keep: i64)
+    {
+        let pg page as pointer[Page]
+        while (pg.exclusive_pages.head as i64) <> keep
+        {
+            let node pg.exclusive_pages.head
+            if node = null
+                return
+            pg.deallocate_exclusive_page(node.page as ref[Page])
+        }
+    }
+
+    ; Interpreter.set_views — the bracket's view region (null: none). A frame
+    ; that took its mark on another one finds FC_VHEAD differing.
+    procedure views(mutable f: pointer[i64], p: ref[Page]?)
+    {
+        if f = null
+            return
+        *(f + FM_VIEWS) := p as i64
+        *(f + FM_VEPOCH) := *(f + FM_VEPOCH) + 1
+    }
+
+    ; A list is about to grow one of its buffers; `owner` is its generator
+    ; record, on the evaluation region. The buffer lands above the view mark
+    ; of every live frame. For a frame whose span HOLDS the list that is
+    ; harmless -- the list dies with it; a frame pushed after the list was
+    ; made must not give that stretch of the view region back, and is told so
+    ; (FC_VHEAD 0: it carries no view mark any more). The walk goes from the
+    ; innermost frame outwards and ends at the first frame that holds the
+    ; list, since every frame around that one holds it too. Frames of another
+    ; generation carry no mark that could be honoured anyway.
+    ; ★The first version raised one counter for all live frames: measured on
+    ; the heaviest real-world codegen it was raised 2.6 million times and left
+    ; 135 MB in the view region of one bracket.
+    procedure view_grows(mutable f: pointer[i64], owner: pointer[void])
+    {
+        if f = null
+            return
+        if *(f + FM_VIEWS) = 0
+            return
+        let head *(f + FM_HEAD)
+        var idx *(f + FM_TOP)
+        if head = 0 or idx >= FM_MAX_DEPTH
+        {
+            *(f + FM_VEPOCH) := *(f + FM_VEPOCH) + 1
+            return
+        }
+        var steps 0
+        while idx >= 0
+        {
+            let c f + (FM_HDR + (idx * FM_COLS))
+            if *(c + FC_GEN) = *(f + FM_GEN)
+            {
+                if FrameMark.in_span(c, head, owner)
+                    return
+                *(c + FC_VHEAD) := 0
+            }
+            idx := idx - 1
+            steps := steps + 1
+            if steps > 256
+            {
+                ; too deep to walk: every live frame keeps its views
+                *(f + FM_VEPOCH) := *(f + FM_VEPOCH) + 1
+                return
+            }
+        }
     }
 
     ; --- for the caller that lifts condition 4 (ELObj.evacuate) --------------
@@ -516,9 +689,27 @@ define FrameMark
         if FrameMark.rewind(c, *(f + FM_HEAD))
         {
             *(f + FM_REWOUND) := *(f + FM_REWOUND) + 1
+            ; the result was taken out, and ELObj.evac_ok lets nothing out
+            ; that holds a buffer of the view region: the frame's lists are
+            ; as dead here as after a plain rewind
+            FrameMark.rewind_views(f, c)
             return true
         }
         false
+    }
+
+    ; Does `p` lie on the view region's own pages? (An Array record does; its
+    ; buffer may have a page of its own, which answers no -- ask the record.)
+    function in_views(f: pointer[i64], p: pointer[void]) returns bool
+    {
+        if f = null
+            return false
+        if p = null
+            return false
+        let vh *(f + FM_VIEWS)
+        if vh = 0
+            return false
+        FrameMark.head_of(Page.get(p) as i64) = vh
     }
 
     ; the size of the result an evacuation is looking at, in objects
