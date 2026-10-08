@@ -20,6 +20,7 @@ use scaly.containers.Array
 use scaly.containers.String.String
 use scaly.containers.StringBuilder.StringBuilder
 use scaly.os.File.File
+use scaly.memory.runtime.fwrite
 use scaly.os.Directory.Directory
 use dazzle.TestScratch.TestScratch
 use opensp.StringC.StringC
@@ -32,6 +33,11 @@ use dazzle.Grove.GroveNode
 define TFB_MIDDLE: int 0
 define TFB_START_OF_ELEMENT: int 1
 define TFB_PENDING_RE: int 2
+
+; A redirected file's buffer is written out and emptied when it holds this
+; many characters (TransformFOTBuilder.spill): a megabyte of buffer, where the
+; whole file used to wait for its entity's end.
+define TFB_SPILL: size_t 262144
 
 ; libc + shim externs for the entity-FO open probe. Prototypes match the
 ; other roots' declarations (runtime.scaly fopen/fclose, Storage.scaly
@@ -62,7 +68,7 @@ shared tfb_prog: pointer[const_char] null
 ; encode scratch, released when the file is written. This is where a codegen
 ; run's memory goes — 84 % of the peak is per-file work, and the entity flow
 ; object is its seam (lever 2).
-define TfbOpenFile (buf: ref[Array[u32]], save: ref[Array[u32]]?, filename: String, sysid: String, region: ref[Page]?)
+define TfbOpenFile (buf: ref[Array[u32]], save: ref[Array[u32]]?, filename: String, sysid: String, region: ref[Page]?, var spilled: bool)
 
 define TransformFOTBuilder
 (
@@ -294,6 +300,7 @@ define TransformFOTBuilder
                 this.out.add(c)
             i := i + 1
         }
+        this.spill()
     }
 
     ; charactersFromNode — SDATA substitution is deferred (preserve-sdata?);
@@ -406,10 +413,80 @@ define TransformFOTBuilder
         this.output_ascii(";")
     }
 
+    ; ★A generator hands the whole content of a file over as ONE string, and
+    ; megabytes of it: it goes into the buffer a stretch at a time, so that
+    ; the buffer can be written out in between (spill) instead of growing to
+    ; the string's size beside it.
     procedure formatting_instruction(mutable this: ref[TransformFOTBuilder], s: StringC)
     {
         this.flush_pending_re()
-        this.output_stringc(s)
+        let all s.as_slice()
+        if all.length <= TFB_SPILL
+        {
+            this.out.add(all)
+            this.spill()
+            return
+        }
+        var pos: size_t 0
+        while pos < all.length
+        {
+            var stop pos + TFB_SPILL
+            if stop > all.length
+                stop := all.length
+            this.out.add(all.subslice(pos, stop))
+            this.spill()
+            pos := stop
+        }
+    }
+
+    ; Write a redirected file's buffer out and empty it once it is large.
+    ; Only where the output encoding is UTF-8 -- encode_records then maps
+    ; character by character, and pieces put together are the whole; another
+    ; encoder may write a byte order mark or keep a state per call, so such a
+    ; file waits for its end as before. The record end still pending is not in
+    ; the buffer (flush_pending_re), so no piece ends inside one.
+    procedure spill(mutable this: ref[TransformFOTBuilder])
+    {
+        if this.out.get_length() < TFB_SPILL
+            return
+        if this.file_count = 0
+            return
+        let ofp this.file_stack.get(this.file_count - 1)
+        if ofp = null
+            return
+        if ofp.region = null
+            return
+        if (ofp.buf as size_t) <> (this.out as size_t)
+            return
+        if CodingSystemKit.output_is_utf8() = false
+            return
+        let region ofp.region as ref[Page]
+        if this.append_buffer_to_file(region, this.out, ofp.filename) = false
+        {
+            this.file_error("cannot write output file ", ofp.sysid, scaly_eio_errno())
+            return
+        }
+        this.out.clear()
+        ofp.spilled := true
+    }
+
+    ; The buffer, encoded, at the END of the file (start_entity has made it
+    ; empty). The encoded bytes live on a region of this call alone.
+    procedure append_buffer_to_file(this: ref[TransformFOTBuilder], region: ref[Page], buf: ref[Array[u32]], filename: String) returns bool
+    {
+        let work region.allocate_exclusive_page()
+        let content this.encode_records(work, buf.as_slice())
+        var ok false
+        let fh fopen(filename.to_c_string(), "ab")
+        if fh <> null
+        {
+            let wrote fwrite(content.get_buffer() as pointer[void], 1, content.get_length(), fh)
+            ok := wrote = content.get_length()
+            if fclose(fh) <> 0
+                ok := false
+        }
+        region.deallocate_exclusive_page(work)
+        ok
     }
 
     ; the CLI driver's argv0 — the prefix of the entity-file app messages.
@@ -470,7 +547,7 @@ define TransformFOTBuilder
                 redirected := true
             }
         }
-        var of TfbOpenFile(this.out, this.out, String(), String(), null)
+        var of TfbOpenFile(this.out, this.out, String(), String(), null, false)
         if redirected
         {
             ; the file's own region — see the TfbOpenFile comment. The buffer
@@ -479,7 +556,7 @@ define TransformFOTBuilder
             ; too and the whole file's output cost dies at end_entity.
             let fr this.host.allocate_exclusive_page()
             let newbuf Array[u32]^fr()
-            of := TfbOpenFile(newbuf, this.out, filename, name_str, fr)
+            of := TfbOpenFile(newbuf, this.out, filename, name_str, fr, false)
             this.out := newbuf
         }
         if this.file_count < this.file_stack.get_length()
@@ -507,7 +584,13 @@ define TransformFOTBuilder
                     var scratch this.host
                     if of.region <> null
                         scratch := of.region as ref[Page]
-                    if this.flush_buffer_to_file(scratch, of.buf, of.filename) = false
+                    ; a file written out in pieces gets its last one the same way
+                    var done false
+                    if of.spilled
+                        done := this.append_buffer_to_file(scratch, of.buf, of.filename)
+                    else
+                        done := this.flush_buffer_to_file(scratch, of.buf, of.filename)
+                    if done = false
                         this.file_error("cannot close output file ", of.sysid, scaly_eio_errno())
                 }
                 this.out := of.save as ref[Array[u32]]

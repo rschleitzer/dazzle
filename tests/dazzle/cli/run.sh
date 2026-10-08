@@ -420,6 +420,19 @@ if [ "$gotCRLF" != " o n e \r \n t w o \r \n " ] || [ "$gotLF" != " o n e \n t w
   echo "  crlf: '$gotCRLF'  lf: '$gotLF'  with MS-DOS file names: '$gotFollow'"; head -2 "$WM/lines.err"
   exit 1
 fi
+# A file LARGER than the buffer a redirected entity is given: the backend
+# writes such a file out in pieces as it goes (TransformFOTBuilder.spill)
+# instead of holding all of it until the entity ends. One string of 640 000
+# characters between two short ones -- the pieces must come out as the whole,
+# in order, each record end once.
+printf '(declare-flow-object-class formatting-instruction "UNREGISTERED::James Clark//Flow Object Class::formatting-instruction")\n(declare-flow-object-class entity "UNREGISTERED::James Clark//Flow Object Class::entity")\n(define (rep n s) (let loop ((i 0) (acc "")) (if (= i n) acc (loop (+ i 1) (string-append acc s)))))\n(element doc (make entity system-id: "big.txt" (make formatting-instruction data: "head\r") (make formatting-instruction data: (rep 40000 "0123456789abcde\r")) (make formatting-instruction data: "tail\r")))\n' > "$WM/big.dsl"
+( cd "$WM" && rm -f big.txt && env -u SCALY_HOME HOME="$WM/home" USERPROFILE="$WM/home" SP_LINE_TERM=lf "$OUT" -t sgml -d big.dsl sub/doc.sgml > /dev/null 2>"$WM/big.err" )
+{ echo head; yes 0123456789abcde | head -40000; echo tail; } > "$WM/big.want"
+if ! cmp -s "$WM/big.txt" "$WM/big.want"; then
+  echo "dazzle-cli: FAIL a file larger than its buffer"
+  echo "  $(wc -c < "$WM/big.txt" 2>/dev/null) bytes, want $(wc -c < "$WM/big.want"); $(head -2 "$WM/big.err")"
+  exit 1
+fi
 rm -rf "$WM"
 
 echo "dazzle-cli: PASS"
