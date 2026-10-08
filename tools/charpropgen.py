@@ -22,7 +22,7 @@ return a `pointer[const_char]` literal).
 
 Usage:  tools/charpropgen.py > /tmp/cp.scaly
         then splice the tables into
-        packages/dazzle/0.1.0/dazzle/CharProps.scaly (the install code below
+        dazzle/CharProps.scaly of the dazzle package (the install code below
         them is hand-written).
 """
 import re, sys, os

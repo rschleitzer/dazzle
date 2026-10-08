@@ -3,7 +3,7 @@
 #
 #   tests/dazzle/framemark/run.sh [scalyc-binary]
 #
-# The mark (packages/dazzle/0.1.0/dazzle/FrameMark.scaly) reclaims per VM FRAME
+# The mark (dazzle/FrameMark.scaly of the dazzle package) reclaims per VM FRAME
 # inside an eval bracket, and it is ON BY DEFAULT since 2026-08-07 — so every
 # other suite in the tree now runs it, and this gate no longer has to. What it
 # guards instead is the other three things a default needs:

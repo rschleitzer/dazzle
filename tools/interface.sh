@@ -3,7 +3,7 @@
 #
 #   tools/interface.sh [--check] [scalyc-binary]
 #
-# packages/<p>/0.1.0/interface/ is the package's module tree with every
+# packages/<p>/<version>/interface/ is the package's module tree with every
 # non-generic body replaced by `linked` and the facts a caller needs written
 # out; the compiler writes it (`scalyc --emit-interface`), and a root that
 # depends on the package reads the package through it. Without --check the
@@ -19,7 +19,7 @@ T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 rc=0
 for p in opensp dazzle; do
-  root="packages/$p/0.1.0/$p.scaly"; out="packages/$p/0.1.0/interface"
+  v="$(tools/version.sh "$p")"; root="packages/$p/$v/$p.scaly"; out="packages/$p/$v/interface"
   if ! ( ulimit -s 65520 2>/dev/null; "$SCALYC" --emit-interface -o "$T/$p" "$root" ) > "$T/$p.out" 2>&1; then
     echo "interface: FAIL ($p)"; head -5 "$T/$p.out"; rc=1; continue
   fi

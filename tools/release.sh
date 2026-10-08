@@ -20,7 +20,7 @@
 #
 # What it does:
 #   1. stamps the version: `dazzle -v` of a released program says
-#      "0.1.0 <day> <commit>" (one line of programs/dazzle.scaly, put back at
+#      "<version> <day> <commit>" (one line of programs/dazzle.scaly, put back at
 #      the end)
 #   2. builds dazzle and onsgmls instrumented (`scaly build --pgo-train`)
 #   3. trains it on what the Scaly repository itself runs: ./mkp (the parser
@@ -41,9 +41,10 @@
 #      must write the ESIS the instrumented one wrote, byte for byte
 #   6. packs dazzle, onsgmls and the licence, with a checksum beside the archive
 #
-# The archive is named dazzle-<day>-<commit>-<system>: this repository's
-# packages stay at 0.1.0 while they change, so the day and the commit are what
-# tells two archives apart.
+# The archive is named dazzle-<day>-<commit>-<system>: a version of the
+# packages is published with a release and worked on in between, so the day
+# and the commit are what tells two archives apart. The version is the one
+# tools/version.sh names.
 set -eu
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
@@ -86,15 +87,16 @@ STAMP="$DAY-$COMMIT"
 NAME="dazzle-$STAMP-$SYSTEM"
 
 W="$(mktemp -d)"
-PROGRAM=packages/dazzle/0.1.0/programs/dazzle.scaly
+V="$(tools/version.sh dazzle)"
+PROGRAM="packages/dazzle/$V/programs/dazzle.scaly"
 cp "$PROGRAM" "$W/dazzle.scaly.kept"
 trap 'cp "$W/dazzle.scaly.kept" "$ROOT/$PROGRAM"; rm -rf "$W"' EXIT
 
 echo "release: $NAME"
 
 # 1. the stamp
-grep -q '^    StringC("0.1.0")$' "$PROGRAM" || { echo "release: FAIL — the version line of $PROGRAM is not where it was"; exit 1; }
-sed "s|^    StringC(\"0.1.0\")\$|    StringC(\"0.1.0 $DAY $COMMIT\")|" "$W/dazzle.scaly.kept" > "$PROGRAM"
+grep -q "^    StringC(\"$V\")\$" "$PROGRAM" || { echo "release: FAIL — the version line of $PROGRAM is not where it was"; exit 1; }
+sed "s|^    StringC(\"$V\")\$|    StringC(\"$V $DAY $COMMIT\")|" "$W/dazzle.scaly.kept" > "$PROGRAM"
 
 export SCALY_CACHE="$W/cache"
 
@@ -104,7 +106,7 @@ echo "release: dazzle, instrumented"
   || { tail -20 "$W/train-build.log"; echo "release: FAIL — the instrumented build"; exit 1; }
 
 echo "release: onsgmls, instrumented"
-ONSGMLS=packages/opensp/0.1.0/programs/onsgmls.scaly
+ONSGMLS="packages/opensp/$(tools/version.sh opensp)/programs/onsgmls.scaly"
 "$SCALY" build "$ONSGMLS" --pgo-train -o "$W/onsgmls-train$EXE" > "$W/onsgmls-train-build.log" 2>&1 \
   || { tail -20 "$W/onsgmls-train-build.log"; echo "release: FAIL — the instrumented build of onsgmls"; exit 1; }
 
@@ -166,7 +168,7 @@ stale=$(grep -c 'profile data may be out of date\|function control flow change d
 
 # 5. the checks
 said="$("$W/dazzle$EXE" -v < /dev/null 2>&1 | head -1 | sed 's/.*:I: //')"
-[ "$said" = "\"dazzle\" version \"0.1.0 $DAY $COMMIT\"" ] || { echo "release: FAIL — the program says: $said"; exit 1; }
+[ "$said" = "\"dazzle\" version \"$V $DAY $COMMIT\"" ] || { echo "release: FAIL — the program says: $said"; exit 1; }
 echo "release: checking — the training checkout regenerated"
 git -C "$TRAIN" checkout -q -- . 2>/dev/null || true
 train "$W/dazzle$EXE" || { echo "release: FAIL — the profiled program on the training runs"; exit 1; }
@@ -195,15 +197,17 @@ mkdir -p "$OUT" "$W/$NAME"
 cp "$W/dazzle$EXE" "$W/onsgmls$EXE" LICENSE "$W/$NAME/"
 # the pdf package the programs were built with: a checkout linked in as
 # packages/pdf (it must be committed), else what scaly fetched
-if [ -d packages/pdf/0.1.0 ]; then
-  git -C packages/pdf/0.1.0 diff --quiet HEAD -- . 2>/dev/null \
+PDFV="$(sed -n 's/^package pdf \([0-9.]*\) .*/\1/p' "packages/dazzle/$V/dazzle.scaly" | head -1)"
+[ -n "$PDFV" ] || { echo "release: FAIL — the dazzle package does not declare the pdf package"; exit 1; }
+if [ -d "packages/pdf/$PDFV" ]; then
+  git -C "packages/pdf/$PDFV" diff --quiet HEAD -- . 2>/dev/null \
     || { echo "release: FAIL — the pdf checkout behind packages/pdf has uncommitted changes"; exit 1; }
-  PDF="$(git -C packages/pdf/0.1.0 rev-parse HEAD 2>/dev/null | cut -c1-7)"
+  PDF="$(git -C "packages/pdf/$PDFV" rev-parse HEAD 2>/dev/null | cut -c1-7)"
 else
-  PDF="$(sed -n 's/^commit //p' "${SCALY_PACKAGES:-${HOME:-$USERPROFILE}/.scaly/packages}/github.com/rschleitzer/pdf/packages/pdf/0.1.0.fetched" 2>/dev/null | cut -c1-7)"
+  PDF="$(sed -n 's/^commit //p' "${SCALY_PACKAGES:-${HOME:-$USERPROFILE}/.scaly/packages}/github.com/rschleitzer/pdf/packages/pdf/$PDFV.fetched" 2>/dev/null | cut -c1-7)"
 fi
 [ -n "$PDF" ] || { echo "release: FAIL — cannot tell which commit of the pdf package was built in"; exit 1; }
-printf 'dazzle 0.1.0 %s %s for %s\npdf 0.1.0 %s\nhttps://github.com/rschleitzer/dazzle\n' "$DAY" "$COMMIT" "$SYSTEM" "$PDF" > "$W/$NAME/VERSION"
+printf "dazzle $V %s %s for %s\npdf $PDFV %s\nhttps://github.com/rschleitzer/dazzle\n" "$DAY" "$COMMIT" "$SYSTEM" "$PDF" > "$W/$NAME/VERSION"
 if [ "$os" = windows ]; then
   ARCHIVE="$NAME.zip"
   ( cd "$W" && "$(cygpath -u "${SYSTEMROOT:-C:\\Windows}")/System32/tar.exe" -a -c -f "$(cygpath -w "$OUT/$ARCHIVE")" "$NAME" )

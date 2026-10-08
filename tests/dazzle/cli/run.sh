@@ -293,8 +293,9 @@ fi
 got14="$(cd "$HERE" && SCALY_HOME="$ROOT" "$OUT" -v -t sgml -d map.dsl doc.sgml 2>"$OUT.verr")"
 rc14=$?
 # (a released program says its day and commit behind the number)
-err14="$(sed -e "s|^$OUT|PROG|" -e 's|"0\.1\.0 [0-9-]* [0-9a-f]*"|"0.1.0"|' "$OUT.verr")"
-wanterr14="$(printf '%s\n' 'PROG:I: "dazzle" version "0.1.0"')"
+V14="$("$ROOT/tools/version.sh" dazzle)"
+err14="$(sed -e "s|^$OUT|PROG|" -e "s|\"${V14//./\\.} [0-9-]* [0-9a-f]*\"|\"$V14\"|" "$OUT.verr")"
+wanterr14="$(printf '%s\n' "PROG:I: \"dazzle\" version \"$V14\"")"
 if [ "$rc14" -ne 0 ] || [ "$got14" != "$base14" ] || [ "$err14" != "$wanterr14" ]; then
   echo "dazzle-cli: FAIL getopt -v (rc=$rc14)"
   echo "  err:  $(printf '%s' "$err14" | cat -v)"
@@ -394,7 +395,7 @@ fi
 WM="$(mktemp -d)"
 mkdir -p "$WM/XMLModel/generator" "$WM/XMLModel/dsssl" "$WM/sub" "$WM/home"
 cp "$HERE/msdos/gen/map.dsl" "$HERE/msdos/gen/rules.scm" "$WM/XMLModel/generator/"
-cp "$ROOT"/packages/dazzle/0.1.0/dsssl/* "$WM/XMLModel/dsssl/"
+cp "$ROOT/packages/dazzle/$("$ROOT/tools/version.sh" dazzle)"/dsssl/* "$WM/XMLModel/dsssl/"
 cp "$HERE/msdos/doc.sgml" "$WM/sub/"
 msdos_run() { ( cd "$WM" && env -u SCALY_HOME HOME="$WM/home" USERPROFILE="$WM/home" SP_FILENAMES="$1" \
   'SGML_CATALOG_FILES=nosuch\catalog;XMLModel\dsssl\catalog' "$OUT" -t sgml -d 'XMLModel\generator\map.dsl' 'sub\doc.sgml' 2>"$WM/$1.err" ); }

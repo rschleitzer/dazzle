@@ -84,8 +84,8 @@ Install Scaly (`curl -fsSL https://scaly.io/install.sh | sh`, on Windows
 [scaly.io/download](https://scaly.io/download/)). Then from this directory:
 
 ```sh
-scaly build packages/dazzle/0.1.0/programs/dazzle.scaly --release -o dazzle
-scaly build packages/opensp/0.1.0/programs/onsgmls.scaly --release -o onsgmls
+scaly build packages/dazzle/$(tools/version.sh dazzle)/programs/dazzle.scaly --release -o dazzle
+scaly build packages/opensp/$(tools/version.sh opensp)/programs/onsgmls.scaly --release -o onsgmls
 ```
 
 The compiler finds dazzle's own packages in `packages/` here and the standard
@@ -99,7 +99,7 @@ them.
 On macOS and Linux compiling the engine needs a 64 MB stack
 (`ulimit -s 65520` in the shell first); on Windows the compiler brings its own.
 
-A program built this way says `0.1.0` for its version (`dazzle -v`). The day
+A program built this way says the number of its package for its version (`dazzle -v`). The day
 and the commit are stamped in by `tools/release.sh`, which builds what the
 [releases](https://github.com/rschleitzer/dazzle/releases) hand out; the
 `VERSION` file of a release names the commit of the pdf package too.

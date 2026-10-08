@@ -31,7 +31,7 @@ cd "$ROOT"
 . tests/toolchain.sh "${1:-}" || exit 2
 set -u
 # SCALY_HOME on a CLI *run* is this repository: the engine resolves its DSSSL
-# prolog and catalog under <home>/packages/dazzle/0.1.0/dsssl. The build keeps
+# prolog and catalog under <home>/packages/dazzle/<version>/dsssl. The build keeps
 # whatever the environment says (the compiler's installation).
 
 DZ="$(mktemp -d)/dazzle"

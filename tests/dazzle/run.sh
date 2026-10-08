@@ -37,7 +37,7 @@ trap 'rm -rf "$TMP"' EXIT
 experr="dazzle:E: invalid character after '#'
 dazzle:E: reference to undefined variable \"bogusvar\"
 dazzle:E: 2nd argument for primitive \"string-append\" of wrong type: \"3\" not a string"
-out="$("$SCALY" test packages/dazzle/0.1.0/dazzle.scaly dazzle.test 2>"$TMP/err")"
+out="$("$SCALY" test "packages/dazzle/$(tools/version.sh dazzle)/dazzle.scaly" dazzle.test 2>"$TMP/err")"
 rc=$?
 err="$(scaly_lf < "$TMP/err")"
 if [ "$rc" -ne 0 ] || [ "$out" != "$(printf 'test dazzle.test ... ok\n1 passed')" ] || [ "$err" != "$experr" ]; then

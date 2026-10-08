@@ -8,7 +8,7 @@
 # Usage:
 #   tools/msggen.py <path-to>/ParserMessages.msg > <out>/ParserMessages.scaly
 #
-# The checked-in output under packages/opensp/0.1.0/opensp/ is byte-exact
+# The checked-in output under opensp/ of the opensp package is byte-exact
 # generator output — regenerate + diff, never hand-edit. See ./mkp (msggen step).
 #
 # Message SOURCING: the diagnostic text + severity + ISO clause + arg count come

@@ -24,7 +24,7 @@ if ! scaly_jit_available; then
   exit 0
 fi
 
-out="$("$SCALY" test packages/opensp/0.1.0/opensp.scaly 2>&1)"
+out="$("$SCALY" test "packages/opensp/$(tools/version.sh opensp)/opensp.scaly" 2>&1)"
 rc=$?
 if [ "$rc" -eq 0 ] && echo "$out" | tail -1 | grep -q ' passed$'; then
   echo "opensp: PASS ($(echo "$out" | tail -1))"
