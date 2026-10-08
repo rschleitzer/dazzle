@@ -8,7 +8,9 @@
 # -- the published one lives on at its commit, which is where a build that
 # declares it fetches it --, and what names the old number follows: the
 # `package <package> <old>` declarations of the other packages and programs
-# here, the version a program of the package says for itself, the README.
+# here and the version a program of the package says for itself. (The
+# README's `scaly install` lines name the PUBLISHED version and follow when
+# the next one is published.)
 #
 # The same renames a version that is NOT published yet -- 0.1.1 to 0.2.0, when
 # `scaly publish --check` says the change takes the second number.
@@ -31,7 +33,6 @@ olde="$(echo "$old" | sed 's/\./\\./g')"
 users="$(git grep -l "^package $p $olde\$" -- '*.scaly' ":!packages/$p/$old" ':!upstream' || true)"
 for f in $users; do
   case "$f" in
-    packages/*/interface/*) ;;
     packages/*/*/*)
       up="$(echo "$f" | cut -d/ -f2)"; uv="$(echo "$f" | cut -d/ -f3)"
       if published "$up" "$uv"; then
@@ -51,11 +52,10 @@ for f in "packages/$p/$new/programs"/*.scaly; do
   [ -f "$f" ] || continue
   sed -i.bak "s/^    StringC(\"$olde\")\$/    StringC(\"$new\")/" "$f" && rm -f "$f.bak"
 done
-sed -i.bak "s/\\([ /]\\)$p $olde\\([ ]\\)/\\1$p $new\\2/g" README.md && rm -f README.md.bak
 echo "next-version: $p $old -> $new (packages/$p/$new; $n files declare it)"
 if published "$p" "$old"; then
   echo "  $old is published: it stays what it was, at its commit."
 else
   echo "  $old was not published: this is a renumbering."
 fi
-echo "  Next: tools/interface.sh (the generated interfaces name versions), tests/run.sh, commit."
+echo "  Next: tests/run.sh, commit."
