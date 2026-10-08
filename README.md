@@ -79,24 +79,39 @@ fetches the package and what it uses, builds its program and puts it beside
 
 ## Build
 
-Install Scaly (`curl -fsSL https://scaly.io/install.sh | sh`, or see
-[scaly.io/download](https://scaly.io/download/)) and check out the pdf package
-beside this repository — `packages/pdf` here is a link into it:
-
-```sh
-git clone https://github.com/rschleitzer/pdf ../pdf
-```
-
-Then from this directory:
+Install Scaly (`curl -fsSL https://scaly.io/install.sh | sh`, on Windows
+`irm https://scaly.io/install.ps1 | iex`, or see
+[scaly.io/download](https://scaly.io/download/)). Then from this directory:
 
 ```sh
 scaly build packages/dazzle/0.1.0/programs/dazzle.scaly --release -o dazzle
 scaly build packages/opensp/0.1.0/programs/onsgmls.scaly --release -o onsgmls
 ```
 
-The compiler finds the packages in `packages/` here and the standard
-library in the installation. Compiling the engine needs a 64 MB stack
-(`ulimit -s 65520`).
+The compiler finds dazzle's own packages in `packages/` here and the standard
+library in the installation. The [pdf](https://github.com/rschleitzer/pdf)
+package is fetched with git the first time, into `~/.scaly/packages/`
+(`%USERPROFILE%\.scaly\packages\` on Windows) — so the first build needs git
+and the network. Its version 0.1.0 is frozen: every build takes the same
+files, and the commit they were fetched at stands in `0.1.0.fetched` beside
+them.
+
+On macOS and Linux compiling the engine needs a 64 MB stack
+(`ulimit -s 65520` in the shell first); on Windows the compiler brings its own.
+
+A program built this way says `0.1.0` for its version (`dazzle -v`). The day
+and the commit are stamped in by `tools/release.sh`, which builds what the
+[releases](https://github.com/rschleitzer/dazzle/releases) hand out; the
+`VERSION` file of a release names the commit of the pdf package too.
+
+To work on the pdf package alongside, link a checkout of it in as
+`packages/pdf` (git ignores the link here); the packages of this directory
+come before a fetched one:
+
+```sh
+git clone https://github.com/rschleitzer/pdf ../pdf
+ln -s ../../pdf/packages/pdf packages/pdf
+```
 
 The program carries its DSSSL prolog and the catalog with the DTDs that read
 a stylesheet, so it runs from any directory:

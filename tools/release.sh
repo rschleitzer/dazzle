@@ -193,7 +193,17 @@ done
 # 6. the archive
 mkdir -p "$OUT" "$W/$NAME"
 cp "$W/dazzle$EXE" "$W/onsgmls$EXE" LICENSE "$W/$NAME/"
-printf 'dazzle 0.1.0 %s %s for %s\nhttps://github.com/rschleitzer/dazzle\n' "$DAY" "$COMMIT" "$SYSTEM" > "$W/$NAME/VERSION"
+# the pdf package the programs were built with: a checkout linked in as
+# packages/pdf (it must be committed), else what scaly fetched
+if [ -d packages/pdf/0.1.0 ]; then
+  git -C packages/pdf/0.1.0 diff --quiet HEAD -- . 2>/dev/null \
+    || { echo "release: FAIL — the pdf checkout behind packages/pdf has uncommitted changes"; exit 1; }
+  PDF="$(git -C packages/pdf/0.1.0 rev-parse HEAD 2>/dev/null | cut -c1-7)"
+else
+  PDF="$(sed -n 's/^commit //p' "${SCALY_PACKAGES:-${HOME:-$USERPROFILE}/.scaly/packages}/github.com/rschleitzer/pdf/packages/pdf/0.1.0.fetched" 2>/dev/null | cut -c1-7)"
+fi
+[ -n "$PDF" ] || { echo "release: FAIL — cannot tell which commit of the pdf package was built in"; exit 1; }
+printf 'dazzle 0.1.0 %s %s for %s\npdf 0.1.0 %s\nhttps://github.com/rschleitzer/dazzle\n' "$DAY" "$COMMIT" "$SYSTEM" "$PDF" > "$W/$NAME/VERSION"
 if [ "$os" = windows ]; then
   ARCHIVE="$NAME.zip"
   ( cd "$W" && "$(cygpath -u "${SYSTEMROOT:-C:\\Windows}")/System32/tar.exe" -a -c -f "$(cygpath -w "$OUT/$ARCHIVE")" "$NAME" )
