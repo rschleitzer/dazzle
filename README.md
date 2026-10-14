@@ -63,6 +63,47 @@ it, so a stylesheet can lay out a whole tree of generated files.
     (make formatting-instruction data: "content")))
 ```
 
+## Performance
+
+Measured on a code generator in daily use:
+[fire](https://github.com/rschleitzer/fire), a FHIR server generated from
+HL7's definitions, with all 146 resource types active. Two stylesheets read
+the same 4.7 MB model. One writes a server in Scaly (309 files: the model as
+data, the program, a client package, a web root), the other a server in C#
+(1459 files, 260 000 lines). Both engines write the same files, byte for
+byte. Apple M4 (four performance and six efficiency cores), macOS 26, fire
+at `b0b8fd1`, this repository at `ce76317`; the median of three runs of
+`/usr/bin/time -l`:
+
+| stylesheet | engine | wall | CPU | instructions | memory |
+|---|---|---|---|---|---|
+| Scaly server | C++ | 6.17 s | 6.04 s | 101.2 G | 158 MB |
+| | Scaly | 4.61 s | 4.12 s | 52.9 G | 228 MB |
+| C# server | C++ | 39.96 s | 39.54 s | 316.4 G | 147 MB |
+| | Scaly | 4.82 s | 3.88 s | 73.1 G | 267 MB |
+
+The C# stylesheet is where the original takes eight times as long. Both
+engines define `node-list-filter` in DSSSL (`builtins.dsl`), as a fold of
+`(node-list result snl)`: a chain of pairs, which the original walks again
+for every member it is asked for, so going through a filtered list is
+quadratic. The port flattens such a list once, on its first access. That
+stylesheet filters often, some of it inside loops over the resources.
+
+Memory goes the other way. The original collects garbage; the port keeps
+what a run allocates, in regions, until the run ends. A stylesheet that
+makes much garbage costs the port more memory than the original, and an
+idiom that is quadratic in garbage costs it orders of magnitude more: the
+Scaly stylesheet above took 7.3 GB (the original 151 MB) until its
+`string-replace` stopped copying the whole string at every match.
+
+To run it, in a checkout of fire:
+
+```sh
+export SP_ENCODING=utf-8
+dazzle -t sgml -d codegen/scaly.dsl model/fhir.xml
+cp model/fhir.xml upstream/ && cd upstream && dazzle -t sgml -d codegen/map.dsl fhir.xml
+```
+
 ## Install
 
 With Scaly installed (`curl -fsSL https://scaly.io/install.sh | sh`, on
