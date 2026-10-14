@@ -1,6 +1,7 @@
 # dazzle
 
-A DSSSL processor: James Clark's OpenSP and OpenJade, ported from C++ to
+A DSSSL processor: OpenSP and OpenJade, the OpenJade Project's continuation
+of James Clark's SP and Jade, ported from C++ to
 [Scaly](https://scaly.io) — and, beyond the original, with a backend that
 writes PDF: a DocBook book goes from its XML to a typeset PDF with one
 program and no TeX in between.
