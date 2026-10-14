@@ -105,6 +105,44 @@ dazzle -t sgml -d codegen/scaly.dsl model/fhir.xml
 cp model/fhir.xml upstream/ && cd upstream && dazzle -t sgml -d codegen/map.dsl fhir.xml
 ```
 
+### Building it
+
+The two code bases are of a size: the build of the original compiles about
+136 000 lines of C++, the port is about 141 000 lines of Scaly in
+`packages/opensp` and `packages/dazzle`.
+Building them from scratch on the same machine, the median of three runs:
+CPU is the user and system time of every process of the build, memory the
+largest of any one process. The C++ build is `upstream/build.sh`: OpenSP's
+library, `nsgmls` and `dazzle`, compiled with `-O2 -g` through libtool. The
+Scaly build is `scaly build` of the program with the opensp, dazzle and pdf
+packages (Scaly 0.2.13), its package cache holding the standard library
+only.
+
+| build | wall | CPU | memory |
+|---|---|---|---|
+| C++, configure and `make -j10` | 53.7 s | 117.2 s | 166 MB |
+| C++, `make -j10` | 21.6 s | 103.8 s | 147 MB |
+| C++, `make -j1` | 61.2 s | 55.5 s | 145 MB |
+| Scaly, release | 17.1 s | 15.9 s | 3.4 GB |
+| Scaly, debug | 20.2 s | 19.5 s | 3.6 GB |
+
+On one core the port builds in about a quarter of the time the original
+takes, and faster than the original on ten. It needs far more memory to do
+it: the compiler is one process that holds the whole program.
+
+After a change it goes the other way:
+
+| changed | C++, `make -j10` | Scaly, release | Scaly, debug |
+|---|---|---|---|
+| nothing | 0.2 s | 10.6 s | 0.4 s |
+| one source file | 1.8 s | 14.0 s | 11.1 s |
+
+The original compiles the one file and links. The port compiles the whole
+package the file belongs to, and a release build optimizes the whole program
+again each time, even when nothing has changed. (The original's build is
+configured without dependency tracking: after a change to a header, `make`
+rebuilds nothing, and only a clean build is a correct one.)
+
 ## Install
 
 With Scaly installed (`curl -fsSL https://scaly.io/install.sh | sh`, on
