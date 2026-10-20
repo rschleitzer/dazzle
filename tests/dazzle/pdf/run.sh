@@ -24,6 +24,14 @@
 # no font files at all, so that it does not depend on the fonts of the
 # machine.
 #
+# oracle/: XML documents with their stylesheets, one per part of the
+# layout that was carried over from Dazzle.Pdf (github.com/rschleitzer/
+# dazzle-net) -- each set with -t canvas and no font files, its page
+# description byte-diffed against its golden. That they set as Dazzle.Pdf
+# sets them is what tools/oracle/compare.py shows, with the system's fonts:
+#
+#   tools/oracle/compare.py tests/dazzle/pdf/oracle/lines.xml tests/dazzle/pdf/oracle/lines.dsl
+#
 # canvas: both again with -t canvas, the same pages as a page description
 # (JSON) a canvas draws, byte-diffed against its own golden -- and held
 # against the PDF of the same run: as many pages, and one text operation for
@@ -96,6 +104,24 @@ run_case() { # name [font directories]
 
 run_case book
 run_case fonts fonts
+
+# the documents held against Dazzle.Pdf, read after the SGML declaration of
+# XML as onsgmls reads one
+for doc in "$HERE"/oracle/*.xml; do
+  name=$(basename "$doc" .xml)
+  ( cd "$HERE/oracle" && DAZZLE_FONTS= SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
+      "$OUT" -t canvas -o "$WORK/$name.json" -d "$name.dsl" "$ROOT/upstream/pubtext/xml.dcl" "$name.xml" 2> "$WORK/$name.err" )
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -s "$WORK/$name.err" ]; then
+    echo "dazzle-pdf: FAIL oracle/$name (rc=$rc)"; cat "$WORK/$name.err"; exit 1
+  fi
+  if [ "${BLESS:-}" = 1 ]; then
+    cp "$WORK/$name.json" "$HERE/oracle/$name.expected.json"
+  fi
+  if ! cmp -s "$HERE/oracle/$name.expected.json" "$WORK/$name.json"; then
+    echo "dazzle-pdf: FAIL oracle/$name (page description differs)"; exit 1
+  fi
+done
 
 # default output name: <docbase>.pdf in the current directory.
 ( cd "$WORK" && rm -f book.pdf && DAZZLE_FONTS= SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
