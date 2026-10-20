@@ -16,7 +16,7 @@
 ;  - *`unknown top level form` fires for a head with NO key AND for a key
 ;    with no top-level meaning (`if` here). Only THREE keys are skipped
 ;    without a word: declare-reference-value-type, define-page-model and
-;    define-column-set-model. This port used to skip EVERY unhandled form
+;    define-column-set-model (this port reads the last two). It used to skip EVERY unhandled form
 ;    silently, which hid the unported declarations instead of reporting
 ;    them - and the three silent ones were not even installed as keys.
 ;
@@ -47,10 +47,14 @@
 ; a key that HAS no top-level meaning is the same diagnostic
 (if 1 2)
 (lambda (x) x)
-; ... and exactly these three are skipped in silence
+; ... and exactly these three are skipped in silence by the reference; the
+; two of the page model are read by this port (not in the original), so
+; they are written here as models are, which both answer with silence
 (declare-reference-value-type "x")
-(define-page-model pm 1)
-(define-column-set-model cm 1)
+(define-page-model pm (width 1in) (height 1in)
+  (region (x-origin 0pt) (y-origin 0pt) (width 1in) (height 1in) (flow #f)))
+(define-column-set-model cm
+  (column-subset (flow ((#f body-text))) (column (x-origin 0pt) (width 1in))))
 ]]>
 </STYLE-SPECIFICATION>
 </STYLE-SHEET>
