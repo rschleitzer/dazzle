@@ -19,6 +19,9 @@
 #   dazzle-wasm    the engine's suites against dazzle as a web page runs it:
 #                  built for wasm32-wasip1, under the page's WASI host
 #                  (tests/dazzle/wasm.sh; SKIPS without a wasi-sdk or node)
+#   dazzle-page    the engine's web page (web/dazzle/) in headless Chrome: set,
+#                  drawn, an error shown, the scale changed (tests/dazzle/
+#                  page.sh; SKIPS without a wasi-sdk or Chrome)
 #   onsgmls-build  the parser's event dumper (tests/sgml/build-onsgmls.sh)
 #   sgml           the SGML corpus against it (tests/sgml/run.sh)
 #   opensp         the parser's self-tests (tests/opensp/run.sh, `scaly test`)
@@ -90,6 +93,7 @@ if step dazzle-build env DAZZLE_PREBUILT= tests/dazzle/build-cli.sh "$LOG/dazzle
 fi
 step dazzle-unit tests/dazzle/run.sh
 step dazzle-wasm env SCALY_POISON=1 tests/dazzle/wasm.sh
+step dazzle-page tests/dazzle/page.sh
 
 if step onsgmls-build tests/sgml/build-onsgmls.sh "$LOG/onsgmls"; then
   # On a Windows shell $LOG/onsgmls is a bash front end over
