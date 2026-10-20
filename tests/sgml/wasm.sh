@@ -3,7 +3,7 @@
 #
 #   tests/sgml/wasm.sh [scalyc-binary]
 #
-# Builds onsgmls for wasm32-wasip1 (web/onsgmls/build.sh, into a scratch
+# Builds onsgmls for wasm32-wasip1 (web/build.sh, into a scratch
 # directory) and replays the whole corpus (tests/sgml/run.sh) through the WASI
 # host of a page — its file system in memory, standard input and output handed
 # in and out as bytes —, driven from the command line by the host's run.mjs,
@@ -22,7 +22,7 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-web/onsgmls/build.sh "$TMP" "${1:-}" > "$TMP/build.out" 2>&1
+web/build.sh onsgmls "$TMP" "${1:-}" > "$TMP/build.out" 2>&1
 case $? in
   0) ;;
   3) echo "sgml (wasm): SKIP ($(tail -1 "$TMP/build.out"))"; exit 0 ;;

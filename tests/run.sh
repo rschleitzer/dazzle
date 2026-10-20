@@ -16,6 +16,9 @@
 #   dazzle-<d>     the engine's suites, side by side: cli coding engine flowobj
 #                  fot framemark grove html mif pdf prims rtf specarena tex
 #   dazzle-unit    the engine's self-tests (tests/dazzle/run.sh, `scaly test`)
+#   dazzle-wasm    the engine's suites against dazzle as a web page runs it:
+#                  built for wasm32-wasip1, under the page's WASI host
+#                  (tests/dazzle/wasm.sh; SKIPS without a wasi-sdk or node)
 #   onsgmls-build  the parser's event dumper (tests/sgml/build-onsgmls.sh)
 #   sgml           the SGML corpus against it (tests/sgml/run.sh)
 #   opensp         the parser's self-tests (tests/opensp/run.sh, `scaly test`)
@@ -86,6 +89,7 @@ if step dazzle-build env DAZZLE_PREBUILT= tests/dazzle/build-cli.sh "$LOG/dazzle
   done
 fi
 step dazzle-unit tests/dazzle/run.sh
+step dazzle-wasm env SCALY_POISON=1 tests/dazzle/wasm.sh
 
 if step onsgmls-build tests/sgml/build-onsgmls.sh "$LOG/onsgmls"; then
   # On a Windows shell $LOG/onsgmls is a bash front end over

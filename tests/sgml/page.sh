@@ -3,7 +3,7 @@
 #
 #   tests/sgml/page.sh [scalyc-binary]
 #
-# Builds the page (web/onsgmls/build.sh, into a scratch directory), serves it
+# Builds the page (web/build.sh, into a scratch directory), serves it
 # over HTTP on a free local port and loads tests/sgml/page/check.html in
 # headless Chrome. That page drives web/onsgmls/index.html in a frame as a
 # reader does -- the document it opens with, then one the DTD does not allow
@@ -34,7 +34,7 @@ PY=$(command -v python3 || command -v python) || { echo "page: SKIP (no python3 
 TMP="$(mktemp -d)"
 server=
 trap '[ -n "$server" ] && kill "$server" 2>/dev/null; rm -rf "$TMP"' EXIT
-web/onsgmls/build.sh "$TMP/www" "${1:-}" > "$TMP/build.out" 2>&1
+web/build.sh onsgmls "$TMP/www" "${1:-}" > "$TMP/build.out" 2>&1
 case $? in
   0) ;;
   3) echo "page: SKIP ($(tail -1 "$TMP/build.out"))"; exit 0 ;;
