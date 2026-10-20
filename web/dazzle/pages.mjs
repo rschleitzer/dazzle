@@ -107,7 +107,7 @@ export function draw_page(canvas, description, index, { faces, images = [], scal
   for (const op of page.ops) {
     switch (op[0]) {
       case 'text': {
-        const [, x, y, font, size, color, text, advances] = op;
+        const [, x, y, font, size, color, text, advances, spacing = 0] = op;
         const face = faces[font] ?? { family: 'sans-serif', weight: 'normal', style: 'normal' };
         const units = description.fonts[font]?.units ?? 1000;
         ctx.font = `${face.style} ${face.weight} ${size * k}px ${face.family}`;
@@ -115,7 +115,7 @@ export function draw_page(canvas, description, index, { faces, images = [], scal
         let at = 0;
         let i = 0;
         for (const ch of text) {
-          ctx.fillText(ch, (x + at * size / units) * k, y * k);
+          ctx.fillText(ch, (x + at * size / units + i * spacing) * k, y * k);
           at += advances[i++] ?? 0;
         }
         break;
