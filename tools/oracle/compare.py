@@ -10,7 +10,8 @@ font files (--fonts, default the system's supplemental fonts on macOS), and
 compares what both pages show: every word with its box (pdftotext -bbox),
 page by page and in reading order, the pages' sizes, and what is drawn --
 every stroked line with its thickness and every filled rectangle (scores,
-rules, borders, backgrounds), read from the content streams with pypdf, and
+rules, borders, backgrounds) and where each image stands, read from the
+content streams with pypdf, and
 where every element with an ID begins (the port's --locations against
 GeneratePdfWithLocations). A word that differs, or stands more than the
 tolerance (default 0.5 pt) away from its place in the other, is reported; the
@@ -45,8 +46,10 @@ def words(pdf):
 
 
 def graphics(pdf):
-    """[([lines (x1, y1, x2, y2, width)], [rectangles (x, y, w, h)])] per page,
-    in points from the top left: what the content stream strokes and fills."""
+    """[([lines (x1, y1, x2, y2, width)], [rectangles (x, y, w, h)], [images
+    (x, y, w, h)])] per page, in points from the top left: what the content
+    stream strokes and fills, and where it draws an XObject (the unit square
+    under the current matrix)."""
     from pypdf import PdfReader
     pages = []
     for page in PdfReader(pdf).pages:
@@ -55,7 +58,7 @@ def graphics(pdf):
         contents = page.get_contents()
         ops = contents.operations if contents is not None else []
         ctm = [1, 0, 0, 1, 0, 0]
-        stack, width, path, lines, rects = [], 1.0, [], [], []
+        stack, width, path, lines, rects, images = [], 1.0, [], [], [], []
 
         def mul(m, n):
             return [m[0] * n[0] + m[1] * n[2], m[0] * n[1] + m[1] * n[3],
@@ -83,6 +86,21 @@ def graphics(pdf):
             elif op == "re" and len(v) == 4:
                 a, b = at(v[0], v[1]), at(v[0] + v[2], v[1] + v[3])
                 path.append(("re", (min(a[0], b[0]), min(a[1], b[1]), abs(b[0] - a[0]), abs(b[1] - a[1]))))
+            elif op == "Do":
+                # an image is the unit square; a form its BBox under its Matrix
+                x0, y0, x1, y1, m = 0.0, 0.0, 1.0, 1.0, [1, 0, 0, 1, 0, 0]
+                try:
+                    xobj = page["/Resources"]["/XObject"][operands[0]].get_object()
+                    if xobj.get("/Subtype") == "/Form":
+                        x0, y0, x1, y1 = [float(v) for v in xobj["/BBox"]]
+                        m = [float(v) for v in xobj.get("/Matrix", m)]
+                except (KeyError, TypeError):
+                    pass
+                pts = []
+                for px, py in ((x0, y0), (x1, y1), (x0, y1), (x1, y0)):
+                    pts.append(at(m[0] * px + m[2] * py + m[4], m[1] * px + m[3] * py + m[5]))
+                xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+                images.append((min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)))
             elif op in ("S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n"):
                 prev = None
                 for kind, pt in path:
@@ -94,8 +112,28 @@ def graphics(pdf):
                     elif kind == "re" and op in ("f", "F", "f*", "B", "B*", "b", "b*"):
                         rects.append(pt)
                 path = []
-        pages.append((lines, rects))
+        pages.append((lines, rects, images))
     return pages
+
+
+def same_lines(wa, wb, tolerance):
+    """Whether two pages show the same lines -- the same text from the same
+    start to the same end at the same height -- where they are split into
+    words differently: a run drawn character by character (letter-spacing in
+    Dazzle.Pdf) reads as single letters, one drawn with a character spacing
+    (Tc, the port) as one word."""
+    def lines(ws):
+        out = []
+        for w in sorted(ws, key=lambda w: (round(w[4] * 2) / 2, w[1])):
+            if out and abs(out[-1][3] - w[4]) <= tolerance:
+                text, x0, x1, y = out[-1]
+                out[-1] = (text + w[0], x0, max(x1, w[3]), y)
+            else:
+                out.append((w[0], w[1], w[3], w[4]))
+        return out
+    la, lb = lines(wa), lines(wb)
+    return len(la) == len(lb) and all(
+        a[0] == b[0] and all(abs(p - q) <= tolerance for p, q in zip(a[1:], b[1:])) for a, b in zip(la, lb))
 
 
 def match(port, oracle, tolerance):
@@ -157,6 +195,8 @@ def compare(doc, dsl, fonts, tolerance, work, oracle):
         if abs(pa[0] - pb[0]) > tolerance or abs(pa[1] - pb[1]) > tolerance:
             findings.append("page %d: size port %.1fx%.1f, oracle %.1fx%.1f" % (n, pa[0], pa[1], pb[0], pb[1]))
         wa, wb = pa[2], pb[2]
+        if [w[0] for w in wa] != [w[0] for w in wb] and same_lines(wa, wb, tolerance):
+            continue
         for i, (x, y) in enumerate(zip(wa, wb)):
             if x[0] != y[0]:
                 findings.append("page %d word %d: port %r at %.1f,%.1f, oracle %r at %.1f,%.1f"
@@ -182,8 +222,8 @@ def compare(doc, dsl, fonts, tolerance, work, oracle):
         ga, gb = graphics(port_pdf), graphics(oracle_pdf)
     except ImportError:
         return findings + ["graphics not compared: no pypdf"]
-    for n, ((la, ra), (lb, rb)) in enumerate(zip(ga, gb), 1):
-        for what, mine, theirs in (("line", la, lb), ("rectangle", ra, rb)):
+    for n, ((la, ra, ia), (lb, rb, ib)) in enumerate(zip(ga, gb), 1):
+        for what, mine, theirs in (("line", la, lb), ("rectangle", ra, rb), ("image", ia, ib)):
             only_port, only_oracle = match(mine, theirs, tolerance)
             for item in only_port:
                 findings.append("page %d: %s only in the port: %s" % (n, what, ", ".join("%.2f" % v for v in item)))
