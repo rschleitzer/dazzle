@@ -21,6 +21,12 @@
 #   opensp         the parser's self-tests (tests/opensp/run.sh, `scaly test`)
 #   cmscratch      the content-model scratch arena (tests/sgml/cmscratch/run.sh)
 #   quiet          onsgmls -s: no ESIS, the same messages (tests/sgml/quiet/run.sh)
+#   sgml-wasm      the SGML corpus against the parser as a web page runs it:
+#                  built for wasm32-wasip1, under the page's WASI host
+#                  (tests/sgml/wasm.sh; SKIPS without a wasi-sdk or node)
+#   page           the parser's web page (web/onsgmls/) in headless Chrome:
+#                  typed into, parsed, read back (tests/sgml/page.sh; SKIPS
+#                  without a wasi-sdk or Chrome)
 #
 # The dazzle suites and the corpus run under SCALY_POISON=1: every released
 # page is overwritten, so a read after release faults at its first use instead
@@ -95,6 +101,8 @@ if step onsgmls-build tests/sgml/build-onsgmls.sh "$LOG/onsgmls"; then
 else
   step opensp tests/opensp/run.sh
 fi
+step sgml-wasm env SCALY_POISON=1 tests/sgml/wasm.sh
+step page tests/sgml/page.sh
 
 if [ $rc = 0 ]; then
   rm -rf "$LOG"
