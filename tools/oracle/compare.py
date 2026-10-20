@@ -46,10 +46,11 @@ def words(pdf):
 
 
 def graphics(pdf):
-    """[([lines (x1, y1, x2, y2, width)], [rectangles (x, y, w, h)], [images
+    """[([lines (x1, y1, x2, y2, width, dash, phase)], [rectangles (x, y, w, h)], [images
     (x, y, w, h)])] per page, in points from the top left: what the content
     stream strokes and fills, and where it draws an XObject (the unit square
-    under the current matrix)."""
+    under the current matrix). A line's dash is the length of its pattern (an
+    odd one taken twice, as it repeats), 0 for a solid line."""
     from pypdf import PdfReader
     pages = []
     for page in PdfReader(pdf).pages:
@@ -59,6 +60,7 @@ def graphics(pdf):
         ops = contents.operations if contents is not None else []
         ctm = [1, 0, 0, 1, 0, 0]
         stack, width, path, lines, rects, images = [], 1.0, [], [], [], []
+        dash, phase = 0.0, 0.0
 
         def mul(m, n):
             return [m[0] * n[0] + m[1] * n[2], m[0] * n[1] + m[1] * n[3],
@@ -72,9 +74,14 @@ def graphics(pdf):
             op = op.decode() if isinstance(op, bytes) else op
             v = [float(o) for o in operands if isinstance(o, (int, float)) or hasattr(o, "as_numeric")]
             if op == "q":
-                stack.append((ctm, width))
+                stack.append((ctm, width, dash, phase))
             elif op == "Q" and stack:
-                ctm, width = stack.pop()
+                ctm, width, dash, phase = stack.pop()
+            elif op == "d" and len(operands) == 2:
+                pattern = [float(v) for v in operands[0]]
+                if len(pattern) % 2 == 1:
+                    pattern = pattern * 2
+                dash, phase = sum(pattern), float(operands[1])
             elif op == "cm" and len(v) == 6:
                 ctm = mul(v, ctm)
             elif op == "w" and v:
@@ -107,7 +114,7 @@ def graphics(pdf):
                     if kind == "m":
                         prev = pt
                     elif kind == "l" and prev is not None and op in ("S", "s", "B", "B*", "b", "b*"):
-                        lines.append((prev[0], prev[1], pt[0], pt[1], width))
+                        lines.append((prev[0], prev[1], pt[0], pt[1], width, dash, phase))
                         prev = pt
                     elif kind == "re" and op in ("f", "F", "f*", "B", "B*", "b", "b*"):
                         rects.append(pt)

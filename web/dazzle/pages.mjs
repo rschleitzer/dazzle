@@ -255,14 +255,19 @@ export function draw_page(canvas, description, index, { faces, images = [], scal
         break;
       }
       case 'line': {
-        const [, x1, y1, x2, y2, thickness, color] = op;
+        // a dashed line: the lengths of dashes and gaps, and the offset into
+        // them where the line begins (line-dash)
+        const [, x1, y1, x2, y2, thickness, color, dash = null, offset = 0] = op;
         ctx.strokeStyle = color;
         ctx.lineWidth = thickness * k;
         ctx.lineCap = 'butt';
+        ctx.setLineDash(dash ? dash.map(d => d * k) : []);
+        ctx.lineDashOffset = offset * k;
         ctx.beginPath();
         ctx.moveTo(x1 * k, y1 * k);
         ctx.lineTo(x2 * k, y2 * k);
         ctx.stroke();
+        ctx.setLineDash([]);
         break;
       }
       case 'rect': {
