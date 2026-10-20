@@ -8,7 +8,9 @@ $DAZZLE, else scalyc/build/dazzle of a Scaly checkout beside this one) and
 Dazzle.Pdf (tools/oracle, built on first use with dotnet) -- with the same
 font files (--fonts, default the system's supplemental fonts on macOS), and
 compares what both pages show: every word with its box (pdftotext -bbox),
-page by page and in reading order, and the pages' sizes. A word that differs,
+page by page and in reading order, the pages' sizes, and what is drawn --
+every stroked line with its thickness and every filled rectangle (scores,
+rules, borders, backgrounds), read from the content streams with pypdf. A word that differs,
 or stands more than the tolerance (default 0.5 pt) away from its place in the
 other, is reported; the exit status is 1 when anything is.
 
@@ -38,6 +40,75 @@ def words(pdf):
               for m in re.finditer(r'<word xMin="([\d.-]+)" yMin="([\d.-]+)" xMax="([\d.-]+)" yMax="([\d.-]+)">(.*?)</word>', page.group(3))]
         pages.append((float(page.group(1)), float(page.group(2)), ws))
     return pages
+
+
+def graphics(pdf):
+    """[([lines (x1, y1, x2, y2, width)], [rectangles (x, y, w, h)])] per page,
+    in points from the top left: what the content stream strokes and fills."""
+    from pypdf import PdfReader
+    pages = []
+    for page in PdfReader(pdf).pages:
+        height = float(page.mediabox.height)
+        # (a content stream is a dictionary: an empty one is false, so ask for None)
+        contents = page.get_contents()
+        ops = contents.operations if contents is not None else []
+        ctm = [1, 0, 0, 1, 0, 0]
+        stack, width, path, lines, rects = [], 1.0, [], [], []
+
+        def mul(m, n):
+            return [m[0] * n[0] + m[1] * n[2], m[0] * n[1] + m[1] * n[3],
+                    m[2] * n[0] + m[3] * n[2], m[2] * n[1] + m[3] * n[3],
+                    m[4] * n[0] + m[5] * n[2] + n[4], m[4] * n[1] + m[5] * n[3] + n[5]]
+
+        def at(x, y):
+            return (ctm[0] * x + ctm[2] * y + ctm[4], height - (ctm[1] * x + ctm[3] * y + ctm[5]))
+
+        for operands, op in ops:
+            op = op.decode() if isinstance(op, bytes) else op
+            v = [float(o) for o in operands if isinstance(o, (int, float)) or hasattr(o, "as_numeric")]
+            if op == "q":
+                stack.append((ctm, width))
+            elif op == "Q" and stack:
+                ctm, width = stack.pop()
+            elif op == "cm" and len(v) == 6:
+                ctm = mul(v, ctm)
+            elif op == "w" and v:
+                width = v[0] * abs(ctm[3] or ctm[0] or 1)
+            elif op == "m" and len(v) == 2:
+                path.append(("m", at(*v)))
+            elif op == "l" and len(v) == 2:
+                path.append(("l", at(*v)))
+            elif op == "re" and len(v) == 4:
+                a, b = at(v[0], v[1]), at(v[0] + v[2], v[1] + v[3])
+                path.append(("re", (min(a[0], b[0]), min(a[1], b[1]), abs(b[0] - a[0]), abs(b[1] - a[1]))))
+            elif op in ("S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n"):
+                prev = None
+                for kind, pt in path:
+                    if kind == "m":
+                        prev = pt
+                    elif kind == "l" and prev is not None and op in ("S", "s", "B", "B*", "b", "b*"):
+                        lines.append((prev[0], prev[1], pt[0], pt[1], width))
+                        prev = pt
+                    elif kind == "re" and op in ("f", "F", "f*", "B", "B*", "b", "b*"):
+                        rects.append(pt)
+                path = []
+        pages.append((lines, rects))
+    return pages
+
+
+def match(port, oracle, tolerance):
+    """The items of one list that have no partner within the tolerance in
+    the other: (port only, oracle only)."""
+    left = list(oracle)
+    alone = []
+    for item in port:
+        for j, other in enumerate(left):
+            if all(abs(a - b) <= tolerance for a, b in zip(item, other)):
+                del left[j]
+                break
+        else:
+            alone.append(item)
+    return alone, left
 
 
 def oracle_binary(keep):
@@ -93,6 +164,17 @@ def compare(doc, dsl, fonts, tolerance, work, oracle):
                                 % (n, i, x[0], x[1], x[4], y[1], y[4], dx, dy))
         if len(wa) != len(wb):
             findings.append("page %d: words port %d, oracle %d" % (n, len(wa), len(wb)))
+    try:
+        ga, gb = graphics(port_pdf), graphics(oracle_pdf)
+    except ImportError:
+        return findings + ["graphics not compared: no pypdf"]
+    for n, ((la, ra), (lb, rb)) in enumerate(zip(ga, gb), 1):
+        for what, mine, theirs in (("line", la, lb), ("rectangle", ra, rb)):
+            only_port, only_oracle = match(mine, theirs, tolerance)
+            for item in only_port:
+                findings.append("page %d: %s only in the port: %s" % (n, what, ", ".join("%.2f" % v for v in item)))
+            for item in only_oracle:
+                findings.append("page %d: %s only in the oracle: %s" % (n, what, ", ".join("%.2f" % v for v in item)))
     return findings
 
 
