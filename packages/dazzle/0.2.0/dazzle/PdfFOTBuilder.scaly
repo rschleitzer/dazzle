@@ -22,13 +22,16 @@
 ; Shape: the builder does NOT stream. The flow object calls build a TREE of
 ; nodes, each with a snapshot of the inherited characteristics it was made
 ; under; finish() lays the tree out TWICE — the first pass finds the page every
-; element begins on, the second writes the file with the page numbers of
-; `current-node-page-number` filled in.
+; element begins on, the second sets the pages with the page numbers of
+; `current-node-page-number` filled in — and then writes the file.
 ;
 ; Layout: blocks flow down the page; a paragraph is broken greedily into
 ; lines. Everything placed goes into a flat list of drawing operations of the
 ; page being set (`ops`), absolute in thousandths of a point, y downwards. A
-; page is written when it is full. Because the operations are plain numbers,
+; page is closed when it is full, and kept: the layout ends with every page
+; as data (`pages`, `page_ops`), and only then is anything written
+; (`write_pages`). The layout asks the document for nothing but the fonts and
+; images it measures with. Because the operations are plain numbers,
 ; a run of them can still be moved: a table row that does not fit, and a
 ; heading that must stay with what follows it, are cut out and put down again
 ; on the next page. Inside a table cell no page is ever broken (`nobreak`).
@@ -39,6 +42,12 @@
 ;
 ; The flow-object bracket (start/end/atomic over the characteristics set for
 ; the NEXT flow object) is the FOTBuilder base's, as in the other backends.
+;
+; Two outputs, one layout (`-t pdf`, `-t canvas`): the PDF file, or a page
+; description a canvas draws (`write_canvas`) -- the same pages, the same
+; operations, the advance of every character, the font files and images
+; they use. What the canvas shows is the page the PDF prints, as long as it
+; draws with the same font files.
 ;
 ; RBMM: nodes, snapshots and buffers live on the builder's page (the run
 ; arena).
@@ -153,6 +162,42 @@ define POP_RECTANGLE: int 2
 define POP_IMAGE: int 3
 ; element
 define POP_MARK: int 4
+
+; --- the pages set: width, height, the page label (-1: none) and the first
+; number it shows, where its operations begin in `page_ops` and how many
+; numbers they take ----------------------------------------------------------
+define PPG_SIZE: int 6
+
+; --- the image files read: the record's stride in `images` -----------------
+define PIM_SIZE: int 6
+
+; The PDF name of a standard font (pdf/Font.scaly: family + bold + italic).
+function standard_font_name(font: int) returns Slice[u8]
+{
+    if font = 0
+        return "Helvetica"
+    if font = 1
+        return "Helvetica-Bold"
+    if font = 2
+        return "Helvetica-Oblique"
+    if font = 3
+        return "Helvetica-BoldOblique"
+    if font = 4
+        return "Times-Roman"
+    if font = 5
+        return "Times-Bold"
+    if font = 6
+        return "Times-Italic"
+    if font = 7
+        return "Times-BoldItalic"
+    if font = 8
+        return "Courier"
+    if font = 9
+        return "Courier-Bold"
+    if font = 10
+        return "Courier-Oblique"
+    "Courier-BoldOblique"
+}
 
 ; --- the atoms of a line: kind, characteristics, two operands, width, and
 ; for text the font it is set in ------------------------------------------
@@ -406,6 +451,8 @@ define PdfFOTBuilder
 (
     var host: ref[Page]
     var out_name: String
+    ; the page description (-t canvas) instead of the PDF
+    var canvas: bool
     ; --- the tree ------------------------------------------------------------
     var root: ref[PdfNode]
     ; the container the next node goes into
@@ -440,6 +487,9 @@ define PdfFOTBuilder
     ; --- the layout ------------------------------------------------------------
     var doc: ref[PdfDocument]
     var ops: ref[PdfInts]
+    ; the pages set (PPG_SIZE numbers each) and their operations
+    var pages: ref[PdfInts]
+    var page_ops: ref[PdfInts]
     var atoms: ref[PdfInts]
     var scratch: ref[PdfInts]
     ; elements met where no line is: they go with the next line set
@@ -449,8 +499,9 @@ define PdfFOTBuilder
     var element_page: ref[Array[int]]
     var page_shown: ref[Array[int]]
     var page_format: ref[Array[int]]
-    ; the files already read: text at, image (-1: not an image), and its
-    ; width and height in pixels
+    ; the files already read (PIM_SIZE numbers each): text at, image (-1:
+    ; not an image), its width and height in pixels, and where its path is
+    ; in the pool and its length
     var images: ref[PdfInts]
     ; the first pass only measures: it reads the size of an image and does
     ; not take it into its document, which is thrown away
@@ -491,11 +542,12 @@ define PdfFOTBuilder
     var row_height: int
 )
 {
-    function make(host: ref[Page], out_name: String) returns ref[PdfFOTBuilder]
+    function make(host: ref[Page], out_name: String, canvas: bool) returns ref[PdfFOTBuilder]
     {
         let f host.allocate(sizeof PdfFOTBuilder, alignof PdfFOTBuilder) as pointer[PdfFOTBuilder]
         f.host := host
         f.out_name := out_name
+        f.canvas := canvas
         f.pool := Array[u8]^host()
         f.next := PdfChars()
         f.stack := Array[ref[PdfChars]?]^host()
@@ -512,6 +564,8 @@ define PdfFOTBuilder
         f.loaded := PdfInts.make(host)
         f.others_known := false
         f.ops := PdfInts.make(host)
+        f.pages := PdfInts.make(host)
+        f.page_ops := PdfInts.make(host)
         f.atoms := PdfInts.make(host)
         f.scratch := PdfInts.make(host)
         f.marks := PdfInts.make(host)
@@ -1437,12 +1491,339 @@ define PdfFOTBuilder
         this.doc.clear()
         this.measuring := false
         this.layout()
+        if this.canvas
+            return this.write_canvas()
+        this.write_pages()
         this.doc.write(this.out_name)
+    }
+
+    ; --- the page description ------------------------------------------------
+    ;
+    ; What a canvas draws, as JSON: the pages set, each with its size and its
+    ; operations in the order the PDF has them -- lengths in thousandths of a
+    ; point, from the top left corner, y downwards, as everywhere here:
+    ;
+    ;   ["text", x, y, font, size, color, text, advances]  text at its baseline;
+    ;            the advance of each character in the font's units
+    ;   ["line", x1, y1, x2, y2, thickness, color]
+    ;   ["rect", x, y, width, height, color]
+    ;   ["image", x, y, width, height, image]
+    ;
+    ; A color is "#rrggbb". `fonts` is indexed by an operation's font: the
+    ; twelve standard fonts by their PDF names, then the font files read, in
+    ; the order they were read, each with its units per em; `images` by an
+    ; operation's image, the file and its size in pixels. A character is put
+    ; where the advances before it say, never where a browser's own shaping
+    ; would put it -- that is what keeps the canvas the page of the PDF.
+    procedure write_canvas(mutable this: ref[PdfFOTBuilder]) returns bool
+    {
+        let host this.host
+        let out &Array[u8]^host()
+        this.json_put(out, "{\"format\":\"dazzle-pages\",\"version\":1,\"fonts\":[")
+        var font 0
+        let fonts this.font_count()
+        while font < fonts
+        {
+            if font > 0
+                out.add(0x2C)
+            if font < PDF_FONT_COUNT
+            {
+                this.json_put(out, "{\"standard\":")
+                this.json_string(out, standard_font_name(font))
+            }
+            else
+            {
+                this.json_put(out, "{\"file\":")
+                this.json_string(out, this.font_path(font))
+            }
+            this.json_put(out, ",\"units\":")
+            this.json_int(out, this.doc.units(font))
+            out.add(0x7D)
+            font := font + 1
+        }
+        this.json_put(out, "],\"images\":[")
+        var image 0
+        var i 0
+        while i < this.images.count
+        {
+            if this.images.at(i + 1) = image
+            {
+                if image > 0
+                    out.add(0x2C)
+                this.json_put(out, "{\"file\":")
+                let at this.images.at(i + 4) as size_t
+                this.json_string(out, this.pool.as_slice().subslice(at, at + (this.images.at(i + 5) as size_t)))
+                this.json_put(out, ",\"width\":")
+                this.json_int(out, this.images.at(i + 2))
+                this.json_put(out, ",\"height\":")
+                this.json_int(out, this.images.at(i + 3))
+                out.add(0x7D)
+                image := image + 1
+                i := 0
+            }
+            else
+                i := i + PIM_SIZE
+        }
+        this.json_put(out, "],\"pages\":[")
+        var p 0
+        while p < this.pages.count
+        {
+            if p > 0
+                out.add(0x2C)
+            this.json_put(out, "{\"width\":")
+            this.json_int(out, this.pages.at(p))
+            this.json_put(out, ",\"height\":")
+            this.json_int(out, this.pages.at(p + 1))
+            this.json_put(out, ",\"ops\":[")
+            var k this.pages.at(p + 4)
+            let end k + this.pages.at(p + 5)
+            var first true
+            while k < end
+            {
+                let kind this.page_ops.at(k)
+                if kind <> POP_MARK
+                {
+                    if first = false
+                        out.add(0x2C)
+                    first := false
+                    this.json_op(out, k)
+                }
+                k := k + POP_SIZE
+            }
+            this.json_put(out, "]}")
+            p := p + PPG_SIZE
+        }
+        this.json_put(out, "]}\n")
+        File.write_from_string(this.out_name, String(out.get_buffer() as pointer[const_char], out.get_length()))
+    }
+
+    ; One operation of `page_ops`, at k.
+    procedure json_op(this: ref[PdfFOTBuilder], mutable out: ref[Array[u8]], k: int)
+    {
+        let kind this.page_ops.at(k)
+        let x this.page_ops.at(k + 1)
+        let y this.page_ops.at(k + 2)
+        let a this.page_ops.at(k + 3)
+        let b this.page_ops.at(k + 4)
+        let c this.page_ops.at(k + 5)
+        let d this.page_ops.at(k + 6)
+        let e this.page_ops.at(k + 7)
+        if kind = POP_TEXT
+        {
+            this.json_put(out, "[\"text\",")
+            this.json_ints(out, x, y, a)
+            out.add(0x2C)
+            this.json_int(out, b)
+            out.add(0x2C)
+            this.json_color(out, c)
+            out.add(0x2C)
+            let text this.pool.as_slice().subslice(d as size_t, (d + e) as size_t)
+            this.json_string(out, text)
+            this.json_put(out, ",[")
+            var i: size_t 0
+            while i < text.length
+            {
+                if i > 0
+                    out.add(0x2C)
+                this.json_int(out, this.doc.advance(a, PdfFont.decode(text, i)))
+                i := i + PdfFont.decoded(text, i)
+            }
+            this.json_put(out, "]]")
+        }
+        else if kind = POP_LINE
+        {
+            this.json_put(out, "[\"line\",")
+            this.json_ints(out, x, y, a)
+            out.add(0x2C)
+            this.json_int(out, b)
+            out.add(0x2C)
+            this.json_int(out, c)
+            out.add(0x2C)
+            this.json_color(out, d)
+            out.add(0x5D)
+        }
+        else if kind = POP_RECTANGLE
+        {
+            this.json_put(out, "[\"rect\",")
+            this.json_ints(out, x, y, a)
+            out.add(0x2C)
+            this.json_int(out, b)
+            out.add(0x2C)
+            this.json_color(out, c)
+            out.add(0x5D)
+        }
+        else if kind = POP_IMAGE
+        {
+            this.json_put(out, "[\"image\",")
+            this.json_ints(out, x, y, a)
+            out.add(0x2C)
+            this.json_int(out, b)
+            out.add(0x2C)
+            this.json_int(out, c)
+            out.add(0x5D)
+        }
+    }
+
+    ; How many fonts the operations may name: the standard ones and the
+    ; files read.
+    function font_count(this: ref[PdfFOTBuilder]) returns int
+    {
+        var n PDF_FONT_COUNT
+        var i 0
+        while i < this.loaded.count
+        {
+            if this.loaded.at(i + 2) >= n
+                n := this.loaded.at(i + 2) + 1
+            i := i + 3
+        }
+        n
+    }
+
+    ; The file a font given was read from.
+    function font_path(this: ref[PdfFOTBuilder], font: int) returns Slice[u8]
+    {
+        var i 0
+        while i < this.loaded.count
+        {
+            if this.loaded.at(i + 2) = font
+            {
+                let at this.loaded.at(i) as size_t
+                return this.family_names.as_slice().subslice(at, at + (this.loaded.at(i + 1) as size_t))
+            }
+            i := i + 3
+        }
+        this.family_names.as_slice().subslice(0, 0)
+    }
+
+    procedure json_ints(this: ref[PdfFOTBuilder], mutable out: ref[Array[u8]], a: int, b: int, c: int)
+    {
+        this.json_int(out, a)
+        out.add(0x2C)
+        this.json_int(out, b)
+        out.add(0x2C)
+        this.json_int(out, c)
+    }
+
+    procedure json_int(this: ref[PdfFOTBuilder], mutable out: ref[Array[u8]], n: int)
+    {
+        var v n
+        if v < 0
+        {
+            out.add(0x2D)
+            v := 0 - v
+        }
+        var unit 1
+        while unit <= v / 10
+            unit := unit * 10
+        while unit > 0
+        {
+            out.add((0x30 + v / unit) as u8)
+            v := v % unit
+            unit := unit / 10
+        }
+    }
+
+    procedure json_color(this: ref[PdfFOTBuilder], mutable out: ref[Array[u8]], rgb: int)
+    {
+        this.json_put(out, "\"#")
+        var shift 20
+        while shift >= 0
+        {
+            let nibble (rgb >> shift) & 15
+            if nibble < 10
+                out.add((0x30 + nibble) as u8)
+            else
+                out.add((0x57 + nibble) as u8)
+            shift := shift - 4
+        }
+        out.add(0x22)
+    }
+
+    ; A JSON string of UTF-8 text: the quote, the backslash and the control
+    ; characters escaped, everything else as it is.
+    procedure json_string(this: ref[PdfFOTBuilder], mutable out: ref[Array[u8]], text: Slice[u8])
+    {
+        out.add(0x22)
+        var i: size_t 0
+        while i < text.length
+        {
+            let b text[i]
+            if b = 0x22 or b = 0x5C
+            {
+                out.add(0x5C)
+                out.add(b)
+            }
+            else if b < 0x20
+            {
+                this.json_put(out, "\\u00")
+                out.add((0x30 + (b >> 4)) as u8)
+                let low b & 15
+                if low < 10
+                    out.add((0x30 + low) as u8)
+                else
+                    out.add((0x57 + low) as u8)
+            }
+            else
+                out.add(b)
+            i := i + 1
+        }
+        out.add(0x22)
+    }
+
+    procedure json_put(this: ref[PdfFOTBuilder], mutable out: ref[Array[u8]], text: Slice[u8])
+    {
+        out.add(text)
+    }
+
+    ; Write the pages set into the document.
+    procedure write_pages(mutable this: ref[PdfFOTBuilder])
+    {
+        let doc this.doc
+        var p 0
+        while p < this.pages.count
+        {
+            doc.begin_page(this.pages.at(p), this.pages.at(p + 1))
+            let style this.pages.at(p + 2)
+            if style >= 0
+                doc.add_page_label(p / PPG_SIZE, style as u8, this.pages.at(p + 3))
+            var i this.pages.at(p + 4)
+            let end i + this.pages.at(p + 5)
+            while i < end
+            {
+                let kind this.page_ops.at(i)
+                let x this.page_ops.at(i + 1)
+                let y this.page_ops.at(i + 2)
+                let a this.page_ops.at(i + 3)
+                let b this.page_ops.at(i + 4)
+                let cc this.page_ops.at(i + 5)
+                let d this.page_ops.at(i + 6)
+                let e this.page_ops.at(i + 7)
+                if kind = POP_TEXT
+                {
+                    doc.set_color((cc >> 16) & 255, (cc >> 8) & 255, cc & 255)
+                    doc.text(a, b, x, y, this.pool.as_slice().subslice(d as size_t, (d + e) as size_t))
+                }
+                else if kind = POP_LINE
+                {
+                    doc.set_color((d >> 16) & 255, (d >> 8) & 255, d & 255)
+                    doc.line(x, y, a, b, cc)
+                }
+                else if kind = POP_RECTANGLE
+                    doc.fill_rectangle(x, y, a, b, (cc >> 16) & 255, (cc >> 8) & 255, cc & 255)
+                else if kind = POP_IMAGE
+                    doc.image(cc, x, y, a, b)
+                i := i + POP_SIZE
+            }
+            doc.end_page()
+            p := p + PPG_SIZE
+        }
     }
 
     procedure layout(mutable this: ref[PdfFOTBuilder])
     {
         this.ops.cut(0)
+        this.pages.cut(0)
+        this.page_ops.cut(0)
         this.atoms.cut(0)
         this.scratch.cut(0)
         this.marks.cut(0)
@@ -1499,54 +1880,37 @@ define PdfFOTBuilder
         this.page_fixed := this.ops.count
     }
 
-    ; Write the page being set.
+    ; Close the page being set: keep it, and note the page of every element
+    ; that begins on it.
     procedure emit_page(mutable this: ref[PdfFOTBuilder])
     {
-        let doc this.doc
         let c this.seq_chars
-        doc.begin_page(c.page_width, c.page_height)
+        var style 0 - 1
         if this.page_labelled
         {
-            var style: u8 0x44
+            style := 0x44
             let format c.number_format
             if format = 0x69
                 style := 0x72
             else if format = 0x49
                 style := 0x52
             else if format = 0x61 or format = 0x41
-                style := format as u8
-            doc.add_page_label(this.page_no - 1, style, this.page_no - this.seq_base)
+                style := format
         }
+        this.pages.push(c.page_width)
+        this.pages.push(c.page_height)
+        this.pages.push(style)
+        this.pages.push(this.page_no - this.seq_base)
+        this.pages.push(this.page_ops.count)
+        this.pages.push(this.ops.count)
         var i 0
         while i < this.ops.count
         {
-            let kind this.ops.at(i)
-            let x this.ops.at(i + 1)
-            let y this.ops.at(i + 2)
-            let a this.ops.at(i + 3)
-            let b this.ops.at(i + 4)
-            let cc this.ops.at(i + 5)
-            let d this.ops.at(i + 6)
-            let e this.ops.at(i + 7)
-            if kind = POP_TEXT
-            {
-                doc.set_color((cc >> 16) & 255, (cc >> 8) & 255, cc & 255)
-                doc.text(a, b, x, y, this.pool.as_slice().subslice(d as size_t, (d + e) as size_t))
-            }
-            else if kind = POP_LINE
-            {
-                doc.set_color((d >> 16) & 255, (d >> 8) & 255, d & 255)
-                doc.line(x, y, a, b, cc)
-            }
-            else if kind = POP_RECTANGLE
-                doc.fill_rectangle(x, y, a, b, (cc >> 16) & 255, (cc >> 8) & 255, cc & 255)
-            else if kind = POP_IMAGE
-                doc.image(cc, x, y, a, b)
-            else if kind = POP_MARK
-                this.note_element(a)
-            i := i + POP_SIZE
+            if this.ops.at(i) = POP_MARK
+                this.note_element(this.ops.at(i + 3))
+            this.page_ops.push(this.ops.at(i))
+            i := i + 1
         }
-        doc.end_page()
         this.ops.cut(0)
         this.page_open := false
         this.keep_at := 0 - 1
@@ -1916,7 +2280,7 @@ define PdfFOTBuilder
                     return 0 - 1
                 return i
             }
-            i := i + 4
+            i := i + PIM_SIZE
         }
         let doc this.doc
         var sb StringBuilder()
@@ -1925,6 +2289,7 @@ define PdfFOTBuilder
         ; a file URL is its path
         if n.text_length > 7 and this.pool[from as size_t] = 0x66 and this.pool[(from + 4) as size_t] = 0x3A and this.pool[(from + 5) as size_t] = 0x2F and this.pool[(from + 6) as size_t] = 0x2F
             from := from + 7
+        let path_at from
         while from < end
         {
             sb.append(this.pool[from as size_t] as char)
@@ -1949,6 +2314,8 @@ define PdfFOTBuilder
         this.images.push(image)
         this.images.push(width)
         this.images.push(height)
+        this.images.push(path_at)
+        this.images.push(end - path_at)
         if image < 0
             return 0 - 1
         entry

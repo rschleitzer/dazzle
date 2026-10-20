@@ -24,6 +24,11 @@
 # no font files at all, so that it does not depend on the fonts of the
 # machine.
 #
+# canvas: both again with -t canvas, the same pages as a page description
+# (JSON) a canvas draws, byte-diffed against its own golden -- and held
+# against the PDF of the same run: as many pages, and one text operation for
+# every text the PDF shows, so the two outputs are one layout.
+#
 # To freeze a new golden after a deliberate change: run with BLESS=1.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -61,6 +66,30 @@ run_case() { # name [font directories]
   if ! cmp -s "$HERE/$name.expected.pdf" "$WORK/$name.out.pdf"; then
     echo "dazzle-pdf: FAIL $name (pdf differs)"
     cmp "$HERE/$name.expected.pdf" "$WORK/$name.out.pdf" | head -3
+    exit 1
+  fi
+
+  ( cd "$WORK" && DAZZLE_FONTS="${2:-}" SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
+      "$OUT" -t canvas -o "$name.out.json" -d "$name.dsl" "$name.sgml" 2> "$name.canvas.err" )
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -s "$WORK/$name.canvas.err" ]; then
+    echo "dazzle-pdf: FAIL $name canvas (rc=$rc)"; cat "$WORK/$name.canvas.err"; exit 1
+  fi
+  if [ "${BLESS:-}" = 1 ]; then
+    cp "$WORK/$name.out.json" "$HERE/$name.expected.json"
+  fi
+  if ! cmp -s "$HERE/$name.expected.json" "$WORK/$name.out.json"; then
+    echo "dazzle-pdf: FAIL $name (canvas description differs)"
+    cmp "$HERE/$name.expected.json" "$WORK/$name.out.json" | head -3
+    exit 1
+  fi
+  local pdf_pages json_pages pdf_texts json_texts
+  pdf_pages=$(grep -ao '/Type /Page[^s]' "$WORK/$name.out.pdf" | wc -l)
+  json_pages=$(grep -o '{"width":' "$WORK/$name.out.json" | wc -l)
+  pdf_texts=$(grep -ao ' Tj ET' "$WORK/$name.out.pdf" | wc -l)
+  json_texts=$(grep -o '\["text",' "$WORK/$name.out.json" | wc -l)
+  if [ "$pdf_pages" -ne "$json_pages" ] || [ "$pdf_texts" -ne "$json_texts" ] || [ "$json_texts" -eq 0 ]; then
+    echo "dazzle-pdf: FAIL $name (pdf $pdf_pages pages, $pdf_texts texts; canvas $json_pages pages, $json_texts texts)"
     exit 1
   fi
 }
