@@ -10,9 +10,11 @@ font files (--fonts, default the system's supplemental fonts on macOS), and
 compares what both pages show: every word with its box (pdftotext -bbox),
 page by page and in reading order, the pages' sizes, and what is drawn --
 every stroked line with its thickness and every filled rectangle (scores,
-rules, borders, backgrounds), read from the content streams with pypdf. A word that differs,
-or stands more than the tolerance (default 0.5 pt) away from its place in the
-other, is reported; the exit status is 1 when anything is.
+rules, borders, backgrounds), read from the content streams with pypdf, and
+where every element with an ID begins (the port's --locations against
+GeneratePdfWithLocations). A word that differs, or stands more than the
+tolerance (default 0.5 pt) away from its place in the other, is reported; the
+exit status is 1 when anything is.
 
 The oracle is the C# backend this port's layout was taken over by, and has
 grown beyond since (min-leading, score, tabs, row spans, column sets, page
@@ -133,15 +135,17 @@ def compare(doc, dsl, fonts, tolerance, work, oracle):
     name = os.path.splitext(os.path.basename(doc))[0]
     port_pdf = os.path.join(work, name + ".port.pdf")
     oracle_pdf = os.path.join(work, name + ".oracle.pdf")
+    port_json = os.path.join(work, name + ".port.json")
+    oracle_json = os.path.join(work, name + ".oracle.json")
     env = dict(os.environ, DAZZLE_FONTS=fonts, SP_CHARSET_FIXED="YES", SP_ENCODING="XML")
     # an XML document is read after the SGML declaration of XML, as onsgmls
     # reads one; Dazzle.Pdf has it built in
     xml_dcl = os.path.join(ROOT, "upstream", "pubtext", "xml.dcl")
-    p = subprocess.run([port_binary(), "-t", "pdf", "-o", port_pdf, "-d", dsl, xml_dcl, doc], env=env,
+    p = subprocess.run([port_binary(), "-t", "pdf", "-o", port_pdf, "--locations", port_json, "-d", dsl, xml_dcl, doc], env=env,
                        capture_output=True, text=True)
     if p.returncode != 0 or p.stderr.strip():
         return ["port: rc=%d %s" % (p.returncode, p.stderr.strip()[:400])]
-    o = subprocess.run(["dotnet", oracle, doc, dsl, oracle_pdf, os.path.join(work, name + ".oracle.json"), fonts],
+    o = subprocess.run(["dotnet", oracle, doc, dsl, oracle_pdf, oracle_json, fonts],
                        capture_output=True, text=True)
     if o.returncode != 0:
         return ["oracle: rc=%d %s" % (o.returncode, o.stderr.strip()[:400])]
@@ -164,6 +168,16 @@ def compare(doc, dsl, fonts, tolerance, work, oracle):
                                 % (n, i, x[0], x[1], x[4], y[1], y[4], dx, dy))
         if len(wa) != len(wb):
             findings.append("page %d: words port %d, oracle %d" % (n, len(wa), len(wb)))
+    with open(port_json) as f:
+        la = json.load(f)
+    with open(oracle_json) as f:
+        lb = json.load(f)
+    for key in sorted(set(la) | set(lb)):
+        if key not in la or key not in lb:
+            findings.append("location %s: only in the %s" % (key, "oracle" if key not in la else "port"))
+        elif la[key][0] != lb[key][0] or any(abs(a - b) > tolerance for a, b in zip(la[key][1:], lb[key][1:])):
+            findings.append("location %s: port page %d at %.2f,%.2f, oracle page %d at %.2f,%.2f"
+                            % (key, la[key][0], la[key][1], la[key][2], lb[key][0], lb[key][1], lb[key][2]))
     try:
         ga, gb = graphics(port_pdf), graphics(oracle_pdf)
     except ImportError:

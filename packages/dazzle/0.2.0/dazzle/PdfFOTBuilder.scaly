@@ -597,11 +597,27 @@ define PdfFOTBuilder
     var page_ops: ref[PdfInts]
     var atoms: ref[PdfInts]
     var scratch: ref[PdfInts]
-    ; elements met where no line is: they go with the next line set
+    ; elements met where no line is: they go with the next line set; those
+    ; from `marks_base` on are the area's being set (a table cell's)
     var marks: ref[PdfInts]
+    var marks_base: int
+    ; elements met between the cells of a table: they wait for the next cell
+    var table_marks: ref[PdfInts]
     ; per element the page it begins on (from 1; 0 unknown), and per page its
     ; number as shown and the format of that number
     var element_page: ref[Array[int]]
+    ; per element where it begins (the top left of its first line or of its
+    ; cell's content), the pass that noted it, and its ID in the pool (-1:
+    ; none); the passes are counted in `pass`
+    var element_x: ref[Array[int]]
+    var element_y: ref[Array[int]]
+    var element_noted: ref[Array[int]]
+    var element_id_at: ref[Array[int]]
+    var element_id_length: ref[Array[int]]
+    var pass: int
+    ; where the places of the elements with an ID go (--locations; empty: not
+    ; written)
+    var locations_path: String
     var page_shown: ref[Array[int]]
     var page_format: ref[Array[int]]
     ; the files already read (PIM_SIZE numbers each): text at, image (-1:
@@ -678,7 +694,16 @@ define PdfFOTBuilder
         f.atoms := PdfInts.make(host)
         f.scratch := PdfInts.make(host)
         f.marks := PdfInts.make(host)
+        f.marks_base := 0
+        f.table_marks := PdfInts.make(host)
         f.element_page := Array[int]^host()
+        f.element_x := Array[int]^host()
+        f.element_y := Array[int]^host()
+        f.element_noted := Array[int]^host()
+        f.element_id_at := Array[int]^host()
+        f.element_id_length := Array[int]^host()
+        f.pass := 0
+        f.locations_path := String()
         f.page_shown := Array[int]^host()
         f.page_format := Array[int]^host()
         f.images := PdfInts.make(host)
@@ -1270,8 +1295,49 @@ define PdfFOTBuilder
         let ei node.element_index
         if ei < 0
             return
+        ; its ID, for --locations
+        let id node.get_id()
+        if id.get_size() > 0
+        {
+            while (this.element_id_at.get_length() as int) <= ei
+            {
+                this.element_id_at.add(0 - 1)
+                this.element_id_length.add(0)
+            }
+            let at this.pool.get_length() as int
+            var i: size_t 0
+            while i < id.get_size()
+            {
+                PdfFont.append(this.pool, id.get(i))
+                i := i + 1
+            }
+            this.element_id_at.put(ei as size_t, at)
+            this.element_id_length.put(ei as size_t, (this.pool.get_length() as int) - at)
+        }
+        ; between the cells of a table (a row element, say) the mark waits
+        ; for the next cell, so that it lands on the page of its row and not
+        ; after the whole table
+        if this.cur.kind = PN_TABLE or this.cur.kind = PN_ROW
+        {
+            this.table_marks.push(ei)
+            return
+        }
         let n this.add(PN_MARK)
         n.i0 := ei
+    }
+
+    ; The marks waiting between the cells of a table, into the container
+    ; open now.
+    procedure put_table_marks(mutable this: ref[PdfFOTBuilder])
+    {
+        var i 0
+        while i < this.table_marks.count
+        {
+            let n this.add(PN_MARK)
+            n.i0 := this.table_marks.at(i)
+            i := i + 1
+        }
+        this.table_marks.cut(0)
     }
 
     procedure end_node(mutable this: ref[PdfFOTBuilder])
@@ -1483,6 +1549,8 @@ define PdfFOTBuilder
         if this.cur.kind = PN_TABLE
             this.section := this.cur.i8
         this.close()
+        ; marks no cell took go after the table
+        this.put_table_marks()
     }
 
     procedure start_table_part_serial(mutable this: ref[PdfFOTBuilder], dnic: ref[DisplayNIC]?)
@@ -1554,6 +1622,9 @@ define PdfFOTBuilder
         n.i6 := 0 - 1
         n.i7 := 0 - 1
         this.open(n)
+        ; a cell the table made up for a hole takes none
+        if nic.missing = false
+            this.put_table_marks()
     }
 
     procedure end_table_cell(mutable this: ref[PdfFOTBuilder])
@@ -1662,10 +1733,75 @@ define PdfFOTBuilder
         this.doc.clear()
         this.measuring := false
         this.layout()
+        if this.locations_path.get_length() > 0 and this.write_locations() = false
+            return false
         if this.canvas
             return this.write_canvas()
         this.write_pages()
         this.doc.write(this.out_name)
+    }
+
+    procedure set_locations(mutable this: ref[PdfFOTBuilder], path: String)
+    {
+        this.locations_path := path
+    }
+
+    ; Where the elements with an ID begin, as JSON, in the order of the
+    ; document: {"id": [page, x, y], ...}, the page from 1, x and y in points
+    ; from the top left of the page -- what Dazzle.Pdf's
+    ; GeneratePdfWithLocations answers. An element on no page is left out.
+    procedure write_locations(mutable this: ref[PdfFOTBuilder]) returns bool
+    {
+        let host this.host
+        let out &Array[u8]^host()
+        out.add(0x7B)
+        var first true
+        var e 0
+        while e < (this.element_id_at.get_length() as int)
+        {
+            let at this.element_id_at[e as size_t]
+            if at >= 0 and e < (this.element_noted.get_length() as int) and this.element_noted[e as size_t] = this.pass
+            {
+                if first = false
+                    out.add(0x2C)
+                first := false
+                this.json_string(out, this.pool.as_slice().subslice(at as size_t, (at + this.element_id_length[e as size_t]) as size_t))
+                out.add(":[")
+                this.json_int(out, this.element_page[e as size_t])
+                out.add(0x2C)
+                this.json_points(out, this.element_x[e as size_t])
+                out.add(0x2C)
+                this.json_points(out, this.element_y[e as size_t])
+                out.add(0x5D)
+            }
+            e := e + 1
+        }
+        out.add(0x7D)
+        out.add(0x0A)
+        File.write_from_string(this.locations_path, String(out.get_buffer() as pointer[const_char], out.get_length()))
+    }
+
+    ; A length in thousandths of a point as points: 56.693, 12, -0.5.
+    procedure json_points(this: ref[PdfFOTBuilder], mutable out: ref[Array[u8]], n: int)
+    {
+        var v n
+        if v < 0
+        {
+            out.add(0x2D)
+            v := 0 - v
+        }
+        this.json_int(out, v / 1000)
+        var rest v % 1000
+        if rest = 0
+            return
+        out.add(0x2E)
+        var unit 100
+        while rest > 0
+        {
+            out.add((0x30 + rest / unit) as u8)
+            rest := rest % unit
+            unit := unit / 10
+        }
     }
 
     ; --- the page description ------------------------------------------------
@@ -1674,8 +1810,9 @@ define PdfFOTBuilder
     ; operations in the order the PDF has them -- lengths in thousandths of a
     ; point, from the top left corner, y downwards, as everywhere here:
     ;
-    ;   ["text", x, y, font, size, color, text, advances]  text at its baseline;
-    ;            the advance of each character in the font's units
+    ;   ["text", x, y, font, size, color, text, advances(, spacing)]  text at
+    ;            its baseline; the advance of each character in the font's
+    ;            units, and where it is not 0 the space after every character
     ;   ["line", x1, y1, x2, y2, thickness, color]
     ;   ["rect", x, y, width, height, color]
     ;   ["image", x, y, width, height, image]
@@ -1995,6 +2132,8 @@ define PdfFOTBuilder
 
     procedure layout(mutable this: ref[PdfFOTBuilder])
     {
+        this.pass := this.pass + 1
+        this.marks_base := 0
         this.ops.cut(0)
         this.pages.cut(0)
         this.page_ops.cut(0)
@@ -2078,13 +2217,20 @@ define PdfFOTBuilder
         this.pages.push(this.page_no - this.seq_base)
         this.pages.push(this.page_ops.count)
         this.pages.push(this.ops.count)
+        ; operation by operation: an operand that happens to be POP_MARK is
+        ; no mark
         var i 0
         while i < this.ops.count
         {
             if this.ops.at(i) = POP_MARK
-                this.note_element(this.ops.at(i + 3))
-            this.page_ops.push(this.ops.at(i))
-            i := i + 1
+                this.note_element(this.ops.at(i + 3), this.ops.at(i + 1), this.ops.at(i + 2))
+            var k 0
+            while k < POP_SIZE
+            {
+                this.page_ops.push(this.ops.at(i + k))
+                k := k + 1
+            }
+            i := i + POP_SIZE
         }
         this.ops.cut(0)
         this.page_open := false
@@ -2092,11 +2238,24 @@ define PdfFOTBuilder
     }
 
     ; An element begins on the page being written.
-    procedure note_element(mutable this: ref[PdfFOTBuilder], element: int)
+    ; Where an element begins: the first place it is met in this pass (a
+    ; header row repeated on a later page does not move it).
+    procedure note_element(mutable this: ref[PdfFOTBuilder], element: int, x: int, y: int)
     {
         while (this.element_page.get_length() as int) <= element
             this.element_page.add(0)
+        while (this.element_noted.get_length() as int) <= element
+        {
+            this.element_noted.add(0)
+            this.element_x.add(0)
+            this.element_y.add(0)
+        }
+        if this.element_noted[element as size_t] = this.pass
+            return
+        this.element_noted.put(element as size_t, this.pass)
         this.element_page.put(element as size_t, this.page_no)
+        this.element_x.put(element as size_t, x)
+        this.element_y.put(element as size_t, y)
     }
 
     ; The page is full: write it and go on on a new one. What must stay with
@@ -2214,13 +2373,13 @@ define PdfFOTBuilder
         }
         else
             this.keep_at := 0 - 1
-        var i 0
+        var i this.marks_base
         while i < this.marks.count
         {
             this.op(POP_MARK, this.frame_x, this.y, this.marks.at(i), 0, 0, 0, 0)
             i := i + 1
         }
-        this.marks.cut(0)
+        this.marks.cut(this.marks_base)
         this.at_top := false
     }
 
@@ -3493,7 +3652,11 @@ define PdfFOTBuilder
         this.pending_cond := 0
         this.pending_fixed := 0
         this.at_top := true
+        let old_marks this.marks_base
+        this.marks_base := this.marks.count
         this.flow_children(part, null, false)
+        this.marks.cut(this.marks_base)
+        this.marks_base := old_marks
         let height this.y
         this.nobreak := this.nobreak - 1
         this.frame_x := old_x
@@ -3804,7 +3967,19 @@ define PdfFOTBuilder
                 this.pending_cond := 0
                 this.pending_fixed := 0
                 this.at_top := true
+                let old_marks this.marks_base
+                this.marks_base := this.marks.count
                 this.flow_children(cn, null, false)
+                ; elements no line of the cell took begin at its content's
+                ; top left
+                var mi this.marks_base
+                while mi < this.marks.count
+                {
+                    this.op(POP_MARK, this.frame_x, top + c.cell_before_row_margin, this.marks.at(mi), 0, 0, 0, 0)
+                    mi := mi + 1
+                }
+                this.marks.cut(this.marks_base)
+                this.marks_base := old_marks
                 ; conditional space at the end of the cell is dropped, the rest
                 ; is in it
                 let cell_height this.y + this.pending_fixed - top + c.cell_after_row_margin

@@ -27,7 +27,8 @@
 # oracle/: XML documents with their stylesheets, one per part of the
 # layout that was carried over from Dazzle.Pdf (github.com/rschleitzer/
 # dazzle-net) -- each set with -t canvas and no font files, its page
-# description byte-diffed against its golden. That they set as Dazzle.Pdf
+# description byte-diffed against its golden, and where it has elements with
+# an ID, the places --locations writes for them against theirs. That they set as Dazzle.Pdf
 # sets them is what tools/oracle/compare.py shows, with the system's fonts:
 #
 #   tools/oracle/compare.py tests/dazzle/pdf/oracle/lines.xml tests/dazzle/pdf/oracle/lines.dsl
@@ -110,16 +111,28 @@ run_case fonts fonts
 for doc in "$HERE"/oracle/*.xml; do
   name=$(basename "$doc" .xml)
   ( cd "$HERE/oracle" && DAZZLE_FONTS= SCALY_HOME="$ROOT" SP_CHARSET_FIXED=YES SP_ENCODING=XML \
-      "$OUT" -t canvas -o "$WORK/$name.json" -d "$name.dsl" "$ROOT/upstream/pubtext/xml.dcl" "$name.xml" 2> "$WORK/$name.err" )
+      "$OUT" -t canvas -o "$WORK/$name.json" --locations "$WORK/$name.locations.json" \
+      -d "$name.dsl" "$ROOT/upstream/pubtext/xml.dcl" "$name.xml" 2> "$WORK/$name.err" )
   rc=$?
   if [ "$rc" -ne 0 ] || [ -s "$WORK/$name.err" ]; then
     echo "dazzle-pdf: FAIL oracle/$name (rc=$rc)"; cat "$WORK/$name.err"; exit 1
   fi
+  # where its elements with an ID begin (--locations), kept where it has any
   if [ "${BLESS:-}" = 1 ]; then
     cp "$WORK/$name.json" "$HERE/oracle/$name.expected.json"
+    if [ "$(cat "$WORK/$name.locations.json")" != "{}" ]; then
+      cp "$WORK/$name.locations.json" "$HERE/oracle/$name.expected-locations.json"
+    fi
   fi
   if ! cmp -s "$HERE/oracle/$name.expected.json" "$WORK/$name.json"; then
     echo "dazzle-pdf: FAIL oracle/$name (page description differs)"; exit 1
+  fi
+  if [ -f "$HERE/oracle/$name.expected-locations.json" ]; then
+    if ! cmp -s "$HERE/oracle/$name.expected-locations.json" "$WORK/$name.locations.json"; then
+      echo "dazzle-pdf: FAIL oracle/$name (locations differ)"; exit 1
+    fi
+  elif [ "$(cat "$WORK/$name.locations.json")" != "{}" ]; then
+    echo "dazzle-pdf: FAIL oracle/$name (locations without a golden)"; exit 1
   fi
 done
 
