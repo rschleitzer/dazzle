@@ -36,6 +36,8 @@ One backend the original does not have, in the Scaly engine only: PDF
 page sequences with headers and footers, paragraphs, display groups, line
 fields, leaders, rules, external graphics (JPEG, PNG) and tables — enough to
 set a book with the DocBook print stylesheets, and not more.
+With `-t canvas` the same backend writes the pages it sets as a page
+description, which a web page draws (see [In the browser](#in-the-browser)).
 
 A font family is looked for among the TrueType files of the system's font
 directories, by the family name and style each file states, and embedded
@@ -212,6 +214,43 @@ for `openjade` runs `dazzle` with the same lines.
 
 The C++ reference is built in its own directory: `cd upstream && ./build.sh`.
 
+## In the browser
+
+Both programs run in a web page too, compiled to WebAssembly
+(`wasm32-wasip1`). What they ask of the system is WASI, which the page
+answers in JavaScript, with a file system in memory: the files of the page
+are what the program reads, and nothing leaves the page.
+
+- `web/onsgmls/` is the SGML parser. Its files are a document and its DTD
+  to begin with; more are typed in or opened from the disk. It shows the
+  ESIS, the messages, and the files the parser wrote (`-t out.rast`).
+- `web/dazzle/` is the engine, setting pages. It runs `dazzle -t canvas`,
+  and `pages.mjs` draws the description onto canvases: every character
+  where the layout put it, never where the browser's own shaping would, so
+  the canvas shows the page of the PDF. The first file is the document, the
+  second the stylesheet. Fonts (`.ttf`, `.otf`) and images (PNG, JPEG) are
+  opened from the disk; a font goes into `/fonts`, where the engine looks
+  for its families (`DAZZLE_FONTS`), and the canvas draws with the same
+  file. A standard font (Helvetica, Times, Courier) has no file and is drawn
+  with what the browser has under that name: its glyphs may differ, their
+  places do not.
+
+Building a page takes a [wasi-sdk](https://github.com/WebAssembly/wasi-sdk)
+(`WASI_SDK`, else the last `~/opt/wasi-sdk-*`), whose clang compiles the
+C the programs use. Then, from this directory:
+
+```sh
+web/onsgmls/build.sh && python3 -m http.server -d web/onsgmls
+web/dazzle/build.sh  && python3 -m http.server -d web/dazzle
+```
+
+and open `http://localhost:8000/`. The script builds the program into the
+page's directory and copies the WASI host (`wasi.mjs`) beside it from the
+standard library of the Scaly installation. The page must come over HTTP: a
+browser loads no module from a `file:` URL. `web/build.sh onsgmls|dazzle
+out-dir` builds into another directory; the engine needs the 64 MB stack
+here as well (`ulimit -s 65520`).
+
 ## Test
 
 ```sh
@@ -223,6 +262,13 @@ its output, backend by backend, with files the C++ reference produced (the
 PDF backend's with files of its own, looked at when they were frozen); the
 SGML corpus (380 documents) compares the parser's ESIS output with the
 reference's; `tests/opensp` runs the parser's unit tests.
+
+With a wasi-sdk and node it runs the corpus and the engine's suites again
+against the programs built for the page, under the page's WASI host
+(`tests/sgml/wasm.sh`, `tests/dazzle/wasm.sh`): the same goldens as the
+native programs. With Chrome as well, it drives both pages in headless
+Chrome as a reader does (`tests/sgml/page.sh`, `tests/dazzle/page.sh`). A
+suite whose tool is missing is skipped by name.
 
 ## License
 
