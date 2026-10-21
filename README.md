@@ -260,7 +260,7 @@ tests/run.sh
 builds both programs once and runs every suite: the engine's suites compare
 its output, backend by backend, with files the C++ reference produced (the
 PDF backend's with files of its own, looked at when they were frozen); the
-SGML corpus (380 documents) compares the parser's ESIS output with the
+SGML corpus (483 documents) compares the parser's ESIS output with the
 reference's; `tests/opensp` runs the parser's unit tests.
 
 With a wasi-sdk and node it runs the corpus and the engine's suites again
