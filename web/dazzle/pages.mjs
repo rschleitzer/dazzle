@@ -218,6 +218,15 @@ function px_per_unit(scale) {
   return scale * 96 / 72 / 1000;
 }
 
+// The links of page `index`: where each lies in CSS pixels at `scale` and the
+// URI it opens. A link draws nothing; the page lays what opens it over the
+// canvas.
+export function page_links(description, index, scale = 1) {
+  const k = px_per_unit(scale);
+  return description.pages[index].ops.filter(op => op[0] === 'link')
+    .map(([, x, y, width, height, uri]) => ({ x: x * k, y: y * k, width: width * k, height: height * k, uri }));
+}
+
 // Draw page `index` onto `canvas`, which is sized for it (and for the
 // device's pixel ratio, so the page is sharp).
 export function draw_page(canvas, description, index, { faces, images = [], scale = 1 } = {}) {
