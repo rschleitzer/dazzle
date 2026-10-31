@@ -11,7 +11,8 @@ compares what both pages show: every word with its box (pdftotext -bbox),
 page by page and in reading order, the pages' sizes, and what is drawn --
 every stroked line with its thickness and every filled rectangle (scores,
 rules, borders, backgrounds) and where each image stands, read from the
-content streams with pypdf, and
+content streams with pypdf, every link with its rectangle and the URI it
+opens (the pages' link annotations), and
 where every element with an ID begins (the port's --locations against
 GeneratePdfWithLocations). A word that differs, or stands more than the
 tolerance (default 0.5 pt) away from its place in the other, is reported; the
@@ -47,7 +48,7 @@ def words(pdf):
 
 def graphics(pdf):
     """[([lines (x1, y1, x2, y2, width, dash, phase)], [rectangles (x, y, w, h)], [images
-    (x, y, w, h)])] per page, in points from the top left: what the content
+    (x, y, w, h)], [links (x, y, w, h, URI)])] per page, in points from the top left: what the content
     stream strokes and fills, and where it draws an XObject (the unit square
     under the current matrix). A line's dash is the length of its pattern (an
     odd one taken twice, as it repeats), 0 for a solid line."""
@@ -119,7 +120,19 @@ def graphics(pdf):
                     elif kind == "re" and op in ("f", "F", "f*", "B", "B*", "b", "b*"):
                         rects.append(pt)
                 path = []
-        pages.append((lines, rects, images))
+        # the links: annotations that open a URI
+        links = []
+        for annot in page.get("/Annots") or []:
+            a = annot.get_object()
+            action = a.get("/A")
+            if a.get("/Subtype") != "/Link" or action is None:
+                continue
+            action = action.get_object()
+            if action.get("/S") != "/URI":
+                continue
+            x0, y0, x1, y1 = [float(v) for v in a["/Rect"]]
+            links.append((min(x0, x1), height - max(y0, y1), abs(x1 - x0), abs(y1 - y0), str(action["/URI"])))
+        pages.append((lines, rects, images, links))
     return pages
 
 
@@ -229,7 +242,14 @@ def compare(doc, dsl, fonts, tolerance, work, oracle):
         ga, gb = graphics(port_pdf), graphics(oracle_pdf)
     except ImportError:
         return findings + ["graphics not compared: no pypdf"]
-    for n, ((la, ra, ia), (lb, rb, ib)) in enumerate(zip(ga, gb), 1):
+    for n, ((la, ra, ia, ka), (lb, rb, ib, kb)) in enumerate(zip(ga, gb), 1):
+        # a link matches one with the same URI whose rectangle lies within the tolerance
+        for uri in sorted(set(k[4] for k in ka) | set(k[4] for k in kb)):
+            only_port, only_oracle = match([k[:4] for k in ka if k[4] == uri], [k[:4] for k in kb if k[4] == uri], tolerance)
+            for item in only_port:
+                findings.append("page %d: link to %s only in the port: %s" % (n, uri, ", ".join("%.2f" % v for v in item)))
+            for item in only_oracle:
+                findings.append("page %d: link to %s only in the oracle: %s" % (n, uri, ", ".join("%.2f" % v for v in item)))
         for what, mine, theirs in (("line", la, lb), ("rectangle", ra, rb), ("image", ia, ib)):
             only_port, only_oracle = match(mine, theirs, tolerance)
             for item in only_port:
