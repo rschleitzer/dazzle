@@ -1,19 +1,20 @@
 // Draw dazzle's page description (`dazzle -t canvas`) onto canvases.
 //
-// The description holds the pages the PDF backend sets -- the same layout,
-// the same operations (PdfFOTBuilder.write_canvas has the format): lengths in
+// The description is dazzle's own format, not a PDF: the pages its layout
+// set, written out by PdfFOTBuilder.write_canvas instead of as a PDF file
+// (`-t pdf` writes the same pages, from the same layout). Lengths in
 // thousandths of a point from the top left corner, y downwards, text at its
 // baseline, and the advance of every character in its font's units. A
 // character is drawn where those advances put it, one at a time: never where
 // the browser's own shaping would put it (kerning, ligatures), which is what
-// keeps the canvas the page of the PDF.
+// keeps a page on the canvas the page `-t pdf` prints.
 //
 // The fonts are the condition: a font the layout measured is drawn with the
 // SAME file (`load_fonts` makes a FontFace of each one the description names,
 // from the bytes the caller hands in). A standard font (Helvetica, Times,
-// Courier, which a PDF reader brings along) has no file; it is drawn with
-// what the browser has under that name, so its glyphs -- not their places --
-// may differ.
+// Courier: those PDF defines, so the layout has their measures without a
+// file) is drawn with what the browser has under that name, so its glyphs
+// -- not their places -- may differ.
 //
 //   import { load_fonts, draw_page, page_size } from './pages.mjs';
 //   const d = JSON.parse(text);
