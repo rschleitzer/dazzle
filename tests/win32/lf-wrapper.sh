@@ -32,9 +32,17 @@
 # ★WHAT IT DELIBERATELY DOES NOT TOUCH: a file the program writes itself (an
 # onsgmls `-t` RAST file, a dazzle `-o` output). Those go through OUR OWN
 # `creat` in the Scaly runtime, which opens with an explicit _O_BINARY — so a
-# carriage return in one would be a DEFECT, and normalising it here would hide
-# exactly the regression the corpora exist to catch. stdout and stderr are
-# different: they reach us through the CRT's fd 1 and 2, which are not ours.
+# carriage return the runtime added would be a DEFECT, and normalising it here
+# would hide exactly the regression the corpora exist to catch. stdout and
+# stderr are different: they reach us through the CRT's fd 1 and 2, which are
+# not ours.
+# ★One CR in such a file is NOT the runtime's and not a defect: the DSSSL
+# transform backend writes a record end as the PLATFORM'S newline, CR LF on
+# Windows, as openjade does there (OpenSP's RecordOutputCharStream,
+# SP_LINE_TERM1/2 under SP_HAVE_SETMODE) -- the author's decision 2026-11-03,
+# dazzle stays byte-identical to the reference on every host. A suite that
+# compares such a file with a POSIX golden takes the CR out itself
+# (tests/dazzle/coding/run.py, tests/dazzle/framemark/run.sh; Scaly's ./mkp).
 #
 # ★THE EXIT CODE IS THE POINT OF THE SHAPE BELOW. `prog | tr -d '\r'` reports
 # TR's status, not the program's — a trap that has made every exit expectation

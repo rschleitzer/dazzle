@@ -9,7 +9,8 @@
 # them, then run this. --check compares and writes nothing.
 import hashlib, os, subprocess, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PKG = os.path.join(ROOT, "packages/dazzle", subprocess.run([os.path.join(ROOT, "tools/version.sh"), "dazzle"], capture_output=True, text=True, check=True).stdout.strip())
+# tools/version.sh through bash: Windows runs no shell script by itself
+PKG = os.path.join(ROOT, "packages/dazzle", subprocess.run(["bash", os.path.join(ROOT, "tools/version.sh"), "dazzle"], capture_output=True, text=True, check=True).stdout.strip())
 SRC = os.path.join(PKG, "dsssl")
 OUT = os.path.join(PKG, "dazzle/DssslData.scaly")
 NAMES = ["builtins.dsl", "catalog", "dsssl.dtd", "fot.dtd", "style-sheet.dtd"]

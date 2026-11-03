@@ -120,6 +120,19 @@ def launch(binary):
     return [name], path
 
 
+def without_cr(data):
+    """A file the engine wrote, its CR before each LF taken out -- on Windows
+    only, where the engine ends a line with CR LF as openjade does there (the
+    DSSSL backend writes a record end as the platform's newline: OpenSP's
+    RecordOutputCharStream, SP_LINE_TERM1/2). The goldens are POSIX's. The CR
+    is the one of the file's ENCODING: one byte, or two in either order."""
+    if os.name != "nt":
+        return data
+    return (data.replace(b"\x00\r\x00\n", b"\x00\n")
+                .replace(b"\r\x00\n\x00", b"\n\x00")
+                .replace(b"\r\n", b"\n"))
+
+
 def run_cell(i, cell, work, prefix, exe):
     label, cenv, args = cell
     d = os.path.join(work, "cell%03d" % i)
@@ -146,7 +159,7 @@ def run_cell(i, cell, work, prefix, exe):
         if is_input(f):
             continue
         out.append("--- file %s\n" % f)
-        out.append(dump(open(os.path.join(d, f), "rb").read()))
+        out.append(dump(without_cr(open(os.path.join(d, f), "rb").read())))
     shutil.rmtree(d, ignore_errors=True)
     return "".join(out)
 

@@ -56,6 +56,12 @@ generate() { # generate <label> [env assignments / engine flags via GEN_ENV, GEN
     -t sgml -d "$SPEC" "$DOC" ) > /dev/null 2> "$TMP/$1"
 }
 golden() { # golden <label>: the generated tree against expected.cksum
+  # On Windows the engine ends a line with CR LF, as openjade does there; the
+  # golden is POSIX's, so the CR goes before the sum is taken (as Scaly's
+  # ./mkp takes it out before a generated file reaches that tree).
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) find "$TMP/gen.$1" -type f -exec sed -i 's/\r$//' {} + ;;
+  esac
   ( cd "$TMP/gen.$1" && find . -type f | sed 's|^\./||' | LC_ALL=C sort | xargs cksum ) > "$TMP/$1.cksum"
   cmp -s "$TMP/$1.cksum" "$HERE/expected.cksum"
 }

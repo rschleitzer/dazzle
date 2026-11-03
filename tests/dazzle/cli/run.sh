@@ -401,7 +401,12 @@ msdos_run() { ( cd "$WM" && env -u SCALY_HOME HOME="$WM/home" USERPROFILE="$WM/h
   'SGML_CATALOG_FILES=nosuch\catalog;XMLModel\dsssl\catalog' "$OUT" -t sgml -d 'XMLModel\generator\map.dsl' 'sub\doc.sgml' 2>"$WM/$1.err" ); }
 gotM="$(msdos_run msdos)"
 gotP="$(msdos_run posix)"
-if [ "$gotM" != "from!rules!" ] || [ "$gotP" = "from!rules!" ] || ! grep -q 'cannot open "nosuch/catalog"' "$WM/msdos.err"; then
+# The negative control needs a system that reads a backslash as part of a
+# NAME: Windows takes it as a separator whatever the program's file-name
+# rules are, so there the POSIX reading finds the entity too.
+neg_ok=1
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) ;; *) [ "$gotP" = "from!rules!" ] && neg_ok=0 ;; esac
+if [ "$gotM" != "from!rules!" ] || [ "$neg_ok" = 0 ] || ! grep -q 'cannot open "nosuch/catalog"' "$WM/msdos.err"; then
   echo "dazzle-cli: FAIL MS-DOS file names"
   echo "  msdos: $(printf '%s' "$gotM" | cat -v) / $(head -2 "$WM/msdos.err" | cut -c1-160)"
   echo "  posix: $(printf '%s' "$gotP" | cat -v)"
