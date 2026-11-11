@@ -22,9 +22,8 @@ cd "$ROOT"
 
 SUITES="cli coding engine flowobj fot grove html mif pdf prims rtf specarena tex"
 
-if ! command -v node >/dev/null 2>&1; then
-  echo "dazzle (wasm): SKIP (no node to run the page's host)"; exit 0
-fi
+# a node that STARTS: one that is merely there can abort in the loader
+NODE=$(tests/node.sh) || { echo "dazzle (wasm): SKIP (no node that starts, to run the page's host)"; exit 0; }
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 web/build.sh dazzle "$TMP" "${1:-}" > "$TMP/build.out" 2>&1
@@ -36,7 +35,7 @@ esac
 # The suites start the program through tests/dazzle/build-cli.sh's front end,
 # which names it in LFW_NAME (what argv[0] would be, and so what its messages
 # begin with); a script cannot read the argv[0] it was started under.
-printf '#!/bin/bash\nexec node --no-warnings %s/run.mjs --argv0 "${LFW_NAME:-$0}" %s/dazzle.wasm "$@"\n' "$TMP" "$TMP" > "$TMP/dazzle"
+printf '#!/bin/bash\nexec "%s" --no-warnings %s/run.mjs --argv0 "${LFW_NAME:-$0}" %s/dazzle.wasm "$@"\n' "$NODE" "$TMP" "$TMP" > "$TMP/dazzle"
 chmod 755 "$TMP/dazzle"
 
 pids=(); names=()

@@ -17,9 +17,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$ROOT"
 
-if ! command -v node >/dev/null 2>&1; then
-  echo "sgml (wasm): SKIP (no node to run the page's host)"; exit 0
-fi
+# a node that STARTS: one that is merely there can abort in the loader
+NODE=$(tests/node.sh) || { echo "sgml (wasm): SKIP (no node that starts, to run the page's host)"; exit 0; }
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 web/build.sh onsgmls "$TMP" "${1:-}" > "$TMP/build.out" 2>&1
@@ -28,6 +27,6 @@ case $? in
   3) echo "sgml (wasm): SKIP ($(tail -1 "$TMP/build.out"))"; exit 0 ;;
   *) cat "$TMP/build.out"; exit 1 ;;
 esac
-printf '#!/bin/bash\nexec node --no-warnings %s/run.mjs %s/onsgmls.wasm "$@"\n' "$TMP" "$TMP" > "$TMP/onsgmls"
+printf '#!/bin/bash\nexec "%s" --no-warnings %s/run.mjs %s/onsgmls.wasm "$@"\n' "$NODE" "$TMP" "$TMP" > "$TMP/onsgmls"
 chmod 755 "$TMP/onsgmls"
 tests/sgml/run.sh "$TMP/onsgmls"

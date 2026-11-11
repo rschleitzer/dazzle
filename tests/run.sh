@@ -18,7 +18,7 @@
 #   dazzle-unit    the engine's self-tests (tests/dazzle/run.sh, `scaly test`)
 #   dazzle-wasm    the engine's suites against dazzle as a web page runs it:
 #                  built for wasm32-wasip1, under the page's WASI host
-#                  (tests/dazzle/wasm.sh; SKIPS without a wasi-sdk or node)
+#                  (tests/dazzle/wasm.sh; SKIPS without a wasi-sdk or a node that starts)
 #   dazzle-page    the engine's web page (web/dazzle/) in headless Chrome: set,
 #                  drawn, an error shown, the scale changed (tests/dazzle/
 #                  page.sh; SKIPS without a wasi-sdk or Chrome)
@@ -29,7 +29,7 @@
 #   quiet          onsgmls -s: no ESIS, the same messages (tests/sgml/quiet/run.sh)
 #   sgml-wasm      the SGML corpus against the parser as a web page runs it:
 #                  built for wasm32-wasip1, under the page's WASI host
-#                  (tests/sgml/wasm.sh; SKIPS without a wasi-sdk or node)
+#                  (tests/sgml/wasm.sh; SKIPS without a wasi-sdk or a node that starts)
 #   page           the parser's web page (web/onsgmls/) in headless Chrome:
 #                  typed into, parsed, read back (tests/sgml/page.sh; SKIPS
 #                  without a wasi-sdk or Chrome)

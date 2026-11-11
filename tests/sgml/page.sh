@@ -61,8 +61,8 @@ for _ in $(seq 100); do
 done
 [ -n "$port" ] || { echo "page: FAIL — the server did not start"; cat "$TMP/server.out"; exit 1; }
 
-"$chrome" --headless=new --disable-gpu --no-first-run --user-data-dir="$TMP/profile" \
-  --virtual-time-budget=60000 --dump-dom "http://127.0.0.1:$port/check.html" > "$TMP/dom.html" 2> "$TMP/chrome.err"
+# not Chrome itself: it does not always end once the DOM is written
+tests/dump-dom.sh "$chrome" "$TMP/profile" "http://127.0.0.1:$port/check.html" "$TMP/dom.html" "$TMP/chrome.err"
 verdict=$(sed -n '/<pre id="verdict">/,/<\/pre>/p' "$TMP/dom.html" | sed -e 's/<[^>]*>//g' -e 's/&quot;/"/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g')
 [ -n "$verdict" ] || { echo "page: FAIL — no verdict in the page"; tail -5 "$TMP/chrome.err"; exit 1; }
 printf '%s\n' "$verdict" | grep '^FAIL'
