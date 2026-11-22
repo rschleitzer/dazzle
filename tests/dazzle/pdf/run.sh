@@ -31,6 +31,10 @@
 # constants are the k-th value k * 10 -- set apart as boxes, spaced by
 # class, the scripts and the fraction placed by those constants.
 #
+# goto: links within the document -- a contents whose entries go to their
+# sections, each on a page of its own (node-list-address): a destination
+# named where each section begins, each entry a link to it.
+#
 # oracle/: XML documents with their stylesheets, one per part of the
 # layout that was carried over from Dazzle.Pdf (github.com/rschleitzer/
 # dazzle-net) -- each set with -t canvas and no font files, its page
@@ -114,6 +118,7 @@ run_case() { # name [font directories]
 run_case book
 run_case fonts fonts
 run_case math mathfonts
+run_case goto
 
 # the documents held against Dazzle.Pdf, read after the SGML declaration of
 # XML as onsgmls reads one
