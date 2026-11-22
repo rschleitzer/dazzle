@@ -24,6 +24,13 @@
 # no font files at all, so that it does not depend on the fonts of the
 # machine.
 #
+# math: formulas made of the math flow objects (math-sequence, fraction,
+# script, fence, characters with their math class), in a line of text and
+# alone in their paragraphs, in a font with a MATH table: the synthetic
+# OpenType font of mathfonts/ (CFF outlines, embedded whole), whose MATH
+# constants are the k-th value k * 10 -- set apart as boxes, spaced by
+# class, the scripts and the fraction placed by those constants.
+#
 # oracle/: XML documents with their stylesheets, one per part of the
 # layout that was carried over from Dazzle.Pdf (github.com/rschleitzer/
 # dazzle-net) -- each set with -t canvas and no font files, its page
@@ -57,6 +64,7 @@ fi
 
 cp "$HERE"/*.sgml "$HERE"/*.dsl "$HERE"/*.png "$WORK/"
 cp -R "$HERE/fonts" "$WORK/fonts"
+cp -R "$HERE/mathfonts" "$WORK/mathfonts"
 
 run_case() { # name [font directories]
   local name="$1"
@@ -105,6 +113,7 @@ run_case() { # name [font directories]
 
 run_case book
 run_case fonts fonts
+run_case math mathfonts
 
 # the documents held against Dazzle.Pdf, read after the SGML declaration of
 # XML as onsgmls reads one
