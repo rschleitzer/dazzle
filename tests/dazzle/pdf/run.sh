@@ -35,6 +35,10 @@
 # sections, each on a page of its own (node-list-address): a destination
 # named where each section begins, each entry a link to it.
 #
+# svg: an external graphic that is SVG (drawing.svg), drawn as the page's
+# own rectangles, lines and text at the size it is set at, its text in the
+# fonts of fonts/ (a family list whose first name no file has).
+#
 # oracle/: XML documents with their stylesheets, one per part of the
 # layout that was carried over from Dazzle.Pdf (github.com/rschleitzer/
 # dazzle-net) -- each set with -t canvas and no font files, its page
@@ -66,7 +70,7 @@ if ! tests/dazzle/build-cli.sh "$OUT" > "$OUT.build.log" 2>&1; then
   echo "dazzle-pdf: FAIL (build)"; tail -8 "$OUT.build.log"; exit 1
 fi
 
-cp "$HERE"/*.sgml "$HERE"/*.dsl "$HERE"/*.png "$WORK/"
+cp "$HERE"/*.sgml "$HERE"/*.dsl "$HERE"/*.png "$HERE"/*.svg "$WORK/"
 cp -R "$HERE/fonts" "$WORK/fonts"
 cp -R "$HERE/mathfonts" "$WORK/mathfonts"
 
@@ -119,6 +123,7 @@ run_case book
 run_case fonts fonts
 run_case math mathfonts
 run_case goto
+run_case svg fonts
 
 # the documents held against Dazzle.Pdf, read after the SGML declaration of
 # XML as onsgmls reads one
