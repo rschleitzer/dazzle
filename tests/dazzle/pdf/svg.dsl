@@ -3,7 +3,7 @@
 <style-specification>
 <style-specification-body>
 ;; An external graphic that is SVG (drawing.svg): its rect (fill, stroke),
-;; line, text and tspan (size, dy, text-anchor, a font-family list whose
+;; circle (filled and drawn, drawn alone), line, text and tspan (size, dy, text-anchor, a font-family list whose
 ;; first family no file has, character and entity references) drawn as the
 ;; page's own operations at the size the graphic is set at -- half as wide
 ;; again as its own; its style element passed over.
